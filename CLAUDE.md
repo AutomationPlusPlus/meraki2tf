@@ -4,11 +4,11 @@
 A robust, secure, and schedulable CLI tool written in Python to extract Cisco Meraki configurations, map them to Terraform structures using the Meraki OpenAPI specification, evaluate state drift, auto-import new resources, and flag unsupported parameters.
 
 ### Core Pipeline Steps
-1. **Spec Ingestion:** Parse the Meraki OpenAPI JSON schema to build a dynamic API-to-Terraform resource registry.
+1. **Dynamic Spec Ingestion:** Parse the Meraki OpenAPI JSON schema dynamically (either via a local file or pulling the latest release) to programmatically build the API-to-Terraform resource registry. **Hard-coded mapping tables are strictly prohibited**; the engine must dynamically derive resources and compound ID paths from the spec metadata to stay future-proof.
 2. **Configuration Discovery:** Ingest network infrastructure schemas via dual input modalities (Live Cloud API or Offline JSON Dump).
 3. **HCL Construction:** Write clean, declarative configuration structures natively utilizing modern Terraform `import` blocks.
-4. **State Orchestration:** Compare configurations against existing state (or initialize a baseline). Output structural differences and changes since the last state.
-5. **State Aggregation:** Apply missing delta pieces into the current state file.
+4. **State Orchestration & Drift Alerting:** Compare discovered configurations against the existing state file. If differences/drifts are found, compile a diff payload and **trigger a drift alert** via configured notification channels.
+5. **State Aggregation & Success Notification:** Apply missing delta pieces into the state file. Upon absolute execution success and state synchronization, **dispatch a success notification** confirming a clean run.
 6. **Exception Auditing:** Flag parameters or features completely unsupported by the Terraform provider, and emit structured payloads to alerting endpoints.
 
 ---
@@ -69,4 +69,7 @@ Do NOT install, generate configurations for, or utilize:
 
 ### 📢 Notification & Alerting Infrastructure
 - Build decoupled modular notifier plugins (Webhook targets, Email placeholders).
-- Trigger alert dispatching whenever an explicit configuration drift occurs, a script run experiences a processing fault, or an unsupported Meraki feature is flagged during code construction.
+- **Trigger alert/notification dispatching on:**
+  - Detection of configuration drift/differences during the comparison phase.
+  - Successful finalization and aggregation of a new state file run.
+  - Identification of unsupported Meraki features or critical script processing faults.
