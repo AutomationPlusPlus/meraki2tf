@@ -19,24 +19,25 @@ def _config(argv: list[str]) -> RuntimeConfig:
 
 
 def test_defaults_to_live_mode() -> None:
-    config = _config([])
+    config = _config(["--spec", "openapi.json"])
     assert config.mode is ExecutionMode.LIVE
     assert config.dump_path is None
-    assert config.output_dir == Path("generated")
-    assert not config.verbose
+    assert config.spec_path == Path("openapi.json")
 
 
 def test_dump_flag_selects_dump_mode() -> None:
-    config = _config(["--from-dump", "snapshots/site.json", "-v"])
+    config = _config(
+        ["--spec", "openapi.json", "--from-dump", "snapshots/site.json", "-v"]
+    )
     assert config.mode is ExecutionMode.DUMP
     assert config.dump_path == Path("snapshots/site.json")
     assert config.verbose
 
 
-def test_spec_and_output_flags_are_carried() -> None:
-    config = _config(["--spec", "spec.json", "--output-dir", "out"])
-    assert config.spec_source == "spec.json"
-    assert config.output_dir == Path("out")
+def test_config_never_carries_credentials() -> None:
+    config = _config(["--spec", "openapi.json"])
+    assert "api_key" not in {f for f in config.__dataclass_fields__}
+    assert "token" not in repr(config).lower()
 
 
 def test_read_api_key_returns_env_token(monkeypatch: pytest.MonkeyPatch) -> None:

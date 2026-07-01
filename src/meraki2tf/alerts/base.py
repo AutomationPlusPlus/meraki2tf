@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import abc
 
-from meraki2tf.notifications.models import NotificationEvent
+from meraki2tf.alerts.models import AlertEvent
 
 
 class Notifier(abc.ABC):
@@ -19,5 +19,5 @@ class Notifier(abc.ABC):
     channel: str = "abstract"
 
     @abc.abstractmethod
-    def send(self, event: NotificationEvent) -> None:
+    def send(self, event: AlertEvent) -> None:
         """Deliver one event to this channel."""

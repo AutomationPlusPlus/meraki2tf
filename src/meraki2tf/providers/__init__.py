@@ -1,18 +1,18 @@
-"""Configuration providers: live cloud API and offline JSON dump.
+"""Dual-modality ingestion providers: live cloud API and offline JSON dump.
 
-Both implement the same :class:`~meraki2tf.providers.base.ConfigurationProvider`
-protocol so the translation pipeline is agnostic to where the network
-graph came from — structural parity between modes is guaranteed by the
-interface, not by convention.
+Both implement the :class:`~meraki2tf.providers.base.MerakiDataProvider`
+protocol and emit identical :class:`~meraki2tf.models.NetworkGraph`
+domain models, so downstream components stay data-source agnostic.
 """
 
-from meraki2tf.providers.base import ConfigurationProvider, OperationNotInSnapshotError
-from meraki2tf.providers.dump import DumpProvider
-from meraki2tf.providers.live import LiveProvider
+from meraki2tf.providers.base import MerakiDataProvider
+from meraki2tf.providers.dump import MalformedDumpError, StaticJsonDataProvider
+from meraki2tf.providers.live import LiveApiDataProvider, LiveDispatchError
 
 __all__ = [
-    "ConfigurationProvider",
-    "DumpProvider",
-    "LiveProvider",
-    "OperationNotInSnapshotError",
+    "LiveApiDataProvider",
+    "LiveDispatchError",
+    "MalformedDumpError",
+    "MerakiDataProvider",
+    "StaticJsonDataProvider",
 ]

@@ -1,43 +1,39 @@
-"""Abstract data provider protocol for network graph ingestion.
+"""MerakiDataProvider: the dual-modality ingestion protocol.
 
-The pipeline never calls the Meraki SDK or reads files directly; it asks
-a provider to execute *operations* — identified by the ``operationId``
-values the spec ingestion engine discovers in the OpenAPI document.
-This keeps discovery fully dynamic (no hard-coded endpoints) and gives
-live and offline runs identical semantics.
+The pipeline consumes exactly one method — :meth:`fetch_network_graph`
+— which returns the shared :class:`~meraki2tf.models.NetworkGraph`
+domain model. The live cloud SDK and the offline JSON snapshot
+implementations both honor this contract, so every downstream component
+(HCL generation, drift orchestration, alerting) is data-source
+agnostic by construction.
 """
 
 from __future__ import annotations
 
 import abc
-from typing import Any
+
+from meraki2tf.models import NetworkGraph
 
 
-class OperationNotInSnapshotError(LookupError):
-    """The requested operation has no captured result in the offline dump."""
-
-
-class ConfigurationProvider(abc.ABC):
-    """Uniform source of Meraki configuration data.
-
-    ``operation_id`` is an OpenAPI operationId (e.g. ``getOrganizationNetworks``)
-    and ``path_params`` are the templated path values that operation
-    requires (e.g. ``organizationId="..."``). Implementations return the
-    parsed JSON payload the Meraki API would produce.
-    """
+class MerakiDataProvider(abc.ABC):
+    """Uniform source of the discovered Meraki configuration surface."""
 
     #: Short mode identifier used in logs.
     mode: str = "abstract"
 
     @abc.abstractmethod
-    def execute(self, operation_id: str, **path_params: str) -> Any:
-        """Return the payload for one discovered API operation."""
+    def fetch_network_graph(self, organization_id: str | None = None) -> NetworkGraph:
+        """Return the full domain graph (networks, devices, features).
+
+        ``organization_id`` scopes live discovery; offline providers may
+        fall back to the organization recorded in the snapshot.
+        """
 
     @abc.abstractmethod
     def close(self) -> None:
         """Release any underlying transport resources."""
 
-    def __enter__(self) -> "ConfigurationProvider":
+    def __enter__(self) -> "MerakiDataProvider":
         return self
 
     def __exit__(self, *exc_info: object) -> None:

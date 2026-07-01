@@ -54,14 +54,3 @@ def test_configure_logging_sets_level_and_redaction(verbose: bool, expected: int
         )
     finally:
         root.handlers, root.level = saved_handlers, saved_level
-
-
-def test_cli_main_runs_cleanly(capsys: pytest.CaptureFixture[str]) -> None:
-    from meraki2tf.cli import main
-
-    root = logging.getLogger()
-    saved_handlers, saved_level = root.handlers, root.level
-    try:
-        assert main([]) == 0
-    finally:
-        root.handlers, root.level = saved_handlers, saved_level

@@ -45,7 +45,7 @@ _PARAM_SEGMENT = re.compile(r"^\{.+\}$")
 TERRAFORM_PROVIDER_PREFIX = "meraki"
 
 
-def _snake(name: str) -> str:
+def snake_case(name: str) -> str:
     """``trafficShaping`` → ``traffic_shaping``; ``organizationId`` → ``organization_id``."""
     return _CAMEL_BOUNDARY.sub("_", name).lower()
 
@@ -54,16 +54,16 @@ def _segments(path: str) -> list[str]:
     return [segment for segment in path.split("/") if segment]
 
 
-def _entity_key(path: str) -> tuple[str, ...]:
+def entity_key(path: str) -> tuple[str, ...]:
     """Non-parameter segments of a path template, snake_cased."""
     return tuple(
-        _snake(segment)
+        snake_case(segment)
         for segment in _segments(path)
         if not _PARAM_SEGMENT.match(segment)
     )
 
 
-def _is_item_path(path: str) -> bool:
+def is_item_path(path: str) -> bool:
     """True when the template addresses one entity instance (ends in a parameter)."""
     segments = _segments(path)
     return bool(segments) and bool(_PARAM_SEGMENT.match(segments[-1]))
@@ -105,7 +105,7 @@ class OpenApiParser:
         canonical_keys = {
             key
             for key, ops in grouped.items()
-            if any(_is_item_path(op.path) for op in ops)
+            if any(is_item_path(op.path) for op in ops)
         }
         merged: dict[tuple[str, ...], list[OperationSpec]] = {}
         for key, ops in grouped.items():
@@ -143,7 +143,7 @@ class OpenApiParser:
     def _group_by_entity(self) -> dict[tuple[str, ...], list[OperationSpec]]:
         grouped: dict[tuple[str, ...], list[OperationSpec]] = {}
         for op in self._endpoints:
-            grouped.setdefault(_entity_key(op.path), []).append(op)
+            grouped.setdefault(entity_key(op.path), []).append(op)
         return grouped
 
     @staticmethod
@@ -167,5 +167,5 @@ class OpenApiParser:
     @staticmethod
     def _id_components(ops: list[OperationSpec]) -> tuple[str, ...]:
         """Ordered compound-ID parts from the entity's most specific endpoint."""
-        best = max(ops, key=lambda op: (_is_item_path(op.path), len(op.path_params)))
-        return tuple(_snake(param) for param in best.path_params)
+        best = max(ops, key=lambda op: (is_item_path(op.path), len(op.path_params)))
+        return tuple(snake_case(param) for param in best.path_params)

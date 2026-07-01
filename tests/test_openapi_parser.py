@@ -8,9 +8,9 @@ import pytest
 from meraki2tf.openapi_parser import (
     OpenApiParser,
     TerraformResourceMapping,
-    _entity_key,
-    _is_item_path,
-    _snake,
+    entity_key,
+    is_item_path,
+    snake_case,
 )
 from meraki2tf.spec.engine import MalformedSpecError
 
@@ -152,17 +152,17 @@ def test_parser_propagates_malformed_spec_errors(tmp_path: Path) -> None:
 
 
 def test_snake_case_helper() -> None:
-    assert _snake("trafficShaping") == "traffic_shaping"
-    assert _snake("organizationId") == "organization_id"
-    assert _snake("serial") == "serial"
+    assert snake_case("trafficShaping") == "traffic_shaping"
+    assert snake_case("organizationId") == "organization_id"
+    assert snake_case("serial") == "serial"
 
 
 def test_path_helpers() -> None:
-    assert _entity_key("/networks/{networkId}/appliance/vlans/{vlanId}") == (
+    assert entity_key("/networks/{networkId}/appliance/vlans/{vlanId}") == (
         "networks",
         "appliance",
         "vlans",
     )
-    assert _is_item_path("/networks/{networkId}")
-    assert not _is_item_path("/organizations")
-    assert not _is_item_path("/networks/{networkId}/appliance/vlans")
+    assert is_item_path("/networks/{networkId}")
+    assert not is_item_path("/organizations")
+    assert not is_item_path("/networks/{networkId}/appliance/vlans")

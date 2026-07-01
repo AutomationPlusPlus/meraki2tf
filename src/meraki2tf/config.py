@@ -36,10 +36,17 @@ class RuntimeConfig:
     """
 
     mode: ExecutionMode
+    org_id: str | None
+    spec_path: Path
     dump_path: Path | None
-    spec_source: str | None
-    output_dir: Path
+    workdir: Path
     verbose: bool
+    webhook_urls: tuple[str, ...]
+    alert_emails: tuple[str, ...]
+    smtp_host: str
+    smtp_port: int
+    email_from: str
+    terraform_bin: str
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> "RuntimeConfig":
@@ -47,10 +54,17 @@ class RuntimeConfig:
         dump_path = Path(args.from_dump) if args.from_dump else None
         return cls(
             mode=ExecutionMode.DUMP if dump_path else ExecutionMode.LIVE,
+            org_id=args.org_id,
+            spec_path=Path(args.spec),
             dump_path=dump_path,
-            spec_source=args.spec,
-            output_dir=Path(args.output_dir),
+            workdir=Path(args.workdir),
             verbose=args.verbose,
+            webhook_urls=tuple(args.webhook_url or ()),
+            alert_emails=tuple(args.alert_email or ()),
+            smtp_host=args.smtp_host,
+            smtp_port=args.smtp_port,
+            email_from=args.email_from,
+            terraform_bin=args.terraform_bin,
         )
 
 
