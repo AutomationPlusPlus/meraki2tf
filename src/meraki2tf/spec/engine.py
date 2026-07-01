@@ -83,14 +83,10 @@ class SpecIngestionEngine:
 
     @classmethod
     def from_latest_release(cls) -> "SpecIngestionEngine":
-        """Pull the latest published Meraki OpenAPI spec.
+        """Pull the latest published Meraki OpenAPI spec from GitHub."""
+        from meraki2tf.spec_resolver import fetch_latest_spec
 
-        Lands with the live-mode iteration (fetched via the SDK transport
-        so proxy/retry behavior stays uniform).
-        """
-        raise NotImplementedError(
-            "Remote spec retrieval is wired in with the live-mode iteration."
-        )
+        return cls(fetch_latest_spec())
 
     def operations(self) -> Iterator[OperationSpec]:
         """Walk every path/method pair in the document, in spec order."""

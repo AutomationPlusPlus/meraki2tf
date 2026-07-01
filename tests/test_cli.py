@@ -8,11 +8,22 @@ from typing import Any
 
 import pytest
 
-from meraki2tf import terraform_runner
+from conftest import PIPELINE_SPEC
+from meraki2tf import spec_resolver, terraform_runner
 from meraki2tf.cli import build_dispatcher, build_parser, build_provider, main
 from meraki2tf.config import RuntimeConfig
 from meraki2tf.openapi_parser import OpenApiParser
 from meraki2tf.providers import LiveApiDataProvider, StaticJsonDataProvider
+from meraki2tf.spec_resolver import SpecResolutionError
+
+
+def _no_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force the spec resolver onto its offline/local-fallback path."""
+
+    def offline(url: str) -> str:
+        raise SpecResolutionError(f"offline test environment ({url})")
+
+    monkeypatch.setattr(spec_resolver, "_download", offline)
 
 
 def _config(argv: list[str]) -> RuntimeConfig:
@@ -52,9 +63,9 @@ def test_parser_collects_repeated_alert_destinations(spec_file: Path) -> None:
     assert config.verbose
 
 
-def test_spec_is_required() -> None:
-    with pytest.raises(SystemExit):
-        build_parser().parse_args([])
+def test_spec_flag_is_optional() -> None:
+    config = _config([])
+    assert config.spec_path is None
 
 
 def test_live_mode_requires_org_id(spec_file: Path) -> None:
@@ -118,6 +129,7 @@ def test_dump_mode_end_to_end(
 
     monkeypatch.setattr(terraform_runner.subprocess, "run", fake_run)
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    _no_network(monkeypatch)
     workdir = tmp_path / "workspace"
 
     exit_code = main(
@@ -166,6 +178,7 @@ def test_pipeline_fault_exits_one_and_alerts(
 
     monkeypatch.setattr(terraform_runner.subprocess, "run", failing_run)
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    _no_network(monkeypatch)
 
     exit_code = main(
         [
@@ -180,7 +193,10 @@ def test_pipeline_fault_exits_one_and_alerts(
     assert delivered[-1]["details"]["stage"] == "terraform init"
 
 
-def test_startup_failure_exits_one(tmp_path: Path) -> None:
+def test_startup_failure_exits_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _no_network(monkeypatch)
     exit_code = main(
         [
             "--spec", str(tmp_path / "missing-spec.json"),
@@ -188,3 +204,30 @@ def test_startup_failure_exits_one(tmp_path: Path) -> None:
         ]
     )
     assert exit_code == 1
+
+
+def test_omitted_spec_downloads_latest_and_runs(
+    dump_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No --spec and no local file: the latest release is fetched and used."""
+    monkeypatch.chdir(tmp_path)
+    remote_spec = {**PIPELINE_SPEC, "info": {"version": "1.56.0"}}
+    monkeypatch.setattr(
+        spec_resolver, "_download", lambda url: json.dumps(remote_spec)
+    )
+
+    def fake_run(command: tuple[str, ...], **kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake_run)
+
+    exit_code = main(
+        ["--from-dump", str(dump_file), "--workdir", str(tmp_path / "workspace")]
+    )
+    assert exit_code == 0
+    downloaded = tmp_path / "spec3.json"
+    assert downloaded.exists()
+    assert json.loads(downloaded.read_text(encoding="utf-8"))["info"] == {
+        "version": "1.56.0"
+    }
+    assert (tmp_path / "workspace" / "imports.tf").exists()

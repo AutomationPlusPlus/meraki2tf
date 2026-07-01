@@ -76,5 +76,13 @@ def test_unimplemented_stages_are_explicit() -> None:
     engine = SpecIngestionEngine(MOCK_SPEC)
     with pytest.raises(NotImplementedError):
         engine.build_registry()
-    with pytest.raises(NotImplementedError):
-        SpecIngestionEngine.from_latest_release()
+
+
+def test_from_latest_release_builds_from_remote_spec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from meraki2tf import spec_resolver
+
+    monkeypatch.setattr(spec_resolver, "fetch_latest_spec", lambda: MOCK_SPEC)
+    engine = SpecIngestionEngine.from_latest_release()
+    assert len(engine.resource_groups()) == 2

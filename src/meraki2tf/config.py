@@ -37,7 +37,8 @@ class RuntimeConfig:
 
     mode: ExecutionMode
     org_id: str | None
-    spec_path: Path
+    #: None means "resolve automatically" — see meraki2tf.spec_resolver.
+    spec_path: Path | None
     dump_path: Path | None
     workdir: Path
     verbose: bool
@@ -55,7 +56,7 @@ class RuntimeConfig:
         return cls(
             mode=ExecutionMode.DUMP if dump_path else ExecutionMode.LIVE,
             org_id=args.org_id,
-            spec_path=Path(args.spec),
+            spec_path=Path(args.spec) if args.spec else None,
             dump_path=dump_path,
             workdir=Path(args.workdir),
             verbose=args.verbose,

@@ -12,7 +12,6 @@ import argparse
 import logging
 import sys
 from collections.abc import Sequence
-from pathlib import Path
 
 from meraki2tf.alerts import AlertDispatcher, EmailNotifier, WebhookNotifier
 from meraki2tf.config import ExecutionMode, RuntimeConfig
@@ -25,6 +24,7 @@ from meraki2tf.providers import (
     MerakiDataProvider,
     StaticJsonDataProvider,
 )
+from meraki2tf.spec_resolver import resolve_spec
 from meraki2tf.terraform_runner import TerraformRunner
 
 logger = logging.getLogger(__name__)
@@ -49,8 +49,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--spec",
         metavar="PATH",
-        required=True,
-        help="Meraki OpenAPI JSON document driving the dynamic resource registry.",
+        default=None,
+        help=(
+            "Meraki OpenAPI JSON document driving the dynamic resource registry. "
+            "If the file exists it is version-checked against the latest GitHub "
+            "release and refreshed when outdated; if missing (or the flag is "
+            "omitted, defaulting to ./spec3.json) the latest release is "
+            "downloaded from GitHub."
+        ),
     )
     parser.add_argument(
         "--from-dump",
@@ -140,7 +146,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     logger.info("meraki2tf starting in %s mode.", config.mode.value)
     try:
-        spec_parser = OpenApiParser(Path(config.spec_path))
+        spec_parser = OpenApiParser(resolve_spec(config.spec_path))
         dispatcher = build_dispatcher(config)
         orchestrator = PipelineOrchestrator(
             provider=build_provider(config, spec_parser),

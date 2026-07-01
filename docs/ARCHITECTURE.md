@@ -11,6 +11,7 @@ src/meraki2tf/
 ├── config.py             # RuntimeConfig, execution modes, env-only secret sourcing
 ├── logging_setup.py      # Clean vs. verbose profiles + mandatory secret redaction
 ├── models.py             # Shared domain objects: NetworkGraph, networks, devices, features
+├── spec_resolver.py     # Spec freshness check + GitHub download (local → version-check → fetch)
 ├── spec/
 │   └── engine.py         # Dynamic OpenAPI walker → operations, resource groups
 ├── openapi_parser.py     # OpenApiParser → Terraform names, compound IDs, lookup table

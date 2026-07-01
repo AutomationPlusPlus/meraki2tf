@@ -25,6 +25,10 @@ def test_defaults_to_live_mode() -> None:
     assert config.spec_path == Path("openapi.json")
 
 
+def test_spec_path_defaults_to_auto_resolution() -> None:
+    assert _config([]).spec_path is None
+
+
 def test_dump_flag_selects_dump_mode() -> None:
     config = _config(
         ["--spec", "openapi.json", "--from-dump", "snapshots/site.json", "-v"]

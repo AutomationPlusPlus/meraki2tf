@@ -32,7 +32,9 @@ exception auditor instead of silently dropped.
 - Python 3.11+
 - The `terraform` CLI on your `PATH` (any version supporting `import` blocks, ≥ 1.5)
 - A Meraki dashboard API key (live mode only)
-- A local copy of the Meraki OpenAPI spec (`openapi.json`)
+- The Meraki OpenAPI spec — fetched from GitHub automatically; only
+  air-gapped runs need a local copy pre-staged (see
+  [OpenAPI spec resolution](#openapi-spec-resolution))
 
 This project deliberately uses plain `venv` + `pip` — poetry and uv are
 not used and not supported.
@@ -106,7 +108,7 @@ ordered parameter values that form its compound import ID.
 | Flag | Default | Purpose |
 | --- | --- | --- |
 | `--org-id` | — | Organization to discover (required in live mode) |
-| `--spec PATH` | required | Meraki OpenAPI JSON document |
+| `--spec PATH` | `./spec3.json` | Meraki OpenAPI JSON document; auto-downloaded/refreshed from GitHub |
 | `--from-dump PATH` | — | Offline snapshot; switches to dump mode |
 | `--workdir DIR` | `generated` | Terraform execution workspace |
 | `--webhook-url URL` | — | Webhook alert endpoint (repeatable) |
@@ -115,6 +117,21 @@ ordered parameter values that form its compound import ID.
 | `--email-from` | `meraki2tf@localhost` | Sender address for email alerts |
 | `--terraform-bin` | `terraform` | Terraform executable to invoke |
 | `-v`, `--verbose` | off | Debug logging (secrets always redacted) |
+
+### OpenAPI spec resolution
+
+You normally never manage the spec by hand:
+
+- **Spec file exists** (at `--spec PATH`, or `./spec3.json` when the
+  flag is omitted): its `info.version` is compared against the latest
+  release in the [`meraki/openapi`](https://github.com/meraki/openapi)
+  GitHub repository; when outdated the file is refreshed in place.
+- **Spec file missing**: the latest release is downloaded from GitHub
+  to that path automatically.
+- **GitHub unreachable** (air-gapped/offline runs): an existing local
+  spec is used as-is with a warning; if there is no local copy either,
+  the run fails with a clear error — pre-stage `spec3.json` for
+  fully offline environments.
 
 ### Logging & secret isolation
 
