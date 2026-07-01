@@ -36,6 +36,7 @@ class RunSummary:
 
     organization_id: str
     imports_written: int
+    imports_skipped_existing: int
     unsupported_count: int
     drift_detected: bool
 
@@ -69,8 +70,19 @@ class PipelineOrchestrator:
             stage = "workspace preparation"
             self._runner.prepare_workspace()
 
+            stage = "state inspection"
+            existing = self._runner.existing_addresses()
+            if existing:
+                logger.info(
+                    "%d resource(s) already tracked in state; only the delta "
+                    "will be imported.",
+                    len(existing),
+                )
+
             stage = "HCL construction"
-            report = self._generator.generate(graph, self._runner.workdir)
+            report = self._generator.generate(
+                graph, self._runner.workdir, existing_addresses=existing
+            )
 
             stage = "terraform init"
             self._runner.init()
@@ -104,6 +116,7 @@ class PipelineOrchestrator:
             return RunSummary(
                 organization_id=graph.organization_id,
                 imports_written=report.imports_written,
+                imports_skipped_existing=report.skipped_existing,
                 unsupported_count=len(report.unsupported),
                 drift_detected=drift,
             )

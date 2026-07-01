@@ -29,6 +29,12 @@ def test_spec_path_defaults_to_auto_resolution() -> None:
     assert _config([]).spec_path is None
 
 
+def test_state_file_defaults_to_workdir_and_accepts_override() -> None:
+    assert _config([]).state_file is None
+    config = _config(["--state-file", "/var/lib/meraki2tf/org.tfstate"])
+    assert config.state_file == Path("/var/lib/meraki2tf/org.tfstate")
+
+
 def test_dump_flag_selects_dump_mode() -> None:
     config = _config(
         ["--spec", "openapi.json", "--from-dump", "snapshots/site.json", "-v"]

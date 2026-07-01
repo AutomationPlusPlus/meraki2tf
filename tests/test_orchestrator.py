@@ -43,8 +43,17 @@ class StubGenerator:
     def __init__(self, imports_written: int = 2) -> None:
         self.imports_written = imports_written
         self.unsupported: tuple = ()  # type: ignore[type-arg]
+        self.skipped_existing = 0
+        self.received_existing: frozenset[str] | None = None
 
-    def generate(self, graph: NetworkGraph, workdir: Path) -> "StubGenerator":
+    def generate(
+        self,
+        graph: NetworkGraph,
+        workdir: Path,
+        existing_addresses: frozenset[str] = frozenset(),
+    ) -> "StubGenerator":
+        self.received_existing = existing_addresses
+        self.skipped_existing = len(existing_addresses)
         return self
 
 
@@ -54,6 +63,7 @@ class StubRunner:
         self.plan_exit = plan_exit
         self.fail_stage = fail_stage
         self.applied = False
+        self.state_addresses: frozenset[str] = frozenset()
 
     def _result(self, code: int) -> TerraformCommandResult:
         return TerraformCommandResult(
@@ -62,6 +72,9 @@ class StubRunner:
 
     def prepare_workspace(self) -> Path:
         return self.workdir
+
+    def existing_addresses(self) -> frozenset[str]:
+        return self.state_addresses
 
     def init(self) -> TerraformCommandResult:
         if self.fail_stage == "init":
@@ -77,14 +90,17 @@ class StubRunner:
 
 
 def _orchestrator(
-    tmp_path: Path, plan_exit: int = 0, fail_stage: str = ""
+    tmp_path: Path,
+    plan_exit: int = 0,
+    fail_stage: str = "",
+    generator: StubGenerator | None = None,
 ) -> tuple[PipelineOrchestrator, RecordingNotifier, StubProvider, StubRunner]:
     recorder = RecordingNotifier()
     provider = StubProvider()
     runner = StubRunner(tmp_path, plan_exit=plan_exit, fail_stage=fail_stage)
     orchestrator = PipelineOrchestrator(
         provider=provider,
-        generator=StubGenerator(),  # type: ignore[arg-type]
+        generator=generator or StubGenerator(),  # type: ignore[arg-type]
         runner=runner,  # type: ignore[arg-type]
         dispatcher=AlertDispatcher([recorder]),
     )
@@ -117,6 +133,17 @@ def test_drift_fires_alert_then_still_aggregates(tmp_path: Path) -> None:
     assert drift.details["workspace"] == str(runner.workdir)
     assert summary.drift_detected is True
     assert runner.applied
+
+
+def test_existing_state_addresses_flow_into_generation(tmp_path: Path) -> None:
+    generator = StubGenerator()
+    orchestrator, _, _, runner = _orchestrator(tmp_path, generator=generator)
+    runner.state_addresses = frozenset({"meraki_networks.n_1"})
+
+    summary = orchestrator.run("org-123")
+
+    assert generator.received_existing == frozenset({"meraki_networks.n_1"})
+    assert summary.imports_skipped_existing == 1
 
 
 def test_fault_dispatches_processing_fault_and_raises(tmp_path: Path) -> None:

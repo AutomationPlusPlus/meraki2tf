@@ -118,6 +118,27 @@ def test_id_component_arity_mismatch_is_flagged(
     assert recorder.events[0].event_type is EventType.UNSUPPORTED_FEATURE_FLAGGED
 
 
+def test_assets_already_in_state_are_skipped(
+    generator: HclImportGenerator, tmp_path: Path, recorder: RecordingNotifier
+) -> None:
+    """Consecutive runs aggregate only the delta into existing state."""
+    report = generator.generate(
+        _graph(),
+        tmp_path,
+        existing_addresses=frozenset(
+            {"meraki_networks.n_1", "meraki_devices.q2ab_cdef_ghij"}
+        ),
+    )
+    content = report.imports_file.read_text(encoding="utf-8")
+
+    assert report.skipped_existing == 2
+    assert report.imports_written == 1  # only the VLAN is new
+    assert "meraki_networks.n_1" not in content
+    assert "meraki_devices.q2ab_cdef_ghij" not in content
+    assert "to = meraki_networks_appliance_vlans.n_1_10\n" in content
+    assert recorder.events == []  # skipping is not an exception-audit event
+
+
 def test_duplicate_assets_are_written_once(
     generator: HclImportGenerator, tmp_path: Path
 ) -> None:

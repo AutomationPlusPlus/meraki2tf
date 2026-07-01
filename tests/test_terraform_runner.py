@@ -9,6 +9,7 @@ import pytest
 
 from meraki2tf import terraform_runner
 from meraki2tf.terraform_runner import (
+    DEFAULT_STATE_FILENAME,
     GENERATED_CONFIG_FILENAME,
     PROVIDER_FILENAME,
     TerraformError,
@@ -48,6 +49,62 @@ def test_prepare_workspace_writes_credential_free_provider_anchor(
     assert "api_key" not in content
 
 
+def test_state_defaults_into_workdir_backend(runner: TerraformRunner) -> None:
+    provider_file = runner.prepare_workspace()
+    expected = (runner.workdir / DEFAULT_STATE_FILENAME).resolve()
+    assert runner.state_path == expected
+    content = provider_file.read_text(encoding="utf-8")
+    assert 'backend "local"' in content
+    assert f'path = "{expected}"' in content
+
+
+def test_custom_state_location_is_anchored_and_parent_created(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state-store" / "org-123.tfstate"
+    runner = TerraformRunner(tmp_path / "ws", state_path=state)
+    provider_file = runner.prepare_workspace()
+    assert runner.state_path == state.resolve()
+    assert state.parent.is_dir()  # created so terraform can write the file
+    assert f'path = "{state.resolve()}"' in provider_file.read_text(encoding="utf-8")
+
+
+def test_existing_addresses_empty_when_no_state(runner: TerraformRunner) -> None:
+    assert runner.existing_addresses() == frozenset()
+
+
+def test_existing_addresses_reads_managed_resources(tmp_path: Path) -> None:
+    state = tmp_path / "terraform.tfstate"
+    state.write_text(
+        '{"resources": ['
+        '{"mode": "managed", "type": "meraki_networks", "name": "n_1"},'
+        '{"mode": "managed", "type": "meraki_devices", "name": "q2ab"},'
+        '{"mode": "data", "type": "meraki_networks", "name": "lookup"},'
+        '"garbage-entry"'
+        "]}",
+        encoding="utf-8",
+    )
+    runner = TerraformRunner(tmp_path / "ws", state_path=state)
+    assert runner.existing_addresses() == frozenset(
+        {"meraki_networks.n_1", "meraki_devices.q2ab"}
+    )
+
+
+def test_existing_addresses_tolerates_non_object_state(tmp_path: Path) -> None:
+    state = tmp_path / "terraform.tfstate"
+    state.write_text("[]", encoding="utf-8")
+    runner = TerraformRunner(tmp_path / "ws", state_path=state)
+    assert runner.existing_addresses() == frozenset()
+
+
+def test_unreadable_state_is_a_hard_error(tmp_path: Path) -> None:
+    state = tmp_path / "terraform.tfstate"
+    state.write_text("{corrupt", encoding="utf-8")
+    runner = TerraformRunner(tmp_path / "ws", state_path=state)
+    with pytest.raises(TerraformError, match="unreadable"):
+        runner.existing_addresses()
+
+
 def test_init_invokes_terraform_with_safe_flags(
     runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -55,7 +112,9 @@ def test_init_invokes_terraform_with_safe_flags(
     monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
     result = runner.init()
     call = fake.calls[0]
-    assert call["command"] == ("terraform", "init", "-input=false", "-no-color")
+    assert call["command"] == (
+        "terraform", "init", "-input=false", "-no-color", "-reconfigure",
+    )
     assert call["cwd"] == runner.workdir
     assert call["capture_output"] is True
     assert result.returncode == 0

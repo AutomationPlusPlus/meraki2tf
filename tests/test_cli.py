@@ -35,6 +35,7 @@ def test_parser_defaults(spec_file: Path) -> None:
     assert config.org_id is None
     assert config.dump_path is None
     assert config.workdir == Path("generated")
+    assert config.state_file is None
     assert config.webhook_urls == ()
     assert config.alert_emails == ()
     assert config.smtp_host == "localhost"
@@ -204,6 +205,50 @@ def test_startup_failure_exits_one(
         ]
     )
     assert exit_code == 1
+
+
+def test_consecutive_run_reuses_existing_state(
+    spec_file: Path,
+    dump_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pre-existing state file means only the delta gets import blocks."""
+    _no_network(monkeypatch)
+    monkeypatch.setattr(
+        terraform_runner.subprocess,
+        "run",
+        lambda command, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    state = tmp_path / "state-store" / "org-123.tfstate"
+    state.parent.mkdir()
+    state.write_text(
+        json.dumps(
+            {
+                "resources": [
+                    {"mode": "managed", "type": "meraki_networks", "name": "n_1"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    workdir = tmp_path / "workspace"
+
+    exit_code = main(
+        [
+            "--spec", str(spec_file),
+            "--from-dump", str(dump_file),
+            "--workdir", str(workdir),
+            "--state-file", str(state),
+        ]
+    )
+
+    assert exit_code == 0
+    imports = (workdir / "imports.tf").read_text(encoding="utf-8")
+    assert "meraki_networks.n_1" not in imports  # already tracked in state
+    assert "to = meraki_devices.q2ab_cdef_ghij\n" in imports
+    provider_tf = (workdir / "provider.tf").read_text(encoding="utf-8")
+    assert f'path = "{state.resolve()}"' in provider_tf
 
 
 def test_omitted_spec_downloads_latest_and_runs(

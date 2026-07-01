@@ -71,6 +71,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Terraform execution workspace directory (default: %(default)s).",
     )
     parser.add_argument(
+        "--state-file",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Terraform state file to aggregate into. An existing state is "
+            "reused so consecutive runs only import the delta; if the file "
+            "does not exist it is created on the first apply "
+            "(default: terraform.tfstate inside --workdir)."
+        ),
+    )
+    parser.add_argument(
         "--webhook-url",
         action="append",
         metavar="URL",
@@ -151,7 +162,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         orchestrator = PipelineOrchestrator(
             provider=build_provider(config, spec_parser),
             generator=HclImportGenerator(spec_parser, dispatcher),
-            runner=TerraformRunner(config.workdir, executable=config.terraform_bin),
+            runner=TerraformRunner(
+                config.workdir,
+                executable=config.terraform_bin,
+                state_path=config.state_file,
+            ),
             dispatcher=dispatcher,
         )
         summary = orchestrator.run(config.org_id)
@@ -169,9 +184,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _report(summary: RunSummary) -> None:
     logger.info(
         "Run complete for organization %s: %d import(s) written, "
-        "%d unsupported asset(s), drift %s.",
+        "%d already in state, %d unsupported asset(s), drift %s.",
         summary.organization_id,
         summary.imports_written,
+        summary.imports_skipped_existing,
         summary.unsupported_count,
         "DETECTED" if summary.drift_detected else "not detected",
     )

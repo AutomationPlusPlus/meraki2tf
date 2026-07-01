@@ -63,6 +63,8 @@ class GenerationReport:
     imports_file: Path
     imports_written: int
     unsupported: tuple[UnsupportedAsset, ...]
+    #: Assets skipped because the state file already tracks them.
+    skipped_existing: int = 0
 
 
 class HclImportGenerator:
@@ -72,14 +74,25 @@ class HclImportGenerator:
         self._parser = parser
         self._dispatcher = dispatcher
 
-    def generate(self, graph: NetworkGraph, workdir: Path) -> GenerationReport:
-        """Translate the graph into import blocks under ``workdir``."""
+    def generate(
+        self,
+        graph: NetworkGraph,
+        workdir: Path,
+        existing_addresses: frozenset[str] = frozenset(),
+    ) -> GenerationReport:
+        """Translate the graph into import blocks under ``workdir``.
+
+        ``existing_addresses`` are resources the state file already
+        tracks; they are skipped so consecutive runs aggregate only the
+        delta instead of re-importing everything from zero.
+        """
         lookup = self._parser.endpoint_lookup()
         mappings = self._parser.resource_mappings()
 
         blocks: list[str] = []
         seen_addresses: set[str] = set()
         unsupported: list[UnsupportedAsset] = []
+        skipped_existing = 0
 
         for candidate in self._candidates(graph):
             terraform_name = lookup.get(candidate.api_path)
@@ -100,6 +113,10 @@ class HclImportGenerator:
                 )
                 continue
             address = f"{terraform_name}.{self._label(candidate.id_values)}"
+            if address in existing_addresses:
+                skipped_existing += 1
+                logger.debug("Skipping %s; already tracked in state.", address)
+                continue
             if address in seen_addresses:
                 logger.debug("Skipping duplicate import address %s", address)
                 continue
@@ -112,13 +129,15 @@ class HclImportGenerator:
             _FILE_HEADER + "\n" + "\n".join(blocks), encoding="utf-8"
         )
         logger.info(
-            "Wrote %d import block(s) to %s (%d unsupported asset(s) flagged).",
-            len(blocks), imports_file, len(unsupported),
+            "Wrote %d import block(s) to %s (%d already in state, "
+            "%d unsupported asset(s) flagged).",
+            len(blocks), imports_file, skipped_existing, len(unsupported),
         )
         return GenerationReport(
             imports_file=imports_file,
             imports_written=len(blocks),
             unsupported=tuple(unsupported),
+            skipped_existing=skipped_existing,
         )
 
     @staticmethod

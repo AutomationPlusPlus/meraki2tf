@@ -41,6 +41,8 @@ class RuntimeConfig:
     spec_path: Path | None
     dump_path: Path | None
     workdir: Path
+    #: None means "terraform.tfstate inside the workdir".
+    state_file: Path | None
     verbose: bool
     webhook_urls: tuple[str, ...]
     alert_emails: tuple[str, ...]
@@ -59,6 +61,7 @@ class RuntimeConfig:
             spec_path=Path(args.spec) if args.spec else None,
             dump_path=dump_path,
             workdir=Path(args.workdir),
+            state_file=Path(args.state_file) if args.state_file else None,
             verbose=args.verbose,
             webhook_urls=tuple(args.webhook_url or ()),
             alert_emails=tuple(args.alert_email or ()),
