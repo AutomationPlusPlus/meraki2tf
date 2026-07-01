@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meraki2tf"
+version = "0.1.0"
+description = "Extract Cisco Meraki configurations and translate them into Terraform structures with drift detection and alerting."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+dependencies = ["meraki"]
+
+[project.scripts]
+meraki2tf = "meraki2tf.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+mypy_path = "src"
+packages = ["meraki2tf"]
+
+[[tool.mypy.overrides]]
+module = "meraki.*"
+ignore_missing_imports = true

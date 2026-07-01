@@ -1,0 +1,8 @@
+# Approved dependencies only — see CLAUDE.md Dependency Escalation Policy.
+meraki
+pre-commit
+flake8
+mypy
+tox
+pytest
+pytest-cov
