@@ -14,7 +14,12 @@ import sys
 from collections.abc import Sequence
 
 from meraki2tf.alerts import AlertDispatcher, EmailNotifier, WebhookNotifier
-from meraki2tf.config import ExecutionMode, RuntimeConfig
+from meraki2tf.config import (
+    API_KEY_ENV_VAR,
+    ExecutionMode,
+    RuntimeConfig,
+    api_key_present,
+)
 from meraki2tf.hcl_generator import HclImportGenerator
 from meraki2tf.logging_setup import configure_logging
 from meraki2tf.openapi_parser import OpenApiParser
@@ -27,7 +32,11 @@ from meraki2tf.providers import (
 from meraki2tf.sanitizer import sanitize_graph
 from meraki2tf.snapshot import write_snapshot
 from meraki2tf.spec_resolver import resolve_spec
-from meraki2tf.terraform_runner import TerraformRunner
+from meraki2tf.terraform_runner import (
+    PROVIDER_FILENAME,
+    TerraformError,
+    TerraformRunner,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +95,22 @@ def build_parser() -> argparse.ArgumentParser:
             "sharing in tests, demos, or bug reports. Structural IDs stay "
             "consistent so the sanitized snapshot remains fully processable."
         ),
+    )
+    parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help=(
+            "Disaster recovery: preview what 'terraform apply' would do with "
+            "the artifacts already generated in --workdir. Add --confirm to "
+            "actually execute the apply. This explicit action is the only way "
+            "meraki2tf ever applies anything — normal pipeline runs are "
+            "strictly read-only toward your Meraki organization."
+        ),
+    )
+    parser.add_argument(
+        "--confirm",
+        action="store_true",
+        help="Escalate --rebuild from a read-only preview to a real terraform apply.",
     )
     parser.add_argument(
         "--workdir",
@@ -181,12 +206,80 @@ def _export_snapshot(provider: MerakiDataProvider, config: RuntimeConfig) -> int
     return 0
 
 
+def _rebuild(config: RuntimeConfig) -> int:
+    """Explicit disaster-recovery action: preview or execute a rebuild apply.
+
+    This is the single place in the tool where ``terraform apply`` can
+    happen, and only when the operator passes both --rebuild and
+    --confirm; --rebuild alone is a read-only plan preview.
+    """
+    if not api_key_present():
+        logger.critical(
+            "--rebuild requires %s: the Terraform provider must authenticate "
+            "against the Meraki dashboard to plan and apply.",
+            API_KEY_ENV_VAR,
+        )
+        return 1
+    if not (config.workdir / PROVIDER_FILENAME).exists():
+        logger.critical(
+            "No rebuild artifacts found in %s (missing %s). Run the pipeline "
+            "first to generate them.",
+            config.workdir,
+            PROVIDER_FILENAME,
+        )
+        return 1
+    runner = TerraformRunner(
+        config.workdir,
+        executable=config.terraform_bin,
+        state_path=config.state_file,
+    )
+    try:
+        runner.init()
+        preview = runner.plan_preview()
+    except (TerraformError, OSError) as exc:
+        logger.critical("Rebuild planning failed: %s", exc)
+        return 1
+    logger.info("Rebuild plan for workspace %s:\n%s", config.workdir, preview.stdout)
+    if not preview.has_changes:
+        logger.info(
+            "Nothing to rebuild: the organization already matches the "
+            "generated artifacts."
+        )
+        return 0
+    if not config.confirm:
+        logger.warning(
+            "Preview only — nothing was applied. Re-run with "
+            "'--rebuild --confirm' to execute terraform apply and rebuild "
+            "the organization from the generated artifacts."
+        )
+        return 0
+    try:
+        runner.rebuild_apply()
+    except (TerraformError, OSError) as exc:
+        logger.critical("Rebuild apply failed: %s", exc)
+        return 1
+    logger.info(
+        "Rebuild complete: the organization now matches the generated artifacts."
+    )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     arg_parser = build_parser()
     args = arg_parser.parse_args(argv)
     config = RuntimeConfig.from_args(args)
     configure_logging(verbose=config.verbose)
 
+    if config.confirm and not config.rebuild:
+        arg_parser.error("--confirm is only valid together with --rebuild.")
+    if config.rebuild:
+        if config.dump_path is not None or config.dump_to is not None:
+            arg_parser.error(
+                "--rebuild operates on an existing --workdir; it cannot be "
+                "combined with --from-dump or --dump-to."
+            )
+        logger.info("meraki2tf starting in rebuild (disaster recovery) mode.")
+        return _rebuild(config)
     if config.mode is ExecutionMode.LIVE and not config.org_id:
         arg_parser.error("--org-id is required in live mode.")
     if config.sanitize and config.dump_to is None:
@@ -222,6 +315,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _report(summary: RunSummary) -> None:
+    if summary.comparison_skipped:
+        drift_status = f"comparison skipped ({API_KEY_ENV_VAR} not set)"
+    elif summary.drift_detected:
+        drift_status = "DETECTED"
+    else:
+        drift_status = "not detected"
     logger.info(
         "Run complete for organization %s: %d import(s) written, "
         "%d already in state, %d unsupported asset(s), drift %s.",
@@ -229,7 +328,7 @@ def _report(summary: RunSummary) -> None:
         summary.imports_written,
         summary.imports_skipped_existing,
         summary.unsupported_count,
-        "DETECTED" if summary.drift_detected else "not detected",
+        drift_status,
     )
 
 

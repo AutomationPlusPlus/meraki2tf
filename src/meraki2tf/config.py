@@ -45,6 +45,11 @@ class RuntimeConfig:
     dump_to: Path | None
     #: Redact secrets/identity from the exported snapshot (--dump-to).
     sanitize: bool
+    #: Disaster-recovery action: preview (or, with confirm, execute) a
+    #: terraform apply over the artifacts already in the workdir.
+    rebuild: bool
+    #: Escalates --rebuild from a read-only preview to a real apply.
+    confirm: bool
     workdir: Path
     #: None means "terraform.tfstate inside the workdir".
     state_file: Path | None
@@ -67,6 +72,8 @@ class RuntimeConfig:
             dump_path=dump_path,
             dump_to=Path(args.dump_to) if args.dump_to else None,
             sanitize=args.sanitize,
+            rebuild=args.rebuild,
+            confirm=args.confirm,
             workdir=Path(args.workdir),
             state_file=Path(args.state_file) if args.state_file else None,
             verbose=args.verbose,
@@ -77,6 +84,16 @@ class RuntimeConfig:
             email_from=args.email_from,
             terraform_bin=args.terraform_bin,
         )
+
+
+def api_key_present() -> bool:
+    """Whether the Meraki dashboard token is available in the environment.
+
+    Terraform's plan/apply stages read live resources through the
+    provider, so runs without a token (typical for offline dump mode)
+    skip them instead of failing.
+    """
+    return bool(os.environ.get(API_KEY_ENV_VAR, "").strip())
 
 
 def read_api_key() -> str:

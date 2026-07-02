@@ -139,6 +139,49 @@ def test_plan_reports_drift_on_detailed_exit_two(
     assert f"-generate-config-out={GENERATED_CONFIG_FILENAME}" in fake.calls[0]["command"]
 
 
+def test_import_only_plan_is_not_drift(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pending imports are normal snapshot growth, never a drift alert."""
+    fake = FakeSubprocess(
+        returncode=2,
+        stdout="Plan: 875 to import, 0 to add, 0 to change, 0 to destroy.",
+    )
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    result = runner.plan_with_generation()
+    assert result.has_changes is True  # imports still need aggregation
+    assert result.has_drift is False
+
+
+def test_real_changes_in_plan_summary_are_drift(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeSubprocess(
+        returncode=2,
+        stdout="Plan: 3 to import, 0 to add, 2 to change, 1 to destroy.",
+    )
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    assert runner.plan_with_generation().has_drift is True
+
+
+def test_summary_without_import_count_still_parses(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeSubprocess(
+        returncode=2, stdout="Plan: 1 to add, 0 to change, 0 to destroy."
+    )
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    assert runner.plan_with_generation().has_drift is True
+
+
+def test_unparseable_plan_falls_back_to_exit_code(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeSubprocess(returncode=2, stdout="~ resource delta")
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    assert runner.plan_with_generation().has_drift is True
+
+
 def test_plan_clears_stale_generated_config(
     runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -151,15 +194,33 @@ def test_plan_clears_stale_generated_config(
     assert not stale.exists()
 
 
-def test_apply_uses_auto_approve(
+def test_plan_preview_never_generates_config(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeSubprocess(returncode=2, stdout="Plan: 1 to add")
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    result = runner.plan_preview()
+    assert result.has_changes is True
+    command = fake.calls[0]["command"]
+    assert command[:2] == ("terraform", "plan")
+    assert "-detailed-exitcode" in command
+    assert not any("generate-config-out" in part for part in command)
+
+
+def test_rebuild_apply_uses_auto_approve(
     runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fake = FakeSubprocess(stdout="Apply complete")
     monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
-    runner.apply()
+    runner.rebuild_apply()
     assert fake.calls[0]["command"] == (
         "terraform", "apply", "-input=false", "-no-color", "-auto-approve",
     )
+
+
+def test_pipeline_surface_has_no_generic_apply() -> None:
+    """The read-only contract: apply exists solely as rebuild_apply."""
+    assert not hasattr(TerraformRunner, "apply")
 
 
 def test_failures_raise_with_cli_diagnostics(
