@@ -59,10 +59,23 @@ def drift_detected(diff: str, workspace: str) -> AlertEvent:
     )
 
 
-def run_success(imports_written: int, drift_was_detected: bool, workspace: str) -> AlertEvent:
+def run_success(
+    imports_written: int,
+    drift_was_detected: bool,
+    workspace: str,
+    discovered_assets: int,
+    imports_already_tracked: int,
+    unsupported_count: int,
+    pending_imports: int | None,
+    comparison_performed: bool,
+) -> AlertEvent:
     """Contract payload for a flawless snapshot-generation run.
 
-    Schema: ``details = {"imports_written", "drift_was_detected", "workspace"}``.
+    Carries the Terraform coverage picture so receivers can verify that
+    everything discovered is captured: total assets, new import blocks,
+    already-tracked resources, unsupported assets (manual DR rebuild),
+    and — when the plan comparison ran — how many imports are still
+    pending aggregation into state (None when unknown).
     """
     return AlertEvent(
         event_type=EventType.RUN_SUCCESS,
@@ -75,6 +88,11 @@ def run_success(imports_written: int, drift_was_detected: bool, workspace: str) 
             "imports_written": imports_written,
             "drift_was_detected": drift_was_detected,
             "workspace": workspace,
+            "discovered_assets": discovered_assets,
+            "imports_already_tracked": imports_already_tracked,
+            "unsupported_count": unsupported_count,
+            "pending_imports": pending_imports,
+            "comparison_performed": comparison_performed,
         },
     )
 

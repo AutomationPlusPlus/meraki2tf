@@ -113,6 +113,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Escalate --rebuild from a read-only preview to a real terraform apply.",
     )
     parser.add_argument(
+        "--rebaseline",
+        action="store_true",
+        help=(
+            "Accept the currently discovered configuration as the new "
+            "baseline: discard the accumulated resources.tf so this run "
+            "regenerates it from live data. Use after reviewing a "
+            "DRIFT_DETECTED alert. Refused while the state file tracks "
+            "resources (their configuration cannot be regenerated)."
+        ),
+    )
+    parser.add_argument(
         "--workdir",
         metavar="DIR",
         default="generated",
@@ -233,6 +244,11 @@ def _rebuild(config: RuntimeConfig) -> int:
         executable=config.terraform_bin,
         state_path=config.state_file,
     )
+    if config.state_file is not None:
+        # Re-anchor the backend at the explicitly requested state file;
+        # otherwise init would silently use whatever path the previous
+        # pipeline run baked into provider.tf.
+        runner.prepare_workspace()
     try:
         runner.init()
         preview = runner.plan_preview()
@@ -301,6 +317,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 state_path=config.state_file,
             ),
             dispatcher=dispatcher,
+            rebaseline=config.rebaseline,
         )
         summary = orchestrator.run(config.org_id)
     except PipelineError as exc:
@@ -321,13 +338,23 @@ def _report(summary: RunSummary) -> None:
         drift_status = "DETECTED"
     else:
         drift_status = "not detected"
+    if summary.pending_imports is not None:
+        pending_status = (
+            f"{summary.pending_imports} import(s) pending state aggregation"
+        )
+    else:
+        pending_status = "pending imports unknown"
     logger.info(
-        "Run complete for organization %s: %d import(s) written, "
-        "%d already in state, %d unsupported asset(s), drift %s.",
+        "Run complete for organization %s: %d/%d asset(s) captured as "
+        "Terraform (%d new import(s), %d already in state), %d unsupported "
+        "asset(s) needing manual DR rebuild, %s, drift %s.",
         summary.organization_id,
+        summary.imports_written + summary.imports_skipped_existing,
+        summary.discovered_assets,
         summary.imports_written,
         summary.imports_skipped_existing,
         summary.unsupported_count,
+        pending_status,
         drift_status,
     )
 

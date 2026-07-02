@@ -9,6 +9,7 @@ import pytest
 
 from meraki2tf import terraform_runner
 from meraki2tf.terraform_runner import (
+    AGGREGATED_CONFIG_FILENAME,
     DEFAULT_STATE_FILENAME,
     GENERATED_CONFIG_FILENAME,
     PROVIDER_FILENAME,
@@ -18,14 +19,23 @@ from meraki2tf.terraform_runner import (
 
 
 class FakeSubprocess:
-    def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
+    def __init__(
+        self,
+        returncode: int = 0,
+        stdout: str = "",
+        stderr: str = "",
+        on_run: Any = None,
+    ) -> None:
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
+        self.on_run = on_run
         self.calls: list[dict[str, Any]] = []
 
     def run(self, command: tuple[str, ...], **kwargs: Any) -> SimpleNamespace:
         self.calls.append({"command": command, **kwargs})
+        if self.on_run is not None:
+            self.on_run()
         return SimpleNamespace(
             returncode=self.returncode, stdout=self.stdout, stderr=self.stderr
         )
@@ -179,19 +189,117 @@ def test_unparseable_plan_falls_back_to_exit_code(
 ) -> None:
     fake = FakeSubprocess(returncode=2, stdout="~ resource delta")
     monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
-    assert runner.plan_with_generation().has_drift is True
+    result = runner.plan_with_generation()
+    assert result.has_drift is True
+    assert result.plan_counts is None
 
 
-def test_plan_clears_stale_generated_config(
+def test_plan_counts_expose_pending_imports_and_changes(
     runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    fake = FakeSubprocess(
+        returncode=2,
+        stdout="Plan: 875 to import, 1 to add, 2 to change, 3 to destroy.",
+    )
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    counts = runner.plan_with_generation().plan_counts
+    assert counts is not None
+    assert (counts.imports, counts.add, counts.change, counts.destroy) == (875, 1, 2, 3)
+    assert counts.has_real_changes is True
+
+
+def test_stale_generated_config_is_absorbed_not_deleted(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Deleting generated config would leave state-tracked resources
+    configless — every later plan would propose destroying them."""
     runner.prepare_workspace()
     stale = runner.workdir / GENERATED_CONFIG_FILENAME
-    stale.write_text("# stale", encoding="utf-8")
+    stale.write_text('resource "meraki_networks" "n_1" {}', encoding="utf-8")
     fake = FakeSubprocess(returncode=0)
     monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
     runner.plan_with_generation()
     assert not stale.exists()
+    aggregated = runner.workdir / AGGREGATED_CONFIG_FILENAME
+    assert 'resource "meraki_networks" "n_1"' in aggregated.read_text(
+        encoding="utf-8"
+    )
+    assert runner.has_config_baseline()
+
+
+def test_freshly_generated_config_is_absorbed_after_plan(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner.prepare_workspace()
+    generated = runner.workdir / GENERATED_CONFIG_FILENAME
+
+    fake = FakeSubprocess(
+        returncode=2,
+        stdout="Plan: 2 to import, 0 to add, 0 to change, 0 to destroy.",
+        on_run=lambda: generated.write_text(
+            'resource "meraki_devices" "q2ab" {}\n', encoding="utf-8"
+        ),
+    )
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    runner.plan_with_generation()
+
+    assert not generated.exists()
+    aggregated = runner.workdir / AGGREGATED_CONFIG_FILENAME
+    assert 'resource "meraki_devices" "q2ab"' in aggregated.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_absorption_accumulates_across_runs(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner.prepare_workspace()
+    generated = runner.workdir / GENERATED_CONFIG_FILENAME
+    aggregated = runner.workdir / AGGREGATED_CONFIG_FILENAME
+    fake = FakeSubprocess(returncode=0)
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+
+    generated.write_text("resource_one {}", encoding="utf-8")
+    runner.plan_with_generation()
+    generated.write_text("resource_two {}", encoding="utf-8")
+    runner.plan_with_generation()
+
+    content = aggregated.read_text(encoding="utf-8")
+    assert "resource_one" in content and "resource_two" in content
+
+
+def test_reset_baseline_discards_config(runner: TerraformRunner) -> None:
+    runner.prepare_workspace()
+    aggregated = runner.workdir / AGGREGATED_CONFIG_FILENAME
+    aggregated.write_text("resource_old {}", encoding="utf-8")
+    runner.reset_baseline(frozenset())
+    assert not aggregated.exists()
+    assert not runner.has_config_baseline()
+    runner.reset_baseline(frozenset())  # idempotent when already absent
+
+
+def test_reset_baseline_refuses_with_tracked_state(
+    runner: TerraformRunner,
+) -> None:
+    """Discarding config of state-tracked resources would plan their
+    destruction — the guard must refuse."""
+    runner.prepare_workspace()
+    (runner.workdir / AGGREGATED_CONFIG_FILENAME).write_text(
+        "resource_old {}", encoding="utf-8"
+    )
+    with pytest.raises(TerraformError, match="rebaseline"):
+        runner.reset_baseline(frozenset({"meraki_networks.n_1"}))
+    assert runner.has_config_baseline()  # nothing was deleted
+
+
+def test_provider_anchor_escapes_hcl_specials_in_state_path(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / 'st"ate' / "terraform.tfstate"
+    runner = TerraformRunner(tmp_path / "ws", state_path=state)
+    provider_file = runner.prepare_workspace()
+    content = provider_file.read_text(encoding="utf-8")
+    assert 'st\\"ate' in content  # quote escaped, backend block stays valid
 
 
 def test_plan_preview_never_generates_config(

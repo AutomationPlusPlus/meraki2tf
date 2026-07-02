@@ -38,6 +38,7 @@ def test_parser_defaults(spec_file: Path) -> None:
     assert not config.sanitize
     assert not config.rebuild
     assert not config.confirm
+    assert not config.rebaseline
     assert config.workdir == Path("generated")
     assert config.state_file is None
     assert config.webhook_urls == ()
@@ -188,7 +189,14 @@ def test_dump_mode_end_to_end(
     def fake_run(command: tuple[str, ...], **kwargs: Any) -> SimpleNamespace:
         terraform_calls.append(command)
         exit_code = 2 if command[1] == "plan" else 0
-        return SimpleNamespace(returncode=exit_code, stdout="~ plan delta", stderr="")
+        return SimpleNamespace(
+            returncode=exit_code,
+            stdout=(
+                "~ plan delta\n"
+                "Plan: 4 to import, 0 to add, 1 to change, 0 to destroy."
+            ),
+            stderr="",
+        )
 
     delivered: list[dict[str, Any]] = []
 
@@ -226,9 +234,13 @@ def test_dump_mode_end_to_end(
         "DRIFT_DETECTED",
         "RUN_SUCCESS",
     ]
-    assert delivered[0]["details"]["diff"] == "~ plan delta"
-    assert delivered[1]["details"]["imports_written"] == 4
-    assert delivered[1]["details"]["drift_was_detected"] is True
+    assert "~ plan delta" in delivered[0]["details"]["diff"]
+    success = delivered[1]["details"]
+    assert success["imports_written"] == 4
+    assert success["drift_was_detected"] is True
+    assert success["pending_imports"] == 4
+    assert success["comparison_performed"] is True
+    assert success["unsupported_count"] == 0
 
 
 def test_pipeline_fault_exits_one_and_alerts(
@@ -461,6 +473,54 @@ def test_rebuild_with_nothing_to_do_never_applies(
 
     assert main(["--rebuild", "--confirm", "--workdir", str(workdir)]) == 0
     assert [call[1] for call in calls] == ["init", "plan"]
+
+
+def test_rebuild_with_explicit_state_file_reanchors_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--rebuild --state-file must not silently apply against the state
+    path a previous pipeline run baked into provider.tf."""
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    workdir = _rebuild_workspace(tmp_path)
+    provider_tf = workdir / "provider.tf"
+    provider_tf.write_text('path = "/old/state.tfstate"', encoding="utf-8")
+    requested_state = tmp_path / "backups" / "B.tfstate"
+    monkeypatch.setattr(
+        terraform_runner.subprocess,
+        "run",
+        lambda command, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+
+    exit_code = main(
+        ["--rebuild", "--workdir", str(workdir), "--state-file", str(requested_state)]
+    )
+
+    assert exit_code == 0
+    content = provider_tf.read_text(encoding="utf-8")
+    assert str(requested_state.resolve()) in content
+    assert "/old/state.tfstate" not in content
+
+
+def test_rebaseline_discards_accumulated_config(
+    spec_file: Path,
+    dump_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _no_network(monkeypatch)
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    workdir = tmp_path / "workspace"
+    workdir.mkdir()
+    stale_baseline = workdir / "resources.tf"
+    stale_baseline.write_text("resource_old {}", encoding="utf-8")
+
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(dump_file),
+         "--workdir", str(workdir), "--rebaseline"]
+    )
+
+    assert exit_code == 0
+    assert not stale_baseline.exists()
 
 
 def test_rebuild_planning_failure_exits_one(

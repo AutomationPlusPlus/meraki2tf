@@ -42,6 +42,7 @@ class RunSummary:
     """Outcome of one completed pipeline cycle."""
 
     organization_id: str
+    discovered_assets: int
     imports_written: int
     imports_skipped_existing: int
     unsupported_count: int
@@ -49,6 +50,9 @@ class RunSummary:
     #: True when the terraform plan comparison was skipped because no
     #: API key was available (typical for offline dump-mode runs).
     comparison_skipped: bool
+    #: Imports the plan reports as not yet aggregated into state; None
+    #: when the comparison was skipped or the plan summary was absent.
+    pending_imports: int | None
 
 
 class PipelineOrchestrator:
@@ -60,11 +64,13 @@ class PipelineOrchestrator:
         generator: HclImportGenerator,
         runner: TerraformRunner,
         dispatcher: AlertDispatcher,
+        rebaseline: bool = False,
     ) -> None:
         self._provider = provider
         self._generator = generator
         self._runner = runner
         self._dispatcher = dispatcher
+        self._rebaseline = rebaseline
 
     def run(self, organization_id: str | None = None) -> RunSummary:
         stage = "startup"
@@ -88,13 +94,49 @@ class PipelineOrchestrator:
                     "will be imported.",
                     len(existing),
                 )
+                if not self._runner.has_config_baseline():
+                    logger.warning(
+                        "State tracks %d resource(s) but the workspace has no "
+                        "accumulated configuration baseline (resources.tf); "
+                        "the plan will propose destroying them. Restore "
+                        "resources.tf from your DR backup or reset the state.",
+                        len(existing),
+                    )
+
+            if self._rebaseline:
+                stage = "baseline reset"
+                self._runner.reset_baseline(existing)
 
             stage = "HCL construction"
             report = self._generator.generate(
                 graph, self._runner.workdir, existing_addresses=existing
             )
 
+            stage = "coverage audit"
+            if report.unsupported:
+                logger.warning(
+                    "%d asset(s) cannot be expressed by the Terraform provider "
+                    "and would need MANUAL rebuild in a DR event: %s",
+                    len(report.unsupported),
+                    "; ".join(
+                        f"{item.api_path} "
+                        f"(ids={','.join(item.identifiers) or '<none>'})"
+                        for item in report.unsupported
+                    ),
+                )
+            logger.info(
+                "Terraform coverage: %d/%d discovered asset(s) captured "
+                "(%d new import block(s), %d already tracked in state), "
+                "%d unsupported.",
+                report.imports_written + report.skipped_existing,
+                graph.asset_count(),
+                report.imports_written,
+                report.skipped_existing,
+                len(report.unsupported),
+            )
+
             drift = False
+            pending_imports: int | None = None
             comparison_skipped = not api_key_present()
             if comparison_skipped:
                 # The Meraki provider needs a token to read live resources
@@ -112,6 +154,14 @@ class PipelineOrchestrator:
 
                 stage = "state comparison"
                 plan = self._runner.plan_with_generation()
+                counts = plan.plan_counts
+                if counts is not None:
+                    pending_imports = counts.imports
+                    logger.info(
+                        "Plan summary: %d to import (pending state "
+                        "aggregation), %d to add, %d to change, %d to destroy.",
+                        counts.imports, counts.add, counts.change, counts.destroy,
+                    )
                 drift = plan.has_drift
                 if drift:
                     logger.warning(
@@ -137,15 +187,22 @@ class PipelineOrchestrator:
                     imports_written=report.imports_written,
                     drift_was_detected=drift,
                     workspace=str(self._runner.workdir),
+                    discovered_assets=graph.asset_count(),
+                    imports_already_tracked=report.skipped_existing,
+                    unsupported_count=len(report.unsupported),
+                    pending_imports=pending_imports,
+                    comparison_performed=not comparison_skipped,
                 )
             )
             return RunSummary(
                 organization_id=graph.organization_id,
+                discovered_assets=graph.asset_count(),
                 imports_written=report.imports_written,
                 imports_skipped_existing=report.skipped_existing,
                 unsupported_count=len(report.unsupported),
                 drift_detected=drift,
                 comparison_skipped=comparison_skipped,
+                pending_imports=pending_imports,
             )
         except Exception as exc:
             logger.exception("Pipeline fault during %s.", stage)

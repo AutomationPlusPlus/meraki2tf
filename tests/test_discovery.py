@@ -43,7 +43,13 @@ def test_read_only_entities_are_not_configuration(parser: OpenApiParser) -> None
 
 def test_scope_param_selects_organization_endpoints(parser: OpenApiParser) -> None:
     paths = {op.path for op in config_collection_operations(parser, "organizationId")}
-    assert paths == {"/organizations/{organizationId}/admins"}
+    # The networks collection qualifies (mutable via POST) but is a
+    # folded alias of the first-class networks entity — consumers skip
+    # it (see the live provider's _folds_elsewhere guard).
+    assert paths == {
+        "/organizations/{organizationId}/admins",
+        "/organizations/{organizationId}/networks",
+    }
 
 
 def test_item_operation_prefers_get_then_any_mutating_verb(

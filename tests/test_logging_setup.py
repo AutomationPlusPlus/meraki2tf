@@ -1,6 +1,7 @@
 """Verbose/clean logging controls and mandatory secret redaction."""
 
 import logging
+import sys
 
 import pytest
 
@@ -39,6 +40,45 @@ def test_raw_token_value_is_redacted(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_benign_messages_pass_through(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
     assert _filtered_message("synced 12 resources") == "synced 12 resources"
+
+
+def test_unquoted_bearer_value_is_fully_redacted() -> None:
+    """`Authorization: Bearer <token>` without quotes must not leak the token."""
+    out = _filtered_message("Authorization: Bearer 0123abcdrotatedkey")
+    assert "0123abcdrotatedkey" not in out
+    assert "[REDACTED]" in out
+
+
+def test_preformatted_exc_text_is_redacted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A record whose traceback was already rendered gets scrubbed too."""
+    monkeypatch.setenv(API_KEY_ENV_VAR, "supersecrettoken")
+    record = logging.LogRecord(
+        name="test", level=logging.ERROR, pathname=__file__, lineno=1,
+        msg="boom", args=None, exc_info=None,
+    )
+    record.exc_text = "Traceback ... Authorization: Bearer supersecrettoken"
+    assert SecretRedactionFilter().filter(record)
+    assert "supersecrettoken" not in record.exc_text
+    assert "[REDACTED]" in record.exc_text
+
+
+def test_exception_tracebacks_are_redacted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """logger.exception output is rendered separately and must be scrubbed too."""
+    monkeypatch.setenv(API_KEY_ENV_VAR, "supersecrettoken")
+    try:
+        raise ValueError(
+            "unknown url type: 'hooks.example/supersecrettoken'"
+        )
+    except ValueError:
+        record = logging.LogRecord(
+            name="test", level=logging.ERROR, pathname=__file__, lineno=1,
+            msg="delivery failed", args=None, exc_info=sys.exc_info(),
+        )
+    assert SecretRedactionFilter().filter(record)
+    rendered = logging.Formatter().format(record)
+    assert "supersecrettoken" not in rendered
+    assert "[REDACTED]" in rendered
+    assert "ValueError" in rendered  # the traceback itself is preserved
 
 
 @pytest.mark.parametrize("verbose,expected", [(False, logging.INFO), (True, logging.DEBUG)])

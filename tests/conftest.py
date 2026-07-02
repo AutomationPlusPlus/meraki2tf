@@ -51,6 +51,7 @@ PIPELINE_SPEC: dict[str, Any] = {
     "paths": {
         "/organizations/{organizationId}/networks": {
             "get": _op("getOrganizationNetworks", "organizations"),
+            "post": _op("createOrganizationNetwork", "organizations"),
         },
         "/organizations/{organizationId}/devices": {
             "get": _op("getOrganizationDevices", "organizations"),

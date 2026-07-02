@@ -35,6 +35,9 @@ logger = logging.getLogger(__name__)
 
 PROVIDER_FILENAME = "provider.tf"
 GENERATED_CONFIG_FILENAME = "generated_resources.tf"
+#: Persistent accumulated configuration: every plan's freshly generated
+#: config is folded in here, so resources keep their HCL across runs.
+AGGREGATED_CONFIG_FILENAME = "resources.tf"
 DEFAULT_STATE_FILENAME = "terraform.tfstate"
 
 _PROVIDER_TF_TEMPLATE = """\
@@ -76,6 +79,31 @@ class TerraformError(RuntimeError):
     """A terraform invocation failed; message carries the CLI diagnostics."""
 
 
+def _hcl_quote(value: str) -> str:
+    """Escape a raw value for interpolation into a quoted HCL literal."""
+    return (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("${", "$${")
+        .replace("%{", "%%{")
+    )
+
+
+@dataclass(frozen=True)
+class PlanCounts:
+    """Change counts parsed from a terraform plan summary line."""
+
+    imports: int
+    add: int
+    change: int
+    destroy: int
+
+    @property
+    def has_real_changes(self) -> bool:
+        """True when the plan proposes mutations, not just imports."""
+        return (self.add + self.change + self.destroy) > 0
+
+
 @dataclass(frozen=True)
 class TerraformCommandResult:
     """Captured outcome of one terraform subprocess invocation."""
@@ -91,6 +119,23 @@ class TerraformCommandResult:
         return self.returncode == _PLAN_CHANGES_PRESENT
 
     @property
+    def plan_counts(self) -> PlanCounts | None:
+        """Parsed plan summary counts, or None when no summary is present.
+
+        Lets the orchestrator report exactly how much of the snapshot is
+        still pending aggregation into state versus real change pressure.
+        """
+        match = _PLAN_SUMMARY_RE.search(self.stdout)
+        if match is None:
+            return None
+        return PlanCounts(
+            imports=int(match.group("imports") or 0),
+            add=int(match.group("add")),
+            change=int(match.group("change")),
+            destroy=int(match.group("destroy")),
+        )
+
+    @property
     def has_drift(self) -> bool:
         """True when the plan proposes real changes (add/change/destroy).
 
@@ -100,12 +145,10 @@ class TerraformCommandResult:
         back to the ``-detailed-exitcode`` contract when no summary line
         can be parsed, so an unrecognized plan errs toward alerting.
         """
-        match = _PLAN_SUMMARY_RE.search(self.stdout)
-        if match is None:
+        counts = self.plan_counts
+        if counts is None:
             return self.returncode == _PLAN_CHANGES_PRESENT
-        return any(
-            int(match.group(group)) > 0 for group in ("add", "change", "destroy")
-        )
+        return counts.has_real_changes
 
 
 class TerraformRunner:
@@ -137,7 +180,7 @@ class TerraformRunner:
         self._state_path.parent.mkdir(parents=True, exist_ok=True)
         provider_file = self._workdir / PROVIDER_FILENAME
         provider_file.write_text(
-            _PROVIDER_TF_TEMPLATE.format(state_path=self._state_path),
+            _PROVIDER_TF_TEMPLATE.format(state_path=_hcl_quote(str(self._state_path))),
             encoding="utf-8",
         )
         if self._state_path.exists():
@@ -191,11 +234,10 @@ class TerraformRunner:
         Returns with ``has_changes`` reflecting the ``-detailed-exitcode``
         contract (0 = state in sync, 2 = delta present).
         """
-        generated = self._workdir / GENERATED_CONFIG_FILENAME
-        if generated.exists():
-            # terraform refuses to overwrite an existing generation target.
-            generated.unlink()
-        return self._run(
+        # terraform refuses to overwrite an existing generation target;
+        # a leftover file from an interrupted run is absorbed first.
+        self._absorb_generated_config()
+        result = self._run(
             "plan",
             "-input=false",
             "-no-color",
@@ -203,6 +245,62 @@ class TerraformRunner:
             f"-generate-config-out={GENERATED_CONFIG_FILENAME}",
             allowed=(_PLAN_NO_CHANGES, _PLAN_CHANGES_PRESENT),
         )
+        self._absorb_generated_config()
+        return result
+
+    def _absorb_generated_config(self) -> None:
+        """Fold freshly generated config into the persistent resources.tf.
+
+        Deleting the generation target instead (the naive fix for
+        terraform's refusal to overwrite it) would leave state-tracked
+        resources with no configuration, so every subsequent plan would
+        propose destroying them — a false drift alert, and a workspace
+        that tears the organization down if rebuild-applied. Accumulating
+        keeps the workspace a faithful, apply-safe DR kit and lets the
+        plan compare tracked resources against their captured baseline.
+        """
+        generated = self._workdir / GENERATED_CONFIG_FILENAME
+        if not generated.exists():
+            return
+        content = generated.read_text(encoding="utf-8")
+        if content.strip():
+            aggregated = self._workdir / AGGREGATED_CONFIG_FILENAME
+            with aggregated.open("a", encoding="utf-8") as handle:
+                handle.write(content if content.endswith("\n") else content + "\n")
+            logger.info(
+                "Absorbed newly generated configuration into %s.",
+                AGGREGATED_CONFIG_FILENAME,
+            )
+        generated.unlink()
+
+    def has_config_baseline(self) -> bool:
+        """Whether the workspace holds accumulated resource configuration."""
+        return (self._workdir / AGGREGATED_CONFIG_FILENAME).exists()
+
+    def reset_baseline(self, existing_addresses: frozenset[str]) -> None:
+        """Discard resources.tf so this run regenerates it from live data.
+
+        Refused while the state tracks resources: their configuration
+        cannot be regenerated (they are skipped from imports.tf, and
+        terraform only generates config for import targets), so deleting
+        the baseline would make the plan propose destroying all of them.
+        """
+        if existing_addresses:
+            raise TerraformError(
+                "--rebaseline cannot discard the configuration baseline while "
+                f"the state file tracks {len(existing_addresses)} resource(s); "
+                "their configuration would not be regenerated and the plan "
+                "would propose destroying them. Reset or relocate the state "
+                "file first."
+            )
+        aggregated = self._workdir / AGGREGATED_CONFIG_FILENAME
+        if aggregated.exists():
+            aggregated.unlink()
+            logger.info(
+                "Baseline reset: %s discarded; this run regenerates the "
+                "configuration from currently discovered data.",
+                AGGREGATED_CONFIG_FILENAME,
+            )
 
     def plan_preview(self) -> TerraformCommandResult:
         """Read-only preview of what a disaster-recovery apply would do.
