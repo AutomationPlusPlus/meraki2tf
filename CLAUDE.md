@@ -1,14 +1,16 @@
 # meraki2tf (Project Contract)
 
 ## Core Mission & Architecture
-A robust, secure, and schedulable CLI tool written in Python to extract Cisco Meraki configurations, map them to Terraform structures using the Meraki OpenAPI specification, evaluate state drift, auto-import new resources, and flag unsupported parameters.
+A robust, secure, and schedulable CLI tool written in Python to extract Cisco Meraki configurations, map them to Terraform structures using the Meraki OpenAPI specification, evaluate state drift, generate import blocks for new resources, and flag unsupported parameters.
+
+**Disaster-Recovery Mission:** meraki2tf continuously converts a Meraki organization into runnable Terraform artifacts so the environment can be rebuilt after a major incident. The pipeline is therefore **strictly read-only toward Meraki: it must never execute `terraform apply`**. The only permissible apply path is the explicit, human-invoked `--rebuild --confirm` disaster-recovery action.
 
 ### Core Pipeline Steps
 1. **Dynamic Spec Ingestion:** Parse the Meraki OpenAPI JSON schema dynamically (either via a local file or pulling the latest release) to programmatically build the API-to-Terraform resource registry. **Hard-coded mapping tables are strictly prohibited**; the engine must dynamically derive resources and compound ID paths from the spec metadata to stay future-proof.
 2. **Configuration Discovery:** Ingest network infrastructure schemas via dual input modalities (Live Cloud API or Offline JSON Dump).
 3. **HCL Construction:** Write clean, declarative configuration structures natively utilizing modern Terraform `import` blocks.
-4. **State Orchestration & Drift Alerting:** Compare discovered configurations against the existing state file. If differences/drifts are found, compile a diff payload and **trigger a drift alert** via configured notification channels.
-5. **State Aggregation & Success Notification:** Apply missing delta pieces into the state file. Upon absolute execution success and state synchronization, **dispatch a success notification** confirming a clean run.
+4. **State Orchestration & Drift Alerting:** Compare discovered configurations against the existing state file via a read-only speculative `terraform plan` (skipped gracefully when no API key is available, e.g. air-gapped dump runs). Pending imports are normal snapshot growth, not drift; when real add/change/destroy differences are found, compile a diff payload and **trigger a drift alert** via configured notification channels.
+5. **Artifact Completion & Success Notification:** Leave a complete rebuild kit (`imports.tf`, `provider.tf`, `generated_resources.tf`) in the workspace. Upon absolute execution success, **dispatch a success notification** confirming a clean run. The pipeline itself never applies anything into state or into Meraki.
 6. **Exception Auditing:** Flag parameters or features completely unsupported by the Terraform provider, and emit structured payloads to alerting endpoints.
 
 ---
@@ -53,6 +55,10 @@ Do NOT install, generate configurations for, or utilize:
 ### ⚠️ Dependency Escalation Policy
 - Pre-approved: `meraki` (SDK), `pre-commit`, `flake8`, `mypy`, `tox`, `pytest`, `pytest-cov`, and Python standard library utilities.
 - **CRITICAL:** The agent must explicitly halt and request human operational authorization before introducing *any* other external pip module.
+
+### 🔒 Read-Only Guarantee (Terraform Apply Ban)
+- The pipeline (scheduled or ad-hoc runs, live or dump mode) must **never** run `terraform apply` or otherwise mutate the Meraki organization or the Terraform state.
+- The sole apply path is the explicit disaster-recovery action `--rebuild --confirm`; `--rebuild` alone must remain a read-only plan preview.
 
 ### 🛡️ Security First Principle
 - **Secret Handling:** Zero tolerance for plaintext token parameters, hardcoded API variables, or hardcoded organization credentials in the repository, state logs, or output fields.
