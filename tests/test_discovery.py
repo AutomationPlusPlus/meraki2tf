@@ -52,6 +52,11 @@ def test_scope_param_selects_organization_endpoints(parser: OpenApiParser) -> No
     }
 
 
+def test_scope_param_selects_device_endpoints(parser: OpenApiParser) -> None:
+    paths = {op.path for op in config_collection_operations(parser, "serial")}
+    assert paths == {"/devices/{serial}/switch/ports"}
+
+
 def test_item_operation_prefers_get_then_any_mutating_verb(
     parser: OpenApiParser,
 ) -> None:

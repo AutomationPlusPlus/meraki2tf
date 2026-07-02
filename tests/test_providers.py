@@ -63,12 +63,18 @@ class FakeSensor:
         raise RuntimeError("400 Bad Request: sensor not available for this network")
 
 
+class FakeSwitch:
+    def getDeviceSwitchPorts(self, serial: str) -> list[dict[str, Any]]:
+        return [{"portId": "1", "name": "Uplink", "enabled": True}]
+
+
 class FakeDashboard:
     def __init__(self) -> None:
         self.organizations = FakeOrganizations()
         self.appliance = FakeAppliance()
         self.networks = FakeNetworksSection()
         self.sensor = FakeSensor()
+        self.switch = FakeSwitch()
 
 
 @pytest.fixture()
@@ -161,7 +167,18 @@ NESTED_DUMP_DOCUMENT = {
                         "name": "HQ",
                         "productTypes": ["appliance", "wireless"],
                     },
-                    "devices": [dict(DEVICE_PAYLOAD)],
+                    "devices": [
+                        # Structured form: per-device configuration sections.
+                        {
+                            "info": dict(DEVICE_PAYLOAD),
+                            "switch_ports": [
+                                {"portId": "1", "name": "Uplink", "enabled": True}
+                            ],
+                            "device_telemetry": [{"metric": "noise"}],
+                        },
+                        # Flat form: the raw device payload, as before.
+                        {"serial": "Q2ZZ-FLAT-0001", "networkId": "N_1"},
+                    ],
                     "clients": [{"id": "k1", "ip": "10.0.0.9"}],
                     "vlans": [{"id": 10, "name": "Data"}],
                     "traffic_shaping": {"globalBandwidthLimits": {"limitUp": 0}},
@@ -193,7 +210,8 @@ def test_nested_dump_builds_graph_from_export_layout(
     graph = provider.fetch_network_graph()
     assert graph.organization_id == "org-777"
     assert [n.network_id for n in graph.networks] == ["N_1"]
-    assert [d.serial for d in graph.devices] == ["Q2AB-CDEF-GHIJ"]
+    # Structured and flat device entries both load.
+    assert [d.serial for d in graph.devices] == ["Q2AB-CDEF-GHIJ", "Q2ZZ-FLAT-0001"]
 
     by_path = {(f.api_path, f.path_values): f for f in graph.features}
     # List section expanded onto the item path, like live discovery.
@@ -211,7 +229,12 @@ def test_nested_dump_builds_graph_from_export_layout(
         ("/organizations/{organizationId}/admins/{adminId}", ("org-777", "A_1"))
     ]
     assert admin.payload["name"] == "ops"
-    assert len(graph.features) == 5
+    # Device-scoped section resolved onto the serial-scoped endpoint.
+    port = by_path[
+        ("/devices/{serial}/switch/ports/{portId}", ("Q2AB-CDEF-GHIJ", "1"))
+    ]
+    assert port.payload["name"] == "Uplink"
+    assert len(graph.features) == 6
 
 
 def test_nested_dump_skips_unmatched_sections_with_warning(
@@ -229,7 +252,13 @@ def test_nested_dump_skips_unmatched_sections_with_warning(
         for record in caplog.records
         if "resolves to no spec-derived" in record.message
     }
-    assert skipped == {"clients", "uplink_statuses", "frobnicators", "scalar_section"}
+    assert skipped == {
+        "clients",
+        "uplink_statuses",
+        "frobnicators",
+        "scalar_section",
+        "device_telemetry",  # device section with no config endpoint
+    }
 
 
 def test_nested_dump_org_override_warns_but_processes_snapshot(
@@ -259,6 +288,14 @@ def test_nested_dump_rejects_structural_violations(
     cases = [
         {"organizations": ["not-an-object"]},
         {"organizations": [{"info": {"id": "o"}, "networks": ["not-an-object"]}]},
+        {
+            "organizations": [
+                {
+                    "info": {"id": "o"},
+                    "networks": [{"info": {"id": "N"}, "devices": ["not-an-object"]}],
+                }
+            ]
+        },
         {"organizations": [{"networks": []}]},  # no info.id, no --org-id
         {"organizations": []},  # nothing recorded, no --org-id
     ]
@@ -306,10 +343,16 @@ def test_live_provider_builds_graph_with_spec_driven_features(
     ]
     assert admin.payload["email"] == "ops@example.com"
 
+    # Device-scoped configuration is discovered per serial.
+    port = by_path[
+        ("/devices/{serial}/switch/ports/{portId}", ("Q2AB-CDEF-GHIJ", "1"))
+    ]
+    assert port.payload["name"] == "Uplink"
+
     # Folded collection aliases (/organizations/{organizationId}/networks
     # lists first-class network assets) are not re-emitted as features,
     # and the refusing sensor endpoint is skipped, not fatal.
-    assert len(graph.features) == 4
+    assert len(graph.features) == 5
 
 
 def test_live_dispatch_gap_warns_once_and_skips(
@@ -326,7 +369,7 @@ def test_live_dispatch_gap_warns_once_and_skips(
         if "cannot be dispatched" in record.message and "admins" in record.message
     ]
     assert len(admin_warnings) == 1  # warned once, not per scope/network
-    assert len(graph.features) == 3  # everything else still discovered
+    assert len(graph.features) == 4  # everything else still discovered
 
 
 def test_try_call_skips_operations_already_known_undispatchable(

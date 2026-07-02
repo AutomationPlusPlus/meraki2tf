@@ -15,7 +15,8 @@ schedulable CLI built as a **disaster-recovery snapshotting tool**.
 ## Project Overview
 
 meraki2tf discovers your Meraki organization (networks, devices, and
-per-network feature configurations), writes modern declarative Terraform
+organization-, network-, and device-scoped feature configuration —
+admins, VLANs, switch ports, …), writes modern declarative Terraform
 `import {}` blocks for every discovered asset, and runs a speculative
 `terraform plan -generate-config-out=...` comparison against your local
 state. Drift, success, and unsupported features each fire structured
@@ -135,7 +136,13 @@ accepted, detected by a top-level `organizations` array:
       "networks": [
         {
           "info": { "id": "N_1", "name": "HQ", "productTypes": ["appliance"] },
-          "devices": [ ... ],
+          "devices": [
+            { "serial": "Q2AB-CDEF-GHIJ", "model": "MS220" },
+            {
+              "info": { "serial": "Q2XY-1234-5678", "model": "MS220" },
+              "switch_ports": [ { "portId": "1", "name": "Uplink" } ]
+            }
+          ],
           "vlans": [ ... ],
           "firewall_l3": { "rules": [ ... ] }
         }
@@ -144,6 +151,12 @@ accepted, detected by a top-level `organizations` array:
   ]
 }
 ```
+
+Device entries come in two shapes: a flat raw device payload, or a
+structured `{ "info": …, "<section>": … }` object whose extra sections
+(`switch_ports`, `management_interface`, …) resolve onto serial-scoped
+endpoints — capturing per-device configuration alongside the device
+itself.
 
 Section names (`vlans`, `firewall_l3`, `ssids`, …) carry no API path, so
 each one is resolved onto its OpenAPI endpoint dynamically — matched by

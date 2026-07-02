@@ -108,6 +108,13 @@ PIPELINE_SPEC: dict[str, Any] = {
             "get": _op("getNetworkApplianceSsid", "appliance"),
             "put": _op("updateNetworkApplianceSsid", "appliance"),
         },
+        "/devices/{serial}/switch/ports": {
+            "get": _op("getDeviceSwitchPorts", "switch"),
+        },
+        "/devices/{serial}/switch/ports/{portId}": {
+            "get": _op("getDeviceSwitchPort", "switch"),
+            "put": _op("updateDeviceSwitchPort", "switch"),
+        },
         "/organizations/{organizationId}/admins": {
             "get": _op("getOrganizationAdmins", "organizations"),
         },

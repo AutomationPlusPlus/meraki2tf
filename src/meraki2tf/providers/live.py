@@ -80,7 +80,7 @@ class LiveApiDataProvider(MerakiDataProvider):
             )
         )
         features = tuple(
-            self._discover_features(dashboard, organization_id, networks)
+            self._discover_features(dashboard, organization_id, networks, devices)
         )
         graph = NetworkGraph(
             organization_id=organization_id,
@@ -99,12 +99,15 @@ class LiveApiDataProvider(MerakiDataProvider):
         dashboard: Any,
         organization_id: str,
         networks: tuple[MerakiNetwork, ...],
+        devices: tuple[MerakiDevice, ...],
     ) -> list[FeatureConfiguration]:
         """Execute every configuration GET the spec exposes.
 
         Organization-scoped endpoints run once, network-scoped endpoints
-        run per network — mirroring the scopes the dump provider resolves
-        so both modalities discover the same surfaces.
+        run per network, and device-scoped endpoints (switch ports,
+        management interfaces, …) run per device serial — mirroring the
+        scopes the dump provider resolves so both modalities discover
+        the same surfaces.
         """
         if self._parser is None:
             logger.debug("No OpenAPI parser supplied; skipping feature discovery.")
@@ -150,6 +153,22 @@ class LiveApiDataProvider(MerakiDataProvider):
                     features.extend(
                         expand_endpoint_payload(
                             self._parser, op, network.network_id, payload
+                        )
+                    )
+        serial_ops = tuple(
+            op
+            for op in config_collection_operations(self._parser, "serial")
+            if not _folds_elsewhere(op)
+        )
+        for device in devices:
+            for op in serial_ops:
+                payload = self._try_call(
+                    dashboard, op, "serial", device.serial, undispatchable
+                )
+                if payload is not None:
+                    features.extend(
+                        expand_endpoint_payload(
+                            self._parser, op, device.serial, payload
                         )
                     )
         return features
