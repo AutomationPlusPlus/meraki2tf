@@ -151,7 +151,7 @@ def test_dump_mode_end_to_end(
     assert "to = meraki_devices.q2ab_cdef_ghij\n" in imports
     assert 'id = "N_1,10"' in imports
     provider_tf = (workdir / "provider.tf").read_text(encoding="utf-8")
-    assert 'source = "cisco-open/meraki"' in provider_tf
+    assert 'source = "CiscoDevNet/meraki"' in provider_tf
 
     assert [event["event_type"] for event in delivered] == [
         "DRIFT_DETECTED",

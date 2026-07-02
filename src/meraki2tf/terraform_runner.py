@@ -1,7 +1,7 @@
 """Local Terraform CLI runner built on the standard subprocess module.
 
 Owns the execution workspace: writes the ``provider.tf`` anchor for the
-``cisco-open/meraki`` source with a local backend pinned to the state
+``CiscoDevNet/meraki`` source with a local backend pinned to the state
 file, runs ``init``, executes the speculative generation plan
 (``terraform plan -generate-config-out=...``), and applies aggregated
 imports into state.
@@ -43,7 +43,7 @@ terraform {{
 
   required_providers {{
     meraki = {{
-      source = "cisco-open/meraki"
+      source = "CiscoDevNet/meraki"
     }}
   }}
 }}

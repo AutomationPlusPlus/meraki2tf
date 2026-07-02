@@ -8,7 +8,8 @@ Security and contract notes:
 * The 10 req/s endpoint budget is honored natively by the SDK's
   built-in rate-limit handler.
 * Feature discovery is spec-driven: the endpoints to call come from the
-  :class:`~meraki2tf.openapi_parser.OpenApiParser`, and each operation
+  :class:`~meraki2tf.openapi_parser.OpenApiParser` via the shared
+  :mod:`~meraki2tf.providers.discovery` helpers, and each operation
   is dispatched onto the SDK dynamically via its OpenAPI tag/operationId
   (``dashboard.<tag>.<operationId>``) — no hard-coded endpoint lists.
 """
@@ -25,15 +26,15 @@ from meraki2tf.models import (
     MerakiNetwork,
     NetworkGraph,
 )
-from meraki2tf.openapi_parser import OpenApiParser, is_item_path
+from meraki2tf.openapi_parser import OpenApiParser
 from meraki2tf.providers.base import MerakiDataProvider
+from meraki2tf.providers.discovery import (
+    config_collection_operations,
+    expand_endpoint_payload,
+)
 from meraki2tf.spec.engine import OperationSpec
 
 logger = logging.getLogger(__name__)
-
-#: Payload keys probed, in order, to identify one element of a listed
-#: collection (after the endpoint's own item parameter name).
-_ITEM_ID_FALLBACK_KEYS = ("id", "serial", "number")
 
 
 class LiveDispatchError(RuntimeError):
@@ -94,17 +95,11 @@ class LiveApiDataProvider(MerakiDataProvider):
     def _discover_features(
         self, dashboard: Any, networks: tuple[MerakiNetwork, ...]
     ) -> list[FeatureConfiguration]:
-        """Execute every network-scoped GET the spec exposes, per network."""
+        """Execute every configuration GET the spec exposes, per network."""
         if self._parser is None:
             logger.debug("No OpenAPI parser supplied; skipping feature discovery.")
             return []
-        feature_ops = [
-            op
-            for op in self._parser.endpoints()
-            if op.method == "get"
-            and op.path_params == ("networkId",)
-            and not is_item_path(op.path)
-        ]
+        feature_ops = config_collection_operations(self._parser)
         features: list[FeatureConfiguration] = []
         for network in networks:
             for op in feature_ops:
@@ -118,7 +113,11 @@ class LiveApiDataProvider(MerakiDataProvider):
                         op.path, network.network_id, exc,
                     )
                     continue
-                features.extend(self._expand(op, network.network_id, payload))
+                features.extend(
+                    expand_endpoint_payload(
+                        self._parser, op, network.network_id, payload
+                    )
+                )
         return features
 
     def _call(self, dashboard: Any, op: OperationSpec, **params: str) -> Any:
@@ -131,70 +130,6 @@ class LiveApiDataProvider(MerakiDataProvider):
                 f"(tags={op.tags!r})."
             )
         return method(**params)
-
-    def _expand(
-        self, op: OperationSpec, network_id: str, payload: Any
-    ) -> list[FeatureConfiguration]:
-        """Normalize one endpoint response into importable feature assets.
-
-        Singleton configs (dict payloads) address themselves at the
-        endpoint's own path; listed collections expand to one asset per
-        element at the corresponding item path, so both shapes come out
-        identical to what an offline snapshot records.
-        """
-        if isinstance(payload, dict):
-            return [
-                FeatureConfiguration(
-                    api_path=op.path, path_values=(network_id,), payload=payload
-                )
-            ]
-        item_op = self._item_operation_for(op)
-        if item_op is None:
-            logger.debug("Collection %s has no item endpoint; keeping one record.", op.path)
-            return [
-                FeatureConfiguration(
-                    api_path=op.path,
-                    path_values=(network_id,),
-                    payload={"items": payload},
-                )
-            ]
-        expanded: list[FeatureConfiguration] = []
-        for element in payload:
-            item_id = self._element_id(item_op, element)
-            if item_id is None:
-                logger.warning(
-                    "Skipping element of %s with no identifiable ID field.", op.path
-                )
-                continue
-            expanded.append(
-                FeatureConfiguration(
-                    api_path=item_op.path,
-                    path_values=(network_id, item_id),
-                    payload=element,
-                )
-            )
-        return expanded
-
-    def _item_operation_for(self, op: OperationSpec) -> OperationSpec | None:
-        assert self._parser is not None  # guarded by _discover_features
-        for candidate in self._parser.endpoints():
-            if (
-                candidate.method == "get"
-                and is_item_path(candidate.path)
-                and candidate.path.startswith(op.path + "/{")
-                and len(candidate.path_params) == 2
-            ):
-                return candidate
-        return None
-
-    @staticmethod
-    def _element_id(item_op: OperationSpec, element: Any) -> str | None:
-        if not isinstance(element, dict):
-            return None
-        for key in (item_op.path_params[-1], *_ITEM_ID_FALLBACK_KEYS):
-            if key in element and str(element[key]).strip():
-                return str(element[key])
-        return None
 
     def close(self) -> None:
         self._client = None

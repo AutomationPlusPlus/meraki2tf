@@ -142,7 +142,7 @@ def build_dispatcher(config: RuntimeConfig) -> AlertDispatcher:
 
 def build_provider(config: RuntimeConfig, parser: OpenApiParser) -> MerakiDataProvider:
     if config.dump_path is not None:
-        return StaticJsonDataProvider(config.dump_path)
+        return StaticJsonDataProvider(config.dump_path, parser=parser)
     return LiveApiDataProvider(parser=parser)
 
 

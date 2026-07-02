@@ -17,6 +17,7 @@ src/meraki2tf/
 ├── openapi_parser.py     # OpenApiParser → Terraform names, compound IDs, lookup table
 ├── providers/            # Dual-modality ingestion (MerakiDataProvider protocol)
 │   ├── base.py           #   fetch_network_graph() contract shared by both modes
+│   ├── discovery.py      #   Shared spec-driven feature discovery, expansion, section matching
 │   ├── live.py           #   LiveApiDataProvider — Meraki SDK, spec-driven dispatch
 │   └── dump.py           #   StaticJsonDataProvider — offline snapshot (--from-dump)
 ├── hcl_generator.py      # HclImportGenerator → imports.tf + exception auditing
@@ -43,11 +44,16 @@ derived from the OpenAPI document at runtime:
    path segments, folds parent-scoped collection paths into their
    canonical entity (`/organizations/{organizationId}/networks` →
    `meraki_networks`), joins snake_cased segments into
-   `cisco-open/meraki` resource names, and orders path parameters into
+   `CiscoDevNet/meraki` resource names, and orders path parameters into
    compound import-ID components (`network_id,vlan_id`).
-3. **Consume** — the live provider executes spec-discovered GET
-   endpoints dynamically (`dashboard.<tag>.<operationId>`); the HCL
-   generator resolves every asset through the derived lookup table.
+3. **Consume** — `providers/discovery.py` selects the spec's
+   configuration surfaces (GET endpoints whose entity also exposes a
+   mutating verb — read-only telemetry is excluded) and normalizes each
+   payload into importable assets. The live provider dispatches those
+   endpoints dynamically (`dashboard.<tag>.<operationId>`); the dump
+   provider resolves raw snapshot section names onto the same endpoints
+   by name-token matching with response-schema tie-breaking. Both feed
+   the HCL generator through the derived lookup table.
 
 ## Execution Flow
 

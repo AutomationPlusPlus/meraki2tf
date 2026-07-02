@@ -19,7 +19,7 @@ Derivation rules (all dynamic):
   ``networks`` entity (canonical item path ``/networks/{networkId}``)
   rather than a phantom ``organizations_networks`` resource.
 * **Terraform name** — ``meraki_`` + the canonical key joined with
-  underscores, matching the cisco-open/meraki provider convention
+  underscores, matching the CiscoDevNet/meraki provider convention
   (``meraki_networks``, ``meraki_networks_appliance_vlans``).
 * **Composite import ID** — the ordered path parameters of the entity's
   most specific endpoint, snake_cased and comma-joined

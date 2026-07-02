@@ -1,7 +1,7 @@
 # meraki2tf
 
 Extract Cisco Meraki configurations, translate them into Terraform
-structures for the [`cisco-open/meraki`](https://registry.terraform.io/providers/cisco-open/meraki)
+structures for the [`CiscoDevNet/meraki`](https://registry.terraform.io/providers/CiscoDevNet/meraki)
 provider, detect state drift, aggregate imports into state, and alert on
 every outcome — from one schedulable CLI.
 
@@ -20,7 +20,7 @@ with every dashboard release. Instead of maintaining a brittle
 hand-written table from API endpoints to Terraform resources, meraki2tf
 ingests the official Meraki OpenAPI JSON document at runtime and derives
 everything from its structure: which paths are resource entities, what
-each one's `cisco-open/meraki` resource name is, and which ordered path
+each one's `CiscoDevNet/meraki` resource name is, and which ordered path
 parameters (`{organizationId}`, `{networkId}`, `{vlanId}`, …) compose
 the comma-separated compound import IDs Terraform needs. Point the tool
 at a newer spec release and new endpoints are picked up with zero code
@@ -102,6 +102,36 @@ Snapshot format:
 `networks`/`devices` use the exact payload shapes the Meraki API
 returns; each feature addresses itself by OpenAPI path template plus the
 ordered parameter values that form its compound import ID.
+
+Nested export layouts produced by common Meraki backup scripts are also
+accepted, detected by a top-level `organizations` array:
+
+```json
+{
+  "organizations": [
+    {
+      "info": { "id": "123456", "name": "Org" },
+      "admins": [ ... ],
+      "networks": [
+        {
+          "info": { "id": "N_1", "name": "HQ", "productTypes": ["appliance"] },
+          "devices": [ ... ],
+          "vlans": [ ... ],
+          "firewall_l3": { "rules": [ ... ] }
+        }
+      ]
+    }
+  ]
+}
+```
+
+Section names (`vlans`, `firewall_l3`, `ssids`, …) carry no API path, so
+each one is resolved onto its OpenAPI endpoint dynamically — matched by
+name tokens against the spec's configuration endpoints, with lexical
+ties broken by comparing payload fields to the declared response
+schemas. Sections that resolve to no configuration endpoint (operational
+telemetry such as `clients` or `uplink_statuses`, or names the spec
+cannot disambiguate) are reported in the log and skipped.
 
 ## Configuration Options
 

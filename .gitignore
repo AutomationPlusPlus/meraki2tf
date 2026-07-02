@@ -33,3 +33,7 @@ logs/
 # Local secrets / environment
 .env
 .env.*
+
+# Runtime workspace and auto-resolved OpenAPI spec
+generated/
+spec3.json

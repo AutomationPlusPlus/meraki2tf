@@ -2,7 +2,7 @@
 
 Every discovered asset is resolved against the OpenAPI-derived lookup
 table (see :class:`~meraki2tf.openapi_parser.OpenApiParser`) — the
-mapping from API path to ``cisco-open/meraki`` resource name is fully
+mapping from API path to ``CiscoDevNet/meraki`` resource name is fully
 dynamic. Assets that resolve are written as declarative ``import {}``
 blocks into ``imports.tf``; assets that cannot be mapped are the
 exception auditor's territory: logged as severe warnings and dispatched

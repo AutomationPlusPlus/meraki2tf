@@ -126,6 +126,128 @@ def test_dump_provider_rejects_feature_without_api_path(tmp_path: Path) -> None:
         StaticJsonDataProvider(path).fetch_network_graph()
 
 
+NESTED_DUMP_DOCUMENT = {
+    "organizations": [
+        {
+            "info": {"id": "org-777", "name": "Sanitized Org"},
+            "admins": [{"id": "A_1", "name": "ops"}, {"email": "no-id@x"}],
+            "uplink_statuses": [{"status": "active"}],
+            "networks": [
+                {
+                    "info": {
+                        "id": "N_1",
+                        "organizationId": "org-777",
+                        "name": "HQ",
+                        "productTypes": ["appliance", "wireless"],
+                    },
+                    "devices": [dict(DEVICE_PAYLOAD)],
+                    "clients": [{"id": "k1", "ip": "10.0.0.9"}],
+                    "vlans": [{"id": 10, "name": "Data"}],
+                    "traffic_shaping": {"globalBandwidthLimits": {"limitUp": 0}},
+                    "syslog": {"servers": [{"host": "10.0.0.1"}]},
+                    "ssids": [
+                        {"number": 0, "authMode": "psk", "splashPage": "None"}
+                    ],
+                    "frobnicators": {"mystery": True},
+                    "empty_section": [],
+                    "scalar_section": "not-a-payload",
+                },
+            ],
+        },
+    ],
+}
+
+
+@pytest.fixture()
+def nested_dump_file(tmp_path: Path) -> Path:
+    path = tmp_path / "nested.json"
+    path.write_text(json.dumps(NESTED_DUMP_DOCUMENT), encoding="utf-8")
+    return path
+
+
+def test_nested_dump_builds_graph_from_export_layout(
+    nested_dump_file: Path, spec_parser: OpenApiParser
+) -> None:
+    provider = StaticJsonDataProvider(nested_dump_file, parser=spec_parser)
+    graph = provider.fetch_network_graph()
+    assert graph.organization_id == "org-777"
+    assert [n.network_id for n in graph.networks] == ["N_1"]
+    assert [d.serial for d in graph.devices] == ["Q2AB-CDEF-GHIJ"]
+
+    by_path = {(f.api_path, f.path_values): f for f in graph.features}
+    # List section expanded onto the item path, like live discovery.
+    vlan = by_path[("/networks/{networkId}/appliance/vlans/{vlanId}", ("N_1", "10"))]
+    assert vlan.payload["name"] == "Data"
+    # Singleton dict section recorded at the endpoint's own path.
+    assert ("/networks/{networkId}/appliance/trafficShaping", ("N_1",)) in by_path
+    # Dict-shaped collection response stays a singleton (syslogServers).
+    assert ("/networks/{networkId}/syslogServers", ("N_1",)) in by_path
+    # Lexical tie (wireless vs appliance ssids) broken by payload schema.
+    assert ("/networks/{networkId}/wireless/ssids/{number}", ("N_1", "0")) in by_path
+    # Org-scoped section expanded via its PUT/DELETE-only item endpoint;
+    # the element without an ID is skipped.
+    admin = by_path[
+        ("/organizations/{organizationId}/admins/{adminId}", ("org-777", "A_1"))
+    ]
+    assert admin.payload["name"] == "ops"
+    assert len(graph.features) == 5
+
+
+def test_nested_dump_skips_unmatched_sections_with_warning(
+    nested_dump_file: Path,
+    spec_parser: OpenApiParser,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    provider = StaticJsonDataProvider(nested_dump_file, parser=spec_parser)
+    with caplog.at_level("WARNING"):
+        graph = provider.fetch_network_graph()
+    matched_paths = {f.api_path for f in graph.features}
+    assert not any("clients" in path for path in matched_paths)
+    skipped = {
+        record.args[0]
+        for record in caplog.records
+        if "resolves to no spec-derived" in record.message
+    }
+    assert skipped == {"clients", "uplink_statuses", "frobnicators", "scalar_section"}
+
+
+def test_nested_dump_org_override_warns_but_processes_snapshot(
+    nested_dump_file: Path,
+    spec_parser: OpenApiParser,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    provider = StaticJsonDataProvider(nested_dump_file, parser=spec_parser)
+    with caplog.at_level("WARNING"):
+        graph = provider.fetch_network_graph("org-override")
+    assert graph.organization_id == "org-override"
+    assert graph.networks  # the snapshot's own data is still processed
+    assert any("processing the" in r.message for r in caplog.records)
+
+
+def test_nested_dump_without_parser_yields_no_features(
+    nested_dump_file: Path,
+) -> None:
+    graph = StaticJsonDataProvider(nested_dump_file).fetch_network_graph()
+    assert graph.features == ()
+    assert graph.networks and graph.devices
+
+
+def test_nested_dump_rejects_structural_violations(
+    tmp_path: Path, spec_parser: OpenApiParser
+) -> None:
+    cases = [
+        {"organizations": ["not-an-object"]},
+        {"organizations": [{"info": {"id": "o"}, "networks": ["not-an-object"]}]},
+        {"organizations": [{"networks": []}]},  # no info.id, no --org-id
+        {"organizations": []},  # nothing recorded, no --org-id
+    ]
+    for document in cases:
+        path = tmp_path / "bad-nested.json"
+        path.write_text(json.dumps(document), encoding="utf-8")
+        with pytest.raises(MalformedDumpError):
+            StaticJsonDataProvider(path, parser=spec_parser).fetch_network_graph()
+
+
 def test_live_provider_requires_env_token(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
     with pytest.raises(MissingApiKeyError):

@@ -43,7 +43,7 @@ def test_prepare_workspace_writes_credential_free_provider_anchor(
     assert runner.workdir.is_dir()
     assert provider_file.name == PROVIDER_FILENAME
     content = provider_file.read_text(encoding="utf-8")
-    assert 'source = "cisco-open/meraki"' in content
+    assert 'source = "CiscoDevNet/meraki"' in content
     assert 'provider "meraki"' in content
     assert "MERAKI_DASHBOARD_API_KEY" in content  # documented, never templated
     assert "api_key" not in content

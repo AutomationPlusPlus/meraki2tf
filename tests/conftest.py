@@ -13,8 +13,33 @@ import pytest
 from meraki2tf.openapi_parser import OpenApiParser
 
 
-def _op(operation_id: str, *tags: str) -> dict[str, object]:
-    return {"operationId": operation_id, "tags": list(tags)}
+def _op(
+    operation_id: str, *tags: str, response_schema: dict[str, Any] | None = None
+) -> dict[str, object]:
+    op: dict[str, object] = {"operationId": operation_id, "tags": list(tags)}
+    if response_schema is not None:
+        op["responses"] = {
+            "200": {"content": {"application/json": {"schema": response_schema}}}
+        }
+    return op
+
+
+#: Response schemas for the two ambiguous ``ssids`` collections; the
+#: section matcher must tell them apart by observed payload keys.
+WIRELESS_SSIDS_SCHEMA: dict[str, Any] = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {"number": {}, "name": {}, "authMode": {}, "splashPage": {}},
+    },
+}
+APPLIANCE_SSIDS_SCHEMA: dict[str, Any] = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {"number": {}, "authMode": {}, "wpaEncryptionMode": {}},
+    },
+}
 
 
 #: Minimized spec mirroring real Meraki OpenAPI structure: canonical
@@ -47,12 +72,47 @@ PIPELINE_SPEC: dict[str, Any] = {
         },
         "/networks/{networkId}/appliance/trafficShaping": {
             "get": _op("getNetworkApplianceTrafficShaping", "appliance"),
+            "put": _op("updateNetworkApplianceTrafficShaping", "appliance"),
         },
         "/networks/{networkId}/syslogServers": {
             "get": _op("getNetworkSyslogServers", "networks"),
+            "put": _op("updateNetworkSyslogServers", "networks"),
         },
         "/networks/{networkId}/sensor/relationships": {
             "get": _op("getNetworkSensorRelationships", "sensor"),
+            "put": _op("updateNetworkSensorRelationships", "sensor"),
+        },
+        "/networks/{networkId}/clients": {
+            "get": _op("getNetworkClients", "networks"),
+        },
+        "/networks/{networkId}/wireless/ssids": {
+            "get": _op(
+                "getNetworkWirelessSsids",
+                "wireless",
+                response_schema=WIRELESS_SSIDS_SCHEMA,
+            ),
+        },
+        "/networks/{networkId}/wireless/ssids/{number}": {
+            "get": _op("getNetworkWirelessSsid", "wireless"),
+            "put": _op("updateNetworkWirelessSsid", "wireless"),
+        },
+        "/networks/{networkId}/appliance/ssids": {
+            "get": _op(
+                "getNetworkApplianceSsids",
+                "appliance",
+                response_schema=APPLIANCE_SSIDS_SCHEMA,
+            ),
+        },
+        "/networks/{networkId}/appliance/ssids/{number}": {
+            "get": _op("getNetworkApplianceSsid", "appliance"),
+            "put": _op("updateNetworkApplianceSsid", "appliance"),
+        },
+        "/organizations/{organizationId}/admins": {
+            "get": _op("getOrganizationAdmins", "organizations"),
+        },
+        "/organizations/{organizationId}/admins/{adminId}": {
+            "put": _op("updateOrganizationAdmin", "organizations"),
+            "delete": _op("deleteOrganizationAdmin", "organizations"),
         },
     },
 }
