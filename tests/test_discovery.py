@@ -82,6 +82,11 @@ def test_element_id_uses_param_name_then_fallbacks(parser: OpenApiParser) -> Non
     assert element_id(vlan_item, {"id": 10}) == "10"
     assert element_id(vlan_item, {"name": "unidentifiable"}) is None
     assert element_id(vlan_item, "not-a-dict") is None
+    # A JSON null is "missing", not the literal ID "None".
+    assert element_id(vlan_item, {"vlanId": None, "id": 10}) == "10"
+    assert element_id(vlan_item, {"id": None}) is None
+    # Whitespace padding never reaches the import ID.
+    assert element_id(vlan_item, {"id": " 10 "}) == "10"
 
 
 def test_expand_endpoint_payload_shapes(parser: OpenApiParser) -> None:

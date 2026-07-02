@@ -16,6 +16,7 @@ Security and contract notes:
 
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import Any
 
@@ -218,6 +219,10 @@ class LiveApiDataProvider(MerakiDataProvider):
                 f"Meraki SDK exposes no method for operation {op.operation_id!r} "
                 f"(tags={op.tags!r})."
             )
+        # Paginated SDK methods default to total_pages=1; without "all"
+        # a large collection would be silently truncated to its first page.
+        if "total_pages" in inspect.signature(method).parameters:
+            return method(total_pages="all", **params)
         return method(**params)
 
     def close(self) -> None:
