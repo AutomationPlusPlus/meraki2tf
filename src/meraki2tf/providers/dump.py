@@ -115,7 +115,9 @@ class StaticJsonDataProvider(MerakiDataProvider):
     # ------------------------------------------------------------------
 
     def _graph_from_contract(self, organization_id: str | None) -> NetworkGraph:
-        org_id = organization_id or str(self._document.get("organizationId", "")).strip()
+        # `or ""` also folds an explicit JSON null into "missing" — str(None)
+        # would otherwise yield the truthy organization ID "None".
+        org_id = organization_id or str(self._document.get("organizationId") or "").strip()
         if not org_id:
             raise MalformedDumpError(
                 f"Snapshot {self._path} records no organizationId and none was supplied."
@@ -142,7 +144,7 @@ class StaticJsonDataProvider(MerakiDataProvider):
         return graph
 
     def _feature(self, item: Any) -> FeatureConfiguration:
-        if not isinstance(item, dict) or not str(item.get("apiPath", "")).strip():
+        if not isinstance(item, dict) or not str(item.get("apiPath") or "").strip():
             raise MalformedDumpError(
                 f"Snapshot {self._path}: each feature needs an 'apiPath' template."
             )
@@ -181,7 +183,7 @@ class StaticJsonDataProvider(MerakiDataProvider):
                 )
             info = entry.get("info")
             org_id = (
-                str(info.get("id", "")).strip() if isinstance(info, dict) else ""
+                str(info.get("id") or "").strip() if isinstance(info, dict) else ""
             ) or (organization_id or "")
             if not org_id:
                 raise MalformedDumpError(

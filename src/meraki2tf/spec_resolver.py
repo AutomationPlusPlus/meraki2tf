@@ -69,7 +69,7 @@ def _version_of(document: dict[str, Any]) -> str | None:
 def _local_version(path: Path) -> str | None:
     try:
         return _version_of(_parse_spec(path.read_text(encoding="utf-8"), str(path)))
-    except (OSError, SpecResolutionError):
+    except (OSError, UnicodeDecodeError, SpecResolutionError):
         logger.warning("Local spec %s is unreadable; treating it as outdated.", path)
         return None
 

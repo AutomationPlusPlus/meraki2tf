@@ -67,6 +67,20 @@ def test_from_file_rejects_invalid_json(tmp_path: Path) -> None:
         SpecIngestionEngine.from_file(spec_path)
 
 
+def test_from_file_rejects_non_object_document(tmp_path: Path) -> None:
+    spec_path = tmp_path / "bad.json"
+    spec_path.write_text("[]", encoding="utf-8")
+    with pytest.raises(MalformedSpecError):
+        SpecIngestionEngine.from_file(spec_path)
+
+
+def test_from_file_rejects_non_utf8_bytes(tmp_path: Path) -> None:
+    spec_path = tmp_path / "bad.json"
+    spec_path.write_bytes(b"\xff\xfe{}")
+    with pytest.raises(MalformedSpecError):
+        SpecIngestionEngine.from_file(spec_path)
+
+
 def test_rejects_document_without_paths() -> None:
     with pytest.raises(MalformedSpecError):
         SpecIngestionEngine({"openapi": "3.0.1"})

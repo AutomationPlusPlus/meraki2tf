@@ -508,7 +508,14 @@ def test_rebaseline_discards_accumulated_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _no_network(monkeypatch)
-    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    monkeypatch.setattr(
+        terraform_runner.subprocess,
+        "run",
+        lambda command, **kwargs: SimpleNamespace(
+            returncode=0, stdout="No changes.", stderr=""
+        ),
+    )
     workdir = tmp_path / "workspace"
     workdir.mkdir()
     stale_baseline = workdir / "resources.tf"
@@ -521,6 +528,30 @@ def test_rebaseline_discards_accumulated_config(
 
     assert exit_code == 0
     assert not stale_baseline.exists()
+
+
+def test_rebaseline_without_api_key_refuses_and_keeps_baseline(
+    spec_file: Path,
+    dump_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a key the plan never regenerates resources.tf, so a
+    keyless --rebaseline would silently destroy the DR baseline."""
+    _no_network(monkeypatch)
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    workdir = tmp_path / "workspace"
+    workdir.mkdir()
+    baseline = workdir / "resources.tf"
+    baseline.write_text("resource_old {}", encoding="utf-8")
+
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(dump_file),
+         "--workdir", str(workdir), "--rebaseline"]
+    )
+
+    assert exit_code == 1
+    assert baseline.read_text(encoding="utf-8") == "resource_old {}"
 
 
 def test_rebuild_planning_failure_exits_one(

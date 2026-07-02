@@ -155,6 +155,31 @@ def test_identity_shaped_values_are_scrubbed_regardless_of_key() -> None:
     assert payload["version"] == "1.72.0"
 
 
+def test_hostnames_with_paths_ports_and_trailing_dots_are_pseudonymized() -> None:
+    """Scheme-less URL shapes carry real domains (and sometimes embedded
+    secrets); they must not slip past the FQDN rule."""
+    graph = NetworkGraph(
+        "org-123", (), (),
+        (
+            FeatureConfiguration(
+                "/networks/{networkId}/appliance/contentFiltering",
+                ("N_1",),
+                {
+                    "patterns": [
+                        "example.com/path",
+                        "example.com.",
+                        "portal.example:8443/login",
+                        "hooks.example.com/services/T0/B0/SECRETTOKEN",
+                    ]
+                },
+            ),
+        ),
+    )
+    patterns = sanitize_graph(graph).features[0].payload["patterns"]
+    assert all(p.startswith("host-") for p in patterns)
+    assert not any("example" in p or "SECRETTOKEN" in p for p in patterns)
+
+
 def test_feature_only_structural_ids_are_pseudonymized() -> None:
     """Org/network IDs seen only in features (multi-org exports, partial
     snapshots) must not leak through --sanitize."""

@@ -117,6 +117,40 @@ def test_dump_provider_requires_some_org_id(tmp_path: Path) -> None:
         StaticJsonDataProvider(path).fetch_network_graph()
 
 
+def test_dump_provider_treats_null_org_id_as_missing(tmp_path: Path) -> None:
+    """An explicit JSON null must not become the organization ID "None"."""
+    path = tmp_path / "null-org.json"
+    path.write_text(
+        json.dumps({"organizationId": None, "networks": []}), encoding="utf-8"
+    )
+    with pytest.raises(MalformedDumpError):
+        StaticJsonDataProvider(path).fetch_network_graph()
+
+
+def test_nested_dump_null_info_id_falls_back_to_override(tmp_path: Path) -> None:
+    path = tmp_path / "nested-null.json"
+    path.write_text(
+        json.dumps({"organizations": [{"info": {"id": None}}]}), encoding="utf-8"
+    )
+    graph = StaticJsonDataProvider(path).fetch_network_graph("org-supplied")
+    assert graph.organization_id == "org-supplied"
+    with pytest.raises(MalformedDumpError):
+        StaticJsonDataProvider(path).fetch_network_graph()
+
+
+def test_dump_provider_rejects_null_api_path(tmp_path: Path) -> None:
+    path = tmp_path / "null-api-path.json"
+    path.write_text(
+        json.dumps(
+            {"organizationId": "org-1",
+             "features": [{"apiPath": None, "pathValues": []}]}
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(MalformedDumpError):
+        StaticJsonDataProvider(path).fetch_network_graph()
+
+
 @pytest.mark.parametrize("content", ["{not json", json.dumps(["not", "an", "object"])])
 def test_dump_provider_rejects_malformed_documents(tmp_path: Path, content: str) -> None:
     path = tmp_path / "bad.json"
@@ -395,6 +429,29 @@ def test_live_provider_without_parser_skips_features(
     assert graph.features == ()
     bare.close()
     assert bare._client is None
+
+
+def test_live_call_requests_all_pages_when_method_paginates(
+    live_provider: LiveApiDataProvider, spec_parser: OpenApiParser
+) -> None:
+    """Paginated SDK methods default to one page; dynamic dispatch must
+    ask for all of them or large collections are silently truncated."""
+    captured: dict[str, Any] = {}
+
+    class PagedOrganizations:
+        def getOrganizationAdmins(
+            self, organizationId: str, total_pages: Any = 1
+        ) -> list[dict[str, Any]]:
+            captured["total_pages"] = total_pages
+            return []
+
+    dashboard = types.SimpleNamespace(organizations=PagedOrganizations())
+    op = next(
+        o for o in spec_parser.endpoints()
+        if o.operation_id == "getOrganizationAdmins"
+    )
+    live_provider._call(dashboard, op, organizationId="org-1")
+    assert captured["total_pages"] == "all"
 
 
 def test_live_provider_client_is_lazy_and_cached(

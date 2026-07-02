@@ -99,8 +99,13 @@ def element_id(item_op: OperationSpec, element: Any) -> str | None:
     if not isinstance(element, Mapping):
         return None
     for key in (item_op.path_params[-1], *_ITEM_ID_FALLBACK_KEYS):
-        if key in element and str(element[key]).strip():
-            return str(element[key])
+        value = element.get(key)
+        if value is None:
+            # A JSON null must not become the literal ID "None".
+            continue
+        text = str(value).strip()
+        if text:
+            return text
     return None
 
 
