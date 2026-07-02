@@ -148,6 +148,50 @@ def test_duplicate_assets_are_written_once(
     assert report.imports_written == 1
 
 
+def test_label_collisions_are_disambiguated_not_dropped(
+    generator: HclImportGenerator, tmp_path: Path
+) -> None:
+    """Distinct IDs that sanitize to the same label must all be captured."""
+    report = generator.generate(
+        _graph(
+            networks=(_network("N-1"), _network("N.1"), _network("N_1")),
+            devices=(),
+            features=(),
+        ),
+        tmp_path,
+    )
+    content = report.imports_file.read_text(encoding="utf-8")
+
+    assert report.imports_written == 3
+    assert "to = meraki_networks.n_1\n" in content
+    assert "to = meraki_networks.n_1_2\n" in content
+    assert "to = meraki_networks.n_1_3\n" in content
+    assert 'id = "N-1"' in content
+    assert 'id = "N.1"' in content
+    assert 'id = "N_1"' in content
+
+
+def test_collision_suffixes_stay_stable_against_existing_state(
+    generator: HclImportGenerator, tmp_path: Path
+) -> None:
+    """A colliding asset tracked under its suffixed address stays skipped."""
+    graph = _graph(
+        networks=(_network("N-1"), _network("N.1")), devices=(), features=()
+    )
+    report = generator.generate(
+        graph,
+        tmp_path,
+        existing_addresses=frozenset({"meraki_networks.n_1"}),
+    )
+    content = report.imports_file.read_text(encoding="utf-8")
+
+    # N-1 (first) resolves to n_1 = already tracked; N.1 keeps n_1_2.
+    assert report.skipped_existing == 1
+    assert report.imports_written == 1
+    assert "to = meraki_networks.n_1_2\n" in content
+    assert 'id = "N.1"' in content
+
+
 def test_labels_are_sanitized_to_valid_terraform_identifiers(
     generator: HclImportGenerator, tmp_path: Path
 ) -> None:
@@ -157,6 +201,44 @@ def test_labels_are_sanitized_to_valid_terraform_identifiers(
     content = report.imports_file.read_text(encoding="utf-8")
     assert "to = meraki_networks.r_123_a_b\n" in content
     assert 'id = "123-A.B"' in content
+
+
+def test_folded_alias_path_is_flagged_not_misimported(
+    generator: HclImportGenerator, tmp_path: Path, recorder: RecordingNotifier
+) -> None:
+    """/organizations/{organizationId}/networks folds into meraki_networks
+    with matching arity — importing an org ID as a network must be refused."""
+    graph = _graph(
+        networks=(),
+        devices=(),
+        features=(
+            FeatureConfiguration(
+                "/organizations/{organizationId}/networks", ("org-123",)
+            ),
+        ),
+    )
+    report = generator.generate(graph, tmp_path)
+
+    assert report.imports_written == 0
+    assert len(report.unsupported) == 1
+    assert "organization_id" in report.unsupported[0].reason
+    assert recorder.events[0].event_type is EventType.UNSUPPORTED_FEATURE_FLAGGED
+    content = report.imports_file.read_text(encoding="utf-8")
+    assert "org-123" not in content  # no wrong import block was emitted
+
+
+def test_import_ids_are_hcl_escaped(
+    generator: HclImportGenerator, tmp_path: Path
+) -> None:
+    """IDs from arbitrary dump JSON must not break or inject into HCL."""
+    report = generator.generate(
+        _graph(networks=(_network('N"1${evil}'),), devices=(), features=()),
+        tmp_path,
+    )
+    content = report.imports_file.read_text(encoding="utf-8")
+    assert report.imports_written == 1
+    assert 'id = "N\\"1$${evil}"' in content
+    assert '"N"1' not in content  # no unterminated string literal
 
 
 def test_empty_graph_writes_header_only_file(

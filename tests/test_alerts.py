@@ -21,6 +21,7 @@ from meraki2tf.alerts import (
     run_success,
     unsupported_feature_flagged,
 )
+from meraki2tf.alerts.email import _default_smtp_factory
 
 
 class RecordingNotifier(Notifier):
@@ -49,7 +50,14 @@ def test_drift_detected_payload_contract() -> None:
 
 def test_run_success_payload_contract() -> None:
     payload = run_success(
-        imports_written=4, drift_was_detected=True, workspace="generated"
+        imports_written=4,
+        drift_was_detected=True,
+        workspace="generated",
+        discovered_assets=10,
+        imports_already_tracked=5,
+        unsupported_count=1,
+        pending_imports=4,
+        comparison_performed=True,
     ).to_payload()
     assert payload["event_type"] == "RUN_SUCCESS"
     assert payload["severity"] == EventSeverity.INFO.value
@@ -57,6 +65,11 @@ def test_run_success_payload_contract() -> None:
         "imports_written": 4,
         "drift_was_detected": True,
         "workspace": "generated",
+        "discovered_assets": 10,
+        "imports_already_tracked": 5,
+        "unsupported_count": 1,
+        "pending_imports": 4,
+        "comparison_performed": True,
     }
 
 
@@ -101,7 +114,16 @@ def test_webhook_posts_structured_json(monkeypatch: pytest.MonkeyPatch) -> None:
         return FakeResponse(200)
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-    event = run_success(imports_written=1, drift_was_detected=False, workspace="w")
+    event = run_success(
+        imports_written=1,
+        drift_was_detected=False,
+        workspace="w",
+        discovered_assets=1,
+        imports_already_tracked=0,
+        unsupported_count=0,
+        pending_imports=1,
+        comparison_performed=True,
+    )
     WebhookNotifier("https://hooks.example/abc", timeout=5.0).send(event)
 
     request = captured["request"]
@@ -135,10 +157,12 @@ def test_webhook_wraps_transport_failures(monkeypatch: pytest.MonkeyPatch) -> No
 
 class FakeSmtp:
     sent: list[EmailMessage] = []
+    last_timeout: float | None = None
 
-    def __init__(self, host: str, port: int) -> None:
+    def __init__(self, host: str, port: int, timeout: float) -> None:
         self.host = host
         self.port = port
+        FakeSmtp.last_timeout = timeout
 
     def __enter__(self) -> "FakeSmtp":
         return self
@@ -163,6 +187,7 @@ def test_email_notifier_builds_and_sends_json_report() -> None:
     notifier.send(event)
 
     assert len(FakeSmtp.sent) == 1
+    assert FakeSmtp.last_timeout == 30.0  # a hung relay cannot wedge a run
     message = FakeSmtp.sent[0]
     assert "DRIFT_DETECTED" in message["Subject"]
     assert message["From"] == "meraki2tf@example.com"
@@ -170,12 +195,35 @@ def test_email_notifier_builds_and_sends_json_report() -> None:
     assert json.loads(message.get_content()) == event.to_payload()
 
 
+def test_default_smtp_factory_applies_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeSMTP:
+        def __init__(self, host: str, port: int, timeout: float) -> None:
+            captured.update(host=host, port=port, timeout=timeout)
+
+    monkeypatch.setattr("meraki2tf.alerts.email.smtplib.SMTP", FakeSMTP)
+    _default_smtp_factory("smtp.example", 25, 30.0)
+    assert captured == {"host": "smtp.example", "port": 25, "timeout": 30.0}
+
+
 def test_dispatcher_fans_out_and_isolates_failures() -> None:
     recorder = RecordingNotifier()
     dispatcher = AlertDispatcher([ExplodingNotifier()])
     dispatcher.register(recorder)
     delivered = dispatcher.dispatch(
-        run_success(imports_written=1, drift_was_detected=False, workspace="w")
+        run_success(
+            imports_written=1,
+            drift_was_detected=False,
+            workspace="w",
+            discovered_assets=1,
+            imports_already_tracked=0,
+            unsupported_count=0,
+            pending_imports=None,
+            comparison_performed=False,
+        )
     )
     assert delivered == 1
     assert recorder.events[0].event_type is EventType.RUN_SUCCESS

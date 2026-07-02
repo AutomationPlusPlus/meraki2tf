@@ -100,7 +100,7 @@ When `MERAKI_DASHBOARD_API_KEY` is not set, the run stops after
 generating `imports.tf` — the `terraform plan` comparison is skipped
 (the Terraform provider needs a token to read live resources) and the
 run still exits 0. Set the variable if you also want drift comparison
-and `generated_resources.tf` from a dump-mode run.
+and the generated `resources.tf` baseline from a dump-mode run.
 
 Snapshot format:
 
@@ -215,11 +215,37 @@ Each run leaves a complete rebuild kit in `--workdir`:
 | --- | --- | --- |
 | `imports.tf` | meraki2tf | One `import {}` block per discovered asset (compound IDs included) |
 | `provider.tf` | meraki2tf | Credential-free provider + local backend anchor |
-| `generated_resources.tf` | `terraform plan -generate-config-out` | Full HCL configuration for every imported asset — the actual rebuild material |
+| `resources.tf` | meraki2tf (accumulated from `terraform plan -generate-config-out`) | Full HCL configuration for every captured asset — the actual rebuild material and the drift-comparison baseline |
+| `generated_resources.tf` | terraform (transient) | Freshly generated config for new imports; folded into `resources.tf` after every plan |
 | `terraform.tfstate` | terraform (only if *you* apply) | State tracking, once you adopt the resources |
 
 Back up the workdir (and ideally a `--dump-to` snapshot) somewhere that
 survives the disaster you are protecting against.
+
+### Knowing what is (and isn't) covered
+
+Every run audits Terraform coverage so you can trust the kit *before*
+you need it. The log and the `RUN_SUCCESS` payload report how many
+discovered assets are captured (new import blocks + already tracked in
+state), and each asset the provider **cannot express** is flagged with
+an `UNSUPPORTED_FEATURE_FLAGGED` alert plus a summary warning naming
+the API paths — those are the pieces you would have to rebuild manually
+in a DR event, so review them ahead of time. When the plan comparison
+runs (API key available), the plan's own summary is also reported:
+pending imports (discovered but not yet aggregated into state) versus
+real add/change/destroy pressure, which fires `DRIFT_DETECTED`. The
+plan stays speculative — nothing is ever applied by the pipeline.
+
+Drift is measured against the captured baseline in `resources.tf`, so a
+`DRIFT_DETECTED` alert keeps firing until you act on it: either fix the
+organization back to the baseline (that's the DR posture), or accept
+the new reality with `--rebaseline`, which discards `resources.tf` so
+the next plan regenerates it from live data:
+
+```bash
+# After reviewing the drift diff and deciding the change is legitimate:
+meraki2tf --org-id 123456 --rebaseline
+```
 
 ### Restoring an existing organization (primary DR path)
 
@@ -264,7 +290,7 @@ Terraform cannot import something that is gone. Adjust the kit first:
    the old one references destroyed resources).
 4. `terraform init && terraform plan && terraform apply`.
 
-> **Greenfield caveat:** `generated_resources.tf` captures IDs as
+> **Greenfield caveat:** `resources.tf` captures IDs as
 > literal strings (organization ID, `network_id = "N_…"`, serials).
 > Rebuilding into a **brand-new organization** assigns new IDs, so
 > cross-resource references must be re-pointed (e.g. replace literal
@@ -286,6 +312,7 @@ Quick reference (each flag is described in detail below):
 | `--sanitize` | off | Redact secrets/identity in the `--dump-to` snapshot |
 | `--rebuild` | off | Disaster recovery: preview a rebuild apply of the workdir artifacts |
 | `--confirm` | off | Escalate `--rebuild` from preview to a real `terraform apply` |
+| `--rebaseline` | off | Accept current reality: discard `resources.tf` so this run regenerates the baseline |
 | `--workdir DIR` | `generated` | Terraform execution workspace |
 | `--state-file PATH` | `<workdir>/terraform.tfstate` | Terraform state to aggregate into across runs |
 | `--webhook-url URL` | — | Webhook alert endpoint (repeatable) |
@@ -337,9 +364,17 @@ Cannot be combined with `--from-dump`/`--dump-to`. See
 `terraform apply`. This flag pair is the *only* way meraki2tf ever
 applies anything; every other invocation is read-only toward Meraki.
 
+**`--rebaseline`** — discard the accumulated `resources.tf`
+configuration baseline so this run regenerates it from currently
+discovered data. Use after reviewing a `DRIFT_DETECTED` alert whose
+changes are legitimate. Refused while the state file tracks resources —
+their configuration cannot be regenerated (they are skipped from
+`imports.tf`, and Terraform only generates config for import targets),
+so discarding it would make the plan propose destroying them.
+
 **`--workdir DIR`** — the Terraform execution workspace. meraki2tf
-writes `provider.tf` and `imports.tf` here, and Terraform adds
-`generated_resources.tf` plus its `.terraform/` directory. This is your
+writes `provider.tf`, `imports.tf`, and the accumulated `resources.tf`
+here, and Terraform adds its `.terraform/` directory. This is your
 disaster-recovery kit — back it up. Use one workdir per organization if
 you manage several.
 
@@ -441,7 +476,7 @@ environment itself.
 | Event | Trigger |
 | --- | --- |
 | `DRIFT_DETECTED` | The speculative plan found real changes (add/change/destroy) on tracked resources — pending imports alone don't count (payload carries the diff) |
-| `RUN_SUCCESS` | Snapshot generation (and comparison, when an API key was available) completed flawlessly |
+| `RUN_SUCCESS` | Snapshot generation (and comparison, when an API key was available) completed flawlessly. Payload carries the coverage picture: `discovered_assets`, `imports_written`, `imports_already_tracked`, `unsupported_count`, `pending_imports` (imports the plan reports as not yet in state; `null` when unknown), and `comparison_performed` |
 | `UNSUPPORTED_FEATURE_FLAGGED` | A discovered asset cannot be mapped to a Terraform resource |
 | `PROCESSING_FAULT` | A critical pipeline failure (payload carries the failing stage) |
 

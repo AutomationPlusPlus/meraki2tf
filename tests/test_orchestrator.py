@@ -6,6 +6,7 @@ import pytest
 
 from meraki2tf.alerts import AlertDispatcher, AlertEvent, EventType, Notifier
 from meraki2tf.config import API_KEY_ENV_VAR
+from meraki2tf.hcl_generator import UnsupportedAsset
 from meraki2tf.models import NetworkGraph
 from meraki2tf.orchestrator import PipelineError, PipelineOrchestrator
 from meraki2tf.providers.base import MerakiDataProvider
@@ -59,18 +60,27 @@ class StubGenerator:
 
 
 class StubRunner:
-    def __init__(self, workdir: Path, plan_exit: int = 0, fail_stage: str = "") -> None:
+    def __init__(
+        self,
+        workdir: Path,
+        plan_exit: int = 0,
+        fail_stage: str = "",
+        plan_stdout: str = "~ delta",
+    ) -> None:
         self.workdir = workdir
         self.plan_exit = plan_exit
         self.fail_stage = fail_stage
+        self.plan_stdout = plan_stdout
         self.initialized = False
         self.planned = False
         self.applied = False
+        self.baseline_reset = False
+        self.config_baseline = True
         self.state_addresses: frozenset[str] = frozenset()
 
     def _result(self, code: int) -> TerraformCommandResult:
         return TerraformCommandResult(
-            command=("terraform",), returncode=code, stdout="~ delta", stderr=""
+            command=("terraform",), returncode=code, stdout=self.plan_stdout, stderr=""
         )
 
     def prepare_workspace(self) -> Path:
@@ -78,6 +88,14 @@ class StubRunner:
 
     def existing_addresses(self) -> frozenset[str]:
         return self.state_addresses
+
+    def has_config_baseline(self) -> bool:
+        return self.config_baseline
+
+    def reset_baseline(self, existing_addresses: frozenset[str]) -> None:
+        if existing_addresses:
+            raise TerraformError("cannot rebaseline with tracked resources")
+        self.baseline_reset = True
 
     def init(self) -> TerraformCommandResult:
         self.initialized = True
@@ -99,15 +117,20 @@ def _orchestrator(
     plan_exit: int = 0,
     fail_stage: str = "",
     generator: StubGenerator | None = None,
+    plan_stdout: str = "~ delta",
+    rebaseline: bool = False,
 ) -> tuple[PipelineOrchestrator, RecordingNotifier, StubProvider, StubRunner]:
     recorder = RecordingNotifier()
     provider = StubProvider()
-    runner = StubRunner(tmp_path, plan_exit=plan_exit, fail_stage=fail_stage)
+    runner = StubRunner(
+        tmp_path, plan_exit=plan_exit, fail_stage=fail_stage, plan_stdout=plan_stdout
+    )
     orchestrator = PipelineOrchestrator(
         provider=provider,
         generator=generator or StubGenerator(),  # type: ignore[arg-type]
         runner=runner,  # type: ignore[arg-type]
         dispatcher=AlertDispatcher([recorder]),
+        rebaseline=rebaseline,
     )
     return orchestrator, recorder, provider, runner
 
@@ -122,14 +145,36 @@ def test_clean_run_fires_only_run_success(tmp_path: Path, api_key: None) -> None
     summary = orchestrator.run("org-123")
 
     assert [e.event_type for e in recorder.events] == [EventType.RUN_SUCCESS]
-    assert recorder.events[0].details["drift_was_detected"] is False
+    success = recorder.events[0]
+    assert success.details["drift_was_detected"] is False
+    assert success.details["comparison_performed"] is True
+    assert success.details["discovered_assets"] == 0
+    assert success.details["unsupported_count"] == 0
     assert summary.drift_detected is False
     assert summary.comparison_skipped is False
     assert summary.imports_written == 2
+    assert summary.pending_imports is None  # stub plan has no summary line
     assert summary.organization_id == "org-123"
     assert provider.closed  # context-managed discovery
     assert runner.planned
     assert not runner.applied  # read-only: the pipeline never applies
+
+
+def test_plan_summary_counts_flow_into_run_summary(
+    tmp_path: Path, api_key: None
+) -> None:
+    orchestrator, recorder, _, _ = _orchestrator(
+        tmp_path,
+        plan_exit=2,
+        plan_stdout="Plan: 875 to import, 0 to add, 0 to change, 0 to destroy.",
+    )
+    summary = orchestrator.run("org-123")
+
+    # Import-only plans are pending aggregation, not drift.
+    assert summary.drift_detected is False
+    assert summary.pending_imports == 875
+    assert [e.event_type for e in recorder.events] == [EventType.RUN_SUCCESS]
+    assert recorder.events[0].details["pending_imports"] == 875
 
 
 def test_drift_fires_alert_but_never_applies(tmp_path: Path, api_key: None) -> None:
@@ -174,6 +219,62 @@ def test_existing_state_addresses_flow_into_generation(
 
     assert generator.received_existing == frozenset({"meraki_networks.n_1"})
     assert summary.imports_skipped_existing == 1
+
+
+def test_unsupported_assets_warn_for_manual_dr_rebuild(
+    tmp_path: Path, api_key: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    generator = StubGenerator()
+    generator.unsupported = (
+        UnsupportedAsset(
+            api_path="/networks/{networkId}/mystery",
+            reason="No Terraform resource maps to this API path.",
+            identifiers=("N_1",),
+        ),
+    )
+    orchestrator, recorder, _, _ = _orchestrator(tmp_path, generator=generator)
+    with caplog.at_level("WARNING", logger="meraki2tf.orchestrator"):
+        summary = orchestrator.run("org-123")
+
+    assert summary.unsupported_count == 1
+    assert any(
+        "MANUAL rebuild" in record.message and "mystery" in record.message
+        for record in caplog.records
+    )
+    assert recorder.events[-1].details["unsupported_count"] == 1
+
+
+def test_rebaseline_resets_before_generation(tmp_path: Path, api_key: None) -> None:
+    orchestrator, recorder, _, runner = _orchestrator(tmp_path, rebaseline=True)
+    orchestrator.run("org-123")
+    assert runner.baseline_reset
+    assert [e.event_type for e in recorder.events] == [EventType.RUN_SUCCESS]
+
+
+def test_rebaseline_with_tracked_state_is_a_fault(
+    tmp_path: Path, api_key: None
+) -> None:
+    orchestrator, recorder, _, runner = _orchestrator(tmp_path, rebaseline=True)
+    runner.state_addresses = frozenset({"meraki_networks.n_1"})
+    with pytest.raises(PipelineError, match="baseline reset"):
+        orchestrator.run("org-123")
+    assert recorder.events[0].details["stage"] == "baseline reset"
+    assert not runner.baseline_reset
+
+
+def test_tracked_state_without_baseline_warns(
+    tmp_path: Path, api_key: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    """State-tracked resources with no resources.tf will plan as destroys."""
+    orchestrator, _, _, runner = _orchestrator(tmp_path)
+    runner.state_addresses = frozenset({"meraki_networks.n_1"})
+    runner.config_baseline = False
+    with caplog.at_level("WARNING", logger="meraki2tf.orchestrator"):
+        orchestrator.run("org-123")
+    assert any(
+        "no accumulated configuration baseline" in record.message
+        for record in caplog.records
+    )
 
 
 def test_fault_dispatches_processing_fault_and_raises(

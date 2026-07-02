@@ -26,7 +26,7 @@ from meraki2tf.models import (
     MerakiNetwork,
     NetworkGraph,
 )
-from meraki2tf.openapi_parser import OpenApiParser
+from meraki2tf.openapi_parser import OpenApiParser, entity_key
 from meraki2tf.providers.base import MerakiDataProvider
 from meraki2tf.providers.discovery import (
     config_collection_operations,
@@ -79,7 +79,9 @@ class LiveApiDataProvider(MerakiDataProvider):
                 organization_id, total_pages="all"
             )
         )
-        features = tuple(self._discover_features(dashboard, networks))
+        features = tuple(
+            self._discover_features(dashboard, organization_id, networks)
+        )
         graph = NetworkGraph(
             organization_id=organization_id,
             networks=networks,
@@ -93,32 +95,100 @@ class LiveApiDataProvider(MerakiDataProvider):
         return graph
 
     def _discover_features(
-        self, dashboard: Any, networks: tuple[MerakiNetwork, ...]
+        self,
+        dashboard: Any,
+        organization_id: str,
+        networks: tuple[MerakiNetwork, ...],
     ) -> list[FeatureConfiguration]:
-        """Execute every configuration GET the spec exposes, per network."""
+        """Execute every configuration GET the spec exposes.
+
+        Organization-scoped endpoints run once, network-scoped endpoints
+        run per network — mirroring the scopes the dump provider resolves
+        so both modalities discover the same surfaces.
+        """
         if self._parser is None:
             logger.debug("No OpenAPI parser supplied; skipping feature discovery.")
             return []
-        feature_ops = config_collection_operations(self._parser)
+        undispatchable: set[str] = set()
         features: list[FeatureConfiguration] = []
-        for network in networks:
-            for op in feature_ops:
-                try:
-                    payload = self._call(dashboard, op, networkId=network.network_id)
-                except Exception as exc:
-                    # Networks routinely lack product types for a given
-                    # endpoint; a refusal is data, not a fault.
-                    logger.debug(
-                        "Feature endpoint %s unavailable for network %s: %s",
-                        op.path, network.network_id, exc,
-                    )
-                    continue
+        mappings = self._parser.resource_mappings()
+        lookup = self._parser.endpoint_lookup()
+
+        def _folds_elsewhere(op: OperationSpec) -> bool:
+            # Collections that fold into another entity list first-class
+            # assets captured individually elsewhere (e.g.
+            # /organizations/{organizationId}/networks → meraki_networks);
+            # re-emitting them here would only produce unimportable noise.
+            name = lookup.get(op.path)
+            return name is not None and mappings[name].entity_key != entity_key(
+                op.path
+            )
+
+        for op in config_collection_operations(self._parser, "organizationId"):
+            if _folds_elsewhere(op):
+                continue
+            payload = self._try_call(
+                dashboard, op, "organizationId", organization_id, undispatchable
+            )
+            if payload is not None:
                 features.extend(
                     expand_endpoint_payload(
-                        self._parser, op, network.network_id, payload
+                        self._parser, op, organization_id, payload
                     )
                 )
+        network_ops = tuple(
+            op
+            for op in config_collection_operations(self._parser)
+            if not _folds_elsewhere(op)
+        )
+        for network in networks:
+            for op in network_ops:
+                payload = self._try_call(
+                    dashboard, op, "networkId", network.network_id, undispatchable
+                )
+                if payload is not None:
+                    features.extend(
+                        expand_endpoint_payload(
+                            self._parser, op, network.network_id, payload
+                        )
+                    )
         return features
+
+    def _try_call(
+        self,
+        dashboard: Any,
+        op: OperationSpec,
+        scope_param: str,
+        scope_value: str,
+        undispatchable: set[str],
+    ) -> Any:
+        """One endpoint call; refusals are data, dispatch gaps are loud.
+
+        A product-type refusal for one network is normal and logged at
+        DEBUG, but an operation the installed SDK cannot dispatch at all
+        would silently drop that endpoint's assets from every scope —
+        that is missing DR coverage, so it warns once and is skipped for
+        the rest of the run.
+        """
+        if op.operation_id in undispatchable:
+            return None
+        try:
+            return self._call(dashboard, op, **{scope_param: scope_value})
+        except LiveDispatchError as exc:
+            undispatchable.add(op.operation_id)
+            logger.warning(
+                "Endpoint %s cannot be dispatched onto the installed meraki "
+                "SDK (%s); its assets will be missing from this snapshot. "
+                "Upgrade the SDK or pin a matching --spec release.",
+                op.path, exc,
+            )
+            return None
+        except Exception as exc:
+            logger.debug(
+                "Feature endpoint %s unavailable for %s %s: %s",
+                op.path, scope_param, scope_value, exc,
+            )
+            return None
 
     def _call(self, dashboard: Any, op: OperationSpec, **params: str) -> Any:
         """Resolve ``dashboard.<first tag>.<operationId>`` dynamically."""

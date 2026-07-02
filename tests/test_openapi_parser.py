@@ -166,3 +166,36 @@ def test_path_helpers() -> None:
     assert is_item_path("/networks/{networkId}")
     assert not is_item_path("/organizations")
     assert not is_item_path("/networks/{networkId}/appliance/vlans")
+
+
+def test_terraform_name_collision_keeps_first_and_warns(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """snake_casing can make distinct entities collide on one provider
+    name; silent overwrite would drop the first entity's endpoints."""
+    spec = {
+        "openapi": "3.0.1",
+        "paths": {
+            "/networks/{networkId}/trafficShaping": {
+                "get": _op("getA", "networks"),
+                "put": _op("putA", "networks"),
+            },
+            "/networks/{networkId}/traffic/shaping": {
+                "get": _op("getB", "networks"),
+                "put": _op("putB", "networks"),
+            },
+        },
+    }
+    path = tmp_path / "colliding.json"
+    path.write_text(json.dumps(spec), encoding="utf-8")
+    parser = OpenApiParser(path)
+
+    with caplog.at_level("WARNING", logger="meraki2tf.openapi_parser"):
+        mappings = parser.resource_mappings()
+
+    assert any("collision" in record.message for record in caplog.records)
+    mapping = mappings["meraki_networks_traffic_shaping"]
+    # First in spec order wins; the loser's paths stay out of the lookup
+    # so its assets are audited as unsupported instead of mis-imported.
+    assert mapping.paths == ("/networks/{networkId}/trafficShaping",)
+    assert "/networks/{networkId}/traffic/shaping" not in parser.endpoint_lookup()

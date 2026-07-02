@@ -41,6 +41,9 @@ class FakeOrganizations:
         assert total_pages == "all"
         return [dict(DEVICE_PAYLOAD)]
 
+    def getOrganizationAdmins(self, organizationId: str) -> list[dict[str, Any]]:
+        return [{"id": "A_1", "email": "ops@example.com"}]
+
 
 class FakeAppliance:
     def getNetworkApplianceVlans(self, networkId: str) -> list[Any]:
@@ -123,6 +126,24 @@ def test_dump_provider_rejects_feature_without_api_path(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     with pytest.raises(MalformedDumpError):
+        StaticJsonDataProvider(path).fetch_network_graph()
+
+
+def test_dump_provider_rejects_string_path_values(tmp_path: Path) -> None:
+    """A bare string would explode character-by-character into garbage IDs."""
+    path = tmp_path / "feature.json"
+    path.write_text(
+        json.dumps(
+            {
+                "organizationId": "org-1",
+                "features": [
+                    {"apiPath": "/networks/{networkId}", "pathValues": "N_1"}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(MalformedDumpError, match="pathValues"):
         StaticJsonDataProvider(path).fetch_network_graph()
 
 
@@ -279,8 +300,47 @@ def test_live_provider_builds_graph_with_spec_driven_features(
     syslog = by_path[("/networks/{networkId}/syslogServers", ("N_1",))]
     assert syslog.payload == {"items": [{"host": "10.0.0.1"}]}
 
-    # The refusing sensor endpoint is skipped, not fatal.
-    assert len(graph.features) == 3
+    # Organization-scoped configuration is discovered too (dump parity).
+    admin = by_path[
+        ("/organizations/{organizationId}/admins/{adminId}", ("org-123", "A_1"))
+    ]
+    assert admin.payload["email"] == "ops@example.com"
+
+    # Folded collection aliases (/organizations/{organizationId}/networks
+    # lists first-class network assets) are not re-emitted as features,
+    # and the refusing sensor endpoint is skipped, not fatal.
+    assert len(graph.features) == 4
+
+
+def test_live_dispatch_gap_warns_once_and_skips(
+    live_provider: LiveApiDataProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An SDK missing an operation is missing DR coverage — loud, not DEBUG."""
+    monkeypatch.delattr(FakeOrganizations, "getOrganizationAdmins")
+    with caplog.at_level("WARNING", logger="meraki2tf.providers.live"):
+        graph = live_provider.fetch_network_graph("org-123")
+    admin_warnings = [
+        record for record in caplog.records
+        if "cannot be dispatched" in record.message and "admins" in record.message
+    ]
+    assert len(admin_warnings) == 1  # warned once, not per scope/network
+    assert len(graph.features) == 3  # everything else still discovered
+
+
+def test_try_call_skips_operations_already_known_undispatchable(
+    live_provider: LiveApiDataProvider, spec_parser: OpenApiParser
+) -> None:
+    op = next(
+        o for o in spec_parser.endpoints()
+        if o.operation_id == "getOrganizationAdmins"
+    )
+    undispatchable = {op.operation_id}
+    result = live_provider._try_call(
+        object(), op, "organizationId", "org-123", undispatchable
+    )
+    assert result is None  # short-circuited, no dispatch attempted
 
 
 def test_live_provider_without_parser_skips_features(

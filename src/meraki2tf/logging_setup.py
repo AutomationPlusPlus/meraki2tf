@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import traceback
 
 from meraki2tf.config import API_KEY_ENV_VAR
 
@@ -21,10 +22,12 @@ _REDACTED = "[REDACTED]"
 
 # Matches Authorization / X-Cisco-Meraki-API-Key header values however they
 # were interpolated into a message (e.g. by HTTP debug logging). Quoted
-# values are consumed wholly so multi-word tokens ("Bearer xyz") never leak.
+# values are consumed wholly, and unquoted scheme-prefixed values
+# ("Bearer xyz", "Token xyz") include the credential after the scheme,
+# so multi-word tokens never leak.
 _HEADER_PATTERN = re.compile(
     r"(?i)((?:authorization|x-cisco-meraki-api-key)['\"]?\s*[:=]\s*)"
-    r"('[^']*'|\"[^\"]*\"|[^,'\"\s]+)",
+    r"('[^']*'|\"[^\"]*\"|(?:bearer\s+|token\s+)?[^,'\"\s]+)",
 )
 
 
@@ -33,14 +36,29 @@ class SecretRedactionFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         message = record.getMessage()
-        redacted = _HEADER_PATTERN.sub(rf"\g<1>{_REDACTED}", message)
-        token = os.environ.get(API_KEY_ENV_VAR, "").strip()
-        if token:
-            redacted = redacted.replace(token, _REDACTED)
+        redacted = self._redact(message)
         if redacted != message:
             record.msg = redacted
             record.args = None
+        # Exception tracebacks (logger.exception) are rendered separately
+        # by the Formatter; pre-render and scrub them so a secret-bearing
+        # exception message (e.g. a webhook URL in a chained error) can
+        # never bypass redaction.
+        if record.exc_text:
+            record.exc_text = self._redact(record.exc_text)
+        elif record.exc_info and record.exc_info[1] is not None:
+            record.exc_text = self._redact(
+                "".join(traceback.format_exception(*record.exc_info)).rstrip("\n")
+            )
         return True
+
+    @staticmethod
+    def _redact(text: str) -> str:
+        redacted = _HEADER_PATTERN.sub(rf"\g<1>{_REDACTED}", text)
+        token = os.environ.get(API_KEY_ENV_VAR, "").strip()
+        if token:
+            redacted = redacted.replace(token, _REDACTED)
+        return redacted
 
 
 def configure_logging(verbose: bool = False) -> None:

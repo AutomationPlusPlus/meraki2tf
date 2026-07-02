@@ -13,7 +13,15 @@ from meraki2tf.alerts.models import AlertEvent
 
 logger = logging.getLogger(__name__)
 
-SmtpFactory = Callable[[str, int], smtplib.SMTP]
+#: Ceiling on connect/delivery so a black-holed relay cannot wedge a
+#: scheduled run inside the alert dispatcher.
+DEFAULT_SMTP_TIMEOUT = 30.0
+
+SmtpFactory = Callable[[str, int, float], smtplib.SMTP]
+
+
+def _default_smtp_factory(host: str, port: int, timeout: float) -> smtplib.SMTP:
+    return smtplib.SMTP(host, port, timeout=timeout)
 
 
 class EmailNotifier(Notifier):
@@ -31,13 +39,15 @@ class EmailNotifier(Notifier):
         port: int,
         sender: str,
         recipients: Sequence[str],
-        smtp_factory: SmtpFactory = smtplib.SMTP,
+        smtp_factory: SmtpFactory = _default_smtp_factory,
+        timeout: float = DEFAULT_SMTP_TIMEOUT,
     ) -> None:
         self._host = host
         self._port = port
         self._sender = sender
         self._recipients = list(recipients)
         self._smtp_factory = smtp_factory
+        self._timeout = timeout
 
     def build_message(self, event: AlertEvent) -> EmailMessage:
         message = EmailMessage()
@@ -49,7 +59,7 @@ class EmailNotifier(Notifier):
 
     def send(self, event: AlertEvent) -> None:
         message = self.build_message(event)
-        with self._smtp_factory(self._host, self._port) as smtp:
+        with self._smtp_factory(self._host, self._port, self._timeout) as smtp:
             smtp.send_message(message)
         logger.debug(
             "Email dispatched for event %s to %d recipient(s).",

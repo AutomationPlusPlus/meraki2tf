@@ -75,7 +75,9 @@ def test_identity_fields_are_pseudonymized() -> None:
     assert payload["name"].startswith("name-")
     assert payload["adminSplashUrl"].startswith("adminsplashurl-")
     assert payload["tags"][0].startswith("tags-")
-    assert payload["serials"][1].startswith("serials-")  # unknown serial
+    # Unknown serials under a structural key get a consistent dev-NNNN
+    # pseudonym (not a one-off digest), keeping references coherent.
+    assert payload["serials"][1] == "dev-0002"
     assert payload["lat"] == 0.0 and payload["lng"] == 0.0
     assert payload["vlanId"] == 10  # structure preserved
 
@@ -138,9 +140,10 @@ def test_identity_shaped_values_are_scrubbed_regardless_of_key() -> None:
     ).features[0].payload["dhcpOptions"][0]["value"]
     assert "10.9.9.9" not in dhcp
     assert "MCPORT=1719" in dhcp  # surrounding text preserved
-    # Comma-separated address lists are sanitized element-wise.
+    # Comma-separated address lists are sanitized element-wise, with the
+    # authored spacing preserved so benign text round-trips unchanged.
     first, second = payload["allowedList"].split(",")
-    assert first.startswith("10.") and second.startswith("10.")
+    assert first.startswith("10.") and second.startswith(" 10.")
     assert "10.1.1.0" not in payload["allowedList"]
     # Identity-shaped dict KEYS (fixed-IP assignments key on MACs) too.
     (mac_key, assignment), = payload["fixedIpAssignments"].items()
@@ -152,6 +155,77 @@ def test_identity_shaped_values_are_scrubbed_regardless_of_key() -> None:
     assert payload["version"] == "1.72.0"
 
 
+def test_feature_only_structural_ids_are_pseudonymized() -> None:
+    """Org/network IDs seen only in features (multi-org exports, partial
+    snapshots) must not leak through --sanitize."""
+    graph = NetworkGraph(
+        organization_id="o1",
+        networks=(),
+        devices=(),
+        features=(
+            FeatureConfiguration(
+                api_path="/organizations/{organizationId}/admins/{adminId}",
+                path_values=("654321", "A_1"),
+                payload={"networkId": "N_998877", "email": "a@b.c"},
+            ),
+        ),
+    )
+    sanitized = sanitize_graph(graph).features[0]
+    assert "654321" not in sanitized.path_values
+    assert sanitized.path_values[0] == "org-0002"  # o1 took org-0001
+    # Opaque item IDs are identifying and get a consistent pseudonym.
+    assert sanitized.path_values[1].startswith("id-")
+    # Structural references only seen inside payloads map too.
+    assert sanitized.payload["networkId"] == "net-0001"
+
+
+def test_numeric_item_path_values_are_preserved() -> None:
+    """VLAN/SSID numbers are structure, not identity."""
+    graph = NetworkGraph(
+        organization_id="org-123",
+        networks=(),
+        devices=(),
+        features=(
+            FeatureConfiguration(
+                api_path="/networks/{networkId}/appliance/vlans/{vlanId}",
+                path_values=("N_1", "10"),
+                payload={},
+            ),
+        ),
+    )
+    assert sanitize_graph(graph).features[0].path_values == ("net-0001", "10")
+
+
+def test_ipv6_addresses_are_pseudonymized() -> None:
+    graph = NetworkGraph(
+        organization_id="org-123",
+        networks=(),
+        devices=(),
+        features=(
+            FeatureConfiguration(
+                api_path="/networks/{networkId}/appliance/firewall/l3FirewallRules",
+                path_values=("N_1",),
+                payload={
+                    "rules": [
+                        {"destCidr": "2001:db8:abcd::/48"},
+                        {"destCidr": "fd00::1"},
+                        {"destCidr": "2001:0db8:85a3:0000:0000:8a2e:0370:7334"},
+                    ],
+                    "bssid": "aa:bb:cc:dd:ee:ff",  # MACs must stay MACs
+                },
+            ),
+        ),
+    )
+    payload = sanitize_graph(graph).features[0].payload
+    rules = payload["rules"]
+    assert rules[0]["destCidr"].startswith("2001:db8:")
+    assert rules[0]["destCidr"] != "2001:db8:abcd::/48"
+    assert rules[0]["destCidr"].endswith("/48")  # prefix length preserved
+    assert "fd00::1" != rules[1]["destCidr"]
+    assert "85a3" not in rules[2]["destCidr"]
+    assert payload["bssid"].startswith("02:")  # not eaten by the IPv6 rule
+
+
 def test_sanitization_is_deterministic_and_non_destructive() -> None:
     graph = _graph()
     first = sanitize_graph(graph)
@@ -161,6 +235,40 @@ def test_sanitization_is_deterministic_and_non_destructive() -> None:
     assert graph.features[0].payload["psk"] == "hunter2"
     assert graph.networks[0].name == "HQ"
     assert graph.organization_id == "org-123"
+
+
+def test_structural_dict_keys_map_consistently() -> None:
+    """Per-device maps key on serials; the key itself must pseudonymize."""
+    graph = NetworkGraph(
+        organization_id="org-123",
+        networks=(),
+        devices=(MerakiDevice("QAAA-0001", "N_1", "MX64", "edge-fw"),),
+        features=(
+            FeatureConfiguration(
+                api_path="/networks/{networkId}/appliance/trafficShaping",
+                path_values=("N_1",),
+                payload={"QAAA-0001": {"limitUp": 0}},
+            ),
+        ),
+    )
+    payload = sanitize_graph(graph).features[0].payload
+    assert payload == {"dev-0001": {"limitUp": 0}}
+
+
+def test_empty_comma_list_parts_are_preserved() -> None:
+    graph = NetworkGraph(
+        "org-123", (), (),
+        (
+            FeatureConfiguration(
+                "/networks/{networkId}/appliance/trafficShaping",
+                ("N_1",),
+                {"allowedList": "10.1.1.0/24, , 10.2.2.0/24"},
+            ),
+        ),
+    )
+    cleaned = sanitize_graph(graph).features[0].payload["allowedList"]
+    assert ", , " in cleaned  # the empty element survives untouched
+    assert "10.1.1.0" not in cleaned
 
 
 def test_keyless_scalars_pass_through_unchanged() -> None:

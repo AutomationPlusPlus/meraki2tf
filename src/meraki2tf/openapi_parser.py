@@ -122,6 +122,19 @@ class OpenApiParser:
                 if op.path not in paths:
                     paths.append(op.path)
             name = "_".join([TERRAFORM_PROVIDER_PREFIX, *key])
+            if name in mappings:
+                # snake_casing can make distinct entity keys collide on
+                # one provider name; overwriting would silently drop the
+                # first entity's endpoints from the lookup table. Keep
+                # the first (spec order) and let the exception auditor
+                # flag the loser's assets visibly.
+                logger.warning(
+                    "Terraform name collision: %r derived from both %r and "
+                    "%r; keeping the first — assets of the second will be "
+                    "audited as unsupported.",
+                    name, mappings[name].entity_key, key,
+                )
+                continue
             mappings[name] = TerraformResourceMapping(
                 terraform_name=name,
                 entity_key=key,

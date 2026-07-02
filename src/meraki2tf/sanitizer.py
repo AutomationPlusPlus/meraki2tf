@@ -62,6 +62,31 @@ _URL_VALUE = re.compile(r"\w+://")
 _FQDN_VALUE = re.compile(r"(?=[^/]*[A-Za-z])[\w*-]+(\.[\w*-]+)+")
 _IPV4_VALUE = re.compile(r"(\d{1,3}\.){3}\d{1,3}(?P<prefix>/\d{1,2})?")
 _MAC_VALUE = re.compile(r"([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}")
+#: Full 8-group form, or any `::`-compressed form (a MAC has neither
+#: eight groups nor a `::`, so the two shapes never collide).
+_IPV6_VALUE = re.compile(
+    r"(?i)(?:"
+    r"(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}"
+    r"|(?:[0-9a-f]{1,4}:)+:(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4})*)?"
+    r"|::(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4})*)?"
+    r")(?P<prefix>/\d{1,3})?"
+)
+
+#: Placeholder names in feature API paths → pseudonym prefixes.
+_PATH_PARAM_PREFIXES = {
+    "organizationid": "org",
+    "networkid": "net",
+    "serial": "dev",
+}
+#: Payload keys whose string values are structural references.
+_STRUCTURAL_KEYS = {
+    "organizationid": "org",
+    "networkid": "net",
+    "networkids": "net",
+    "serial": "dev",
+    "serials": "dev",
+}
+_PATH_PARAM = re.compile(r"\{([^}]+)\}")
 
 
 def _pseudonym(key: str, value: str) -> str:
@@ -85,6 +110,13 @@ def _fake_mac(value: str) -> str:
     return ":".join(["02", *(f"{byte:02x}" for byte in tail)])
 
 
+def _fake_ipv6(value: str, prefix: str) -> str:
+    # Deterministic addresses inside the 2001:db8::/32 documentation
+    # range, prefix length preserved (mirrors the IPv4 treatment).
+    a, b, c, d = _digest_bytes(value)[:4]
+    return f"2001:db8:{a:02x}{b:02x}:{c:02x}{d:02x}::1{prefix}"
+
+
 class _GraphSanitizer:
     """One sanitization pass; holds the consistent structural-ID map."""
 
@@ -98,6 +130,20 @@ class _GraphSanitizer:
         for device in graph.devices:
             self._assign(device.network_id, "net")
             self._assign(device.serial, "dev")
+        # Feature path values can reference structural IDs that appear
+        # nowhere in the networks/devices lists (multi-org exports,
+        # partial snapshots); classify them by their path placeholder so
+        # they pseudonymize instead of leaking. Opaque item-level IDs
+        # (adminId, httpServerId, …) are identifying too; purely numeric
+        # ones (vlanId 10, SSID number 3) are structure, not identity.
+        for feature in graph.features:
+            placeholders = _PATH_PARAM.findall(feature.api_path)
+            for name, value in zip(placeholders, feature.path_values):
+                prefix = _PATH_PARAM_PREFIXES.get(name.lower())
+                if prefix:
+                    self._assign(value, prefix)
+                elif value and not value.isdigit():
+                    self._assign(value, "id")
 
     def _assign(self, value: str, prefix: str) -> None:
         if value and value not in self._id_map:
@@ -162,6 +208,14 @@ class _GraphSanitizer:
         # any key-based rule can obscure the reference.
         if isinstance(value, str) and value in self._id_map:
             return self._id_map[value]
+        if isinstance(value, str) and value and key is not None:
+            # Structural references seen only inside payloads (a
+            # networkId pointing at a network absent from the snapshot's
+            # own lists) still get a consistent pseudonym.
+            prefix = _STRUCTURAL_KEYS.get(key.lower())
+            if prefix:
+                self._assign(value, prefix)
+                return self._id_map[value]
         if key is None:
             return value
         if _SECRET_KEY.search(key):
@@ -180,10 +234,12 @@ class _GraphSanitizer:
     def _clean_identity_shaped(self, value: str) -> str:
         """Pseudonymize identity-shaped values regardless of their key."""
         if "," in value:
-            # Fields like firewall destCidr carry comma-separated lists.
-            return ",".join(
-                self._clean_identity_shaped(part.strip())
-                for part in value.split(",")
+            # Fields like firewall destCidr carry comma-separated lists;
+            # spacing around the commas is preserved so benign free text
+            # round-trips byte-identical.
+            return "".join(
+                part if index % 2 else self._clean_list_part(part)
+                for index, part in enumerate(re.split(r"(\s*,\s*)", value))
             )
         if _URL_VALUE.search(value):
             return _pseudonym("url", value)
@@ -194,7 +250,17 @@ class _GraphSanitizer:
         value = _IPV4_VALUE.sub(
             lambda m: _fake_ip(m.group(0), m.group("prefix") or ""), value
         )
+        value = _IPV6_VALUE.sub(
+            lambda m: _fake_ipv6(m.group(0), m.group("prefix") or ""), value
+        )
         return _MAC_VALUE.sub(lambda m: _fake_mac(m.group(0)), value)
+
+    def _clean_list_part(self, part: str) -> str:
+        """Clean one comma-list element, keeping its surrounding whitespace."""
+        stripped = part.strip()
+        if not stripped:
+            return part
+        return part.replace(stripped, self._clean_identity_shaped(stripped), 1)
 
 
 def sanitize_graph(graph: NetworkGraph) -> NetworkGraph:

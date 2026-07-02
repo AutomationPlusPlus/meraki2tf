@@ -141,9 +141,17 @@ class StaticJsonDataProvider(MerakiDataProvider):
             raise MalformedDumpError(
                 f"Snapshot {self._path}: each feature needs an 'apiPath' template."
             )
+        raw_values = item.get("pathValues") or ()
+        if not isinstance(raw_values, (list, tuple)):
+            # A bare string would iterate character by character and
+            # silently produce garbage compound import IDs.
+            raise MalformedDumpError(
+                f"Snapshot {self._path}: feature 'pathValues' must be an "
+                f"array of ID components, got {type(raw_values).__name__}."
+            )
         return FeatureConfiguration(
             api_path=str(item["apiPath"]),
-            path_values=tuple(str(v) for v in item.get("pathValues") or ()),
+            path_values=tuple(str(v) for v in raw_values),
             payload=item.get("payload") or {},
         )
 

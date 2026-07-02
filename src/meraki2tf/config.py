@@ -50,6 +50,9 @@ class RuntimeConfig:
     rebuild: bool
     #: Escalates --rebuild from a read-only preview to a real apply.
     confirm: bool
+    #: Discard the accumulated resources.tf baseline so this run
+    #: regenerates configuration from currently discovered data.
+    rebaseline: bool
     workdir: Path
     #: None means "terraform.tfstate inside the workdir".
     state_file: Path | None
@@ -74,6 +77,7 @@ class RuntimeConfig:
             sanitize=args.sanitize,
             rebuild=args.rebuild,
             confirm=args.confirm,
+            rebaseline=args.rebaseline,
             workdir=Path(args.workdir),
             state_file=Path(args.state_file) if args.state_file else None,
             verbose=args.verbose,
