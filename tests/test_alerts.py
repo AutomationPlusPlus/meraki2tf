@@ -155,6 +155,19 @@ def test_webhook_wraps_transport_failures(monkeypatch: pytest.MonkeyPatch) -> No
         )
 
 
+def test_webhook_failure_never_leaks_the_url() -> None:
+    """A scheme-less URL fails inside urllib with the full URL (and its
+    embedded secret) in the message; the wrapped error must scrub it."""
+    url = "hooks.example.com/services/T000/B000/SECRETTOKEN"
+    with pytest.raises(WebhookDeliveryError) as excinfo:
+        WebhookNotifier(url).send(processing_fault(stage="x", error="y"))
+    assert "SECRETTOKEN" not in str(excinfo.value)
+    assert "<webhook-url>" in str(excinfo.value)
+    # No chained exception for the dispatcher's traceback log to echo.
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__suppress_context__
+
+
 class FakeSmtp:
     sent: list[EmailMessage] = []
     last_timeout: float | None = None

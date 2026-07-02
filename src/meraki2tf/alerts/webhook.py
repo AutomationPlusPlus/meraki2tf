@@ -32,17 +32,23 @@ class WebhookNotifier(Notifier):
 
     def send(self, event: AlertEvent) -> None:
         body = json.dumps(event.to_payload()).encode("utf-8")
-        request = urllib.request.Request(
-            self._url,
-            data=body,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
         try:
+            request = urllib.request.Request(
+                self._url,
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
             with urllib.request.urlopen(request, timeout=self._timeout) as response:
                 status = int(getattr(response, "status", 200))
         except Exception as exc:
-            raise WebhookDeliveryError(f"Webhook delivery failed: {exc}") from exc
+            # Some urllib exceptions (e.g. a scheme-less URL's ValueError)
+            # embed the full URL; scrub it and drop the exception chain so
+            # the dispatcher's traceback logging cannot echo the secret.
+            detail = str(exc).replace(self._url, "<webhook-url>")
+            raise WebhookDeliveryError(
+                f"Webhook delivery failed ({type(exc).__name__}): {detail}"
+            ) from None
         if status >= 300:
             raise WebhookDeliveryError(f"Webhook endpoint answered HTTP {status}.")
         logger.debug(

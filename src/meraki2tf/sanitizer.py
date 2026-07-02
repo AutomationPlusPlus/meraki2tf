@@ -58,8 +58,10 @@ _COORDINATE_KEYS = frozenset({"lat", "lng"})
 
 _URL_VALUE = re.compile(r"\w+://")
 #: Dotted, letter-bearing hostname shapes (wildcards allowed) — catches
-#: FQDNs under generic keys like `host`, `fqdn`, or filter `patterns`.
-_FQDN_VALUE = re.compile(r"(?=[^/]*[A-Za-z])[\w*-]+(\.[\w*-]+)+")
+#: FQDNs under generic keys like `host`, `fqdn`, or filter `patterns`,
+#: including trailing-dot forms, ports, and scheme-less URL paths
+#: (`example.com./x`, `host:8080`, `hooks.example.com/T0/SECRET`).
+_FQDN_VALUE = re.compile(r"(?=[^/]*[A-Za-z])[\w*-]+(\.[\w*-]+)+\.?(:\d+)?(/\S*)?")
 _IPV4_VALUE = re.compile(r"(\d{1,3}\.){3}\d{1,3}(?P<prefix>/\d{1,2})?")
 _MAC_VALUE = re.compile(r"([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}")
 #: Full 8-group form, or any `::`-compressed form (a MAC has neither
