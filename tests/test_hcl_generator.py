@@ -241,6 +241,35 @@ def test_import_ids_are_hcl_escaped(
     assert '"N"1' not in content  # no unterminated string literal
 
 
+def test_newlines_in_import_ids_are_escaped(
+    generator: HclImportGenerator, tmp_path: Path
+) -> None:
+    """HCL quoted literals cannot span lines; a raw newline in one ID
+    would corrupt the entire imports.tf."""
+    report = generator.generate(
+        _graph(networks=(_network("N\n1"),), devices=(), features=()), tmp_path
+    )
+    content = report.imports_file.read_text(encoding="utf-8")
+    assert report.imports_written == 1
+    assert 'id = "N\\n1"' in content
+
+
+def test_collision_suffixes_ignore_discovery_order(
+    generator: HclImportGenerator, tmp_path: Path
+) -> None:
+    """API listing order changes between runs must not reshuffle which
+    colliding asset owns the base label vs the suffixed one."""
+    ordered = generator.generate(
+        _graph(networks=(_network("N-1"), _network("N.1")), devices=(), features=()),
+        tmp_path,
+    ).imports_file.read_text(encoding="utf-8")
+    reordered = generator.generate(
+        _graph(networks=(_network("N.1"), _network("N-1")), devices=(), features=()),
+        tmp_path,
+    ).imports_file.read_text(encoding="utf-8")
+    assert ordered == reordered
+
+
 def test_empty_graph_writes_header_only_file(
     generator: HclImportGenerator, tmp_path: Path
 ) -> None:

@@ -84,6 +84,9 @@ def _hcl_quote(value: str) -> str:
     return (
         value.replace("\\", "\\\\")
         .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
         .replace("${", "$${")
         .replace("%{", "%%{")
     )

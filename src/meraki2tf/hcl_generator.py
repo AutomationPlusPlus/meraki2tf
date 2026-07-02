@@ -179,7 +179,9 @@ class HclImportGenerator:
             ImportCandidate(feature.api_path, feature.path_values)
             for feature in graph.features
         )
-        return candidates
+        # Sorted so collision-suffix assignment in _resolve_address does
+        # not depend on API listing order, which can change between runs.
+        return sorted(candidates, key=lambda c: (c.api_path, c.id_values))
 
     def _flag(self, candidate: ImportCandidate, reason: str) -> UnsupportedAsset:
         """Exception auditor: severe log + UNSUPPORTED_FEATURE_FLAGGED alert."""
@@ -205,12 +207,16 @@ class HclImportGenerator:
         """Escape a raw ID for a quoted HCL string literal.
 
         Dump-mode snapshots feed arbitrary JSON values into import IDs;
-        an unescaped ``"``, ``\\``, ``${`` or ``%{`` would break the
-        whole imports.tf parse or inject an interpolation expression.
+        an unescaped ``"``, ``\\``, ``${``, ``%{`` or a raw newline
+        would break the whole imports.tf parse or inject an
+        interpolation expression.
         """
         return (
             value.replace("\\", "\\\\")
             .replace('"', '\\"')
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
+            .replace("\t", "\\t")
             .replace("${", "$${")
             .replace("%{", "%%{")
         )

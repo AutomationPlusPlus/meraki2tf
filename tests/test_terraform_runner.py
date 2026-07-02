@@ -302,6 +302,10 @@ def test_provider_anchor_escapes_hcl_specials_in_state_path(
     assert 'st\\"ate' in content  # quote escaped, backend block stays valid
 
 
+def test_hcl_quote_escapes_control_characters() -> None:
+    assert terraform_runner._hcl_quote("a\nb\rc\td") == "a\\nb\\rc\\td"
+
+
 def test_plan_preview_never_generates_config(
     runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
