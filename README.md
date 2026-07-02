@@ -1,5 +1,12 @@
 # meraki2tf
 
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Terraform](https://img.shields.io/badge/terraform-CiscoDevNet%2Fmeraki-844FBA?logo=terraform&logoColor=white)](https://registry.terraform.io/providers/CiscoDevNet/meraki)
+[![Tests](https://img.shields.io/badge/tests-passing-success?logo=pytest&logoColor=white)](#contributor-architecture)
+[![Coverage](https://img.shields.io/badge/coverage-100%25-success)](#contributor-architecture)
+[![Typing: mypy strict](https://img.shields.io/badge/typing-mypy%20strict-blue)](#contributor-architecture)
+[![License: AGPL v3](https://img.shields.io/badge/license-AGPL%20v3-blue)](LICENSE)
+
 Extract Cisco Meraki configurations, translate them into Terraform
 structures for the [`CiscoDevNet/meraki`](https://registry.terraform.io/providers/CiscoDevNet/meraki)
 provider, detect state drift, aggregate imports into state, and alert on
@@ -133,6 +140,52 @@ schemas. Sections that resolve to no configuration endpoint (operational
 telemetry such as `clients` or `uplink_statuses`, or names the spec
 cannot disambiguate) are reported in the log and skipped.
 
+### Producing a snapshot (`--dump-to`)
+
+The easiest way to create a `--from-dump` file is to let meraki2tf make
+one for you. `--dump-to PATH` runs discovery and writes the canonical
+snapshot instead of executing the Terraform pipeline:
+
+```bash
+# Export a live organization to a snapshot for later offline runs.
+export MERAKI_DASHBOARD_API_KEY="<your-dashboard-api-key>"
+meraki2tf --org-id 123456 --dump-to ./snapshots/org-123456.json
+
+# Replay it later — fully offline, no API key needed for discovery.
+meraki2tf --from-dump ./snapshots/org-123456.json
+```
+
+`--dump-to` also accepts `--from-dump` as its *input*, which normalizes
+an existing nested export into the canonical contract:
+
+```bash
+meraki2tf --from-dump ./backup-tool-export.json --dump-to ./canonical.json
+```
+
+Add `--sanitize` to strip sensitive information for tests, demos, or
+bug reports:
+
+```bash
+meraki2tf --org-id 123456 --dump-to ./demo-snapshot.json --sanitize
+```
+
+Sanitization is deterministic and preserves referential integrity:
+
+| Data | Treatment |
+| --- | --- |
+| Organization/network IDs, device serials | Pseudonymized consistently everywhere (`org-0001`, `net-0007`, `dev-0042`) — cross-references and import-block generation keep working |
+| Credential-shaped fields (`psk`, `secret`, `password`, `communityString`, `…token`, `…apiKey`, …) | Replaced with `**REDACTED**` |
+| Names, emails, URLs, addresses, notes, tags, MACs | Stable `<kind>-<digest>` placeholders |
+| URL/FQDN-shaped values under any key (RADIUS hosts, filter patterns, …) | Stable placeholders |
+| IPv4 addresses and CIDRs under any key (subnets, firewall rules, …) | Deterministic fake `10.x.y.z` addresses, prefix length preserved |
+| Coordinates (`lat`/`lng`) | Zeroed |
+| Product types, models, feature structure | Preserved — the snapshot stays a faithful structural replica |
+
+> **Note:** Terraform's `plan`/`apply` stages always read the real
+> resources through the Meraki provider, so a sanitized snapshot
+> exercises everything up to and including `imports.tf` generation;
+> importing into state additionally needs real IDs and an API key.
+
 ## Configuration Options
 
 Quick reference (each flag is described in detail below):
@@ -142,6 +195,8 @@ Quick reference (each flag is described in detail below):
 | `--org-id` | — | Organization to discover (required in live mode) |
 | `--spec PATH` | `./spec3.json` | Meraki OpenAPI JSON document; auto-downloaded/refreshed from GitHub |
 | `--from-dump PATH` | — | Offline snapshot; switches to dump mode |
+| `--dump-to PATH` | — | Export discovery output as a snapshot instead of running Terraform |
+| `--sanitize` | off | Redact secrets/identity in the `--dump-to` snapshot |
 | `--workdir DIR` | `generated` | Terraform execution workspace |
 | `--state-file PATH` | `<workdir>/terraform.tfstate` | Terraform state to aggregate into across runs |
 | `--webhook-url URL` | — | Webhook alert endpoint (repeatable) |
@@ -170,6 +225,17 @@ for the freshness/download rules.
 **`--from-dump PATH`** — run entirely offline against a JSON snapshot
 (format above). No API key needed; ideal for air-gapped runs and
 regression tests.
+
+**`--dump-to PATH`** — write the discovered configuration to PATH as a
+canonical snapshot and exit; the Terraform pipeline does not run. Works
+from live discovery (`--org-id`) or from an existing dump
+(`--from-dump`, e.g. to normalize a nested export). See
+[Producing a snapshot](#producing-a-snapshot---dump-to).
+
+**`--sanitize`** — redact secrets and pseudonymize identifying details
+in the snapshot written by `--dump-to`. Deterministic; structural IDs
+stay internally consistent so the sanitized snapshot remains fully
+processable.
 
 **`--workdir DIR`** — the Terraform execution workspace. meraki2tf
 writes `provider.tf` and `imports.tf` here, and Terraform adds

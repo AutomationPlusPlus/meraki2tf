@@ -34,6 +34,8 @@ def test_parser_defaults(spec_file: Path) -> None:
     config = _config(["--spec", str(spec_file)])
     assert config.org_id is None
     assert config.dump_path is None
+    assert config.dump_to is None
+    assert not config.sanitize
     assert config.workdir == Path("generated")
     assert config.state_file is None
     assert config.webhook_urls == ()
@@ -96,6 +98,69 @@ def test_build_provider_selects_modality(
         _config(["--spec", str(spec_file), "--from-dump", str(dump_file)]), spec_parser
     )
     assert isinstance(dump, StaticJsonDataProvider)
+
+
+def test_sanitize_requires_dump_to(spec_file: Path) -> None:
+    with pytest.raises(SystemExit):
+        main(["--spec", str(spec_file), "--org-id", "org-123", "--sanitize"])
+
+
+def test_dump_to_exports_snapshot_without_running_terraform(
+    spec_file: Path,
+    dump_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _no_network(monkeypatch)
+
+    def forbidden_run(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("terraform must not run during a snapshot export")
+
+    monkeypatch.setattr(terraform_runner.subprocess, "run", forbidden_run)
+    out = tmp_path / "exports" / "snapshot.json"
+
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(dump_file), "--dump-to", str(out)]
+    )
+
+    assert exit_code == 0
+    document = json.loads(out.read_text(encoding="utf-8"))
+    assert document["organizationId"] == "org-123"
+    assert document["networks"][0]["id"] == "N_1"
+    assert any(
+        feature["apiPath"] == "/networks/{networkId}/appliance/vlans/{vlanId}"
+        for feature in document["features"]
+    )
+
+
+def test_dump_to_with_sanitize_strips_identity(
+    spec_file: Path,
+    dump_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _no_network(monkeypatch)
+    out = tmp_path / "sanitized.json"
+
+    exit_code = main(
+        [
+            "--spec", str(spec_file),
+            "--from-dump", str(dump_file),
+            "--dump-to", str(out),
+            "--sanitize",
+        ]
+    )
+
+    assert exit_code == 0
+    raw = out.read_text(encoding="utf-8")
+    assert "Q2AB-CDEF-GHIJ" not in raw
+    assert '"HQ"' not in raw
+    document = json.loads(raw)
+    assert document["organizationId"] == "org-0001"
+    assert document["networks"][0]["id"] == "net-0001"
+    assert document["devices"][0]["serial"] == "dev-0001"
+    # The sanitized snapshot is itself a valid --from-dump input.
+    assert document["features"][0]["pathValues"][0] == "net-0001"
 
 
 class FakeResponse:

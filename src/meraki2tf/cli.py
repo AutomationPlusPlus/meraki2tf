@@ -24,6 +24,8 @@ from meraki2tf.providers import (
     MerakiDataProvider,
     StaticJsonDataProvider,
 )
+from meraki2tf.sanitizer import sanitize_graph
+from meraki2tf.snapshot import write_snapshot
 from meraki2tf.spec_resolver import resolve_spec
 from meraki2tf.terraform_runner import TerraformRunner
 
@@ -63,6 +65,27 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         default=None,
         help="Run offline against a local JSON snapshot instead of the live cloud API.",
+    )
+    parser.add_argument(
+        "--dump-to",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Write the discovered configuration to PATH as an offline snapshot "
+            "(the --from-dump format) instead of running the Terraform pipeline. "
+            "Combine with --org-id for a live export, or with --from-dump to "
+            "normalize an existing nested export into the canonical format."
+        ),
+    )
+    parser.add_argument(
+        "--sanitize",
+        action="store_true",
+        help=(
+            "Redact secrets and pseudonymize identifying details (IDs, names, "
+            "serials, MACs, URLs, …) in the snapshot written by --dump-to — for "
+            "sharing in tests, demos, or bug reports. Structural IDs stay "
+            "consistent so the sanitized snapshot remains fully processable."
+        ),
     )
     parser.add_argument(
         "--workdir",
@@ -146,6 +169,18 @@ def build_provider(config: RuntimeConfig, parser: OpenApiParser) -> MerakiDataPr
     return LiveApiDataProvider(parser=parser)
 
 
+def _export_snapshot(provider: MerakiDataProvider, config: RuntimeConfig) -> int:
+    """Discover the graph and write it as an offline snapshot (--dump-to)."""
+    assert config.dump_to is not None  # guarded by the caller
+    with provider as source:
+        graph = source.fetch_network_graph(config.org_id)
+    if config.sanitize:
+        graph = sanitize_graph(graph)
+        logger.info("Snapshot sanitized: secrets redacted, identity pseudonymized.")
+    write_snapshot(graph, config.dump_to)
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     arg_parser = build_parser()
     args = arg_parser.parse_args(argv)
@@ -154,13 +189,18 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if config.mode is ExecutionMode.LIVE and not config.org_id:
         arg_parser.error("--org-id is required in live mode.")
+    if config.sanitize and config.dump_to is None:
+        arg_parser.error("--sanitize requires --dump-to.")
 
     logger.info("meraki2tf starting in %s mode.", config.mode.value)
     try:
         spec_parser = OpenApiParser(resolve_spec(config.spec_path))
+        provider = build_provider(config, spec_parser)
+        if config.dump_to is not None:
+            return _export_snapshot(provider, config)
         dispatcher = build_dispatcher(config)
         orchestrator = PipelineOrchestrator(
-            provider=build_provider(config, spec_parser),
+            provider=provider,
             generator=HclImportGenerator(spec_parser, dispatcher),
             runner=TerraformRunner(
                 config.workdir,

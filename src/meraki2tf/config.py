@@ -40,6 +40,11 @@ class RuntimeConfig:
     #: None means "resolve automatically" — see meraki2tf.spec_resolver.
     spec_path: Path | None
     dump_path: Path | None
+    #: When set, discovery output is written here as a canonical
+    #: snapshot instead of running the Terraform pipeline.
+    dump_to: Path | None
+    #: Redact secrets/identity from the exported snapshot (--dump-to).
+    sanitize: bool
     workdir: Path
     #: None means "terraform.tfstate inside the workdir".
     state_file: Path | None
@@ -60,6 +65,8 @@ class RuntimeConfig:
             org_id=args.org_id,
             spec_path=Path(args.spec) if args.spec else None,
             dump_path=dump_path,
+            dump_to=Path(args.dump_to) if args.dump_to else None,
+            sanitize=args.sanitize,
             workdir=Path(args.workdir),
             state_file=Path(args.state_file) if args.state_file else None,
             verbose=args.verbose,

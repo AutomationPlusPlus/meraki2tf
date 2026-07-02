@@ -20,6 +20,8 @@ src/meraki2tf/
 │   ├── discovery.py      #   Shared spec-driven feature discovery, expansion, section matching
 │   ├── live.py           #   LiveApiDataProvider — Meraki SDK, spec-driven dispatch
 │   └── dump.py           #   StaticJsonDataProvider — offline snapshot (--from-dump)
+├── snapshot.py           # Graph → canonical offline snapshot writer (--dump-to)
+├── sanitizer.py          # Deterministic secret/identity scrubbing (--sanitize)
 ├── hcl_generator.py      # HclImportGenerator → imports.tf + exception auditing
 ├── terraform_runner.py   # subprocess runner: provider.tf, init, plan -generate-config-out, apply
 ├── orchestrator.py       # PipelineOrchestrator — full lifecycle + alert triggers
