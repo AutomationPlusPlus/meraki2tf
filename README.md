@@ -9,18 +9,25 @@
 
 Extract Cisco Meraki configurations, translate them into Terraform
 structures for the [`CiscoDevNet/meraki`](https://registry.terraform.io/providers/CiscoDevNet/meraki)
-provider, detect state drift, aggregate imports into state, and alert on
-every outcome — from one schedulable CLI.
+provider, detect state drift, and alert on every outcome — from one
+schedulable CLI built as a **disaster-recovery snapshotting tool**.
 
 ## Project Overview
 
 meraki2tf discovers your Meraki organization (networks, devices, and
 per-network feature configurations), writes modern declarative Terraform
-`import {}` blocks for every discovered asset, runs a speculative
+`import {}` blocks for every discovered asset, and runs a speculative
 `terraform plan -generate-config-out=...` comparison against your local
-state, and applies the missing delta. Drift, success, and unsupported
-features each fire structured alerts to your configured webhook/email
-channels.
+state. Drift, success, and unsupported features each fire structured
+alerts to your configured webhook/email channels.
+
+**Read-only guarantee:** the pipeline never runs `terraform apply` and
+never mutates your Meraki organization. Its job is to continuously
+convert your org into runnable Terraform artifacts; in the event of a
+major incident you use those artifacts to rebuild — see
+[Disaster Recovery](#disaster-recovery). The only code path that can
+ever apply anything is the explicit, human-invoked
+`--rebuild --confirm` action.
 
 **Why dynamic OpenAPI spec parsing?** The Meraki API surface changes
 with every dashboard release. Instead of maintaining a brittle
@@ -88,6 +95,12 @@ meraki2tf \
   --from-dump ./snapshots/org-123456.json \
   --workdir ./generated
 ```
+
+When `MERAKI_DASHBOARD_API_KEY` is not set, the run stops after
+generating `imports.tf` — the `terraform plan` comparison is skipped
+(the Terraform provider needs a token to read live resources) and the
+run still exits 0. Set the variable if you also want drift comparison
+and `generated_resources.tf` from a dump-mode run.
 
 Snapshot format:
 
@@ -181,10 +194,84 @@ Sanitization is deterministic and preserves referential integrity:
 | Coordinates (`lat`/`lng`) | Zeroed |
 | Product types, models, feature structure | Preserved — the snapshot stays a faithful structural replica |
 
-> **Note:** Terraform's `plan`/`apply` stages always read the real
-> resources through the Meraki provider, so a sanitized snapshot
-> exercises everything up to and including `imports.tf` generation;
-> importing into state additionally needs real IDs and an API key.
+> **Note:** Terraform's `plan` stage always reads the real resources
+> through the Meraki provider, so a sanitized snapshot exercises
+> everything up to and including `imports.tf` generation; the plan
+> comparison additionally needs real IDs and an API key.
+
+## Disaster Recovery
+
+meraki2tf is designed as a DR tool: schedule it to run continuously so
+your organization's configuration is always captured as runnable
+Terraform, and when a major incident hits, rebuild from the latest
+artifacts. Normal runs are **strictly read-only** toward Meraki — no
+`terraform apply` ever happens during the pipeline.
+
+### What a run produces
+
+Each run leaves a complete rebuild kit in `--workdir`:
+
+| Artifact | Written by | Purpose |
+| --- | --- | --- |
+| `imports.tf` | meraki2tf | One `import {}` block per discovered asset (compound IDs included) |
+| `provider.tf` | meraki2tf | Credential-free provider + local backend anchor |
+| `generated_resources.tf` | `terraform plan -generate-config-out` | Full HCL configuration for every imported asset — the actual rebuild material |
+| `terraform.tfstate` | terraform (only if *you* apply) | State tracking, once you adopt the resources |
+
+Back up the workdir (and ideally a `--dump-to` snapshot) somewhere that
+survives the disaster you are protecting against.
+
+### Restoring an existing organization (primary DR path)
+
+When the org still exists but its configuration was damaged (mass
+misconfiguration, botched change, malicious edits), the artifacts
+restore it to the last captured snapshot:
+
+```bash
+export MERAKI_DASHBOARD_API_KEY="<your-dashboard-api-key>"
+
+# 1. Preview — read-only, shows exactly what would change:
+meraki2tf --rebuild --workdir ./generated
+
+# 2. Execute — the ONLY way meraki2tf ever runs terraform apply:
+meraki2tf --rebuild --confirm --workdir ./generated
+```
+
+`--rebuild` alone is always a dry run (`terraform plan`); nothing is
+touched until you add `--confirm`. Prefer doing it by hand? The workdir
+is a plain Terraform root module:
+
+```bash
+cd ./generated
+terraform init
+terraform plan     # inspect
+terraform apply    # rebuild
+```
+
+On the first apply the `import {}` blocks adopt every still-existing
+resource into state, then Terraform reverts any settings that diverged
+from the snapshot.
+
+### Rebuilding from scratch (org or resources destroyed)
+
+If resources no longer exist, their `import {}` blocks will fail —
+Terraform cannot import something that is gone. Adjust the kit first:
+
+1. Copy the workdir to a fresh directory (keep the original as backup).
+2. Delete `imports.tf` (or just the blocks for destroyed resources) so
+   Terraform **creates** instead of imports.
+3. Start from an empty state (delete/relocate `terraform.tfstate` if
+   the old one references destroyed resources).
+4. `terraform init && terraform plan && terraform apply`.
+
+> **Greenfield caveat:** `generated_resources.tf` captures IDs as
+> literal strings (organization ID, `network_id = "N_…"`, serials).
+> Rebuilding into a **brand-new organization** assigns new IDs, so
+> cross-resource references must be re-pointed (e.g. replace literal
+> network IDs with `meraki_networks.<name>.id` references) and device
+> serials must match hardware you actually own. Restoring into the
+> *same* organization avoids all of this, which is why it is the
+> primary DR path.
 
 ## Configuration Options
 
@@ -197,6 +284,8 @@ Quick reference (each flag is described in detail below):
 | `--from-dump PATH` | — | Offline snapshot; switches to dump mode |
 | `--dump-to PATH` | — | Export discovery output as a snapshot instead of running Terraform |
 | `--sanitize` | off | Redact secrets/identity in the `--dump-to` snapshot |
+| `--rebuild` | off | Disaster recovery: preview a rebuild apply of the workdir artifacts |
+| `--confirm` | off | Escalate `--rebuild` from preview to a real `terraform apply` |
 | `--workdir DIR` | `generated` | Terraform execution workspace |
 | `--state-file PATH` | `<workdir>/terraform.tfstate` | Terraform state to aggregate into across runs |
 | `--webhook-url URL` | — | Webhook alert endpoint (repeatable) |
@@ -237,11 +326,22 @@ in the snapshot written by `--dump-to`. Deterministic; structural IDs
 stay internally consistent so the sanitized snapshot remains fully
 processable.
 
+**`--rebuild`** — disaster-recovery action: run `terraform init` +
+`terraform plan` over the artifacts already in `--workdir` and show
+what an apply would do. Read-only on its own; requires
+`MERAKI_DASHBOARD_API_KEY` and a workdir populated by a previous run.
+Cannot be combined with `--from-dump`/`--dump-to`. See
+[Disaster Recovery](#disaster-recovery).
+
+**`--confirm`** — escalates `--rebuild` to actually execute
+`terraform apply`. This flag pair is the *only* way meraki2tf ever
+applies anything; every other invocation is read-only toward Meraki.
+
 **`--workdir DIR`** — the Terraform execution workspace. meraki2tf
 writes `provider.tf` and `imports.tf` here, and Terraform adds
-`generated_resources.tf` plus its `.terraform/` directory. Safe to
-delete between runs — everything in it is regenerated. Use one workdir
-per organization if you manage several.
+`generated_resources.tf` plus its `.terraform/` directory. This is your
+disaster-recovery kit — back it up. Use one workdir per organization if
+you manage several.
 
 **`--state-file PATH`** — where Terraform state lives; see
 [Terraform state management](#terraform-state-management).
@@ -287,23 +387,25 @@ in the generated `provider.tf`:
 - **Default**: `terraform.tfstate` inside `--workdir` (e.g.
   `generated/terraform.tfstate`).
 - **Custom location**: pass `--state-file /path/to/existing.tfstate` to
-  aggregate into a state file you already have — parent directories are
-  created as needed, and if the file doesn't exist Terraform creates it
-  on the first apply.
+  point at a state file you already have — parent directories are
+  created as needed.
 
-Consecutive runs are incremental: before generating `imports.tf`,
-meraki2tf reads the state file and **skips every resource address it
-already tracks**, so a weekly run only imports newly discovered assets
-instead of regenerating state from zero. Newly appeared drift on
-already-tracked resources still surfaces through the speculative plan
-and fires `DRIFT_DETECTED`.
+Because the pipeline never applies, **it never writes state itself**:
+state only gains resources when *you* apply (via
+`--rebuild --confirm` or a manual `terraform apply` in the workdir).
+Runs with an empty or absent state simply regenerate the complete
+import/config snapshot every time — exactly what a DR kit should be.
+
+If you do maintain a populated state, runs are incremental: before
+generating `imports.tf`, meraki2tf reads the state file and **skips
+every resource address it already tracks**, so a weekly run only writes
+import blocks for newly discovered assets. Drift on already-tracked
+resources surfaces through the speculative plan and fires
+`DRIFT_DETECTED` — pending imports alone are *not* treated as drift.
 
 ```bash
-# Monday: first run creates /var/lib/meraki2tf/org-123456.tfstate
+# Weekly snapshot against a state you maintain:
 meraki2tf --org-id 123456 --state-file /var/lib/meraki2tf/org-123456.tfstate
-
-# Following Mondays: same command; only the delta is imported,
-# existing state is updated in place.
 ```
 
 Treat the state file like any Terraform state: back it up, and never
@@ -338,8 +440,8 @@ environment itself.
 
 | Event | Trigger |
 | --- | --- |
-| `DRIFT_DETECTED` | The speculative plan found differences between discovery and state (payload carries the diff) |
-| `RUN_SUCCESS` | State aggregation completed flawlessly |
+| `DRIFT_DETECTED` | The speculative plan found real changes (add/change/destroy) on tracked resources — pending imports alone don't count (payload carries the diff) |
+| `RUN_SUCCESS` | Snapshot generation (and comparison, when an API key was available) completed flawlessly |
 | `UNSUPPORTED_FEATURE_FLAGGED` | A discovered asset cannot be mapped to a Terraform resource |
 | `PROCESSING_FAULT` | A critical pipeline failure (payload carries the failing stage) |
 

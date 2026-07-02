@@ -60,7 +60,7 @@ def drift_detected(diff: str, workspace: str) -> AlertEvent:
 
 
 def run_success(imports_written: int, drift_was_detected: bool, workspace: str) -> AlertEvent:
-    """Contract payload for a flawless state-aggregation run.
+    """Contract payload for a flawless snapshot-generation run.
 
     Schema: ``details = {"imports_written", "drift_was_detected", "workspace"}``.
     """
@@ -68,8 +68,8 @@ def run_success(imports_written: int, drift_was_detected: bool, workspace: str) 
         event_type=EventType.RUN_SUCCESS,
         severity=EventSeverity.INFO,
         summary=(
-            f"meraki2tf run completed cleanly; {imports_written} import(s) aggregated "
-            "into state."
+            f"meraki2tf run completed cleanly; {imports_written} import block(s) "
+            "generated."
         ),
         details={
             "imports_written": imports_written,

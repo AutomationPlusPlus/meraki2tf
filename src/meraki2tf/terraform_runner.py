@@ -2,15 +2,19 @@
 
 Owns the execution workspace: writes the ``provider.tf`` anchor for the
 ``CiscoDevNet/meraki`` source with a local backend pinned to the state
-file, runs ``init``, executes the speculative generation plan
-(``terraform plan -generate-config-out=...``), and applies aggregated
-imports into state.
+file, runs ``init``, and executes the speculative generation plan
+(``terraform plan -generate-config-out=...``).
+
+Read-only guarantee: the pipeline never mutates the Meraki
+organization. ``terraform apply`` exists solely as
+:meth:`TerraformRunner.rebuild_apply`, reachable only through the
+explicit, human-invoked ``--rebuild --confirm`` disaster-recovery
+action — never through a scheduled or normal run.
 
 State lifecycle: the state file location is explicit (``--state-file``,
 defaulting to ``terraform.tfstate`` inside the workspace). An existing
-file is reused so consecutive runs only aggregate the delta; when none
-exists Terraform creates it on the first apply. The runner can also
-report which resource addresses the state already tracks, so upstream
+file is reused so consecutive runs only import the delta; the runner
+reports which resource addresses the state already tracks, so upstream
 generation skips re-importing them.
 
 Security: the Meraki token never touches disk — the provider block is
@@ -22,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,6 +64,13 @@ _PLAN_NO_CHANGES = 0
 _PLAN_ERROR = 1
 _PLAN_CHANGES_PRESENT = 2
 
+#: Terraform's human plan summary, e.g.
+#: ``Plan: 875 to import, 0 to add, 2 to change, 0 to destroy.``
+_PLAN_SUMMARY_RE = re.compile(
+    r"Plan: (?:(?P<imports>\d+) to import, )?(?P<add>\d+) to add, "
+    r"(?P<change>\d+) to change, (?P<destroy>\d+) to destroy"
+)
+
 
 class TerraformError(RuntimeError):
     """A terraform invocation failed; message carries the CLI diagnostics."""
@@ -77,6 +89,23 @@ class TerraformCommandResult:
     def has_changes(self) -> bool:
         """True for ``plan -detailed-exitcode`` runs that found a delta."""
         return self.returncode == _PLAN_CHANGES_PRESENT
+
+    @property
+    def has_drift(self) -> bool:
+        """True when the plan proposes real changes (add/change/destroy).
+
+        Pending ``import`` blocks are not drift — a plan that only
+        imports means discovery found resources the state does not track
+        yet, which is the tool's normal snapshot-growing behavior. Falls
+        back to the ``-detailed-exitcode`` contract when no summary line
+        can be parsed, so an unrecognized plan errs toward alerting.
+        """
+        match = _PLAN_SUMMARY_RE.search(self.stdout)
+        if match is None:
+            return self.returncode == _PLAN_CHANGES_PRESENT
+        return any(
+            int(match.group(group)) > 0 for group in ("add", "change", "destroy")
+        )
 
 
 class TerraformRunner:
@@ -115,7 +144,9 @@ class TerraformRunner:
             logger.info("Reusing existing Terraform state at %s.", self._state_path)
         else:
             logger.info(
-                "No Terraform state at %s; a new state file will be created.",
+                "No Terraform state at %s; each run regenerates the full "
+                "import snapshot (state is only written when you apply, "
+                "e.g. via --rebuild --confirm).",
                 self._state_path,
             )
         logger.debug("Workspace prepared at %s", self._workdir)
@@ -173,8 +204,28 @@ class TerraformRunner:
             allowed=(_PLAN_NO_CHANGES, _PLAN_CHANGES_PRESENT),
         )
 
-    def apply(self) -> TerraformCommandResult:
-        """Aggregate the planned imports/resources into the state file."""
+    def plan_preview(self) -> TerraformCommandResult:
+        """Read-only preview of what a disaster-recovery apply would do.
+
+        Runs a plain ``terraform plan`` over the artifacts already in the
+        workspace (no config generation) so the ``--rebuild`` action can
+        show exactly what ``--confirm`` would execute.
+        """
+        return self._run(
+            "plan",
+            "-input=false",
+            "-no-color",
+            "-detailed-exitcode",
+            allowed=(_PLAN_NO_CHANGES, _PLAN_CHANGES_PRESENT),
+        )
+
+    def rebuild_apply(self) -> TerraformCommandResult:
+        """Execute ``terraform apply`` for an explicit disaster-recovery rebuild.
+
+        The pipeline never calls this — normal runs are strictly
+        read-only toward the Meraki organization. The only caller is the
+        human-invoked ``--rebuild --confirm`` CLI action.
+        """
         return self._run("apply", "-input=false", "-no-color", "-auto-approve")
 
     def _run(

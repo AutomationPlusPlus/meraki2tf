@@ -23,7 +23,8 @@ src/meraki2tf/
 ├── snapshot.py           # Graph → canonical offline snapshot writer (--dump-to)
 ├── sanitizer.py          # Deterministic secret/identity scrubbing (--sanitize)
 ├── hcl_generator.py      # HclImportGenerator → imports.tf + exception auditing
-├── terraform_runner.py   # subprocess runner: provider.tf, init, plan -generate-config-out, apply
+├── terraform_runner.py   # subprocess runner: provider.tf, init, plan -generate-config-out
+│                         #   (apply exists only as rebuild_apply for --rebuild --confirm)
 ├── orchestrator.py       # PipelineOrchestrator — full lifecycle + alert triggers
 └── alerts/               # Decoupled alerting subsystem
     ├── models.py         #   Event contracts: DRIFT_DETECTED / RUN_SUCCESS /
@@ -69,18 +70,26 @@ JSON dump ─┘   (identical domain models)     │        │            │
                                              ▼                     alerts
                      TerraformRunner: provider.tf → init
                        → plan -detailed-exitcode -generate-config-out
+                          (skipped when no API key is available)
                              │                        │
-                       delta found              state in sync
+                    real changes found       in sync / imports only
                              │                        │
                       DRIFT_DETECTED alert            │
-                             └──────────► apply ◄─────┘
-                                            │
-                                      RUN_SUCCESS alert
+                             └──────────┬─────────────┘
+                                        │
+                                 RUN_SUCCESS alert
+                          (no apply — pipeline is read-only)
 ```
 
 `PipelineOrchestrator` owns this cycle; any stage failure dispatches a
 `PROCESSING_FAULT` alert and surfaces as `PipelineError` → exit code 1,
 making the CLI safe for headless cron scheduling.
+
+The pipeline never executes `terraform apply`: meraki2tf is a
+disaster-recovery snapshotting tool and stays read-only toward the
+Meraki organization. The single apply path is the explicit CLI action
+`--rebuild --confirm` (`TerraformRunner.rebuild_apply`), which bypasses
+the orchestrator entirely; `--rebuild` alone is a plan preview.
 
 ## Security Posture
 

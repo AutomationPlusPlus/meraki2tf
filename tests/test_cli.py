@@ -11,7 +11,7 @@ import pytest
 from conftest import PIPELINE_SPEC
 from meraki2tf import spec_resolver, terraform_runner
 from meraki2tf.cli import build_dispatcher, build_parser, build_provider, main
-from meraki2tf.config import RuntimeConfig
+from meraki2tf.config import API_KEY_ENV_VAR, RuntimeConfig
 from meraki2tf.openapi_parser import OpenApiParser
 from meraki2tf.providers import LiveApiDataProvider, StaticJsonDataProvider
 from meraki2tf.spec_resolver import SpecResolutionError
@@ -36,6 +36,8 @@ def test_parser_defaults(spec_file: Path) -> None:
     assert config.dump_path is None
     assert config.dump_to is None
     assert not config.sanitize
+    assert not config.rebuild
+    assert not config.confirm
     assert config.workdir == Path("generated")
     assert config.state_file is None
     assert config.webhook_urls == ()
@@ -180,6 +182,7 @@ def test_dump_mode_end_to_end(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Full pipeline: snapshot in, imports.tf out, drift + success alerts."""
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
     terraform_calls: list[tuple[str, ...]] = []
 
     def fake_run(command: tuple[str, ...], **kwargs: Any) -> SimpleNamespace:
@@ -209,7 +212,8 @@ def test_dump_mode_end_to_end(
     )
 
     assert exit_code == 0
-    assert [call[1] for call in terraform_calls] == ["init", "plan", "apply"]
+    # Read-only pipeline: terraform apply is never part of a run.
+    assert [call[1] for call in terraform_calls] == ["init", "plan"]
 
     imports = (workdir / "imports.tf").read_text(encoding="utf-8")
     assert "to = meraki_networks.n_1\n" in imports
@@ -233,6 +237,8 @@ def test_pipeline_fault_exits_one_and_alerts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+
     def failing_run(command: tuple[str, ...], **kwargs: Any) -> SimpleNamespace:
         return SimpleNamespace(returncode=1, stdout="", stderr="Error: no terraform")
 
@@ -280,6 +286,7 @@ def test_consecutive_run_reuses_existing_state(
 ) -> None:
     """A pre-existing state file means only the delta gets import blocks."""
     _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
     monkeypatch.setattr(
         terraform_runner.subprocess,
         "run",
@@ -321,6 +328,7 @@ def test_omitted_spec_downloads_latest_and_runs(
 ) -> None:
     """No --spec and no local file: the latest release is fetched and used."""
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
     remote_spec = {**PIPELINE_SPEC, "info": {"version": "1.56.0"}}
     monkeypatch.setattr(
         spec_resolver, "_download", lambda url: json.dumps(remote_spec)
@@ -341,3 +349,147 @@ def test_omitted_spec_downloads_latest_and_runs(
         "version": "1.56.0"
     }
     assert (tmp_path / "workspace" / "imports.tf").exists()
+
+
+def test_offline_run_without_api_key_skips_terraform(
+    spec_file: Path,
+    dump_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Air-gapped dump runs generate artifacts without ever invoking terraform."""
+    _no_network(monkeypatch)
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+
+    def forbidden_run(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("terraform must not run without an API key")
+
+    monkeypatch.setattr(terraform_runner.subprocess, "run", forbidden_run)
+    workdir = tmp_path / "workspace"
+
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(dump_file),
+         "--workdir", str(workdir)]
+    )
+
+    assert exit_code == 0
+    assert (workdir / "imports.tf").exists()
+    assert (workdir / "provider.tf").exists()
+
+
+def _rebuild_workspace(tmp_path: Path) -> Path:
+    """A workdir that looks like a previous pipeline run populated it."""
+    workdir = tmp_path / "workspace"
+    workdir.mkdir()
+    (workdir / "provider.tf").write_text('provider "meraki" {}\n', encoding="utf-8")
+    return workdir
+
+
+def test_confirm_without_rebuild_is_a_usage_error() -> None:
+    with pytest.raises(SystemExit):
+        main(["--confirm"])
+
+
+def test_rebuild_rejects_dump_flags(dump_file: Path) -> None:
+    with pytest.raises(SystemExit):
+        main(["--rebuild", "--from-dump", str(dump_file)])
+
+
+def test_rebuild_requires_api_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    workdir = _rebuild_workspace(tmp_path)
+    assert main(["--rebuild", "--workdir", str(workdir)]) == 1
+
+
+def test_rebuild_requires_existing_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    assert main(["--rebuild", "--workdir", str(tmp_path / "empty")]) == 1
+
+
+def test_rebuild_without_confirm_is_preview_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    workdir = _rebuild_workspace(tmp_path)
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(command: tuple[str, ...], **kwargs: Any) -> SimpleNamespace:
+        calls.append(command)
+        exit_code = 2 if command[1] == "plan" else 0
+        return SimpleNamespace(returncode=exit_code, stdout="Plan: 5 to add", stderr="")
+
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake_run)
+
+    assert main(["--rebuild", "--workdir", str(workdir)]) == 0
+    assert [call[1] for call in calls] == ["init", "plan"]  # no apply
+
+
+def test_rebuild_with_confirm_applies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    workdir = _rebuild_workspace(tmp_path)
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(command: tuple[str, ...], **kwargs: Any) -> SimpleNamespace:
+        calls.append(command)
+        exit_code = 2 if command[1] == "plan" else 0
+        return SimpleNamespace(returncode=exit_code, stdout="Plan: 5 to add", stderr="")
+
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake_run)
+
+    assert main(["--rebuild", "--confirm", "--workdir", str(workdir)]) == 0
+    assert [call[1] for call in calls] == ["init", "plan", "apply"]
+
+
+def test_rebuild_with_nothing_to_do_never_applies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    workdir = _rebuild_workspace(tmp_path)
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(command: tuple[str, ...], **kwargs: Any) -> SimpleNamespace:
+        calls.append(command)
+        return SimpleNamespace(returncode=0, stdout="No changes.", stderr="")
+
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake_run)
+
+    assert main(["--rebuild", "--confirm", "--workdir", str(workdir)]) == 0
+    assert [call[1] for call in calls] == ["init", "plan"]
+
+
+def test_rebuild_planning_failure_exits_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    workdir = _rebuild_workspace(tmp_path)
+    monkeypatch.setattr(
+        terraform_runner.subprocess,
+        "run",
+        lambda command, **kwargs: SimpleNamespace(
+            returncode=1, stdout="", stderr="Error: init failed"
+        ),
+    )
+    assert main(["--rebuild", "--workdir", str(workdir)]) == 1
+
+
+def test_rebuild_apply_failure_exits_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    workdir = _rebuild_workspace(tmp_path)
+
+    def fake_run(command: tuple[str, ...], **kwargs: Any) -> SimpleNamespace:
+        if command[1] == "apply":
+            return SimpleNamespace(returncode=1, stdout="", stderr="Error: apply boom")
+        exit_code = 2 if command[1] == "plan" else 0
+        return SimpleNamespace(returncode=exit_code, stdout="Plan: 5 to add", stderr="")
+
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake_run)
+
+    assert main(["--rebuild", "--confirm", "--workdir", str(workdir)]) == 1

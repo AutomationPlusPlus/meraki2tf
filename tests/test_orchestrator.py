@@ -1,10 +1,11 @@
-"""Lifecycle coordinator: alert triggers and failure semantics."""
+"""Lifecycle coordinator: alert triggers, failure semantics, read-only contract."""
 
 from pathlib import Path
 
 import pytest
 
 from meraki2tf.alerts import AlertDispatcher, AlertEvent, EventType, Notifier
+from meraki2tf.config import API_KEY_ENV_VAR
 from meraki2tf.models import NetworkGraph
 from meraki2tf.orchestrator import PipelineError, PipelineOrchestrator
 from meraki2tf.providers.base import MerakiDataProvider
@@ -62,6 +63,8 @@ class StubRunner:
         self.workdir = workdir
         self.plan_exit = plan_exit
         self.fail_stage = fail_stage
+        self.initialized = False
+        self.planned = False
         self.applied = False
         self.state_addresses: frozenset[str] = frozenset()
 
@@ -77,14 +80,16 @@ class StubRunner:
         return self.state_addresses
 
     def init(self) -> TerraformCommandResult:
+        self.initialized = True
         if self.fail_stage == "init":
             raise TerraformError("terraform init failed with exit code 1: boom")
         return self._result(0)
 
     def plan_with_generation(self) -> TerraformCommandResult:
+        self.planned = True
         return self._result(self.plan_exit)
 
-    def apply(self) -> TerraformCommandResult:
+    def rebuild_apply(self) -> TerraformCommandResult:
         self.applied = True
         return self._result(0)
 
@@ -107,20 +112,27 @@ def _orchestrator(
     return orchestrator, recorder, provider, runner
 
 
-def test_clean_run_fires_only_run_success(tmp_path: Path) -> None:
+@pytest.fixture()
+def api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+
+
+def test_clean_run_fires_only_run_success(tmp_path: Path, api_key: None) -> None:
     orchestrator, recorder, provider, runner = _orchestrator(tmp_path, plan_exit=0)
     summary = orchestrator.run("org-123")
 
     assert [e.event_type for e in recorder.events] == [EventType.RUN_SUCCESS]
     assert recorder.events[0].details["drift_was_detected"] is False
     assert summary.drift_detected is False
+    assert summary.comparison_skipped is False
     assert summary.imports_written == 2
     assert summary.organization_id == "org-123"
     assert provider.closed  # context-managed discovery
-    assert runner.applied
+    assert runner.planned
+    assert not runner.applied  # read-only: the pipeline never applies
 
 
-def test_drift_fires_alert_then_still_aggregates(tmp_path: Path) -> None:
+def test_drift_fires_alert_but_never_applies(tmp_path: Path, api_key: None) -> None:
     orchestrator, recorder, _, runner = _orchestrator(tmp_path, plan_exit=2)
     summary = orchestrator.run("org-123")
 
@@ -132,10 +144,28 @@ def test_drift_fires_alert_then_still_aggregates(tmp_path: Path) -> None:
     assert drift.details["diff"] == "~ delta"
     assert drift.details["workspace"] == str(runner.workdir)
     assert summary.drift_detected is True
-    assert runner.applied
+    assert not runner.applied
 
 
-def test_existing_state_addresses_flow_into_generation(tmp_path: Path) -> None:
+def test_missing_api_key_skips_comparison(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Offline dump runs still produce artifacts; terraform is not touched."""
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    orchestrator, recorder, _, runner = _orchestrator(tmp_path)
+    summary = orchestrator.run("org-123")
+
+    assert [e.event_type for e in recorder.events] == [EventType.RUN_SUCCESS]
+    assert summary.comparison_skipped is True
+    assert summary.drift_detected is False
+    assert not runner.initialized
+    assert not runner.planned
+    assert not runner.applied
+
+
+def test_existing_state_addresses_flow_into_generation(
+    tmp_path: Path, api_key: None
+) -> None:
     generator = StubGenerator()
     orchestrator, _, _, runner = _orchestrator(tmp_path, generator=generator)
     runner.state_addresses = frozenset({"meraki_networks.n_1"})
@@ -146,7 +176,9 @@ def test_existing_state_addresses_flow_into_generation(tmp_path: Path) -> None:
     assert summary.imports_skipped_existing == 1
 
 
-def test_fault_dispatches_processing_fault_and_raises(tmp_path: Path) -> None:
+def test_fault_dispatches_processing_fault_and_raises(
+    tmp_path: Path, api_key: None
+) -> None:
     orchestrator, recorder, _, runner = _orchestrator(tmp_path, fail_stage="init")
     with pytest.raises(PipelineError, match="terraform init"):
         orchestrator.run("org-123")
