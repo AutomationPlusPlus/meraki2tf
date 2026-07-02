@@ -30,7 +30,11 @@ export/backup scripts, detected by a top-level ``organizations`` array::
           "networks": [
             {
               "info": { ...network payload... },
-              "devices": [ ...device payloads... ],
+              "devices": [
+                ...device payloads, or per-device section objects:
+                { "info": { ...device payload... },
+                  "switch_ports": [ ... ], "management_interface": { ... } }
+              ],
               "vlans": [ ... ], "ssids": [ ... ], "firewall_l3": { ... }
             }
           ],
@@ -76,6 +80,7 @@ _NESTED_MARKER = "organizations"
 #: Keys of a nested entry that are structural, not feature sections.
 _ORG_STRUCTURAL_KEYS = frozenset({"info", "networks"})
 _NETWORK_STRUCTURAL_KEYS = frozenset({"info", "devices"})
+_DEVICE_STRUCTURAL_KEYS = frozenset({"info"})
 
 
 class MalformedDumpError(ValueError):
@@ -199,12 +204,14 @@ class StaticJsonDataProvider(MerakiDataProvider):
                     )
                 network = MerakiNetwork.from_payload(network_entry.get("info") or {})
                 networks.append(network)
-                devices.extend(
-                    MerakiDevice.from_payload(item)
-                    for item in coerce_sequence(
-                        network_entry.get("devices"), "'devices'"
+                for device_entry in coerce_sequence(
+                    network_entry.get("devices"), "'devices'"
+                ):
+                    device, device_features = self._device_entry(
+                        device_entry, unmatched
                     )
-                )
+                    devices.append(device)
+                    features.extend(device_features)
                 for section, payload in network_entry.items():
                     if section in _NETWORK_STRUCTURAL_KEYS:
                         continue
@@ -240,6 +247,34 @@ class StaticJsonDataProvider(MerakiDataProvider):
         )
         self._log_graph(graph)
         return graph
+
+    def _device_entry(
+        self, entry: Any, unmatched: Counter[str]
+    ) -> tuple[MerakiDevice, list[FeatureConfiguration]]:
+        """One nested device: a flat payload, or ``{info, <sections>…}``.
+
+        The structured form carries per-device configuration sections
+        (``switch_ports``, ``management_interface``, …) which resolve
+        onto serial-scoped spec endpoints — the same surfaces live
+        discovery queries per device.
+        """
+        if not isinstance(entry, dict):
+            raise MalformedDumpError(
+                f"Snapshot {self._path}: each device entry must be an object."
+            )
+        if "info" not in entry:
+            return MerakiDevice.from_payload(entry), []
+        device = MerakiDevice.from_payload(entry.get("info") or {})
+        features: list[FeatureConfiguration] = []
+        for section, payload in entry.items():
+            if section in _DEVICE_STRUCTURAL_KEYS:
+                continue
+            features.extend(
+                self._section_features(
+                    section, payload, "serial", device.serial, unmatched
+                )
+            )
+        return device, features
 
     def _section_features(
         self,
