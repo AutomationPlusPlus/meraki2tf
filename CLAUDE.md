@@ -10,7 +10,7 @@ A robust, secure, and schedulable CLI tool written in Python to extract Cisco Me
 2. **Configuration Discovery:** Ingest network infrastructure schemas via dual input modalities (Live Cloud API or Offline JSON Dump).
 3. **HCL Construction:** Write clean, declarative configuration structures natively utilizing modern Terraform `import` blocks.
 4. **State Orchestration & Drift Alerting:** Compare discovered configurations against the existing state file via a read-only speculative `terraform plan` (skipped gracefully when no API key is available, e.g. air-gapped dump runs). Pending imports are normal snapshot growth, not drift; when real add/change/destroy differences are found, compile a diff payload and **trigger a drift alert** via configured notification channels.
-5. **Artifact Completion & Success Notification:** Leave a complete rebuild kit (`imports.tf`, `provider.tf`, `generated_resources.tf`) in the workspace. Upon absolute execution success, **dispatch a success notification** confirming a clean run. The pipeline itself never applies anything into state or into Meraki.
+5. **Artifact Completion & Success Notification:** Leave a complete rebuild kit (`imports.tf`, `provider.tf`, and the accumulated `resources.tf` configuration baseline) in the workspace. Upon absolute execution success, **dispatch a success notification** confirming a clean run. The pipeline itself never applies anything into state or into Meraki.
 6. **Exception Auditing:** Flag parameters or features completely unsupported by the Terraform provider, and emit structured payloads to alerting endpoints.
 
 ---
