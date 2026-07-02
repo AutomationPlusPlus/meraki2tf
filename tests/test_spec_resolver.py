@@ -80,6 +80,18 @@ def test_unreadable_local_spec_is_treated_as_outdated(
     assert path.read_text(encoding="utf-8") == remote_text
 
 
+def test_non_utf8_local_spec_is_treated_as_outdated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "spec3.json"
+    path.write_bytes(b"\xff\xfe{}")
+    remote_text = json.dumps(_spec("1.56.0"))
+    _patch_remote(monkeypatch, remote_text)
+
+    resolve_spec(path)
+    assert path.read_text(encoding="utf-8") == remote_text
+
+
 def test_offline_with_local_spec_falls_back_with_warning(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
