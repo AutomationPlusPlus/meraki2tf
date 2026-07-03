@@ -66,6 +66,71 @@ def test_secrets_are_redacted_but_flags_keep_their_type() -> None:
     assert payload["authMode"] == "psk"  # a mode value, not a secret key
 
 
+def test_extended_secret_keys_are_redacted() -> None:
+    """SNMP v3 passes, PINs, passcodes, private keys, credentials, and
+    license keys are credentials too and must never survive --sanitize."""
+    graph = NetworkGraph(
+        "org-123", (), (),
+        (
+            FeatureConfiguration(
+                "/organizations/{organizationId}/snmp",
+                ("org-123",),
+                {
+                    "v3AuthPass": "authpass1",
+                    "v3PrivPass": "privpass1",
+                    "simPin": "1234",
+                    "passcode": "0000",
+                    "privateKey": "-----BEGIN RSA PRIVATE KEY-----\nMIIE\n",
+                    "credentials": "svc:hunter2",
+                    "licenseKey": "Z2AB-CDEF-GHIJ",
+                    "pinEnabled": True,  # flag, not a credential
+                },
+            ),
+        ),
+    )
+    payload = sanitize_graph(graph).features[0].payload
+    for key in (
+        "v3AuthPass", "v3PrivPass", "simPin", "passcode",
+        "privateKey", "credentials", "licenseKey",
+    ):
+        assert payload[key] == REDACTED, key
+    assert payload["pinEnabled"] is True
+
+
+def test_pem_private_keys_are_redacted_regardless_of_key() -> None:
+    """A PEM private-key block under a non-secret-shaped key (e.g. a
+    combined `certificate` blob) must still be redacted."""
+    graph = NetworkGraph(
+        "org-123", (), (),
+        (
+            FeatureConfiguration(
+                "/networks/{networkId}/wireless/radsec",
+                ("N_1",),
+                {"certificate": "-----BEGIN PRIVATE KEY-----\nMIIE\n"
+                                "-----END PRIVATE KEY-----"},
+            ),
+        ),
+    )
+    payload = sanitize_graph(graph).features[0].payload
+    assert payload["certificate"] == REDACTED
+
+
+def test_phone_numbers_are_pseudonymized() -> None:
+    graph = NetworkGraph(
+        "org-123", (), (),
+        (
+            FeatureConfiguration(
+                "/networks/{networkId}/sm/devices",
+                ("N_1",),
+                {"phoneNumber": "+1 617 555 0100"},
+            ),
+        ),
+    )
+    payload = sanitize_graph(graph).features[0].payload
+    assert payload["phoneNumber"].startswith("phonenumber-")
+    assert "617" not in payload["phoneNumber"]
+
+
 def test_identity_fields_are_pseudonymized() -> None:
     sanitized = sanitize_graph(_graph())
     assert sanitized.networks[0].name.startswith("network-")

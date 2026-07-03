@@ -14,8 +14,11 @@ across runs):
   import-block generation) survives sanitization.
 * **Secret-bearing fields are redacted.** Any payload key that looks
   credential-shaped (``psk``, ``secret``, ``password``,
-  ``communityString``, ``…token``, ``…apiKey``, …) has its value
-  replaced with ``**REDACTED**``.
+  ``communityString``, ``…token``, ``…apiKey``, ``v3AuthPass``,
+  ``passcode``, ``…Pin``, ``privateKey``, ``credentials``,
+  ``licenseKey``, …) has its value replaced with ``**REDACTED**``, and
+  any string value carrying a PEM private-key block is redacted no
+  matter what key it sits under.
 * **Identity-bearing fields are pseudonymized.** Names, emails, URLs,
   addresses, notes, tags, MACs, and stray serials become stable
   ``<kind>-<digest>`` placeholders; coordinates are zeroed.
@@ -50,12 +53,14 @@ REDACTED = "**REDACTED**"
 #: DR runbook and gap replayer must agree with the sanitizer on what
 #: counts as a secret (redact in artifacts, restore from the dump).
 SECRET_KEY_PATTERN = re.compile(
-    r"secret|psk|passphrase|password|community|token|api_?key|auth_?key|shared_?key",
+    r"secret|psk|passphrase|password|community|token|api_?key|auth_?key"
+    r"|shared_?key|auth_?pass|priv_?pass|passcode|pin$|private_?key"
+    r"|credential|license_?key",
     re.IGNORECASE,
 )
 _SECRET_KEY = SECRET_KEY_PATTERN
 _IDENTITY_KEY = re.compile(
-    r"name$|names$|email|url$|urls$|address|notes|^mac$|^tags$|serial",
+    r"name$|names$|email|url$|urls$|address|notes|^mac$|^tags$|serial|phone",
     re.IGNORECASE,
 )
 _COORDINATE_KEYS = frozenset({"lat", "lng"})
@@ -261,6 +266,10 @@ class _GraphSanitizer:
 
     def _clean_identity_shaped(self, value: str) -> str:
         """Pseudonymize identity-shaped values regardless of their key."""
+        if "PRIVATE KEY-----" in value:
+            # PEM private-key blocks (RADSEC, custom certs) are secrets
+            # even under non-secret-shaped keys like `certificate`.
+            return REDACTED
         if "," in value:
             # Fields like firewall destCidr carry comma-separated lists;
             # spacing around the commas is preserved so benign free text
