@@ -89,6 +89,21 @@ _STRUCTURAL_KEYS = {
     "serials": "dev",
 }
 _PATH_PARAM = re.compile(r"\{([^}]+)\}")
+#: Payload keys that reference other objects by opaque ID (``id``,
+#: ``interfaceId``, ``policyIds`` — but not words merely ending in "id"
+#: like ``ssid``). Their values are identifying and must map like any
+#: other structural ID.
+_ID_REFERENCE_KEY = re.compile(r"^ids?$|Ids?$")
+#: Digit-count ceiling under which an all-numeric value is treated as
+#: structure (VLAN 10, SSID number 3, port 48) rather than identity.
+#: Real Meraki object IDs (admin IDs, interface IDs, opt-in IDs, …) are
+#: far longer and leak the environment's identity if preserved.
+_STRUCTURAL_NUMBER_MAX_DIGITS = 4
+
+
+def _is_structural_number(value: str) -> bool:
+    """Small numerics are structure, not identity; long ones identify."""
+    return value.isdigit() and len(value) <= _STRUCTURAL_NUMBER_MAX_DIGITS
 
 
 def _pseudonym(key: str, value: str) -> str:
@@ -136,15 +151,16 @@ class _GraphSanitizer:
         # nowhere in the networks/devices lists (multi-org exports,
         # partial snapshots); classify them by their path placeholder so
         # they pseudonymize instead of leaking. Opaque item-level IDs
-        # (adminId, httpServerId, …) are identifying too; purely numeric
-        # ones (vlanId 10, SSID number 3) are structure, not identity.
+        # (adminId, httpServerId, …) are identifying too — including
+        # all-numeric ones (adminId 2038677) — while short numerics
+        # (vlanId 10, SSID number 3) are structure, not identity.
         for feature in graph.features:
             placeholders = _PATH_PARAM.findall(feature.api_path)
             for name, value in zip(placeholders, feature.path_values):
                 prefix = _PATH_PARAM_PREFIXES.get(name.lower())
                 if prefix:
                     self._assign(value, prefix)
-                elif value and not value.isdigit():
+                elif value and not _is_structural_number(value):
                     self._assign(value, "id")
 
     def _assign(self, value: str, prefix: str) -> None:
@@ -217,6 +233,12 @@ class _GraphSanitizer:
             prefix = _STRUCTURAL_KEYS.get(key.lower())
             if prefix:
                 self._assign(value, prefix)
+                return self._id_map[value]
+            # Opaque ID references seen only inside payloads
+            # (`interfaceId`, nested `id` echoes, `…Ids` lists) map to
+            # the same consistent pseudonyms as path-level IDs.
+            if _ID_REFERENCE_KEY.search(key) and not _is_structural_number(value):
+                self._assign(value, "id")
                 return self._id_map[value]
         if key is None:
             return value

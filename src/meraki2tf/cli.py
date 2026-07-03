@@ -33,6 +33,7 @@ from meraki2tf.hcl_generator import HclImportGenerator
 from meraki2tf.logging_setup import configure_logging
 from meraki2tf.openapi_parser import OpenApiParser
 from meraki2tf.orchestrator import PipelineError, PipelineOrchestrator, RunSummary
+from meraki2tf.provider_catalog import resolve_catalog
 from meraki2tf.providers import (
     LiveApiDataProvider,
     MerakiDataProvider,
@@ -179,7 +180,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Terraform state file to aggregate into. An existing state is "
             "reused so consecutive runs only import the delta; if the file "
             "does not exist it is created on the first apply "
-            "(default: terraform.tfstate inside --workdir)."
+            "(default: meraki2tf.tfstate inside --workdir)."
         ),
     )
     parser.add_argument(
@@ -373,14 +374,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         if config.dump_to is not None:
             return _export_snapshot(provider, config)
         dispatcher = build_dispatcher(config)
+        runner = TerraformRunner(
+            config.workdir,
+            executable=config.terraform_bin,
+            state_path=config.state_file,
+        )
         orchestrator = PipelineOrchestrator(
             provider=provider,
-            generator=HclImportGenerator(spec_parser, dispatcher),
-            runner=TerraformRunner(
-                config.workdir,
-                executable=config.terraform_bin,
-                state_path=config.state_file,
+            generator=HclImportGenerator(
+                spec_parser,
+                dispatcher,
+                # Resolved lazily at generation time: keyed runs read
+                # the installed provider's identity schemas (init +
+                # schema dump, then cached in the workdir); keyless
+                # runs fall back to that cache or the bundled catalog.
+                catalog_provider=lambda: resolve_catalog(
+                    runner, keyed=api_key_present()
+                ),
             ),
+            runner=runner,
             dispatcher=dispatcher,
             rebaseline=config.rebaseline,
             sync=config.sync,
@@ -435,6 +447,28 @@ def _report(summary: RunSummary) -> None:
         pending_status,
         drift_status,
     )
+    if (
+        summary.reconciliation_dropped
+        or summary.unmanaged_secret_attributes
+        or summary.normalized_addresses
+    ):
+        logger.info(
+            "Plan reconciliation: %d resource(s) dropped as unexpressible, "
+            "%d resource(s) with unmanaged secret attribute(s), "
+            "%d resource(s) normalized to state values.",
+            len(summary.reconciliation_dropped),
+            len(summary.unmanaged_secret_attributes),
+            len(summary.normalized_addresses),
+        )
+    if summary.unmanaged_secret_attributes:
+        logger.warning(
+            "Secrets not captured in the DR kit (restore manually after a "
+            "rebuild): %s",
+            "; ".join(
+                f"{address}: {', '.join(attrs)}"
+                for address, attrs in summary.unmanaged_secret_attributes.items()
+            ),
+        )
     if summary.resources_added_to_state:
         logger.info(
             "State grew by %d resource(s): %s",

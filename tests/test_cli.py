@@ -10,6 +10,8 @@ from typing import Any
 import pytest
 
 from conftest import PIPELINE_SPEC
+from conftest import fixture_schema_document
+
 from meraki2tf import spec_resolver, terraform_runner
 from meraki2tf.cli import build_dispatcher, build_parser, build_provider, main
 from meraki2tf.config import API_KEY_ENV_VAR, RuntimeConfig
@@ -189,6 +191,18 @@ def test_dump_mode_end_to_end(
 
     def fake_run(command: tuple[str, ...], **kwargs: Any) -> SimpleNamespace:
         terraform_calls.append(command)
+        if command[1] == "providers":
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(fixture_schema_document()),
+                stderr="",
+            )
+        if command[1] == "show":
+            # reconciliation classifies the saved plan; an empty change
+            # set means nothing to remediate (the delta is real drift)
+            return SimpleNamespace(
+                returncode=0, stdout='{"resource_changes": []}', stderr=""
+            )
         exit_code = 2 if command[1] == "plan" else 0
         return SimpleNamespace(
             returncode=exit_code,
@@ -221,12 +235,17 @@ def test_dump_mode_end_to_end(
     )
 
     assert exit_code == 0
-    # Read-only pipeline: terraform apply is never part of a run.
-    assert [call[1] for call in terraform_calls] == ["init", "plan"]
+    # Read-only pipeline: terraform apply is never part of a run. The
+    # catalog resolution initializes and dumps the provider schema
+    # before generation; the comparison stage re-inits (idempotent) and
+    # reconciliation classifies the changes-present plan via show.
+    assert [call[1] for call in terraform_calls] == [
+        "init", "providers", "init", "plan", "show",
+    ]
 
     imports = (workdir / "imports.tf").read_text(encoding="utf-8")
-    assert "to = meraki_networks.n_1\n" in imports
-    assert "to = meraki_devices.q2ab_cdef_ghij\n" in imports
+    assert "to = meraki_network.n_1\n" in imports
+    assert "to = meraki_device.q2ab_cdef_ghij\n" in imports
     assert 'id = "N_1,10"' in imports
     provider_tf = (workdir / "provider.tf").read_text(encoding="utf-8")
     assert 'source = "CiscoDevNet/meraki"' in provider_tf
@@ -311,7 +330,7 @@ def test_consecutive_run_reuses_existing_state(
         json.dumps(
             {
                 "resources": [
-                    {"mode": "managed", "type": "meraki_networks", "name": "n_1"},
+                    {"mode": "managed", "type": "meraki_network", "name": "n_1"},
                 ]
             }
         ),
@@ -330,8 +349,8 @@ def test_consecutive_run_reuses_existing_state(
 
     assert exit_code == 0
     imports = (workdir / "imports.tf").read_text(encoding="utf-8")
-    assert "meraki_networks.n_1" not in imports  # already tracked in state
-    assert "to = meraki_devices.q2ab_cdef_ghij\n" in imports
+    assert "meraki_network.n_1" not in imports  # already tracked in state
+    assert "to = meraki_device.q2ab_cdef_ghij\n" in imports
     provider_tf = (workdir / "provider.tf").read_text(encoding="utf-8")
     assert f'path = "{state.resolve()}"' in provider_tf
 
@@ -690,25 +709,35 @@ def test_sync_end_to_end_applies_import_only_plan(
     monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
     _no_network(monkeypatch)
     workdir = tmp_path / "workspace"
-    state = workdir / "terraform.tfstate"
+    state = workdir / "meraki2tf.tfstate"
     terraform_calls: list[tuple[str, ...]] = []
 
     def fake_run(command: tuple[str, ...], **kwargs: Any) -> SimpleNamespace:
         terraform_calls.append(command)
+        if command[1] == "providers":
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(fixture_schema_document()),
+                stderr="",
+            )
         if command[1] == "plan":
             return SimpleNamespace(
                 returncode=2,
                 stdout="Plan: 4 to import, 0 to add, 0 to change, 0 to destroy.",
                 stderr="",
             )
+        if command[1] == "show":
+            return SimpleNamespace(
+                returncode=0, stdout='{"resource_changes": []}', stderr=""
+            )
         if command[1] == "apply":
             state.write_text(
                 json.dumps(
                     {
                         "resources": [
-                            {"mode": "managed", "type": "meraki_networks",
+                            {"mode": "managed", "type": "meraki_network",
                              "name": "n_1"},
-                            {"mode": "managed", "type": "meraki_devices",
+                            {"mode": "managed", "type": "meraki_device",
                              "name": "q2ab_cdef_ghij"},
                         ]
                     }
@@ -733,13 +762,16 @@ def test_sync_end_to_end_applies_import_only_plan(
     )
 
     assert exit_code == 0
-    # init → generation plan → guard plan → apply of the verified plan file.
-    assert [call[1] for call in terraform_calls] == ["init", "plan", "plan", "apply"]
+    # catalog (init + schema) → init → generation plan (import-only, so
+    # reconciliation classifies nothing) → guard plan → apply.
+    assert [call[1] for call in terraform_calls] == [
+        "init", "providers", "init", "plan", "plan", "apply",
+    ]
     assert terraform_calls[-1][-1] == "meraki2tf-sync.tfplan"
     assert [event["event_type"] for event in delivered] == ["RUN_SUCCESS"]
     success = delivered[0]["details"]
     assert success["resources_added_to_state"] == [
-        "meraki_devices.q2ab_cdef_ghij", "meraki_networks.n_1",
+        "meraki_device.q2ab_cdef_ghij", "meraki_network.n_1",
     ]
     assert success["pending_imports"] == 0
     manifest = json.loads((workdir / "coverage.json").read_text(encoding="utf-8"))
@@ -836,3 +868,31 @@ def test_report_surfaces_every_dr_outcome(
     assert "meraki_devices.confirmed" in text
     assert "--confirm-deletions" in text and "meraki_devices.gone" in text
     assert "80.00% coverage" in text
+
+
+def test_report_logs_reconciliation_outcomes(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from meraki2tf.cli import _report
+    from meraki2tf.orchestrator import RunSummary
+
+    summary = RunSummary(
+        organization_id="org-123",
+        discovered_assets=3,
+        imports_written=2,
+        imports_skipped_existing=0,
+        unsupported_count=1,
+        drift_detected=False,
+        comparison_skipped=False,
+        pending_imports=2,
+        reconciliation_dropped=("meraki_network_firmware_upgrades.l_1",),
+        unmanaged_secret_attributes={"meraki_wireless_ssid.s_0": ("psk",)},
+        normalized_addresses=("meraki_network_alerts_settings.l_1",),
+    )
+    with caplog.at_level("INFO", logger="meraki2tf.cli"):
+        _report(summary)
+    text = caplog.text
+    assert "1 resource(s) dropped as unexpressible" in text
+    assert "1 resource(s) with unmanaged secret attribute(s)" in text
+    assert "1 resource(s) normalized to state values" in text
+    assert "meraki_wireless_ssid.s_0: psk" in text

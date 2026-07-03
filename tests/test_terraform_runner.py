@@ -4,7 +4,7 @@ import json
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Any
 
 import pytest
 
@@ -47,20 +47,19 @@ class FakeSubprocess:
 
 
 class ScriptedSubprocess:
-    """One (returncode, stdout, side-effect) triple consumed per call."""
+    """One (returncode, stdout, side-effect[, stderr]) step per call."""
 
-    def __init__(
-        self, *steps: tuple[int, str, Callable[[], None] | None]
-    ) -> None:
+    def __init__(self, *steps: tuple[Any, ...]) -> None:
         self.steps = list(steps)
         self.calls: list[tuple[str, ...]] = []
 
     def run(self, command: tuple[str, ...], **kwargs: Any) -> SimpleNamespace:
         self.calls.append(command)
-        returncode, stdout, side_effect = self.steps.pop(0)
+        returncode, stdout, side_effect, *rest = self.steps.pop(0)
         if side_effect is not None:
             side_effect()
-        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr="")
+        stderr = rest[0] if rest else ""
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
 
 
 @pytest.fixture()
@@ -76,9 +75,72 @@ def test_prepare_workspace_writes_credential_free_provider_anchor(
     assert provider_file.name == PROVIDER_FILENAME
     content = provider_file.read_text(encoding="utf-8")
     assert 'source = "CiscoDevNet/meraki"' in content
+    # identity schemas (the resource-matching ground truth) need >= 1.12
+    assert 'version = ">= 1.12.0"' in content
     assert 'provider "meraki"' in content
     assert "MERAKI_DASHBOARD_API_KEY" in content  # documented, never templated
     assert "api_key" not in content
+
+
+def test_provider_schema_catalog_parses_identity_schemas(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from conftest import fixture_schema_document
+
+    fake = FakeSubprocess(stdout=json.dumps(fixture_schema_document()))
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    catalog = runner.provider_schema_catalog()
+    assert fake.calls[0]["command"] == (
+        "terraform", "providers", "schema", "-json",
+    )
+    assert catalog.resources["meraki_wireless_ssid"] == frozenset(
+        {"network_id", "number"}
+    )
+
+
+@pytest.mark.parametrize("stdout", ["{not json", json.dumps(["not", "an", "object"])])
+def test_provider_schema_catalog_rejects_unparseable_output(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch, stdout: str
+) -> None:
+    fake = FakeSubprocess(stdout=stdout)
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    with pytest.raises(TerraformError):
+        runner.provider_schema_catalog()
+
+
+def test_subprocess_env_bridges_dashboard_key_to_provider_var(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MERAKI_DASHBOARD_API_KEY", "dashboard-secret")
+    monkeypatch.delenv("MERAKI_API_KEY", raising=False)
+    fake = FakeSubprocess(stdout="Initialized")
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    runner.init()
+    env = fake.calls[0]["env"]
+    assert env["MERAKI_API_KEY"] == "dashboard-secret"
+    assert env["MERAKI_DASHBOARD_API_KEY"] == "dashboard-secret"
+
+
+def test_subprocess_env_never_overrides_explicit_provider_key(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MERAKI_DASHBOARD_API_KEY", "dashboard-secret")
+    monkeypatch.setenv("MERAKI_API_KEY", "explicit-provider-key")
+    fake = FakeSubprocess(stdout="Initialized")
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    runner.init()
+    assert fake.calls[0]["env"]["MERAKI_API_KEY"] == "explicit-provider-key"
+
+
+def test_subprocess_env_without_any_key_adds_nothing(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("MERAKI_DASHBOARD_API_KEY", raising=False)
+    monkeypatch.delenv("MERAKI_API_KEY", raising=False)
+    fake = FakeSubprocess(stdout="Initialized")
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    runner.init()
+    assert "MERAKI_API_KEY" not in fake.calls[0]["env"]
 
 
 def test_state_defaults_into_workdir_backend(runner: TerraformRunner) -> None:
@@ -99,6 +161,57 @@ def test_custom_state_location_is_anchored_and_parent_created(
     assert runner.state_path == state.resolve()
     assert state.parent.is_dir()  # created so terraform can write the file
     assert f'path = "{state.resolve()}"' in provider_file.read_text(encoding="utf-8")
+
+
+def test_state_default_avoids_terraform_legacy_filename(
+    runner: TerraformRunner,
+) -> None:
+    """terraform init empties a workdir file named terraform.tfstate
+    (legacy-state migration), so the default must never use that name."""
+    assert runner.state_path.name == "meraki2tf.tfstate"
+
+
+def test_state_file_named_like_legacy_state_is_refused(tmp_path: Path) -> None:
+    ws = tmp_path / "ws"
+    with pytest.raises(TerraformError, match="legacy state"):
+        TerraformRunner(ws, state_path=ws / "terraform.tfstate")
+
+
+def test_prepare_workspace_adopts_legacy_default_state(tmp_path: Path) -> None:
+    """State accumulated by older versions at <workdir>/terraform.tfstate
+    is renamed to the safe default before terraform can destroy it."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    legacy = ws / "terraform.tfstate"
+    legacy.write_text('{"resources": []}', encoding="utf-8")
+    runner = TerraformRunner(ws)
+    runner.prepare_workspace()
+    assert not legacy.exists()
+    assert runner.state_path.read_text(encoding="utf-8") == '{"resources": []}'
+
+
+def test_prepare_workspace_ignores_empty_legacy_state(tmp_path: Path) -> None:
+    """A zero-byte legacy file (terraform's leftover) is not adopted."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "terraform.tfstate").write_text("", encoding="utf-8")
+    runner = TerraformRunner(ws)
+    runner.prepare_workspace()
+    assert not runner.state_path.exists()
+
+
+def test_prepare_workspace_keeps_custom_state_over_legacy(tmp_path: Path) -> None:
+    """Legacy adoption only applies to the default location; an explicit
+    --state-file is authoritative."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    legacy = ws / "terraform.tfstate"
+    legacy.write_text('{"resources": []}', encoding="utf-8")
+    custom = tmp_path / "elsewhere" / "org.tfstate"
+    runner = TerraformRunner(ws, state_path=custom)
+    runner.prepare_workspace()
+    assert legacy.exists()  # untouched
+    assert not custom.exists()
 
 
 def test_existing_addresses_empty_when_no_state(runner: TerraformRunner) -> None:
@@ -165,7 +278,7 @@ def test_plan_reports_drift_on_detailed_exit_two(
 ) -> None:
     fake = FakeSubprocess(returncode=2, stdout="~ resource delta")
     monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
-    result = runner.plan_with_generation()
+    result = runner.plan_with_generation(reconcile=False)
     assert result.has_changes is True
     assert "-detailed-exitcode" in fake.calls[0]["command"]
     assert f"-generate-config-out={GENERATED_CONFIG_FILENAME}" in fake.calls[0]["command"]
@@ -180,7 +293,7 @@ def test_import_only_plan_is_not_drift(
         stdout="Plan: 875 to import, 0 to add, 0 to change, 0 to destroy.",
     )
     monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
-    result = runner.plan_with_generation()
+    result = runner.plan_with_generation(reconcile=False)
     assert result.has_changes is True  # imports still need aggregation
     assert result.has_drift is False
 
@@ -193,7 +306,7 @@ def test_real_changes_in_plan_summary_are_drift(
         stdout="Plan: 3 to import, 0 to add, 2 to change, 1 to destroy.",
     )
     monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
-    assert runner.plan_with_generation().has_drift is True
+    assert runner.plan_with_generation(reconcile=False).has_drift is True
 
 
 def test_summary_without_import_count_still_parses(
@@ -203,7 +316,7 @@ def test_summary_without_import_count_still_parses(
         returncode=2, stdout="Plan: 1 to add, 0 to change, 0 to destroy."
     )
     monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
-    assert runner.plan_with_generation().has_drift is True
+    assert runner.plan_with_generation(reconcile=False).has_drift is True
 
 
 def test_unparseable_plan_falls_back_to_exit_code(
@@ -211,7 +324,7 @@ def test_unparseable_plan_falls_back_to_exit_code(
 ) -> None:
     fake = FakeSubprocess(returncode=2, stdout="~ resource delta")
     monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
-    result = runner.plan_with_generation()
+    result = runner.plan_with_generation(reconcile=False)
     assert result.has_drift is True
     assert result.plan_counts is None
 
@@ -224,7 +337,7 @@ def test_plan_counts_expose_pending_imports_and_changes(
         stdout="Plan: 875 to import, 1 to add, 2 to change, 3 to destroy.",
     )
     monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
-    counts = runner.plan_with_generation().plan_counts
+    counts = runner.plan_with_generation(reconcile=False).plan_counts
     assert counts is not None
     assert (counts.imports, counts.add, counts.change, counts.destroy) == (875, 1, 2, 3)
     assert counts.has_real_changes is True
@@ -263,7 +376,7 @@ def test_freshly_generated_config_is_absorbed_after_plan(
         ),
     )
     monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
-    runner.plan_with_generation()
+    runner.plan_with_generation(reconcile=False)
 
     assert not generated.exists()
     aggregated = runner.workdir / AGGREGATED_CONFIG_FILENAME
@@ -465,16 +578,18 @@ def test_guard_violation_is_a_terraform_error() -> None:
     assert issubclass(ImportGuardViolation, TerraformError)
 
 
-def test_plan_with_generation_saves_plan_on_request(
+def test_plan_with_generation_always_saves_the_plan(
     runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Reconciliation classifies the saved plan via show -json, so the
+    generation plan is always written to the sync plan file."""
     runner.prepare_workspace()
     fake = FakeSubprocess(returncode=0)
     monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
     runner.plan_with_generation(save_plan=True)
     assert f"-out={SYNC_PLAN_FILENAME}" in fake.calls[0]["command"]
     runner.plan_with_generation()
-    assert f"-out={SYNC_PLAN_FILENAME}" not in fake.calls[1]["command"]
+    assert f"-out={SYNC_PLAN_FILENAME}" in fake.calls[1]["command"]
 
 
 def test_plan_resource_actions_parses_show_json(
@@ -599,3 +714,240 @@ def test_prune_leaves_unrelated_addresses_intact(runner: TerraformRunner) -> Non
     baseline.write_text(BASELINE, encoding="utf-8")
     runner.remove_resources({"meraki_networks.unknown"})
     assert baseline.read_text(encoding="utf-8") == BASELINE
+
+
+VALIDATION_STDERR = """\
+Error: Invalid Attribute Value Match
+
+  with meraki_network_firmware_upgrades.l_1,
+  on generated_resources.tf line 30:
+  (source code not available)
+
+Attribute upgrade_window_day_of_week value must be one of: ["mon"], got: "Mon"
+"""
+
+FIRMWARE_BLOCK = (
+    'resource "meraki_network_firmware_upgrades" "l_1" {\n'
+    '  network_id = "L_1"\n'
+    "}\n"
+)
+FIRMWARE_IMPORT = (
+    "import {\n"
+    "  to = meraki_network_firmware_upgrades.l_1\n"
+    '  id = "L_1"\n'
+    "}\n"
+)
+SECRET_PLAN_JSON = json.dumps(
+    {
+        "resource_changes": [
+            {
+                "address": "meraki_network_snmp.l_1",
+                "change": {
+                    "actions": ["update"],
+                    "before": {"community_string": "s3cret"},
+                    "after": {"community_string": None},
+                    "before_sensitive": {"community_string": True},
+                    "after_sensitive": {},
+                },
+            }
+        ]
+    }
+)
+SNMP_BLOCK = (
+    'resource "meraki_network_snmp" "l_1" {\n'
+    '  access = "community"\n'
+    "}\n"
+)
+
+
+def test_reconciliation_drops_unexpressible_resources_then_replans(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Validation failure → drop the kit artifacts → replan clean."""
+    runner.prepare_workspace()
+    (runner.workdir / AGGREGATED_CONFIG_FILENAME).write_text(
+        FIRMWARE_BLOCK, encoding="utf-8"
+    )
+    (runner.workdir / "imports.tf").write_text(FIRMWARE_IMPORT, encoding="utf-8")
+    scripted = ScriptedSubprocess(
+        (1, "", None, VALIDATION_STDERR),
+        (0, "No changes.", None),
+    )
+    monkeypatch.setattr(terraform_runner.subprocess, "run", scripted.run)
+    outcome = runner.plan_with_generation()
+    assert outcome.has_changes is False
+    assert set(outcome.dropped) == {"meraki_network_firmware_upgrades.l_1"}
+    assert "Invalid Attribute Value Match" in outcome.dropped[
+        "meraki_network_firmware_upgrades.l_1"
+    ]
+    baseline = (runner.workdir / AGGREGATED_CONFIG_FILENAME).read_text(
+        encoding="utf-8"
+    )
+    assert "firmware_upgrades" not in baseline
+    imports = (runner.workdir / "imports.tf").read_text(encoding="utf-8")
+    assert "firmware_upgrades" not in imports
+    assert [c[1] for c in scripted.calls] == ["plan", "plan"]
+
+
+def test_reconciliation_suppresses_secret_nulls_then_replans(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Changes → classify via show -json → lifecycle edit → replan."""
+    runner.prepare_workspace()
+    (runner.workdir / AGGREGATED_CONFIG_FILENAME).write_text(
+        SNMP_BLOCK, encoding="utf-8"
+    )
+    scripted = ScriptedSubprocess(
+        (2, "Plan: 1 to import, 0 to add, 1 to change, 0 to destroy.", None),
+        (0, SECRET_PLAN_JSON, None),  # show -json
+        (2, "Plan: 1 to import, 0 to add, 0 to change, 0 to destroy.", None),
+    )
+    monkeypatch.setattr(terraform_runner.subprocess, "run", scripted.run)
+    outcome = runner.plan_with_generation()
+    assert outcome.ignored_secrets == {
+        "meraki_network_snmp.l_1": ("community_string",)
+    }
+    assert outcome.has_drift is False
+    baseline = (runner.workdir / AGGREGATED_CONFIG_FILENAME).read_text(
+        encoding="utf-8"
+    )
+    assert "ignore_changes = [community_string]" in baseline
+    assert [c[1] for c in scripted.calls] == ["plan", "show", "plan"]
+
+
+def test_reconciliation_new_attribute_on_same_address_is_progress(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Progress is tracked per (address, attribute): a second pass
+    proposing a different attribute of an already-edited resource must
+    keep the loop going, and the report merges the attribute tuples."""
+    second_attr_json = json.dumps(
+        {
+            "resource_changes": [
+                {
+                    "address": "meraki_network_snmp.l_1",
+                    "change": {
+                        "actions": ["update"],
+                        "before": {"users_string": "u"},
+                        "after": {"users_string": None},
+                        "before_sensitive": {"users_string": True},
+                        "after_sensitive": {},
+                    },
+                }
+            ]
+        }
+    )
+    runner.prepare_workspace()
+    (runner.workdir / AGGREGATED_CONFIG_FILENAME).write_text(
+        SNMP_BLOCK, encoding="utf-8"
+    )
+    changes = "Plan: 0 to import, 0 to add, 1 to change, 0 to destroy."
+    scripted = ScriptedSubprocess(
+        (2, changes, None),
+        (0, SECRET_PLAN_JSON, None),  # pass 1: community_string
+        (2, changes, None),
+        (0, second_attr_json, None),  # pass 2: users_string -> progress
+        (0, "Plan: 1 to import, 0 to add, 0 to change, 0 to destroy.", None),
+    )
+    monkeypatch.setattr(terraform_runner.subprocess, "run", scripted.run)
+    outcome = runner.plan_with_generation()
+    assert outcome.ignored_secrets == {
+        "meraki_network_snmp.l_1": ("community_string", "users_string")
+    }
+    assert outcome.has_drift is False
+    assert [c[1] for c in scripted.calls] == [
+        "plan", "show", "plan", "show", "plan",
+    ]
+
+
+def test_reconciliation_stops_when_remediations_make_no_progress(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A diff that keeps re-proposing already-applied remediations is
+    surfaced as drift instead of looping (re-editing cannot help)."""
+    runner.prepare_workspace()
+    (runner.workdir / AGGREGATED_CONFIG_FILENAME).write_text(
+        SNMP_BLOCK, encoding="utf-8"
+    )
+    changes = "Plan: 0 to import, 0 to add, 1 to change, 0 to destroy."
+    scripted = ScriptedSubprocess(
+        (2, changes, None),
+        (0, SECRET_PLAN_JSON, None),
+        (2, changes, None),
+        (0, SECRET_PLAN_JSON, None),  # same remediation again -> break
+    )
+    monkeypatch.setattr(terraform_runner.subprocess, "run", scripted.run)
+    outcome = runner.plan_with_generation()
+    assert outcome.has_drift is True  # surfaced as drift, not retried
+    assert [c[1] for c in scripted.calls] == [
+        "plan", "show", "plan", "show",
+    ]
+
+
+def test_reconciliation_breaks_when_nothing_is_remediable(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_change_json = json.dumps(
+        {
+            "resource_changes": [
+                {
+                    "address": "meraki_networks.n_1",
+                    "change": {
+                        "actions": ["update"],
+                        "before": {"name": "old"},
+                        "after": {"name": "new"},
+                        "before_sensitive": {},
+                        "after_sensitive": {},
+                    },
+                }
+            ]
+        }
+    )
+    runner.prepare_workspace()
+    scripted = ScriptedSubprocess(
+        (2, "Plan: 0 to import, 0 to add, 1 to change, 0 to destroy.", None),
+        (0, real_change_json, None),
+    )
+    monkeypatch.setattr(terraform_runner.subprocess, "run", scripted.run)
+    outcome = runner.plan_with_generation()
+    assert outcome.has_drift is True
+    assert outcome.dropped == {} and outcome.ignored_secrets == {}
+    assert [c[1] for c in scripted.calls] == ["plan", "show"]
+
+
+def test_validation_errors_without_addresses_still_raise(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner.prepare_workspace()
+    scripted = ScriptedSubprocess(
+        (1, "", None, "Error: Unable to find API key\n\nboom\n"),
+    )
+    monkeypatch.setattr(terraform_runner.subprocess, "run", scripted.run)
+    with pytest.raises(TerraformError, match="Unable to find API key"):
+        runner.plan_with_generation()
+
+
+def test_merged_with_earlier_keeps_prior_remediations() -> None:
+    from meraki2tf.terraform_runner import (
+        ReconciledPlanResult,
+        TerraformCommandResult,
+    )
+
+    base = TerraformCommandResult(
+        command=("terraform",), returncode=0, stdout="", stderr=""
+    )
+
+    first = ReconciledPlanResult(
+        result=base,
+        dropped={"a.b": "r1"},
+        ignored_secrets={"c.d": ("psk",)},
+        normalized={},
+    )
+    second = ReconciledPlanResult(
+        result=base, dropped={"a.b": "r2"}, ignored_secrets={},
+        normalized={"e.f": ("body",)},
+    )
+    merged = second.merged_with_earlier(first)
+    assert merged.dropped == {"a.b": "r2"}
+    assert merged.ignored_secrets == {"c.d": ("psk",)}
+    assert merged.normalized == {"e.f": ("body",)}

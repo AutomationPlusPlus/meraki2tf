@@ -101,6 +101,7 @@ def run_success(
     resources_added_to_state: Sequence[str] = (),
     coverage_percent: float | None = None,
     deletions_pending: Sequence[str] = (),
+    unmanaged_secret_attributes: Mapping[str, Sequence[str]] | None = None,
 ) -> AlertEvent:
     """Contract payload for a flawless snapshot-generation run.
 
@@ -109,8 +110,10 @@ def run_success(
     already-tracked resources, the count *and list* of unsupported
     assets (the manual DR runbook), the resources this run added to
     state (sync mode), the coverage percentage, deletions awaiting
-    confirmation, and — when the plan comparison ran — how many imports
-    are still pending aggregation into state (None when unknown).
+    confirmation, secret attributes the kit cannot carry (restore them
+    manually after a rebuild), and — when the plan comparison ran — how
+    many imports are still pending aggregation into state (None when
+    unknown).
     """
     return AlertEvent(
         event_type=EventType.RUN_SUCCESS,
@@ -132,6 +135,14 @@ def run_success(
             "resources_added_to_state": list(resources_added_to_state),
             "coverage_percent": coverage_percent,
             "deletions_pending_confirmation": list(deletions_pending),
+            "unmanaged_secret_attribute_count": sum(
+                len(attrs)
+                for attrs in (unmanaged_secret_attributes or {}).values()
+            ),
+            "unmanaged_secret_attributes": {
+                address: list(attrs)
+                for address, attrs in (unmanaged_secret_attributes or {}).items()
+            },
         },
     )
 

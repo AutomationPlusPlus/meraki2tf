@@ -33,21 +33,28 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+import dataclasses
+
 from meraki2tf.alerts import (
     AlertDispatcher,
     deletion_pending_confirmation,
     drift_detected,
     processing_fault,
     run_success,
+    unsupported_feature_flagged,
 )
 from meraki2tf.config import API_KEY_ENV_VAR, api_key_present
 from meraki2tf.coverage import build_manifest, unsupported_payload, write_manifest
-from meraki2tf.hcl_generator import GenerationReport, HclImportGenerator
+from meraki2tf.hcl_generator import (
+    GenerationReport,
+    HclImportGenerator,
+    UnsupportedAsset,
+)
 from meraki2tf.models import NetworkGraph
 from meraki2tf.providers.base import MerakiDataProvider
 from meraki2tf.terraform_runner import (
     ImportGuardViolation,
-    TerraformCommandResult,
+    ReconciledPlanResult,
     TerraformError,
     TerraformRunner,
 )
@@ -90,6 +97,16 @@ class RunSummary:
     regenerated_addresses: tuple[str, ...] = ()
     #: Share of discovered objects Terraform can rebuild, per manifest.
     coverage_percent: float = 100.0
+    #: Resources reconciliation dropped because the provider rejects its
+    #: own generated configuration (reported as unsupported).
+    reconciliation_dropped: tuple[str, ...] = ()
+    #: address → secret attributes excluded from management; the DR kit
+    #: cannot carry them, restore manually after a rebuild.
+    unmanaged_secret_attributes: dict[str, tuple[str, ...]] = dataclasses.field(
+        default_factory=dict
+    )
+    #: Resources whose generated values were normalized to match state.
+    normalized_addresses: tuple[str, ...] = ()
 
 
 class PipelineOrchestrator:
@@ -112,6 +129,9 @@ class PipelineOrchestrator:
         self._rebaseline = rebaseline
         self._sync = sync
         self._confirm_deletions = confirm_deletions
+        #: Addresses already alerted as unsupported by reconciliation
+        #: this run — regeneration re-plans must not duplicate alerts.
+        self._reconciliation_alerted: set[str] = set()
 
     def run(self, organization_id: str | None = None) -> RunSummary:
         stage = "startup"
@@ -197,6 +217,10 @@ class PipelineOrchestrator:
             added: tuple[str, ...] = ()
             apply_aborted = False
             regenerated: tuple[str, ...] = ()
+            recon_dropped: tuple[str, ...] = ()
+            unmanaged_secrets: dict[str, tuple[str, ...]] = {}
+            normalized_addresses: tuple[str, ...] = ()
+            self._reconciliation_alerted.clear()
             comparison_skipped = not api_key_present()
             if comparison_skipped:
                 # The Meraki provider needs a token to read live resources
@@ -214,6 +238,10 @@ class PipelineOrchestrator:
 
                 stage = "state comparison"
                 plan = self._runner.plan_with_generation(save_plan=self._sync)
+                stage = "plan reconciliation audit"
+                report, unsupported_details = self._report_reconciliation(
+                    plan, report
+                )
                 counts = plan.plan_counts
                 if counts is not None:
                     pending_imports = counts.imports
@@ -235,6 +263,11 @@ class PipelineOrchestrator:
                             self._handle_sync_drift(
                                 plan, graph, report, unsupported_details
                             )
+                        )
+                        # regeneration re-plans, so reconciliation may
+                        # have dropped/suppressed again — re-audit.
+                        report, unsupported_details = (
+                            self._report_reconciliation(plan, report)
                         )
                         counts = plan.plan_counts
                         if counts is not None:
@@ -258,6 +291,10 @@ class PipelineOrchestrator:
                     if added:
                         pending_imports = 0
 
+                recon_dropped = tuple(sorted(plan.dropped))
+                unmanaged_secrets = dict(sorted(plan.ignored_secrets.items()))
+                normalized_addresses = tuple(sorted(plan.normalized))
+
             stage = "coverage manifest"
             final_state = self._runner.existing_addresses()
             manifest = build_manifest(
@@ -266,6 +303,7 @@ class PipelineOrchestrator:
                 unsupported=report.unsupported,
                 state_addresses=final_state,
                 deletions_pending=deletions_pending,
+                unmanaged_secret_attributes=unmanaged_secrets,
             )
             write_manifest(manifest, self._runner.workdir)
             coverage_percent = float(manifest["coverage_percent"])
@@ -288,6 +326,7 @@ class PipelineOrchestrator:
                     resources_added_to_state=added,
                     coverage_percent=coverage_percent,
                     deletions_pending=deletions_pending,
+                    unmanaged_secret_attributes=unmanaged_secrets,
                 )
             )
             return RunSummary(
@@ -305,11 +344,78 @@ class PipelineOrchestrator:
                 deletions_removed=deletions_removed,
                 regenerated_addresses=regenerated,
                 coverage_percent=coverage_percent,
+                reconciliation_dropped=recon_dropped,
+                unmanaged_secret_attributes=unmanaged_secrets,
+                normalized_addresses=normalized_addresses,
             )
         except Exception as exc:
             logger.exception("Pipeline fault during %s.", stage)
             self._dispatcher.dispatch(processing_fault(stage=stage, error=str(exc)))
             raise PipelineError(f"Pipeline failed during {stage}: {exc}") from exc
+
+    def _report_reconciliation(
+        self, plan: ReconciledPlanResult, report: GenerationReport
+    ) -> tuple[GenerationReport, list[dict[str, Any]]]:
+        """Fold reconciliation outcomes into the coverage picture.
+
+        Resources dropped because the provider rejects its own generated
+        configuration move from *captured* to *unsupported* — they are
+        part of the manual-rebuild runbook (Cardinal Rule 2) and get the
+        mandated UNSUPPORTED_FEATURE_FLAGGED alert exactly once per run.
+        """
+        if plan.dropped:
+            dropped_assets = tuple(
+                asset for asset in report.captured if asset.address in plan.dropped
+            )
+            flagged: list[UnsupportedAsset] = []
+            for asset in dropped_assets:
+                reason = (
+                    "Provider cannot express this configuration: "
+                    f"{plan.dropped[asset.address]}"
+                )
+                identifiers = tuple(asset.import_id.split(","))
+                flagged.append(
+                    UnsupportedAsset(
+                        api_path=asset.api_path,
+                        reason=reason,
+                        identifiers=identifiers,
+                    )
+                )
+                if asset.address not in self._reconciliation_alerted:
+                    logger.error(
+                        "UNSUPPORTED FEATURE: %s (ids=%s) — %s",
+                        asset.api_path, ",".join(identifiers), reason,
+                    )
+                    self._dispatcher.dispatch(
+                        unsupported_feature_flagged(
+                            api_path=asset.api_path,
+                            reason=reason,
+                            identifiers=identifiers,
+                        )
+                    )
+                    self._reconciliation_alerted.add(asset.address)
+            report = dataclasses.replace(
+                report,
+                captured=tuple(
+                    asset
+                    for asset in report.captured
+                    if asset.address not in plan.dropped
+                ),
+                unsupported=report.unsupported + tuple(flagged),
+                imports_written=report.imports_written
+                - sum(1 for asset in dropped_assets if not asset.already_in_state),
+            )
+        if plan.ignored_secrets:
+            logger.warning(
+                "%d resource(s) hold secret attributes the DR kit cannot "
+                "carry (%s); restore them manually after any rebuild.",
+                len(plan.ignored_secrets),
+                "; ".join(
+                    f"{address}: {', '.join(attrs)}"
+                    for address, attrs in sorted(plan.ignored_secrets.items())
+                ),
+            )
+        return report, unsupported_payload(report.unsupported)
 
     def _review_deletions(
         self, existing: frozenset[str], report: GenerationReport
@@ -348,11 +454,11 @@ class PipelineOrchestrator:
 
     def _handle_sync_drift(
         self,
-        plan: TerraformCommandResult,
+        plan: ReconciledPlanResult,
         graph: NetworkGraph,
         report: GenerationReport,
         unsupported_details: list[dict[str, Any]],
-    ) -> tuple[TerraformCommandResult, GenerationReport, tuple[str, ...], bool]:
+    ) -> tuple[ReconciledPlanResult, GenerationReport, tuple[str, ...], bool]:
         """DR-mode drift decision: regenerate modified objects, abort the rest.
 
         Meraki is the source of truth, so purely *modified* objects get
@@ -417,7 +523,9 @@ class PipelineOrchestrator:
         report = self._generator.generate(
             graph, self._runner.workdir, existing_addresses=refreshed, audit=False
         )
-        plan = self._runner.plan_with_generation(save_plan=True)
+        plan = self._runner.plan_with_generation(save_plan=True).merged_with_earlier(
+            plan
+        )
         if plan.has_drift:
             logger.error(
                 "Drift persists after baseline regeneration; aborting the "

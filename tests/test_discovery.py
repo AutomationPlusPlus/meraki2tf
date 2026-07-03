@@ -9,6 +9,7 @@ import pytest
 from meraki2tf.openapi_parser import OpenApiParser
 from meraki2tf.providers.discovery import (
     FeatureSectionMatcher,
+    _collection_id_key,
     config_collection_operations,
     element_id,
     expand_endpoint_payload,
@@ -72,6 +73,90 @@ def test_item_operation_prefers_get_then_any_mutating_verb(
     assert item_operation_for(parser, syslog) is None
 
 
+def test_element_id_derives_collection_keyed_field(tmp_path: Path) -> None:
+    """A generic {id} placeholder still finds `<singular>Id` elements
+    (adaptive policy groups carry groupId, not id)."""
+    parser = _write_spec(
+        tmp_path,
+        {
+            "/organizations/{organizationId}/adaptivePolicy/groups": {
+                "get": {"operationId": "getGroups", "tags": ["organizations"]},
+                "post": {"operationId": "createGroup", "tags": ["organizations"]},
+            },
+            "/organizations/{organizationId}/adaptivePolicy/groups/{id}": {
+                "get": {"operationId": "getGroup", "tags": ["organizations"]},
+                "put": {"operationId": "updateGroup", "tags": ["organizations"]},
+            },
+        },
+    )
+    collection = _get_op(
+        parser, "/organizations/{organizationId}/adaptivePolicy/groups"
+    )
+    item = item_operation_for(parser, collection)
+    assert item is not None
+    assert element_id(item, {"groupId": "3661426497", "name": "x"}) == "3661426497"
+    # The endpoint's own placeholder and conventional fields still win.
+    assert element_id(item, {"id": "direct", "groupId": "later"}) == "direct"
+
+
+def test_unidentifiable_elements_surface_as_collection_assets(
+    tmp_path: Path,
+) -> None:
+    """Discovered objects without an ID are never dropped silently; they
+    are recorded at the collection path so the unsupported-asset audit
+    reports them (coverage manifest + alerts)."""
+    parser = _write_spec(
+        tmp_path,
+        {
+            "/organizations/{organizationId}/adaptivePolicy/groups": {
+                "get": {"operationId": "getGroups", "tags": ["organizations"]},
+                "post": {"operationId": "createGroup", "tags": ["organizations"]},
+            },
+            "/organizations/{organizationId}/adaptivePolicy/groups/{id}": {
+                "get": {"operationId": "getGroup", "tags": ["organizations"]},
+                "put": {"operationId": "updateGroup", "tags": ["organizations"]},
+            },
+        },
+    )
+    op = _get_op(parser, "/organizations/{organizationId}/adaptivePolicy/groups")
+    assets = expand_endpoint_payload(
+        parser, op, "1234567", [{"name": "no-id-here"}, {"groupId": "42424242"}]
+    )
+    assert len(assets) == 2
+    unidentifiable, identified = assets
+    assert unidentifiable.api_path == op.path
+    assert unidentifiable.path_values == ("1234567",)
+    assert unidentifiable.payload == {"name": "no-id-here"}
+    assert identified.path_values == ("1234567", "42424242")
+
+
+def test_collection_id_key_shapes_and_guards(tmp_path: Path) -> None:
+    """Derived <singular>Id fields handle plural forms; non-item and
+    parameter-only shapes derive nothing."""
+    parser = _write_spec(
+        tmp_path,
+        {
+            "/organizations/{organizationId}/adaptivePolicy/policies/{id}": {
+                "get": {"operationId": "getPolicy", "tags": ["organizations"]},
+            },
+            "/networks/{networkId}/appliance/trafficShaping": {
+                "get": {"operationId": "getShaping", "tags": ["appliance"]},
+            },
+            "/organizations/{organizationId}/{itemId}": {
+                "get": {"operationId": "getOpaque", "tags": ["organizations"]},
+            },
+        },
+    )
+    policy = _get_op(
+        parser, "/organizations/{organizationId}/adaptivePolicy/policies/{id}"
+    )
+    assert _collection_id_key(policy) == "policyId"  # ies -> y
+    shaping = _get_op(parser, "/networks/{networkId}/appliance/trafficShaping")
+    assert _collection_id_key(shaping) is None  # not an item path
+    opaque = _get_op(parser, "/organizations/{organizationId}/{itemId}")
+    assert _collection_id_key(opaque) is None  # collection segment is a param
+
+
 def test_element_id_uses_param_name_then_fallbacks(parser: OpenApiParser) -> None:
     vlan_item = next(
         op for op in parser.endpoints()
@@ -96,7 +181,11 @@ def test_expand_endpoint_payload_shapes(parser: OpenApiParser) -> None:
     )
     assert [(f.api_path, f.path_values) for f in expanded] == [
         ("/networks/{networkId}/appliance/vlans/{vlanId}", ("N_1", "10")),
+        # Unidentifiable elements surface at the collection path (they
+        # become unsupported-asset coverage entries, never dropped).
+        ("/networks/{networkId}/appliance/vlans", ("N_1",)),
     ]
+    assert expanded[1].payload == {"nameless": True}
 
     shaping = _get_op(parser, "/networks/{networkId}/appliance/trafficShaping")
     singleton = expand_endpoint_payload(parser, shaping, "N_1", {"limitUp": 0})

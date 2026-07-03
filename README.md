@@ -34,13 +34,19 @@ ever apply anything is the explicit, human-invoked
 with every dashboard release. Instead of maintaining a brittle
 hand-written table from API endpoints to Terraform resources, meraki2tf
 ingests the official Meraki OpenAPI JSON document at runtime and derives
-everything from its structure: which paths are resource entities, what
-each one's `CiscoDevNet/meraki` resource name is, and which ordered path
-parameters (`{organizationId}`, `{networkId}`, `{vlanId}`, …) compose
-the comma-separated compound import IDs Terraform needs. Point the tool
-at a newer spec release and new endpoints are picked up with zero code
-changes; anything the provider cannot express is flagged through the
-exception auditor instead of silently dropped.
+the resource entities and their ordered path parameters
+(`{organizationId}`, `{networkId}`, `{vlanId}`, …) from its structure.
+Each entity is then **matched against the installed
+`CiscoDevNet/meraki` provider's own resource identity schemas**
+(`terraform providers schema -json`, cached per workdir with a bundled
+fallback for air-gapped runs), which yields the authoritative resource
+type names (`meraki_appliance_vlan`) and the comma-separated compound
+import IDs Terraform needs — including the provider's conventions of
+prefixing the organization ID where the identity demands it and
+supplying a literal `false` for `force_delete` identities. Point the
+tool at a newer spec release or provider version and new endpoints are
+picked up with zero code changes; anything the provider cannot express
+is flagged through the exception auditor instead of silently dropped.
 
 ## Prerequisites & Installation
 
@@ -231,7 +237,7 @@ Each run leaves a complete rebuild kit in `--workdir`:
 | `resources.tf` | meraki2tf (accumulated from `terraform plan -generate-config-out`) | Full HCL configuration for every captured asset — the actual rebuild material and the drift-comparison baseline |
 | `generated_resources.tf` | terraform (transient) | Freshly generated config for new imports; folded into `resources.tf` after every plan |
 | `coverage.json` / `coverage.txt` | meraki2tf | Per-run coverage manifest: every discovered object with status `imported`, `pending-import`, or `unsupported` (with reason), plus totals and a coverage percentage |
-| `terraform.tfstate` | terraform (`--sync` runs, `--rebuild --confirm`, or a manual apply) | State tracking, once the resources are adopted |
+| `meraki2tf.tfstate` | terraform (`--sync` runs, `--rebuild --confirm`, or a manual apply) | State tracking, once the resources are adopted |
 
 Back up the workdir (and ideally a `--dump-to` snapshot) somewhere that
 survives the disaster you are protecting against.
@@ -256,6 +262,16 @@ own summary is also reported: pending imports (discovered but not yet
 aggregated into state) versus real add/change/destroy pressure, which
 fires `DRIFT_DETECTED`. By default the plan stays speculative — nothing
 is applied unless you opt into `--sync`.
+
+The comparison also **reconciles provider round-trip artifacts** before
+judging drift (see `docs/ARCHITECTURE.md`, *Plan Reconciliation*):
+configurations the provider itself refuses to accept are dropped and
+reported `unsupported`; secret attributes the generated config cannot
+carry (Wi-Fi PSKs, SNMP community strings, …) are excluded from
+management and listed as `unmanaged_secret_attributes` in the manifest
+and the success notification — **restore those manually after any
+rebuild**; formatting-only differences are normalized away. Only real
+changes ever fire `DRIFT_DETECTED`.
 
 ### Scheduled DR automation (`--sync`)
 
@@ -339,7 +355,7 @@ Terraform cannot import something that is gone. Adjust the kit first:
 1. Copy the workdir to a fresh directory (keep the original as backup).
 2. Delete `imports.tf` (or just the blocks for destroyed resources) so
    Terraform **creates** instead of imports.
-3. Start from an empty state (delete/relocate `terraform.tfstate` if
+3. Start from an empty state (delete/relocate `meraki2tf.tfstate` if
    the old one references destroyed resources).
 4. `terraform init && terraform plan && terraform apply`.
 
@@ -370,7 +386,7 @@ Quick reference (each flag is described in detail below):
 | `--confirm-deletions` | off | Human confirmation to remove Meraki-deleted resources from the kit and state |
 | `--fail-on-gaps` | off | Exit 3 when unsupported (uncoverable) objects exist — CI coverage gate |
 | `--workdir DIR` | `generated` | Terraform execution workspace |
-| `--state-file PATH` | `<workdir>/terraform.tfstate` | Terraform state to aggregate into across runs |
+| `--state-file PATH` | `<workdir>/meraki2tf.tfstate` | Terraform state to aggregate into across runs |
 | `--webhook-url URL` | — | Webhook alert endpoint (repeatable) |
 | `--alert-email ADDR` | — | Email alert recipient (repeatable) |
 | `--smtp-host` / `--smtp-port` | `localhost` / `25` | SMTP relay for email alerts |
@@ -496,8 +512,14 @@ redacted at every level, so verbose is safe for shared logs.
 State is stored via Terraform's **local backend** at the path anchored
 in the generated `provider.tf`:
 
-- **Default**: `terraform.tfstate` inside `--workdir` (e.g.
-  `generated/terraform.tfstate`).
+- **Default**: `meraki2tf.tfstate` inside `--workdir` (e.g.
+  `generated/meraki2tf.tfstate`). The name is deliberately not
+  `terraform.tfstate`: `terraform init` treats a file of that exact name
+  next to the configuration as pre-backend legacy state and empties it
+  during backend initialization, which would destroy the accumulated
+  imports. A legacy `terraform.tfstate` from older meraki2tf versions is
+  adopted (renamed) automatically, and `--state-file` refuses that
+  filename inside the workdir.
 - **Custom location**: pass `--state-file /path/to/existing.tfstate` to
   point at a state file you already have — parent directories are
   created as needed.
@@ -553,7 +575,7 @@ environment itself.
 | Event | Trigger |
 | --- | --- |
 | `DRIFT_DETECTED` | The speculative plan found real changes (add/change/destroy) on tracked resources — pending imports alone don't count. Payload carries the diff, the unsupported list, `apply_aborted` (true when a `--sync` auto-apply was refused), and `regenerated_addresses` (modified objects re-baselined in sync mode) |
-| `RUN_SUCCESS` | Snapshot generation (and comparison, when an API key was available) completed flawlessly. Payload carries the coverage picture: `discovered_assets`, `imports_written`, `imports_already_tracked`, `unsupported_count` plus the full `unsupported` list, `pending_imports` (imports the plan reports as not yet in state; `null` when unknown), `comparison_performed`, `resources_added_to_state` (sync mode), `coverage_percent`, and `deletions_pending_confirmation` |
+| `RUN_SUCCESS` | Snapshot generation (and comparison, when an API key was available) completed flawlessly. Payload carries the coverage picture: `discovered_assets`, `imports_written`, `imports_already_tracked`, `unsupported_count` plus the full `unsupported` list, `pending_imports` (imports the plan reports as not yet in state; `null` when unknown), `comparison_performed`, `resources_added_to_state` (sync mode), `coverage_percent`, `deletions_pending_confirmation`, and `unmanaged_secret_attributes` (secrets the kit cannot carry — restore manually after a rebuild) |
 | `UNSUPPORTED_FEATURE_FLAGGED` | A discovered asset cannot be mapped to a Terraform resource |
 | `DELETION_PENDING_CONFIRMATION` | Resources tracked in the DR kit were not found in Meraki (deleted?); they stay in the kit until a human confirms with `--confirm-deletions` |
 | `PROCESSING_FAULT` | A critical pipeline failure (payload carries the failing stage) |

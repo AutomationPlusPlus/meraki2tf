@@ -24,28 +24,61 @@ reports which resource addresses the state already tracks, so upstream
 generation skips re-importing them.
 
 Security: the Meraki token never touches disk — the provider block is
-written credential-free and the ``meraki`` Terraform provider reads
-``MERAKI_DASHBOARD_API_KEY`` from the process environment on its own.
+written credential-free. The ``CiscoDevNet/meraki`` Terraform provider
+reads its credential from ``MERAKI_API_KEY``, so every terraform
+subprocess is launched with that variable injected from meraki2tf's own
+``MERAKI_DASHBOARD_API_KEY`` (an explicitly set ``MERAKI_API_KEY`` is
+respected and never overridden).
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import subprocess
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from .config import API_KEY_ENV_VAR
+from .plan_reconciler import (
+    ReconciliationPlan,
+    apply_remediations,
+    classify_plan,
+    drop_import_blocks,
+    drop_resource_blocks,
+    hcl_quote,
+    validation_failures,
+)
+
+if TYPE_CHECKING:  # pragma: no cover - import cycle guard, types only
+    from meraki2tf.provider_catalog import ProviderCatalog
 
 logger = logging.getLogger(__name__)
+
+#: Environment variable the ``CiscoDevNet/meraki`` Terraform provider
+#: reads its credential from. Distinct from meraki2tf's own
+#: ``MERAKI_DASHBOARD_API_KEY`` (the Meraki SDK convention), so the
+#: runner bridges the two at subprocess launch.
+PROVIDER_API_KEY_ENV_VAR = "MERAKI_API_KEY"
 
 PROVIDER_FILENAME = "provider.tf"
 GENERATED_CONFIG_FILENAME = "generated_resources.tf"
 #: Persistent accumulated configuration: every plan's freshly generated
 #: config is folded in here, so resources keep their HCL across runs.
 AGGREGATED_CONFIG_FILENAME = "resources.tf"
-DEFAULT_STATE_FILENAME = "terraform.tfstate"
+#: The state must NOT be named ``terraform.tfstate`` inside the
+#: workspace: ``terraform init`` treats a file of exactly that name
+#: next to the configuration as pre-backend *legacy state* and
+#: "migrates" it — emptying the file — whenever the backend cache is
+#: absent or ``-reconfigure`` is used. Live-tested: that destroyed a
+#: fully imported state on the second sync run.
+DEFAULT_STATE_FILENAME = "meraki2tf.tfstate"
+#: Terraform's legacy default state name; see DEFAULT_STATE_FILENAME.
+LEGACY_STATE_FILENAME = "terraform.tfstate"
 #: Saved plan file for the sync-mode guard: the plan verified as
 #: import-only is the exact plan that gets applied.
 SYNC_PLAN_FILENAME = "meraki2tf-sync.tfplan"
@@ -62,13 +95,19 @@ terraform {{
   required_providers {{
     meraki = {{
       source = "CiscoDevNet/meraki"
+      # Resource identity schemas (the resource-matching ground truth)
+      # ship from 1.12.0 onward.
+      version = ">= 1.12.0"
     }}
   }}
 }}
 
 provider "meraki" {{
-  # Credentials are read from the MERAKI_DASHBOARD_API_KEY environment
-  # variable by the provider itself and are never written to disk.
+  # Credentials are never written to disk. The provider reads the
+  # MERAKI_API_KEY environment variable; meraki2tf injects it into every
+  # terraform subprocess from its own MERAKI_DASHBOARD_API_KEY. When
+  # running terraform manually in this workspace, export MERAKI_API_KEY
+  # (or set it from MERAKI_DASHBOARD_API_KEY) yourself.
 }}
 """
 
@@ -105,17 +144,34 @@ class ImportGuardViolation(TerraformError):
         self.plan_output = plan_output
 
 
-def _hcl_quote(value: str) -> str:
-    """Escape a raw value for interpolation into a quoted HCL literal."""
-    return (
-        value.replace("\\", "\\\\")
-        .replace('"', '\\"')
-        .replace("\n", "\\n")
-        .replace("\r", "\\r")
-        .replace("\t", "\\t")
-        .replace("${", "$${")
-        .replace("%{", "%%{")
-    )
+#: HCL escaping lives with the reconciler's file surgery now; the alias
+#: keeps this module's provider.tf templating (and its tests) intact.
+_hcl_quote = hcl_quote
+
+
+def _attr_pairs(
+    kind: str, mapping: dict[str, tuple[str, ...]]
+) -> set[tuple[str, str, str]]:
+    """(kind, address, attribute) triples for progress comparison.
+
+    Progress is tracked per attribute, not per address: a second
+    reconciliation pass that touches a *new* attribute of an
+    already-edited resource is progress; re-proposing an
+    already-applied edit is not.
+    """
+    return {
+        (kind, address, attr)
+        for address, attrs in mapping.items()
+        for attr in attrs
+    }
+
+
+def _merge_attr_map(
+    into: dict[str, tuple[str, ...]], new: dict[str, tuple[str, ...]]
+) -> None:
+    """Merge attribute tuples per address (sorted, deduplicated)."""
+    for address, attrs in new.items():
+        into[address] = tuple(sorted({*into.get(address, ()), *attrs}))
 
 
 @dataclass(frozen=True)
@@ -180,6 +236,57 @@ class TerraformCommandResult:
         return counts.has_real_changes
 
 
+@dataclass(frozen=True)
+class ReconciledPlanResult:
+    """A generation plan plus everything reconciliation did to converge it.
+
+    Exposes the same read surface as :class:`TerraformCommandResult`
+    (``has_changes``/``has_drift``/``plan_counts``/``stdout``), so plan
+    consumers are agnostic to whether reconciliation ran.
+    """
+
+    result: TerraformCommandResult
+    #: Resources dropped from the kit because the provider's own
+    #: validators reject the configuration terraform generated for
+    #: them: address → operator-facing reason. These must be reported
+    #: as unsupported (Cardinal Rule 2).
+    dropped: dict[str, str]
+    #: Secret attributes now excluded from management per resource —
+    #: the DR kit cannot carry them; restore manually after a rebuild.
+    ignored_secrets: dict[str, tuple[str, ...]]
+    #: Attributes rewritten/injected to match state byte-for-byte.
+    normalized: dict[str, tuple[str, ...]]
+
+    @property
+    def has_changes(self) -> bool:
+        return self.result.has_changes
+
+    @property
+    def plan_counts(self) -> PlanCounts | None:
+        return self.result.plan_counts
+
+    @property
+    def has_drift(self) -> bool:
+        return self.result.has_drift
+
+    @property
+    def stdout(self) -> str:
+        return self.result.stdout
+
+    def merged_with_earlier(self, earlier: "ReconciledPlanResult") -> (
+        "ReconciledPlanResult"
+    ):
+        """This plan's outcome, keeping remediations an earlier pass in
+        the same run already applied (their diffs are suppressed now,
+        so this pass alone would under-report them)."""
+        return ReconciledPlanResult(
+            result=self.result,
+            dropped={**earlier.dropped, **self.dropped},
+            ignored_secrets={**earlier.ignored_secrets, **self.ignored_secrets},
+            normalized={**earlier.normalized, **self.normalized},
+        )
+
+
 class TerraformRunner:
     """Drives the local ``terraform`` binary inside a managed workspace."""
 
@@ -191,9 +298,18 @@ class TerraformRunner:
     ) -> None:
         self._workdir = workdir
         self._executable = executable
+        self._default_state = state_path is None
         self._state_path = (
             state_path if state_path is not None else workdir / DEFAULT_STATE_FILENAME
         ).resolve()
+        if self._state_path == (workdir / LEGACY_STATE_FILENAME).resolve():
+            raise TerraformError(
+                f"--state-file must not be named {LEGACY_STATE_FILENAME} "
+                "inside the workspace directory: terraform init treats "
+                "that exact file as legacy state and empties it during "
+                "backend initialization. Choose another name or location "
+                f"(default: {DEFAULT_STATE_FILENAME} in the workdir)."
+            )
 
     @property
     def workdir(self) -> Path:
@@ -207,6 +323,7 @@ class TerraformRunner:
         """Create the execution directory and anchor provider + state backend."""
         self._workdir.mkdir(parents=True, exist_ok=True)
         self._state_path.parent.mkdir(parents=True, exist_ok=True)
+        self._adopt_legacy_state()
         provider_file = self._workdir / PROVIDER_FILENAME
         provider_file.write_text(
             _PROVIDER_TF_TEMPLATE.format(state_path=_hcl_quote(str(self._state_path))),
@@ -223,6 +340,32 @@ class TerraformRunner:
             )
         logger.debug("Workspace prepared at %s", self._workdir)
         return provider_file
+
+    def _adopt_legacy_state(self) -> None:
+        """Rescue state from the old default location.
+
+        Earlier meraki2tf versions kept the state at
+        ``<workdir>/terraform.tfstate`` — the exact filename terraform's
+        legacy-state migration destroys (see DEFAULT_STATE_FILENAME).
+        When the current default location is empty and the legacy file
+        holds a non-empty state, move it so accumulated imports survive
+        the upgrade.
+        """
+        if not self._default_state:
+            return
+        legacy = self._workdir / LEGACY_STATE_FILENAME
+        if (
+            legacy.exists()
+            and legacy.stat().st_size > 0
+            and not self._state_path.exists()
+        ):
+            legacy.rename(self._state_path)
+            logger.info(
+                "Adopted legacy state file %s as %s (terraform init "
+                "would destroy state stored under the legacy name).",
+                legacy,
+                self._state_path,
+            )
 
     def existing_addresses(self) -> frozenset[str]:
         """Resource addresses (``type.name``) already tracked in the state.
@@ -257,31 +400,170 @@ class TerraformRunner:
         # differs from a previous run in the same workspace.
         return self._run("init", "-input=false", "-no-color", "-reconfigure")
 
-    def plan_with_generation(self, save_plan: bool = False) -> TerraformCommandResult:
-        """Speculative check: plan imports and generate missing config.
+    def provider_schema_catalog(self) -> "ProviderCatalog":
+        """Identity-schema catalog of the provider terraform installed.
+
+        Requires an initialized workspace (:meth:`init`). This is the
+        authoritative source for resource matching: the catalog always
+        reflects the provider version terraform actually selected.
+        """
+        from meraki2tf.provider_catalog import ProviderCatalog
+
+        result = self._run("providers", "schema", "-json")
+        try:
+            document = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise TerraformError(
+                f"terraform providers schema produced unparseable output: {exc}"
+            ) from exc
+        if not isinstance(document, dict):
+            raise TerraformError(
+                "terraform providers schema produced a non-object document."
+            )
+        return ProviderCatalog.from_schema_document(document)
+
+    #: Plan invocations one generation call may spend converging: one
+    #: for validation drops, one for change remediation, one to verify.
+    #: Runaway backstop for the reconciliation loop. Every iteration
+    #: must make progress (drop a rejected resource or apply a new
+    #: remediation) or the loop breaks on its own; the cap only guards
+    #: against pathological plan behavior. Real runs need up to ~4
+    #: passes: terraform reports validation errors piecemeal, so two
+    #: drop rounds can precede the classify + verify rounds.
+    _MAX_PLAN_ATTEMPTS = 10
+
+    def plan_with_generation(
+        self, save_plan: bool = False, reconcile: bool = True
+    ) -> ReconciledPlanResult:
+        """Speculative check: plan imports, generate missing config, and
+        reconcile provider round-trip artifacts (see plan_reconciler).
 
         Returns with ``has_changes`` reflecting the ``-detailed-exitcode``
-        contract (0 = state in sync, 2 = delta present). With
-        ``save_plan`` the plan is also written to the sync plan file so
-        :meth:`plan_resource_actions` can classify it per resource.
+        contract (0 = state in sync, 2 = delta present). The plan is
+        always saved to the sync plan file (reconciliation classifies it
+        via ``show -json``; sync mode re-verifies its own fresh plan
+        before applying regardless). Bounded loop: at most
+        ``_MAX_PLAN_ATTEMPTS`` plan invocations — remaining changes after
+        that are reported as drift, never looped on.
         """
-        # terraform refuses to overwrite an existing generation target;
-        # a leftover file from an interrupted run is absorbed first.
-        self._absorb_generated_config()
-        args = [
+        dropped: dict[str, str] = {}
+        ignored: dict[str, tuple[str, ...]] = {}
+        normalized: dict[str, tuple[str, ...]] = {}
+        args = (
             "plan",
             "-input=false",
             "-no-color",
             "-detailed-exitcode",
             f"-generate-config-out={GENERATED_CONFIG_FILENAME}",
-        ]
-        if save_plan:
-            args.append(f"-out={SYNC_PLAN_FILENAME}")
-        result = self._run(
-            *args, allowed=(_PLAN_NO_CHANGES, _PLAN_CHANGES_PRESENT)
+            f"-out={SYNC_PLAN_FILENAME}",
         )
-        self._absorb_generated_config()
-        return result
+        allowed = (
+            (_PLAN_NO_CHANGES, _PLAN_ERROR, _PLAN_CHANGES_PRESENT)
+            if reconcile
+            else (_PLAN_NO_CHANGES, _PLAN_CHANGES_PRESENT)
+        )
+        attempt = 0
+        while True:
+            attempt += 1
+            # terraform refuses to overwrite an existing generation
+            # target; leftovers (interrupted or prior iteration) are
+            # absorbed first so surgery always edits resources.tf.
+            self._absorb_generated_config()
+            result = self._run(*args, allowed=allowed)
+            self._absorb_generated_config()
+            final_attempt = attempt >= self._MAX_PLAN_ATTEMPTS
+            if result.returncode == _PLAN_ERROR:
+                failures = validation_failures(
+                    result.stderr or result.stdout
+                )
+                if not failures or final_attempt:
+                    raise TerraformError(
+                        f"terraform plan failed with exit code "
+                        f"{result.returncode}: "
+                        f"{result.stderr.strip() or result.stdout.strip()}"
+                    )
+                self._drop_unexpressible(failures)
+                dropped.update(failures)
+                continue
+            if not reconcile or not result.has_drift or final_attempt:
+                # import-only plans are healthy snapshot growth; only
+                # real add/change/destroy pressure warrants classifying.
+                break
+            reconciliation = classify_plan(self._show_plan_document())
+            if not reconciliation.has_remediations:
+                break
+            new_ignored, new_normalized = apply_remediations(
+                self._workdir,
+                reconciliation,
+                (GENERATED_CONFIG_FILENAME, AGGREGATED_CONFIG_FILENAME),
+            )
+            proposed = _attr_pairs("ignore", new_ignored) | _attr_pairs(
+                "normalize", new_normalized
+            )
+            applied = _attr_pairs("ignore", ignored) | _attr_pairs(
+                "normalize", normalized
+            )
+            if not proposed - applied:
+                # Every proposed (address, attribute) remediation was
+                # applied before yet the diff persists — re-editing
+                # would loop forever, so surface it as drift instead.
+                logger.warning(
+                    "Reconciliation made no further progress; reporting "
+                    "the remaining plan changes as drift."
+                )
+                break
+            _merge_attr_map(ignored, new_ignored)
+            _merge_attr_map(normalized, new_normalized)
+            self._log_reconciliation(reconciliation, new_ignored, new_normalized)
+        return ReconciledPlanResult(
+            result=result,
+            dropped=dropped,
+            ignored_secrets=ignored,
+            normalized=normalized,
+        )
+
+    def _drop_unexpressible(self, failures: dict[str, str]) -> None:
+        """Remove kit artifacts for resources the provider rejects.
+
+        The provider's validators refused the configuration generated
+        from its own Read (e.g. enum case the API does not emit) — the
+        resource cannot round-trip, so it leaves the kit and is
+        reported as unsupported by the orchestrator.
+        """
+        addresses = set(failures)
+        logger.warning(
+            "Dropping %d resource(s) whose generated configuration the "
+            "provider itself rejects: %s",
+            len(addresses), ", ".join(sorted(addresses)),
+        )
+        drop_resource_blocks(
+            (
+                self._workdir / GENERATED_CONFIG_FILENAME,
+                self._workdir / AGGREGATED_CONFIG_FILENAME,
+            ),
+            addresses,
+        )
+        from meraki2tf.hcl_generator import IMPORTS_FILENAME
+
+        drop_import_blocks(self._workdir / IMPORTS_FILENAME, addresses)
+
+    @staticmethod
+    def _log_reconciliation(
+        plan: ReconciliationPlan,
+        ignored: dict[str, tuple[str, ...]],
+        normalized: dict[str, tuple[str, ...]],
+    ) -> None:
+        logger.info(
+            "Plan reconciliation: %d secret attribute set(s) marked "
+            "unmanaged, %d resource(s) normalized to state values%s.",
+            len(ignored),
+            len(normalized),
+            (
+                f"; {len(plan.real_changes)} real change(s) left as drift"
+                if plan.real_changes
+                else ""
+            ),
+        )
 
     def plan_resource_actions(self) -> dict[str, tuple[str, ...]]:
         """Per-resource actions from the saved sync plan (``show -json``).
@@ -291,13 +573,7 @@ class TerraformRunner:
         modified objects (Meraki is truth → baseline regeneration) from
         anything else (abort and alert).
         """
-        result = self._run("show", "-json", SYNC_PLAN_FILENAME)
-        try:
-            document = json.loads(result.stdout)
-        except json.JSONDecodeError as exc:
-            raise TerraformError(
-                f"terraform show -json produced unparseable output: {exc}"
-            ) from exc
+        document = self._show_plan_document()
         actions: dict[str, tuple[str, ...]] = {}
         changes = document.get("resource_changes") if isinstance(document, dict) else None
         for change in changes or ():
@@ -307,6 +583,20 @@ class TerraformRunner:
             raw = change_body.get("actions", ()) if isinstance(change_body, dict) else ()
             actions[str(change["address"])] = tuple(str(action) for action in raw)
         return actions
+
+    def _show_plan_document(self) -> Any:
+        """The saved sync plan rendered as a JSON document.
+
+        Consumers guard the document shape themselves (an unexpected
+        non-object tolerantly classifies as "nothing to act on").
+        """
+        result = self._run("show", "-json", SYNC_PLAN_FILENAME)
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise TerraformError(
+                f"terraform show -json produced unparseable output: {exc}"
+            ) from exc
 
     def apply_import_plan(self) -> tuple[str, ...]:
         """Guarded sync-mode apply: grow the state, never touch Meraki.
@@ -497,6 +787,23 @@ class TerraformRunner:
         """
         return self._run("apply", "-input=false", "-no-color", "-auto-approve")
 
+    @staticmethod
+    def _subprocess_env() -> dict[str, str]:
+        """Environment for terraform subprocesses.
+
+        The ``CiscoDevNet/meraki`` provider authenticates via
+        ``MERAKI_API_KEY``, while meraki2tf follows the Meraki SDK
+        convention of ``MERAKI_DASHBOARD_API_KEY``. Bridge the two so
+        the speculative plan and guarded applies can authenticate,
+        keeping the credential out of every file the runner writes. An
+        explicitly set ``MERAKI_API_KEY`` always wins.
+        """
+        env = dict(os.environ)
+        dashboard_key = env.get(API_KEY_ENV_VAR, "").strip()
+        if dashboard_key and not env.get(PROVIDER_API_KEY_ENV_VAR, "").strip():
+            env[PROVIDER_API_KEY_ENV_VAR] = dashboard_key
+        return env
+
     def _run(
         self, *args: str, allowed: tuple[int, ...] = (0,)
     ) -> TerraformCommandResult:
@@ -508,6 +815,7 @@ class TerraformRunner:
             capture_output=True,
             text=True,
             check=False,
+            env=self._subprocess_env(),
         )
         if completed.stdout:
             logger.debug("terraform %s stdout:\n%s", args[0], completed.stdout)

@@ -14,6 +14,7 @@ from meraki2tf.orchestrator import PipelineError, PipelineOrchestrator
 from meraki2tf.providers.base import MerakiDataProvider
 from meraki2tf.terraform_runner import (
     ImportGuardViolation,
+    ReconciledPlanResult,
     TerraformCommandResult,
     TerraformError,
 )
@@ -114,6 +115,10 @@ class StubRunner:
         self.config_baseline = True
         self.state_addresses: set[str] = set()
         self.removed: list[tuple[str, ...]] = []
+        #: Reconciliation outcomes every plan_with_generation reports.
+        self.reconciliation_dropped: dict[str, str] = {}
+        self.reconciliation_secrets: dict[str, tuple[str, ...]] = {}
+        self.reconciliation_normalized: dict[str, tuple[str, ...]] = {}
 
     def prepare_workspace(self) -> Path:
         return self.workdir
@@ -137,11 +142,18 @@ class StubRunner:
             command=("terraform",), returncode=0, stdout="", stderr=""
         )
 
-    def plan_with_generation(self, save_plan: bool = False) -> TerraformCommandResult:
+    def plan_with_generation(
+        self, save_plan: bool = False, reconcile: bool = True
+    ) -> ReconciledPlanResult:
         self.plan_calls.append(save_plan)
         code, stdout = self.plans[0] if len(self.plans) == 1 else self.plans.pop(0)
-        return TerraformCommandResult(
-            command=("terraform",), returncode=code, stdout=stdout, stderr=""
+        return ReconciledPlanResult(
+            result=TerraformCommandResult(
+                command=("terraform",), returncode=code, stdout=stdout, stderr=""
+            ),
+            dropped=dict(self.reconciliation_dropped),
+            ignored_secrets=dict(self.reconciliation_secrets),
+            normalized=dict(self.reconciliation_normalized),
         )
 
     def plan_resource_actions(self) -> dict[str, tuple[str, ...]]:
@@ -652,3 +664,83 @@ def test_coverage_manifest_written_for_keyless_runs(
     orchestrator.run("org-123")
     assert (tmp_path / COVERAGE_JSON_FILENAME).exists()
     assert (tmp_path / COVERAGE_SUMMARY_FILENAME).exists()
+
+
+def test_reconciliation_drops_become_unsupported_with_alert(
+    tmp_path: Path, api_key: None
+) -> None:
+    """Resources the provider rejects move captured → unsupported, fire
+    the mandated alert once, and leave the coverage manifest honest."""
+    orchestrator, recorder, _, runner = _orchestrator(
+        tmp_path,
+        plan_exit=2,
+        plan_stdout="Plan: 1 to import, 0 to add, 0 to change, 0 to destroy.",
+    )
+    runner.reconciliation_dropped = {
+        "meraki_networks.n_1": "Invalid Attribute Value Match: got Mon"
+    }
+    summary = orchestrator.run("org-123")
+
+    assert summary.reconciliation_dropped == ("meraki_networks.n_1",)
+    assert summary.unsupported_count == 1
+    assert summary.imports_written == 1  # the dropped import no longer counts
+    flagged = [
+        e for e in recorder.events
+        if e.event_type is EventType.UNSUPPORTED_FEATURE_FLAGGED
+    ]
+    assert len(flagged) == 1
+    assert "Provider cannot express this configuration" in flagged[0].details[
+        "reason"
+    ]
+    manifest = json.loads(
+        (tmp_path / COVERAGE_JSON_FILENAME).read_text(encoding="utf-8")
+    )
+    by_status = {}
+    for entry in manifest["objects"]:
+        by_status.setdefault(entry["status"], []).append(
+            entry.get("address", entry["api_path"])
+        )
+    assert "meraki_networks.n_1" not in by_status.get("pending-import", [])
+    assert manifest["totals"]["unsupported"] == 1
+    success = [
+        e for e in recorder.events if e.event_type is EventType.RUN_SUCCESS
+    ][0]
+    assert success.details["unsupported_count"] == 1
+
+
+def test_unmanaged_secrets_reach_summary_manifest_and_notification(
+    tmp_path: Path, api_key: None
+) -> None:
+    orchestrator, recorder, _, runner = _orchestrator(
+        tmp_path,
+        plan_exit=2,
+        plan_stdout="Plan: 2 to import, 0 to add, 0 to change, 0 to destroy.",
+    )
+    runner.reconciliation_secrets = {"meraki_devices.q2ab": ("psk",)}
+    runner.reconciliation_normalized = {"meraki_networks.n_1": ("body",)}
+    summary = orchestrator.run("org-123")
+
+    assert summary.unmanaged_secret_attributes == {
+        "meraki_devices.q2ab": ("psk",)
+    }
+    assert summary.normalized_addresses == ("meraki_networks.n_1",)
+    manifest = json.loads(
+        (tmp_path / COVERAGE_JSON_FILENAME).read_text(encoding="utf-8")
+    )
+    assert manifest["unmanaged_secret_attributes"] == {
+        "meraki_devices.q2ab": ["psk"]
+    }
+    summary_txt = (tmp_path / COVERAGE_SUMMARY_FILENAME).read_text(
+        encoding="utf-8"
+    )
+    assert "Secrets not captured (restore manually after a rebuild):" in (
+        summary_txt
+    )
+    assert "meraki_devices.q2ab: psk" in summary_txt
+    success = [
+        e for e in recorder.events if e.event_type is EventType.RUN_SUCCESS
+    ][0]
+    assert success.details["unmanaged_secret_attribute_count"] == 1
+    assert success.details["unmanaged_secret_attributes"] == {
+        "meraki_devices.q2ab": ["psk"]
+    }

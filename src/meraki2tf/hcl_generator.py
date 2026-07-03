@@ -1,24 +1,37 @@
 """HCL translation engine: domain graph → modern Terraform import blocks.
 
-Every discovered asset is resolved against the OpenAPI-derived lookup
-table (see :class:`~meraki2tf.openapi_parser.OpenApiParser`) — the
-mapping from API path to ``CiscoDevNet/meraki`` resource name is fully
-dynamic. Assets that resolve are written as declarative ``import {}``
-blocks into ``imports.tf``; assets that cannot be mapped are the
-exception auditor's territory: logged as severe warnings and dispatched
-as ``UNSUPPORTED_FEATURE_FLAGGED`` alert payloads.
+Every discovered asset is resolved against the provider-resource match
+table (see :mod:`~meraki2tf.resource_matcher`): spec-derived entities
+matched onto the ``CiscoDevNet/meraki`` provider's own identity-schema
+catalog, so every emitted resource type is one the installed provider
+actually implements. The mapping is fully dynamic — spec + provider
+metadata, no hard-coded tables. Assets that resolve are written as
+declarative ``import {}`` blocks into ``imports.tf``; assets that
+cannot be mapped are the exception auditor's territory: logged as
+severe warnings and dispatched as ``UNSUPPORTED_FEATURE_FLAGGED``
+alert payloads.
+
+Import ID composition follows the provider's conventions: ordered path
+parameter values joined by commas, with the organization ID prepended
+when the resource's identity demands it (``meraki_network`` imports as
+``"<organization_id>,<network_id>"``) and a literal ``"false"``
+inserted for ``force_delete`` identities (group policies) so an import
+can never cascade into a delete.
 """
 
 from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from meraki2tf.alerts import AlertDispatcher, unsupported_feature_flagged
 from meraki2tf.models import NetworkGraph
 from meraki2tf.openapi_parser import OpenApiParser, snake_case
+from meraki2tf.provider_catalog import ProviderCatalog
+from meraki2tf.resource_matcher import MatchedResource, path_matches
 
 logger = logging.getLogger(__name__)
 
@@ -91,9 +104,24 @@ class GenerationReport:
 class HclImportGenerator:
     """Writes ``imports.tf`` and audits unmappable assets."""
 
-    def __init__(self, parser: OpenApiParser, dispatcher: AlertDispatcher) -> None:
+    def __init__(
+        self,
+        parser: OpenApiParser,
+        dispatcher: AlertDispatcher,
+        catalog_provider: Callable[[], ProviderCatalog],
+    ) -> None:
         self._parser = parser
         self._dispatcher = dispatcher
+        #: Resolved lazily on first generate(): live keyed runs dump the
+        #: installed provider's schema, which requires the workspace to
+        #: be prepared/initialized first — construction time is too early.
+        self._catalog_provider = catalog_provider
+        self._matches: dict[str, MatchedResource | None] | None = None
+
+    def _match_table(self) -> dict[str, MatchedResource | None]:
+        if self._matches is None:
+            self._matches = path_matches(self._parser, self._catalog_provider())
+        return self._matches
 
     def generate(
         self,
@@ -111,8 +139,7 @@ class HclImportGenerator:
         UNSUPPORTED_FEATURE_FLAGGED alerts); a same-run regeneration
         pass disables it so identical findings are not dispatched twice.
         """
-        lookup = self._parser.endpoint_lookup()
-        mappings = self._parser.resource_mappings()
+        matches = self._match_table()
 
         blocks: list[str] = []
         #: address → import ID, so identical assets dedupe while distinct
@@ -123,8 +150,7 @@ class HclImportGenerator:
         skipped_existing = 0
 
         for candidate in self._candidates(graph):
-            terraform_name = lookup.get(candidate.api_path)
-            if terraform_name is None:
+            if candidate.api_path not in matches:
                 unsupported.append(
                     self._flag(
                         candidate,
@@ -133,14 +159,25 @@ class HclImportGenerator:
                     )
                 )
                 continue
-            expected = mappings[terraform_name].id_components
+            match = matches[candidate.api_path]
+            if match is None:
+                unsupported.append(
+                    self._flag(
+                        candidate,
+                        "No CiscoDevNet/meraki provider resource matches "
+                        "this endpoint.",
+                        audit=audit,
+                    )
+                )
+                continue
+            expected = match.import_id_components
             provided = tuple(
                 snake_case(name)
                 for name in _PATH_PLACEHOLDER.findall(candidate.api_path)
             )
             if provided != expected:
                 # A folded collection alias (e.g. /organizations/{organizationId}
-                # /networks → meraki_networks) can coincide in arity while
+                # /networks → meraki_network) can coincide in arity while
                 # carrying the wrong ID components entirely — importing an
                 # organization ID as a network. Semantics must match, not
                 # just the count.
@@ -164,8 +201,10 @@ class HclImportGenerator:
                     )
                 )
                 continue
-            import_id = ",".join(candidate.id_values)
-            base = f"{terraform_name}.{self._label(candidate.id_values)}"
+            import_id = ",".join(
+                self._import_components(match, candidate, graph.organization_id)
+            )
+            base = f"{match.terraform_name}.{self._label(candidate.id_values)}"
             address = self._resolve_address(base, import_id, seen_addresses)
             if address is None:
                 logger.debug("Skipping duplicate import of id %s", import_id)
@@ -205,6 +244,26 @@ class HclImportGenerator:
             skipped_existing=skipped_existing,
             captured=tuple(captured),
         )
+
+    @staticmethod
+    def _import_components(
+        match: MatchedResource, candidate: ImportCandidate, organization_id: str
+    ) -> tuple[str, ...]:
+        """Ordered import-ID components per the provider's conventions.
+
+        The asset's path values are the base. Identities carrying
+        ``force_delete`` (group policies) take a literal ``"false"``
+        before the item ID — imports must never be armed to cascade a
+        delete. Identities demanding an ``organization_id`` the path
+        does not carry get the always-known organization prepended
+        (``meraki_network`` → ``"<organization_id>,<network_id>"``).
+        """
+        components = list(candidate.id_values)
+        if match.has_force_delete:
+            components.insert(len(components) - 1, "false")
+        if match.needs_org_prefix:
+            components.insert(0, organization_id)
+        return tuple(components)
 
     @staticmethod
     def _candidates(graph: NetworkGraph) -> list[ImportCandidate]:

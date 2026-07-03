@@ -90,6 +90,7 @@ def test_run_success_payload_contract() -> None:
         resources_added_to_state=["meraki_networks.n_1"],
         coverage_percent=90.0,
         deletions_pending=["meraki_devices.q2ab"],
+        unmanaged_secret_attributes={"meraki_wireless_ssid.s_0": ("psk",)},
     ).to_payload()
     assert payload["event_type"] == "RUN_SUCCESS"
     assert payload["severity"] == EventSeverity.INFO.value
@@ -106,6 +107,8 @@ def test_run_success_payload_contract() -> None:
         "resources_added_to_state": ["meraki_networks.n_1"],
         "coverage_percent": 90.0,
         "deletions_pending_confirmation": ["meraki_devices.q2ab"],
+        "unmanaged_secret_attribute_count": 1,
+        "unmanaged_secret_attributes": {"meraki_wireless_ssid.s_0": ["psk"]},
     }
     assert "1 resource(s) added to state" in run_success(
         imports_written=4,
