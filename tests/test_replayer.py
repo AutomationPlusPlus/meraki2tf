@@ -19,9 +19,12 @@ from meraki2tf.replayer import (
     GapReplayer,
     ReplayAction,
     ReplayDispatchError,
+    _collection_items,
+    _single_array_body_field,
     plan_replay,
 )
 from meraki2tf.sanitizer import REDACTED
+from meraki2tf.spec.engine import OperationSpec
 
 VLAN_PATH = "/networks/{networkId}/appliance/vlans/{vlanId}"
 SSID_PATH = "/networks/{networkId}/wireless/ssids/{number}"
@@ -134,6 +137,25 @@ def test_plan_replay_skips_dashboard_only_and_payloadless(
     reasons = {item.api_path: item.reason for item in skipped}
     assert "dashboard-only" in reasons[CLIENTS_PATH]
     assert "No payload" in reasons[VLAN_PATH]
+
+
+def test_plan_replay_skips_empty_collection_envelopes(
+    spec_parser: OpenApiParser,
+) -> None:
+    """A paginated GET that returned no items leaves nothing to write."""
+    path = "/organizations/{organizationId}/networks"
+    graph = _graph(
+        FeatureConfiguration(
+            path,
+            ("org-123",),
+            {"items": [], "meta": {"counts": {"items": {"total": 0}}}},
+        )
+    )
+    report = _report(unsupported=(UnsupportedAsset(path, "no match", ("org-123",)),))
+    actions, skipped = plan_replay(graph, report, spec_parser)
+    assert actions == ()
+    (skip,) = skipped
+    assert "empty at capture" in skip.reason
 
 
 def test_plan_replay_restores_secrets_from_captured_assets(
@@ -363,6 +385,118 @@ def test_call_filters_body_to_explicit_signatures(
         {"id": 10, "name": "Data"},  # "id" is not in the strict signature
     )
     assert calls == [{"networkId": "N_9", "vlanId": "10", "name": "Data"}]
+
+
+def _staged_stages_op() -> OperationSpec:
+    """A write op whose body is a single array field, like the real
+    updateNetworkFirmwareUpgradesStagedStages."""
+    return OperationSpec(
+        operation_id="updateNetworkFirmwareUpgradesStagedStages",
+        method="put",
+        path="/networks/{networkId}/firmwareUpgrades/staged/stages",
+        path_params=("networkId",),
+        tags=("networks",),
+        raw={
+            "requestBody": {
+                "content": {
+                    "application/json": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "_json": {"type": "array", "items": {}}
+                            },
+                        }
+                    }
+                }
+            }
+        },
+    )
+
+
+def test_call_maps_collection_envelope_to_array_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    section = _FakeSection()
+    dashboard = types.SimpleNamespace(networks=section)
+    stub = types.ModuleType("meraki")
+    stub.DashboardAPI = lambda **kwargs: dashboard  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "meraki", stub)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "unit-test-key")
+
+    GapReplayer()._call(
+        _staged_stages_op(),
+        {"networkId": "N_9"},
+        {"items": [{"group": {"id": "-1", "description": None}}]},
+    )
+    (name, kwargs) = section.calls[0]
+    assert name == "updateNetworkFirmwareUpgradesStagedStages"
+    # envelope unwrapped onto the spec's array field, nulls stripped
+    assert kwargs["_json"] == [{"group": {"id": "-1"}}]
+    assert "items" not in kwargs
+
+
+def test_call_strips_null_payload_fields(
+    monkeypatch: pytest.MonkeyPatch, spec_parser: OpenApiParser
+) -> None:
+    """GET echoes unset fields as null; write endpoints reject them."""
+    dashboard = _FakeDashboard(networks=[])
+    _install_fake_meraki(monkeypatch, dashboard)
+    op = next(
+        o
+        for o in spec_parser.endpoints()
+        if o.operation_id == "updateNetworkApplianceVlan"
+    )
+    GapReplayer()._call(
+        op,
+        {"networkId": "N_9", "vlanId": "10"},
+        {"name": "Data", "description": None, "nested": [{"x": None, "y": 1}]},
+    )
+    (_, kwargs) = dashboard.appliance.calls[0]
+    assert kwargs["name"] == "Data"
+    assert "description" not in kwargs
+    assert kwargs["nested"] == [{"y": 1}]
+
+
+def test_collection_and_array_body_helpers_reject_non_matches() -> None:
+    # a real object payload that merely has an "items" key is no envelope
+    assert _collection_items({"items": [], "name": "x"}) is None
+    assert _collection_items({"name": "x"}) is None
+    assert _collection_items({"items": ["a"], "meta": {}}) == ["a"]
+    # multi-property or non-array bodies never get the envelope mapping
+    multi = OperationSpec(
+        operation_id="op", method="put", path="/p", path_params=(),
+        tags=("t",),
+        raw={
+            "requestBody": {
+                "content": {
+                    "application/json": {
+                        "schema": {
+                            "properties": {
+                                "a": {"type": "array"},
+                                "b": {"type": "string"},
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    )
+    assert _single_array_body_field(multi) is None
+    scalar = OperationSpec(
+        operation_id="op", method="put", path="/p", path_params=(),
+        tags=("t",),
+        raw={
+            "requestBody": {
+                "content": {
+                    "application/json": {
+                        "schema": {"properties": {"name": {"type": "string"}}}
+                    }
+                }
+            }
+        },
+    )
+    assert _single_array_body_field(scalar) is None
+    assert _single_array_body_field(_staged_stages_op()) == "_json"
 
 
 def test_call_raises_on_missing_sdk_method(
