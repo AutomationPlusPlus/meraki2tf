@@ -24,21 +24,33 @@ reports which resource addresses the state already tracks, so upstream
 generation skips re-importing them.
 
 Security: the Meraki token never touches disk — the provider block is
-written credential-free and the ``meraki`` Terraform provider reads
-``MERAKI_DASHBOARD_API_KEY`` from the process environment on its own.
+written credential-free. The ``CiscoDevNet/meraki`` Terraform provider
+reads its credential from ``MERAKI_API_KEY``, so every terraform
+subprocess is launched with that variable injected from meraki2tf's own
+``MERAKI_DASHBOARD_API_KEY`` (an explicitly set ``MERAKI_API_KEY`` is
+respected and never overridden).
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import subprocess
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
+from .config import API_KEY_ENV_VAR
+
 logger = logging.getLogger(__name__)
+
+#: Environment variable the ``CiscoDevNet/meraki`` Terraform provider
+#: reads its credential from. Distinct from meraki2tf's own
+#: ``MERAKI_DASHBOARD_API_KEY`` (the Meraki SDK convention), so the
+#: runner bridges the two at subprocess launch.
+PROVIDER_API_KEY_ENV_VAR = "MERAKI_API_KEY"
 
 PROVIDER_FILENAME = "provider.tf"
 GENERATED_CONFIG_FILENAME = "generated_resources.tf"
@@ -67,8 +79,11 @@ terraform {{
 }}
 
 provider "meraki" {{
-  # Credentials are read from the MERAKI_DASHBOARD_API_KEY environment
-  # variable by the provider itself and are never written to disk.
+  # Credentials are never written to disk. The provider reads the
+  # MERAKI_API_KEY environment variable; meraki2tf injects it into every
+  # terraform subprocess from its own MERAKI_DASHBOARD_API_KEY. When
+  # running terraform manually in this workspace, export MERAKI_API_KEY
+  # (or set it from MERAKI_DASHBOARD_API_KEY) yourself.
 }}
 """
 
@@ -497,6 +512,23 @@ class TerraformRunner:
         """
         return self._run("apply", "-input=false", "-no-color", "-auto-approve")
 
+    @staticmethod
+    def _subprocess_env() -> dict[str, str]:
+        """Environment for terraform subprocesses.
+
+        The ``CiscoDevNet/meraki`` provider authenticates via
+        ``MERAKI_API_KEY``, while meraki2tf follows the Meraki SDK
+        convention of ``MERAKI_DASHBOARD_API_KEY``. Bridge the two so
+        the speculative plan and guarded applies can authenticate,
+        keeping the credential out of every file the runner writes. An
+        explicitly set ``MERAKI_API_KEY`` always wins.
+        """
+        env = dict(os.environ)
+        dashboard_key = env.get(API_KEY_ENV_VAR, "").strip()
+        if dashboard_key and not env.get(PROVIDER_API_KEY_ENV_VAR, "").strip():
+            env[PROVIDER_API_KEY_ENV_VAR] = dashboard_key
+        return env
+
     def _run(
         self, *args: str, allowed: tuple[int, ...] = (0,)
     ) -> TerraformCommandResult:
@@ -508,6 +540,7 @@ class TerraformRunner:
             capture_output=True,
             text=True,
             check=False,
+            env=self._subprocess_env(),
         )
         if completed.stdout:
             logger.debug("terraform %s stdout:\n%s", args[0], completed.stdout)

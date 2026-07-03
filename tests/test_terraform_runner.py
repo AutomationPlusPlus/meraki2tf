@@ -81,6 +81,41 @@ def test_prepare_workspace_writes_credential_free_provider_anchor(
     assert "api_key" not in content
 
 
+def test_subprocess_env_bridges_dashboard_key_to_provider_var(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MERAKI_DASHBOARD_API_KEY", "dashboard-secret")
+    monkeypatch.delenv("MERAKI_API_KEY", raising=False)
+    fake = FakeSubprocess(stdout="Initialized")
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    runner.init()
+    env = fake.calls[0]["env"]
+    assert env["MERAKI_API_KEY"] == "dashboard-secret"
+    assert env["MERAKI_DASHBOARD_API_KEY"] == "dashboard-secret"
+
+
+def test_subprocess_env_never_overrides_explicit_provider_key(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MERAKI_DASHBOARD_API_KEY", "dashboard-secret")
+    monkeypatch.setenv("MERAKI_API_KEY", "explicit-provider-key")
+    fake = FakeSubprocess(stdout="Initialized")
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    runner.init()
+    assert fake.calls[0]["env"]["MERAKI_API_KEY"] == "explicit-provider-key"
+
+
+def test_subprocess_env_without_any_key_adds_nothing(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("MERAKI_DASHBOARD_API_KEY", raising=False)
+    monkeypatch.delenv("MERAKI_API_KEY", raising=False)
+    fake = FakeSubprocess(stdout="Initialized")
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    runner.init()
+    assert "MERAKI_API_KEY" not in fake.calls[0]["env"]
+
+
 def test_state_defaults_into_workdir_backend(runner: TerraformRunner) -> None:
     provider_file = runner.prepare_workspace()
     expected = (runner.workdir / DEFAULT_STATE_FILENAME).resolve()
