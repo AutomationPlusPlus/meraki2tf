@@ -93,12 +93,38 @@ def item_operation_for(
     return fallback
 
 
+def _collection_id_key(item_op: OperationSpec) -> str | None:
+    """Conventional ``<singular>Id`` field named after the collection.
+
+    Some Meraki collections key their elements this way while the item
+    endpoint's own placeholder is a generic ``{id}`` — adaptive policy
+    ``groups/{id}`` elements carry ``groupId``, not ``id``.
+    """
+    segments = [s for s in item_op.path.split("/") if s]
+    if len(segments) < 2 or not segments[-1].startswith("{"):
+        return None
+    collection = segments[-2]
+    if collection.startswith("{"):
+        return None
+    if collection.endswith("ies"):
+        singular = collection[:-3] + "y"
+    else:
+        singular = collection.removesuffix("s")
+    return f"{singular}Id"
+
+
 def element_id(item_op: OperationSpec, element: Any) -> str | None:
     """Identify one collection element by the item endpoint's own
     parameter name, falling back to conventional ID fields."""
     if not isinstance(element, Mapping):
         return None
-    for key in (item_op.path_params[-1], *_ITEM_ID_FALLBACK_KEYS):
+    derived = _collection_id_key(item_op)
+    candidates = (
+        item_op.path_params[-1],
+        *_ITEM_ID_FALLBACK_KEYS,
+        *((derived,) if derived else ()),
+    )
+    for key in candidates:
         value = element.get(key)
         if value is None:
             # A JSON null must not become the literal ID "None".
@@ -140,8 +166,25 @@ def expand_endpoint_payload(
     for element in payload:
         item_id = element_id(item_op, element)
         if item_id is None:
+            # Never drop a discovered object silently: without an ID it
+            # cannot become an import block, but recording it at the
+            # collection path routes it through the unsupported-asset
+            # audit so it reaches the coverage manifest and alerts.
             logger.warning(
-                "Skipping element of %s with no identifiable ID field.", op.path
+                "Element of %s has no identifiable ID field; it will be "
+                "reported as a coverage gap.",
+                op.path,
+            )
+            expanded.append(
+                FeatureConfiguration(
+                    api_path=op.path,
+                    path_values=(scope_value,),
+                    payload=(
+                        element
+                        if isinstance(element, Mapping)
+                        else {"value": element}
+                    ),
+                )
             )
             continue
         expanded.append(

@@ -258,17 +258,22 @@ def test_nested_dump_builds_graph_from_export_layout(
     # Lexical tie (wireless vs appliance ssids) broken by payload schema.
     assert ("/networks/{networkId}/wireless/ssids/{number}", ("N_1", "0")) in by_path
     # Org-scoped section expanded via its PUT/DELETE-only item endpoint;
-    # the element without an ID is skipped.
+    # the element without an ID surfaces at the collection path so the
+    # coverage audit reports it instead of dropping it.
     admin = by_path[
         ("/organizations/{organizationId}/admins/{adminId}", ("org-777", "A_1"))
     ]
     assert admin.payload["name"] == "ops"
+    no_id_admin = by_path[
+        ("/organizations/{organizationId}/admins", ("org-777",))
+    ]
+    assert no_id_admin.payload == {"email": "no-id@x"}
     # Device-scoped section resolved onto the serial-scoped endpoint.
     port = by_path[
         ("/devices/{serial}/switch/ports/{portId}", ("Q2AB-CDEF-GHIJ", "1"))
     ]
     assert port.payload["name"] == "Uplink"
-    assert len(graph.features) == 6
+    assert len(graph.features) == 7
 
 
 def test_nested_dump_skips_unmatched_sections_with_warning(
@@ -359,9 +364,11 @@ def test_live_provider_builds_graph_with_spec_driven_features(
     assert graph.devices[0].model == "MX64"
     by_path = {(f.api_path, f.path_values): f for f in graph.features}
 
-    # List payload expanded to the item path; unidentifiable element skipped.
+    # List payload expanded to the item path; the unidentifiable element
+    # surfaces at the collection path for the coverage audit.
     vlan = by_path[("/networks/{networkId}/appliance/vlans/{vlanId}", ("N_1", "10"))]
     assert vlan.payload["name"] == "Data"
+    assert ("/networks/{networkId}/appliance/vlans", ("N_1",)) in by_path
 
     # Singleton config recorded at its own endpoint path.
     shaping = by_path[("/networks/{networkId}/appliance/trafficShaping", ("N_1",))]
@@ -385,8 +392,9 @@ def test_live_provider_builds_graph_with_spec_driven_features(
 
     # Folded collection aliases (/organizations/{organizationId}/networks
     # lists first-class network assets) are not re-emitted as features,
-    # and the refusing sensor endpoint is skipped, not fatal.
-    assert len(graph.features) == 5
+    # and the refusing sensor endpoint is skipped, not fatal. The two
+    # unidentifiable VLAN elements surface as collection-path assets.
+    assert len(graph.features) == 7
 
 
 def test_live_dispatch_gap_warns_once_and_skips(
@@ -403,7 +411,7 @@ def test_live_dispatch_gap_warns_once_and_skips(
         if "cannot be dispatched" in record.message and "admins" in record.message
     ]
     assert len(admin_warnings) == 1  # warned once, not per scope/network
-    assert len(graph.features) == 4  # everything else still discovered
+    assert len(graph.features) == 6  # everything else still discovered
 
 
 def test_try_call_skips_operations_already_known_undispatchable(
