@@ -355,7 +355,13 @@ class TerraformRunner:
 
     #: Plan invocations one generation call may spend converging: one
     #: for validation drops, one for change remediation, one to verify.
-    _MAX_PLAN_ATTEMPTS = 3
+    #: Runaway backstop for the reconciliation loop. Every iteration
+    #: must make progress (drop a rejected resource or apply a new
+    #: remediation) or the loop breaks on its own; the cap only guards
+    #: against pathological plan behavior. Real runs need up to ~4
+    #: passes: terraform reports validation errors piecemeal, so two
+    #: drop rounds can precede the classify + verify rounds.
+    _MAX_PLAN_ATTEMPTS = 10
 
     def plan_with_generation(
         self, save_plan: bool = False, reconcile: bool = True
@@ -422,6 +428,18 @@ class TerraformRunner:
                 reconciliation,
                 (GENERATED_CONFIG_FILENAME, AGGREGATED_CONFIG_FILENAME),
             )
+            if not (
+                set(new_ignored) - set(ignored)
+                or set(new_normalized) - set(normalized)
+            ):
+                # The proposed remediations were all applied before yet
+                # the diff persists — re-editing would loop forever, so
+                # surface whatever remains as drift instead.
+                logger.warning(
+                    "Reconciliation made no further progress; reporting "
+                    "the remaining plan changes as drift."
+                )
+                break
             ignored.update(new_ignored)
             normalized.update(new_normalized)
             self._log_reconciliation(reconciliation, new_ignored, new_normalized)

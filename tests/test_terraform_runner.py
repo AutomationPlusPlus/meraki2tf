@@ -764,11 +764,11 @@ def test_reconciliation_suppresses_secret_nulls_then_replans(
     assert [c[1] for c in scripted.calls] == ["plan", "show", "plan"]
 
 
-def test_reconciliation_loop_is_bounded(
+def test_reconciliation_stops_when_remediations_make_no_progress(
     runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A plan that keeps proposing remediable changes stops at the
-    attempt ceiling instead of looping."""
+    """A diff that keeps re-proposing already-applied remediations is
+    surfaced as drift instead of looping (re-editing cannot help)."""
     runner.prepare_workspace()
     (runner.workdir / AGGREGATED_CONFIG_FILENAME).write_text(
         SNMP_BLOCK, encoding="utf-8"
@@ -778,14 +778,13 @@ def test_reconciliation_loop_is_bounded(
         (2, changes, None),
         (0, SECRET_PLAN_JSON, None),
         (2, changes, None),
-        (0, SECRET_PLAN_JSON, None),
-        (2, changes, None),
+        (0, SECRET_PLAN_JSON, None),  # same remediation again -> break
     )
     monkeypatch.setattr(terraform_runner.subprocess, "run", scripted.run)
     outcome = runner.plan_with_generation()
     assert outcome.has_drift is True  # surfaced as drift, not retried
     assert [c[1] for c in scripted.calls] == [
-        "plan", "show", "plan", "show", "plan",
+        "plan", "show", "plan", "show",
     ]
 
 
