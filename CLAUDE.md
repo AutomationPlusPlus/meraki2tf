@@ -48,7 +48,7 @@ The weekly DR job must build real Terraform state unattended, which requires app
 - Optional CI gate: a flag (e.g. `--fail-on-gaps`) makes the run exit nonzero when unsupported objects exist, so schedulers can gate on full coverage.
 
 ### Implementation Status Note
-The `--sync` guarded auto-apply, deletion-confirmation flow, coverage manifest, and `--fail-on-gaps` describe the **target contract**; verify against the current CLI (`src/meraki2tf/cli.py`) before assuming they exist. Anything already implemented (read-only pipeline, `--rebuild --confirm`, `--rebaseline`, dump/live providers, webhook/email alerts) must not regress while these land.
+The full contract above is implemented as of 2026-07-02: `--sync` guarded auto-apply (guard in `terraform_runner.apply_import_plan`), the deletion flow (`DELETION_PENDING_CONFIRMATION` alert + `--confirm-deletions`), the coverage manifest (`coverage.json`/`coverage.txt`), and `--fail-on-gaps` (exit 3). None of it — nor the earlier surface (read-only pipeline, `--rebuild --confirm`, `--rebaseline`, dump/live providers, webhook/email alerts) — may regress.
 
 ---
 

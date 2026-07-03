@@ -230,7 +230,8 @@ Each run leaves a complete rebuild kit in `--workdir`:
 | `provider.tf` | meraki2tf | Credential-free provider + local backend anchor |
 | `resources.tf` | meraki2tf (accumulated from `terraform plan -generate-config-out`) | Full HCL configuration for every captured asset — the actual rebuild material and the drift-comparison baseline |
 | `generated_resources.tf` | terraform (transient) | Freshly generated config for new imports; folded into `resources.tf` after every plan |
-| `terraform.tfstate` | terraform (only if *you* apply) | State tracking, once you adopt the resources |
+| `coverage.json` / `coverage.txt` | meraki2tf | Per-run coverage manifest: every discovered object with status `imported`, `pending-import`, or `unsupported` (with reason), plus totals and a coverage percentage |
+| `terraform.tfstate` | terraform (`--sync` runs, `--rebuild --confirm`, or a manual apply) | State tracking, once the resources are adopted |
 
 Back up the workdir (and ideally a `--dump-to` snapshot) somewhere that
 survives the disaster you are protecting against.
@@ -238,16 +239,55 @@ survives the disaster you are protecting against.
 ### Knowing what is (and isn't) covered
 
 Every run audits Terraform coverage so you can trust the kit *before*
-you need it. The log and the `RUN_SUCCESS` payload report how many
-discovered assets are captured (new import blocks + already tracked in
-state), and each asset the provider **cannot express** is flagged with
-an `UNSUPPORTED_FEATURE_FLAGGED` alert plus a summary warning naming
-the API paths — those are the pieces you would have to rebuild manually
-in a DR event, so review them ahead of time. When the plan comparison
-runs (API key available), the plan's own summary is also reported:
-pending imports (discovered but not yet aggregated into state) versus
-real add/change/destroy pressure, which fires `DRIFT_DETECTED`. The
-plan stays speculative — nothing is ever applied by the pipeline.
+you need it. The workdir always contains a machine-readable
+`coverage.json` and a human-readable `coverage.txt` listing **every**
+discovered object with a status — `imported` (in state),
+`pending-import` (in the kit, not yet in state), or `unsupported`
+(cannot be rebuilt by Terraform, with the reason) — plus totals and a
+coverage percentage. The log and the `RUN_SUCCESS` payload carry the
+same picture, and each asset the provider **cannot express** is flagged
+with an `UNSUPPORTED_FEATURE_FLAGGED` alert; the full unsupported list
+also rides along on every success and drift notification — those are
+the pieces you would have to rebuild manually in a DR event, so review
+them ahead of time. Pass `--fail-on-gaps` to exit with code 3 whenever
+unsupported objects exist, so CI or your scheduler can gate on full
+coverage. When the plan comparison runs (API key available), the plan's
+own summary is also reported: pending imports (discovered but not yet
+aggregated into state) versus real add/change/destroy pressure, which
+fires `DRIFT_DETECTED`. By default the plan stays speculative — nothing
+is applied unless you opt into `--sync`.
+
+### Scheduled DR automation (`--sync`)
+
+The default invocation is the ad-hoc/open-source mode: strictly
+read-only end to end, safe for anyone to run against any org. The
+weekly DR job passes `--sync` to also **materialize Terraform state**
+unattended:
+
+- After the speculative plan, the run auto-applies **only when the plan
+  is 100% imports (0 to add, 0 to change, 0 to destroy)**. Import
+  blocks only write state — Meraki is never touched. The guard lives in
+  the Terraform runner itself and re-verifies the saved plan
+  immediately before applying it, so no code path can sneak a mutation
+  through.
+- Any mutating plan **aborts the apply** and fires a `DRIFT_DETECTED`
+  alert with the diff (`apply_aborted: true`). A human decides next.
+- Modified objects (Meraki is truth): their HCL baseline is regenerated
+  to mirror the current dashboard via local state surgery
+  (`terraform state rm` + baseline prune + re-import) and the diff is
+  alerted with `regenerated_addresses`.
+- Deleted objects: **alert-only** in every mode. Resources tracked in
+  the kit that discovery no longer finds fire a
+  `DELETION_PENDING_CONFIRMATION` alert and stay in the kit until a
+  human re-runs with `--confirm-deletions`, which removes them from
+  `resources.tf` and the state.
+- Every applied run reports exactly which resources were added to state
+  (log + `RUN_SUCCESS.resources_added_to_state`), so weekly reruns tell
+  you what grew.
+
+`--sync` requires `MERAKI_DASHBOARD_API_KEY` and fails loudly without
+it — silently skipping the apply would let the scheduled job believe it
+built state when it did not.
 
 Drift is measured against the captured baseline in `resources.tf`, so a
 `DRIFT_DETECTED` alert keeps firing until you act on it: either fix the
@@ -326,6 +366,9 @@ Quick reference (each flag is described in detail below):
 | `--rebuild` | off | Disaster recovery: preview a rebuild apply of the workdir artifacts |
 | `--confirm` | off | Escalate `--rebuild` from preview to a real `terraform apply` |
 | `--rebaseline` | off | Accept current reality: discard `resources.tf` so this run regenerates the baseline |
+| `--sync` | off | DR automation: guarded import-only auto-apply + modified-object baseline regeneration |
+| `--confirm-deletions` | off | Human confirmation to remove Meraki-deleted resources from the kit and state |
+| `--fail-on-gaps` | off | Exit 3 when unsupported (uncoverable) objects exist — CI coverage gate |
 | `--workdir DIR` | `generated` | Terraform execution workspace |
 | `--state-file PATH` | `<workdir>/terraform.tfstate` | Terraform state to aggregate into across runs |
 | `--webhook-url URL` | — | Webhook alert endpoint (repeatable) |
@@ -384,6 +427,27 @@ changes are legitimate. Refused while the state file tracks resources —
 their configuration cannot be regenerated (they are skipped from
 `imports.tf`, and Terraform only generates config for import targets),
 so discarding it would make the plan propose destroying them.
+
+**`--sync`** — opt-in DR automation for the scheduled job. After the
+speculative plan, auto-apply it **only** when it is verified as 100%
+imports (0 to add, 0 to change, 0 to destroy) — imports only write
+state, so Meraki is never touched. Mutating plans abort with a
+`DRIFT_DETECTED` alert (`apply_aborted: true`); purely *modified*
+objects get their HCL baseline regenerated to mirror current Meraki
+before the guarded apply. Requires `MERAKI_DASHBOARD_API_KEY` and
+refuses to start without it. See
+[Scheduled DR automation](#scheduled-dr-automation---sync).
+
+**`--confirm-deletions`** — the human side of the deletion contract.
+Deletions detected in Meraki are alert-only until you review them and
+re-run with this flag, which removes the confirmed resources from
+`resources.tf` and the Terraform state (local surgery — Meraki is
+untouched).
+
+**`--fail-on-gaps`** — exit with code 3 when the run discovers objects
+Terraform cannot rebuild, so CI and schedulers can gate on full
+coverage. The gap list is in `coverage.json`/`coverage.txt` and in
+every success/drift notification.
 
 **`--workdir DIR`** — the Terraform execution workspace. meraki2tf
 writes `provider.tf`, `imports.tf`, and the accumulated `resources.tf`
@@ -488,23 +552,29 @@ environment itself.
 
 | Event | Trigger |
 | --- | --- |
-| `DRIFT_DETECTED` | The speculative plan found real changes (add/change/destroy) on tracked resources — pending imports alone don't count (payload carries the diff) |
-| `RUN_SUCCESS` | Snapshot generation (and comparison, when an API key was available) completed flawlessly. Payload carries the coverage picture: `discovered_assets`, `imports_written`, `imports_already_tracked`, `unsupported_count`, `pending_imports` (imports the plan reports as not yet in state; `null` when unknown), and `comparison_performed` |
+| `DRIFT_DETECTED` | The speculative plan found real changes (add/change/destroy) on tracked resources — pending imports alone don't count. Payload carries the diff, the unsupported list, `apply_aborted` (true when a `--sync` auto-apply was refused), and `regenerated_addresses` (modified objects re-baselined in sync mode) |
+| `RUN_SUCCESS` | Snapshot generation (and comparison, when an API key was available) completed flawlessly. Payload carries the coverage picture: `discovered_assets`, `imports_written`, `imports_already_tracked`, `unsupported_count` plus the full `unsupported` list, `pending_imports` (imports the plan reports as not yet in state; `null` when unknown), `comparison_performed`, `resources_added_to_state` (sync mode), `coverage_percent`, and `deletions_pending_confirmation` |
 | `UNSUPPORTED_FEATURE_FLAGGED` | A discovered asset cannot be mapped to a Terraform resource |
+| `DELETION_PENDING_CONFIRMATION` | Resources tracked in the DR kit were not found in Meraki (deleted?); they stay in the kit until a human confirms with `--confirm-deletions` |
 | `PROCESSING_FAULT` | A critical pipeline failure (payload carries the failing stage) |
 
 ### Scheduled (cron) execution
 
 The CLI is non-interactive end to end and reports outcome via exit code
-(0 clean, 1 fault), so a weekly headless run is one crontab line:
+(0 clean, 1 fault, 2 usage error, 3 coverage gaps with
+`--fail-on-gaps`), so a weekly headless run is one crontab line:
 
 ```cron
-# Every Monday 06:00 — stream live, alert to the NetOps webhook.
+# Every Monday 06:00 — stream live, materialize state, alert to the NetOps webhook.
 0 6 * * 1 cd /opt/meraki2tf && . .venv/bin/activate && \
   MERAKI_DASHBOARD_API_KEY=$(cat /etc/meraki2tf/token) \
-  meraki2tf --org-id 123456 --spec ./openapi.json \
+  meraki2tf --org-id 123456 --spec ./openapi.json --sync \
   --webhook-url https://hooks.example.com/meraki2tf >> /var/log/meraki2tf.log 2>&1
 ```
+
+Drop `--sync` if you want the job to stay plan-only (state building
+then remains a manual step), and add `--fail-on-gaps` to turn
+unsupported objects into a nonzero exit your scheduler can page on.
 
 ## Contributor Architecture
 
