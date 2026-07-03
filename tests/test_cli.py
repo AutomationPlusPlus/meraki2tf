@@ -915,7 +915,10 @@ def test_report_logs_reconciliation_outcomes(
     text = caplog.text
     assert "1 resource(s) dropped as unexpressible" in text
     assert "1 resource(s) with unmanaged secret attribute(s)" in text
-    assert "1 resource(s) normalized to state values" in text
+    assert (
+        "1 resource(s) with values normalized for provider round-trip"
+        in text
+    )
     assert "meraki_wireless_ssid.s_0: psk" in text
 
 

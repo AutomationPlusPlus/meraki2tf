@@ -110,7 +110,8 @@ class RunSummary:
     unmanaged_secret_attributes: dict[str, tuple[str, ...]] = dataclasses.field(
         default_factory=dict
     )
-    #: Resources whose generated values were normalized to match state.
+    #: Resources whose generated values were normalized to round-trip
+    #: (state formatting/omissions or provider enum casing).
     normalized_addresses: tuple[str, ...] = ()
 
 
