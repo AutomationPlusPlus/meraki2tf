@@ -22,6 +22,7 @@ src/meraki2tf/
 │   └── dump.py           #   StaticJsonDataProvider — offline snapshot (--from-dump)
 ├── snapshot.py           # Graph → canonical offline snapshot writer (--dump-to)
 ├── sanitizer.py          # Deterministic secret/identity scrubbing (--sanitize)
+├── fsperms.py            # Owner-only (0600) enforcement + degraded-filesystem warning
 ├── hcl_generator.py      # HclImportGenerator → imports.tf + exception auditing
 ├── terraform_runner.py   # subprocess runner: provider.tf, init, plan -generate-config-out
 │                         #   (apply exists only as rebuild_apply for --rebuild --confirm)

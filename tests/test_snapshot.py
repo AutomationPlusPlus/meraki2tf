@@ -3,6 +3,9 @@
 import json
 from pathlib import Path
 
+import pytest
+
+from meraki2tf import snapshot
 from meraki2tf.providers import StaticJsonDataProvider
 from meraki2tf.snapshot import graph_to_snapshot, write_snapshot
 
@@ -34,3 +37,19 @@ def test_snapshot_document_uses_the_canonical_contract(dump_file: Path) -> None:
         "/networks/{networkId}/appliance/trafficShaping",
     }
     json.dumps(document)  # fully JSON-serializable
+
+
+def test_snapshot_routes_through_owner_only_helper(
+    dump_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Permission enforcement (and its degraded-FS warning) is delegated."""
+    restricted: list[Path] = []
+    monkeypatch.setattr(
+        snapshot, "restrict_to_owner", lambda path: restricted.append(path) or True
+    )
+    graph = StaticJsonDataProvider(dump_file).fetch_network_graph()
+    out = tmp_path / "snapshot.json"
+
+    write_snapshot(graph, out)
+
+    assert restricted == [out]

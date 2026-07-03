@@ -14,6 +14,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from meraki2tf.fsperms import restrict_to_owner
 from meraki2tf.models import NetworkGraph
 
 logger = logging.getLogger(__name__)
@@ -61,7 +62,7 @@ def write_snapshot(graph: NetworkGraph, path: Path) -> Path:
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.touch(mode=0o600, exist_ok=True)
-    path.chmod(0o600)
+    restrict_to_owner(path)
     path.write_text(
         json.dumps(graph_to_snapshot(graph), indent=2) + "\n", encoding="utf-8"
     )

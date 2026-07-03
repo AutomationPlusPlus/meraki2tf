@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .config import API_KEY_ENV_VAR
+from .fsperms import restrict_to_owner
 from .plan_reconciler import (
     ReconciliationPlan,
     apply_remediations,
@@ -129,6 +130,10 @@ _RESOURCE_BLOCK_RE = re.compile(r'^resource\s+"(?P<type>[^"]+)"\s+"(?P<name>[^"]
 
 class TerraformError(RuntimeError):
     """A terraform invocation failed; message carries the CLI diagnostics."""
+
+
+class TerraformNotFoundError(TerraformError):
+    """The terraform executable could not be launched because it does not exist."""
 
 
 class ImportGuardViolation(TerraformError):
@@ -803,7 +808,7 @@ class TerraformRunner:
             self._state_path.with_name(self._state_path.name + ".backup"),
         ):
             if path.exists():
-                path.chmod(0o600)
+                restrict_to_owner(path)
 
     @staticmethod
     def _subprocess_env() -> dict[str, str]:
@@ -827,14 +832,22 @@ class TerraformRunner:
     ) -> TerraformCommandResult:
         command = (self._executable, *args)
         logger.debug("Executing: %s (cwd=%s)", " ".join(command), self._workdir)
-        completed = subprocess.run(
-            command,
-            cwd=self._workdir,
-            capture_output=True,
-            text=True,
-            check=False,
-            env=self._subprocess_env(),
-        )
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=self._workdir,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=self._subprocess_env(),
+            )
+        except FileNotFoundError as exc:
+            raise TerraformNotFoundError(
+                f"terraform executable {self._executable!r} was not found. "
+                "Install Terraform (https://developer.hashicorp.com/terraform/install) "
+                "and ensure it is on PATH, or pass --terraform-bin with the full "
+                "path to the binary."
+            ) from exc
         if completed.stdout:
             logger.debug("terraform %s stdout:\n%s", args[0], completed.stdout)
         if completed.stderr:

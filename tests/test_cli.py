@@ -442,6 +442,27 @@ def test_rebuild_requires_existing_workspace(
     assert main(["--rebuild", "--workdir", str(tmp_path / "empty")]) == 1
 
 
+def test_rebuild_reports_missing_terraform_binary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A missing binary surfaces install guidance, not a raw OSError."""
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    workdir = _rebuild_workspace(tmp_path)
+
+    def raise_missing(command: tuple[str, ...], **kwargs: Any) -> SimpleNamespace:
+        raise FileNotFoundError(2, "No such file or directory", "terraform")
+
+    monkeypatch.setattr(terraform_runner.subprocess, "run", raise_missing)
+
+    assert main(["--rebuild", "--workdir", str(workdir)]) == 1
+
+    stderr = capsys.readouterr().err
+    assert "Install Terraform" in stderr
+    assert "--terraform-bin" in stderr
+
+
 def test_rebuild_without_confirm_is_preview_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
