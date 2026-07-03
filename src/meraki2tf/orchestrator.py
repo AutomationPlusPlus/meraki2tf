@@ -1,36 +1,61 @@
 """Lifecycle coordinator: one full extraction/translation/comparison cycle.
 
 Wires the pipeline end to end — discovery, HCL generation with
-exception auditing, speculative drift comparison — and fires the
-contract alerts at each mandated trigger point. Suitable for ad-hoc
-terminal runs and headless scheduled (cron) execution alike: every
-failure path resolves to an alert plus a raised :class:`PipelineError`
-for the CLI to convert into an exit code.
+exception auditing, deletion review, speculative drift comparison,
+optional sync-mode state materialization, and the per-run coverage
+manifest — and fires the contract alerts at each mandated trigger
+point. Suitable for ad-hoc terminal runs and headless scheduled (cron)
+execution alike: every failure path resolves to an alert plus a raised
+:class:`PipelineError` for the CLI to convert into an exit code.
 
-Read-only guarantee: this is a disaster-recovery snapshotting tool, so
-the pipeline never executes ``terraform apply`` and never mutates the
-Meraki organization. Rebuilding from the generated artifacts is an
-explicit, human-invoked CLI action (``--rebuild --confirm``) that does
-not pass through this orchestrator.
+Meraki read-only guarantee: no run mutates the Meraki organization.
+The default pipeline never executes ``terraform apply`` at all; opt-in
+sync mode (the scheduled DR job) may apply **state-only** import plans
+through :meth:`TerraformRunner.apply_import_plan`, which independently
+re-verifies the plan as 100% imports (0 to add, 0 to change,
+0 to destroy) immediately before applying. Rebuilding Meraki from the
+generated artifacts is an explicit, human-invoked CLI action
+(``--rebuild --confirm``) that does not pass through this orchestrator.
+
+Sync-mode drift defaults (Meraki is the source of truth):
+
+- New objects: auto-generated, auto-imported into state, reported.
+- Modified objects: the HCL baseline is regenerated to mirror current
+  Meraki (local state surgery + re-import — Meraki untouched) and the
+  diff is dispatched via a DRIFT_DETECTED alert.
+- Deleted objects: alert-only in every mode. Nothing leaves the DR kit
+  until a human confirms with ``--confirm-deletions``.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import Any
 
 from meraki2tf.alerts import (
     AlertDispatcher,
+    deletion_pending_confirmation,
     drift_detected,
     processing_fault,
     run_success,
 )
 from meraki2tf.config import API_KEY_ENV_VAR, api_key_present
-from meraki2tf.hcl_generator import HclImportGenerator
+from meraki2tf.coverage import build_manifest, unsupported_payload, write_manifest
+from meraki2tf.hcl_generator import GenerationReport, HclImportGenerator
+from meraki2tf.models import NetworkGraph
 from meraki2tf.providers.base import MerakiDataProvider
-from meraki2tf.terraform_runner import TerraformError, TerraformRunner
+from meraki2tf.terraform_runner import (
+    ImportGuardViolation,
+    TerraformCommandResult,
+    TerraformError,
+    TerraformRunner,
+)
 
 logger = logging.getLogger(__name__)
+
+#: Plan actions that do not mutate anything (imports plan as no-op).
+_HARMLESS_ACTIONS = frozenset({"no-op", "read"})
 
 
 class PipelineError(RuntimeError):
@@ -53,6 +78,18 @@ class RunSummary:
     #: Imports the plan reports as not yet aggregated into state; None
     #: when the comparison was skipped or the plan summary was absent.
     pending_imports: int | None
+    #: Resources the sync-mode guarded apply added to the state.
+    resources_added_to_state: tuple[str, ...] = ()
+    #: True when sync mode refused to auto-apply a mutating plan.
+    apply_aborted: bool = False
+    #: Meraki deletions detected and alerted, awaiting confirmation.
+    deletions_pending: tuple[str, ...] = ()
+    #: Deletions removed from kit + state via --confirm-deletions.
+    deletions_removed: tuple[str, ...] = ()
+    #: Modified objects whose HCL baseline was regenerated (sync mode).
+    regenerated_addresses: tuple[str, ...] = ()
+    #: Share of discovered objects Terraform can rebuild, per manifest.
+    coverage_percent: float = 100.0
 
 
 class PipelineOrchestrator:
@@ -65,12 +102,16 @@ class PipelineOrchestrator:
         runner: TerraformRunner,
         dispatcher: AlertDispatcher,
         rebaseline: bool = False,
+        sync: bool = False,
+        confirm_deletions: bool = False,
     ) -> None:
         self._provider = provider
         self._generator = generator
         self._runner = runner
         self._dispatcher = dispatcher
         self._rebaseline = rebaseline
+        self._sync = sync
+        self._confirm_deletions = confirm_deletions
 
     def run(self, organization_id: str | None = None) -> RunSummary:
         stage = "startup"
@@ -144,9 +185,18 @@ class PipelineOrchestrator:
                 report.skipped_existing,
                 len(report.unsupported),
             )
+            unsupported_details = unsupported_payload(report.unsupported)
+
+            stage = "deletion review"
+            deletions_pending, deletions_removed = self._review_deletions(
+                existing, report
+            )
 
             drift = False
             pending_imports: int | None = None
+            added: tuple[str, ...] = ()
+            apply_aborted = False
+            regenerated: tuple[str, ...] = ()
             comparison_skipped = not api_key_present()
             if comparison_skipped:
                 # The Meraki provider needs a token to read live resources
@@ -163,7 +213,7 @@ class PipelineOrchestrator:
                 self._runner.init()
 
                 stage = "state comparison"
-                plan = self._runner.plan_with_generation()
+                plan = self._runner.plan_with_generation(save_plan=self._sync)
                 counts = plan.plan_counts
                 if counts is not None:
                     pending_imports = counts.imports
@@ -179,18 +229,51 @@ class PipelineOrchestrator:
                         "DRIFT_DETECTED alert."
                     )
                     logger.debug("Full drift diff:\n%s", plan.stdout)
-                    self._dispatcher.dispatch(
-                        drift_detected(
-                            diff=plan.stdout, workspace=str(self._runner.workdir)
+                    if self._sync:
+                        stage = "sync drift handling"
+                        plan, report, regenerated, apply_aborted = (
+                            self._handle_sync_drift(
+                                plan, graph, report, unsupported_details
+                            )
                         )
-                    )
+                        counts = plan.plan_counts
+                        if counts is not None:
+                            pending_imports = counts.imports
+                    else:
+                        self._dispatcher.dispatch(
+                            drift_detected(
+                                diff=plan.stdout,
+                                workspace=str(self._runner.workdir),
+                                unsupported=unsupported_details,
+                            )
+                        )
                 else:
                     logger.info("State comparison found no drift.")
 
+                if self._sync and not apply_aborted and plan.has_changes:
+                    stage = "state materialization (guarded import-only apply)"
+                    added, apply_aborted = self._materialize_state(
+                        unsupported_details
+                    )
+                    if added:
+                        pending_imports = 0
+
+            stage = "coverage manifest"
+            final_state = self._runner.existing_addresses()
+            manifest = build_manifest(
+                organization_id=graph.organization_id,
+                captured=report.captured,
+                unsupported=report.unsupported,
+                state_addresses=final_state,
+                deletions_pending=deletions_pending,
+            )
+            write_manifest(manifest, self._runner.workdir)
+            coverage_percent = float(manifest["coverage_percent"])
+
             logger.info(
                 "Snapshot generation complete; dispatching RUN_SUCCESS "
-                "notification. No terraform apply was executed — this "
-                "pipeline is read-only."
+                "notification. The Meraki organization was not modified — "
+                "every run is read-only toward Meraki."
             )
             self._dispatcher.dispatch(
                 run_success(
@@ -199,9 +282,12 @@ class PipelineOrchestrator:
                     workspace=str(self._runner.workdir),
                     discovered_assets=graph.asset_count(),
                     imports_already_tracked=report.skipped_existing,
-                    unsupported_count=len(report.unsupported),
+                    unsupported=unsupported_details,
                     pending_imports=pending_imports,
                     comparison_performed=not comparison_skipped,
+                    resources_added_to_state=added,
+                    coverage_percent=coverage_percent,
+                    deletions_pending=deletions_pending,
                 )
             )
             return RunSummary(
@@ -213,8 +299,167 @@ class PipelineOrchestrator:
                 drift_detected=drift,
                 comparison_skipped=comparison_skipped,
                 pending_imports=pending_imports,
+                resources_added_to_state=added,
+                apply_aborted=apply_aborted,
+                deletions_pending=deletions_pending,
+                deletions_removed=deletions_removed,
+                regenerated_addresses=regenerated,
+                coverage_percent=coverage_percent,
             )
         except Exception as exc:
             logger.exception("Pipeline fault during %s.", stage)
             self._dispatcher.dispatch(processing_fault(stage=stage, error=str(exc)))
             raise PipelineError(f"Pipeline failed during {stage}: {exc}") from exc
+
+    def _review_deletions(
+        self, existing: frozenset[str], report: GenerationReport
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Handle state-tracked resources discovery no longer sees in Meraki.
+
+        Alert-only by default: an accidental clickops deletion must not
+        quietly poison the rebuild baseline, so nothing is removed until
+        a human passes ``--confirm-deletions``.
+        """
+        deleted = existing - report.captured_addresses
+        if not deleted:
+            return (), ()
+        if self._confirm_deletions:
+            logger.warning(
+                "Removing %d human-confirmed deletion(s) from the DR kit and "
+                "state: %s",
+                len(deleted), ", ".join(sorted(deleted)),
+            )
+            self._runner.init()  # `state rm` needs an initialized backend
+            self._runner.remove_resources(deleted)
+            return (), tuple(sorted(deleted))
+        pending = tuple(sorted(deleted))
+        logger.warning(
+            "%d resource(s) tracked in the DR kit were not discovered in "
+            "Meraki (deleted?): %s. Alert-only — re-run with "
+            "--confirm-deletions after review to remove them.",
+            len(pending), ", ".join(pending),
+        )
+        self._dispatcher.dispatch(
+            deletion_pending_confirmation(
+                addresses=pending, workspace=str(self._runner.workdir)
+            )
+        )
+        return pending, ()
+
+    def _handle_sync_drift(
+        self,
+        plan: TerraformCommandResult,
+        graph: NetworkGraph,
+        report: GenerationReport,
+        unsupported_details: list[dict[str, Any]],
+    ) -> tuple[TerraformCommandResult, GenerationReport, tuple[str, ...], bool]:
+        """DR-mode drift decision: regenerate modified objects, abort the rest.
+
+        Meraki is the source of truth, so purely *modified* objects get
+        their HCL baseline regenerated via local state surgery
+        (``state rm`` + baseline prune + re-import — Meraki untouched).
+        Any other mutation (creates from Meraki deletions, destroys from
+        baseline corruption, replaces, or an unclassifiable plan) aborts
+        the auto-apply and leaves the decision to a human.
+
+        Returns ``(plan, report, regenerated_addresses, apply_aborted)``.
+        """
+        actions = self._runner.plan_resource_actions()
+        mutated = {
+            address: acts
+            for address, acts in actions.items()
+            if not set(acts) <= _HARMLESS_ACTIONS
+        }
+        modified = tuple(
+            sorted(
+                address for address, acts in mutated.items() if acts == ("update",)
+            )
+        )
+        blocking = {
+            address: acts for address, acts in mutated.items() if acts != ("update",)
+        }
+        workspace = str(self._runner.workdir)
+        if blocking or not modified:
+            logger.error(
+                "Sync auto-apply ABORTED: the plan proposes mutations that "
+                "cannot be resolved by baseline regeneration (%s). A human "
+                "must review the drift alert.",
+                ", ".join(
+                    f"{address}={'+'.join(acts)}"
+                    for address, acts in sorted(blocking.items())
+                )
+                or "unclassifiable plan",
+            )
+            self._dispatcher.dispatch(
+                drift_detected(
+                    diff=plan.stdout,
+                    workspace=workspace,
+                    unsupported=unsupported_details,
+                    apply_aborted=True,
+                )
+            )
+            return plan, report, (), True
+        logger.warning(
+            "Meraki is truth: regenerating the HCL baseline for %d modified "
+            "resource(s): %s",
+            len(modified), ", ".join(modified),
+        )
+        self._dispatcher.dispatch(
+            drift_detected(
+                diff=plan.stdout,
+                workspace=workspace,
+                unsupported=unsupported_details,
+                regenerated_addresses=modified,
+            )
+        )
+        self._runner.remove_resources(modified)
+        refreshed = self._runner.existing_addresses()
+        report = self._generator.generate(
+            graph, self._runner.workdir, existing_addresses=refreshed, audit=False
+        )
+        plan = self._runner.plan_with_generation(save_plan=True)
+        if plan.has_drift:
+            logger.error(
+                "Drift persists after baseline regeneration; aborting the "
+                "sync auto-apply for human review."
+            )
+            self._dispatcher.dispatch(
+                drift_detected(
+                    diff=plan.stdout,
+                    workspace=workspace,
+                    unsupported=unsupported_details,
+                    apply_aborted=True,
+                    regenerated_addresses=modified,
+                )
+            )
+            return plan, report, modified, True
+        return plan, report, modified, False
+
+    def _materialize_state(
+        self, unsupported_details: list[dict[str, Any]]
+    ) -> tuple[tuple[str, ...], bool]:
+        """Run the guarded import-only apply; abort (never fail) on refusal.
+
+        The guard lives in the runner itself — this wrapper only decides
+        what an abort means for the run: dispatch the mandated drift
+        alert with the offending plan and carry on read-only.
+        """
+        try:
+            added = self._runner.apply_import_plan()
+        except ImportGuardViolation as exc:
+            logger.error("Guarded apply refused by the runner: %s", exc)
+            self._dispatcher.dispatch(
+                drift_detected(
+                    diff=exc.plan_output or str(exc),
+                    workspace=str(self._runner.workdir),
+                    unsupported=unsupported_details,
+                    apply_aborted=True,
+                )
+            )
+            return (), True
+        if added:
+            logger.info(
+                "State grew by %d resource(s) this run: %s",
+                len(added), ", ".join(added),
+            )
+        return added, False

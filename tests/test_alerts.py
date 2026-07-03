@@ -16,6 +16,7 @@ from meraki2tf.alerts import (
     Notifier,
     WebhookDeliveryError,
     WebhookNotifier,
+    deletion_pending_confirmation,
     drift_detected,
     processing_fault,
     run_success,
@@ -45,7 +46,35 @@ def test_drift_detected_payload_contract() -> None:
     payload = drift_detected(diff="~ plan delta", workspace="generated").to_payload()
     assert payload["event_type"] == "DRIFT_DETECTED"
     assert payload["severity"] == EventSeverity.WARNING.value
-    assert payload["details"] == {"diff": "~ plan delta", "workspace": "generated"}
+    assert payload["details"] == {
+        "diff": "~ plan delta",
+        "workspace": "generated",
+        "apply_aborted": False,
+        "regenerated_addresses": [],
+        "unsupported_count": 0,
+        "unsupported": [],
+    }
+
+
+def test_drift_alert_carries_unsupported_list_and_abort_marker() -> None:
+    """Contract: drift notifications always carry the manual-rebuild list,
+    and an aborted sync auto-apply is flagged for human review."""
+    unsupported = [
+        {"api_path": "/x", "reason": "no mapping", "identifiers": ["N_1"]}
+    ]
+    event = drift_detected(
+        diff="~ delta",
+        workspace="generated",
+        unsupported=unsupported,
+        apply_aborted=True,
+        regenerated_addresses=["meraki_networks.n_1"],
+    )
+    assert "aborted" in event.summary
+    details = event.to_payload()["details"]
+    assert details["apply_aborted"] is True
+    assert details["unsupported_count"] == 1
+    assert details["unsupported"] == unsupported
+    assert details["regenerated_addresses"] == ["meraki_networks.n_1"]
 
 
 def test_run_success_payload_contract() -> None:
@@ -55,9 +84,12 @@ def test_run_success_payload_contract() -> None:
         workspace="generated",
         discovered_assets=10,
         imports_already_tracked=5,
-        unsupported_count=1,
+        unsupported=[{"api_path": "/x", "reason": "r", "identifiers": []}],
         pending_imports=4,
         comparison_performed=True,
+        resources_added_to_state=["meraki_networks.n_1"],
+        coverage_percent=90.0,
+        deletions_pending=["meraki_devices.q2ab"],
     ).to_payload()
     assert payload["event_type"] == "RUN_SUCCESS"
     assert payload["severity"] == EventSeverity.INFO.value
@@ -68,9 +100,36 @@ def test_run_success_payload_contract() -> None:
         "discovered_assets": 10,
         "imports_already_tracked": 5,
         "unsupported_count": 1,
+        "unsupported": [{"api_path": "/x", "reason": "r", "identifiers": []}],
         "pending_imports": 4,
         "comparison_performed": True,
+        "resources_added_to_state": ["meraki_networks.n_1"],
+        "coverage_percent": 90.0,
+        "deletions_pending_confirmation": ["meraki_devices.q2ab"],
     }
+    assert "1 resource(s) added to state" in run_success(
+        imports_written=4,
+        drift_was_detected=False,
+        workspace="w",
+        discovered_assets=1,
+        imports_already_tracked=0,
+        unsupported=[],
+        pending_imports=None,
+        comparison_performed=True,
+        resources_added_to_state=["meraki_networks.n_1"],
+    ).summary
+
+
+def test_deletion_pending_confirmation_payload_contract() -> None:
+    event = deletion_pending_confirmation(
+        addresses=["meraki_networks.n_1"], workspace="generated"
+    )
+    assert event.event_type is EventType.DELETION_PENDING_CONFIRMATION
+    assert event.severity is EventSeverity.WARNING
+    details = event.to_payload()["details"]
+    assert details["addresses"] == ["meraki_networks.n_1"]
+    assert details["workspace"] == "generated"
+    assert "--confirm-deletions" in details["remediation"]
 
 
 def test_unsupported_feature_payload_contract() -> None:
@@ -120,7 +179,7 @@ def test_webhook_posts_structured_json(monkeypatch: pytest.MonkeyPatch) -> None:
         workspace="w",
         discovered_assets=1,
         imports_already_tracked=0,
-        unsupported_count=0,
+        unsupported=[],
         pending_imports=1,
         comparison_performed=True,
     )
@@ -233,7 +292,7 @@ def test_dispatcher_fans_out_and_isolates_failures() -> None:
             workspace="w",
             discovered_assets=1,
             imports_already_tracked=0,
-            unsupported_count=0,
+            unsupported=[],
             pending_imports=None,
             comparison_performed=False,
         )

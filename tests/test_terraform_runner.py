@@ -1,9 +1,10 @@
 """Terraform CLI runner: workspace management and subprocess contracts."""
 
+import json
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 
 import pytest
 
@@ -13,9 +14,13 @@ from meraki2tf.terraform_runner import (
     DEFAULT_STATE_FILENAME,
     GENERATED_CONFIG_FILENAME,
     PROVIDER_FILENAME,
+    SYNC_PLAN_FILENAME,
+    ImportGuardViolation,
     TerraformError,
     TerraformRunner,
 )
+
+PLAN_IMPORT_ONLY = "Plan: 2 to import, 0 to add, 0 to change, 0 to destroy."
 
 
 class FakeSubprocess:
@@ -39,6 +44,23 @@ class FakeSubprocess:
         return SimpleNamespace(
             returncode=self.returncode, stdout=self.stdout, stderr=self.stderr
         )
+
+
+class ScriptedSubprocess:
+    """One (returncode, stdout, side-effect) triple consumed per call."""
+
+    def __init__(
+        self, *steps: tuple[int, str, Callable[[], None] | None]
+    ) -> None:
+        self.steps = list(steps)
+        self.calls: list[tuple[str, ...]] = []
+
+    def run(self, command: tuple[str, ...], **kwargs: Any) -> SimpleNamespace:
+        self.calls.append(command)
+        returncode, stdout, side_effect = self.steps.pop(0)
+        if side_effect is not None:
+            side_effect()
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr="")
 
 
 @pytest.fixture()
@@ -355,3 +377,225 @@ def test_plan_exit_one_is_still_an_error(
 
 def test_real_subprocess_module_is_used() -> None:
     assert terraform_runner.subprocess is subprocess
+
+
+# ---------------------------------------------------------------------------
+# Sync-mode guard: import-only verification lives in the runner itself
+# ---------------------------------------------------------------------------
+
+
+def _write_state(path: Path, *addresses: str) -> None:
+    resources = [
+        {
+            "mode": "managed",
+            "type": address.split(".", 1)[0],
+            "name": address.split(".", 1)[1],
+        }
+        for address in addresses
+    ]
+    path.write_text(json.dumps({"resources": resources}), encoding="utf-8")
+
+
+def test_apply_import_plan_verifies_then_applies_the_saved_plan(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner.prepare_workspace()
+    scripted = ScriptedSubprocess(
+        (2, PLAN_IMPORT_ONLY, None),
+        (
+            0,
+            "Apply complete!",
+            lambda: _write_state(
+                runner.state_path, "meraki_networks.n_1", "meraki_devices.q2ab"
+            ),
+        ),
+    )
+    monkeypatch.setattr(terraform_runner.subprocess, "run", scripted.run)
+    added = runner.apply_import_plan()
+
+    plan_command, apply_command = scripted.calls
+    assert plan_command[1] == "plan"
+    assert f"-out={SYNC_PLAN_FILENAME}" in plan_command
+    # The verified plan file is applied verbatim — no TOCTOU window.
+    assert apply_command == (
+        "terraform", "apply", "-input=false", "-no-color", SYNC_PLAN_FILENAME,
+    )
+    assert added == ("meraki_devices.q2ab", "meraki_networks.n_1")
+    assert not (runner.workdir / SYNC_PLAN_FILENAME).exists()
+
+
+def test_apply_import_plan_noop_when_state_is_current(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner.prepare_workspace()
+    scripted = ScriptedSubprocess((0, "No changes.", None))
+    monkeypatch.setattr(terraform_runner.subprocess, "run", scripted.run)
+    assert runner.apply_import_plan() == ()
+    assert len(scripted.calls) == 1  # plan only; nothing to apply
+
+
+def test_guard_refuses_plans_with_mutations(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner.prepare_workspace()
+    scripted = ScriptedSubprocess(
+        (2, "Plan: 5 to import, 1 to add, 0 to change, 0 to destroy.", None)
+    )
+    monkeypatch.setattr(terraform_runner.subprocess, "run", scripted.run)
+    with pytest.raises(ImportGuardViolation, match="1 to add") as excinfo:
+        runner.apply_import_plan()
+    assert len(scripted.calls) == 1  # refused before any apply
+    assert "1 to add" in excinfo.value.plan_output
+
+
+def test_guard_refuses_unverifiable_plans(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No parseable summary → fail safe, never apply."""
+    runner.prepare_workspace()
+    scripted = ScriptedSubprocess((2, "~ mystery delta", None))
+    monkeypatch.setattr(terraform_runner.subprocess, "run", scripted.run)
+    with pytest.raises(ImportGuardViolation, match="could not be parsed"):
+        runner.apply_import_plan()
+    assert len(scripted.calls) == 1
+
+
+def test_guard_violation_is_a_terraform_error() -> None:
+    """Callers that only know TerraformError still fail closed."""
+    assert issubclass(ImportGuardViolation, TerraformError)
+
+
+def test_plan_with_generation_saves_plan_on_request(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner.prepare_workspace()
+    fake = FakeSubprocess(returncode=0)
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    runner.plan_with_generation(save_plan=True)
+    assert f"-out={SYNC_PLAN_FILENAME}" in fake.calls[0]["command"]
+    runner.plan_with_generation()
+    assert f"-out={SYNC_PLAN_FILENAME}" not in fake.calls[1]["command"]
+
+
+def test_plan_resource_actions_parses_show_json(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    document = {
+        "resource_changes": [
+            {"address": "meraki_networks.n_1", "change": {"actions": ["update"]}},
+            {"address": "meraki_devices.q2ab", "change": {"actions": ["no-op"]}},
+            {"change": {"actions": ["delete"]}},  # no address → skipped
+            "garbage-entry",
+        ]
+    }
+    fake = FakeSubprocess(returncode=0, stdout=json.dumps(document))
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    actions = runner.plan_resource_actions()
+    assert fake.calls[0]["command"] == ("terraform", "show", "-json", SYNC_PLAN_FILENAME)
+    assert actions == {
+        "meraki_networks.n_1": ("update",),
+        "meraki_devices.q2ab": ("no-op",),
+    }
+
+
+def test_plan_resource_actions_rejects_unparseable_output(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeSubprocess(returncode=0, stdout="{not json")
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    with pytest.raises(TerraformError, match="unparseable"):
+        runner.plan_resource_actions()
+
+
+def test_plan_resource_actions_tolerates_non_object_document(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeSubprocess(returncode=0, stdout="[]")
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    assert runner.plan_resource_actions() == {}
+
+
+# ---------------------------------------------------------------------------
+# Local removal surgery: confirmed deletions and baseline regeneration
+# ---------------------------------------------------------------------------
+
+BASELINE = """\
+resource "meraki_networks" "n_1" {
+  name = "HQ"
+  tags = {
+    site = "hq"
+  }
+}
+
+resource "meraki_devices" "q2ab" {
+  name = "edge"
+}
+
+resource "meraki_networks" "oneliner" {}
+"""
+
+
+def test_remove_resources_prunes_baseline_and_state(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner.prepare_workspace()
+    (runner.workdir / AGGREGATED_CONFIG_FILENAME).write_text(
+        BASELINE, encoding="utf-8"
+    )
+    _write_state(runner.state_path, "meraki_networks.n_1", "meraki_devices.q2ab")
+    fake = FakeSubprocess(returncode=0)
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+
+    runner.remove_resources({"meraki_networks.n_1", "meraki_networks.oneliner"})
+
+    content = (runner.workdir / AGGREGATED_CONFIG_FILENAME).read_text(encoding="utf-8")
+    assert 'resource "meraki_networks" "n_1"' not in content
+    assert 'site = "hq"' not in content  # nested braces stay inside the block
+    assert 'resource "meraki_networks" "oneliner"' not in content
+    assert 'resource "meraki_devices" "q2ab"' in content  # untouched neighbor
+    # Only the state-tracked address reaches `state rm`.
+    assert fake.calls[0]["command"] == (
+        "terraform", "state", "rm", "-no-color", "meraki_networks.n_1",
+    )
+
+
+def test_remove_resources_without_tracked_state_skips_state_rm(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner.prepare_workspace()
+    (runner.workdir / AGGREGATED_CONFIG_FILENAME).write_text(
+        BASELINE, encoding="utf-8"
+    )
+    fake = FakeSubprocess(returncode=0)
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    runner.remove_resources({"meraki_devices.q2ab"})
+    assert fake.calls == []  # nothing tracked → no terraform invocation
+    content = (runner.workdir / AGGREGATED_CONFIG_FILENAME).read_text(encoding="utf-8")
+    assert 'resource "meraki_devices" "q2ab"' not in content
+
+
+def test_remove_resources_with_no_targets_is_a_noop(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeSubprocess(returncode=0)
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    runner.remove_resources(())
+    assert fake.calls == []
+
+
+def test_remove_resources_tolerates_missing_baseline(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner.prepare_workspace()
+    fake = FakeSubprocess(returncode=0)
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    runner.remove_resources({"meraki_networks.n_1"})  # no resources.tf, no state
+    assert fake.calls == []
+
+
+def test_prune_leaves_unrelated_addresses_intact(runner: TerraformRunner) -> None:
+    runner.prepare_workspace()
+    baseline = runner.workdir / AGGREGATED_CONFIG_FILENAME
+    baseline.write_text(BASELINE, encoding="utf-8")
+    runner.remove_resources({"meraki_networks.unknown"})
+    assert baseline.read_text(encoding="utf-8") == BASELINE

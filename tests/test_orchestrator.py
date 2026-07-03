@@ -1,16 +1,25 @@
 """Lifecycle coordinator: alert triggers, failure semantics, read-only contract."""
 
+import json
 from pathlib import Path
 
 import pytest
 
 from meraki2tf.alerts import AlertDispatcher, AlertEvent, EventType, Notifier
 from meraki2tf.config import API_KEY_ENV_VAR
-from meraki2tf.hcl_generator import UnsupportedAsset
+from meraki2tf.coverage import COVERAGE_JSON_FILENAME, COVERAGE_SUMMARY_FILENAME
+from meraki2tf.hcl_generator import CapturedAsset, GenerationReport, UnsupportedAsset
 from meraki2tf.models import NetworkGraph
 from meraki2tf.orchestrator import PipelineError, PipelineOrchestrator
 from meraki2tf.providers.base import MerakiDataProvider
-from meraki2tf.terraform_runner import TerraformCommandResult, TerraformError
+from meraki2tf.terraform_runner import (
+    ImportGuardViolation,
+    TerraformCommandResult,
+    TerraformError,
+)
+
+PLAN_IMPORT_ONLY = "Plan: 2 to import, 0 to add, 0 to change, 0 to destroy."
+PLAN_WITH_CHANGES = "Plan: 0 to import, 0 to add, 1 to change, 0 to destroy."
 
 
 class RecordingNotifier(Notifier):
@@ -42,21 +51,43 @@ class StubProvider(MerakiDataProvider):
 
 
 class StubGenerator:
-    def __init__(self, imports_written: int = 2) -> None:
-        self.imports_written = imports_written
-        self.unsupported: tuple = ()  # type: ignore[type-arg]
-        self.skipped_existing = 0
-        self.received_existing: frozenset[str] | None = None
+    """Yields a deterministic GenerationReport over configurable addresses."""
+
+    def __init__(
+        self,
+        addresses: tuple[str, ...] = ("meraki_devices.q2ab", "meraki_networks.n_1"),
+        unsupported: tuple[UnsupportedAsset, ...] = (),
+    ) -> None:
+        self.addresses = addresses
+        self.unsupported = unsupported
+        #: (existing_addresses, audit) per generate() invocation.
+        self.calls: list[tuple[frozenset[str], bool]] = []
 
     def generate(
         self,
         graph: NetworkGraph,
         workdir: Path,
         existing_addresses: frozenset[str] = frozenset(),
-    ) -> "StubGenerator":
-        self.received_existing = existing_addresses
-        self.skipped_existing = len(existing_addresses)
-        return self
+        audit: bool = True,
+    ) -> GenerationReport:
+        self.calls.append((existing_addresses, audit))
+        captured = tuple(
+            CapturedAsset(
+                address=address,
+                api_path="/stub/{id}",
+                import_id=f"id-{address}",
+                already_in_state=address in existing_addresses,
+            )
+            for address in self.addresses
+        )
+        skipped = sum(asset.already_in_state for asset in captured)
+        return GenerationReport(
+            imports_file=workdir / "imports.tf",
+            imports_written=len(captured) - skipped,
+            unsupported=self.unsupported,
+            skipped_existing=skipped,
+            captured=captured,
+        )
 
 
 class StubRunner:
@@ -68,26 +99,27 @@ class StubRunner:
         plan_stdout: str = "~ delta",
     ) -> None:
         self.workdir = workdir
-        self.plan_exit = plan_exit
         self.fail_stage = fail_stage
-        self.plan_stdout = plan_stdout
+        #: Queue of (exit code, stdout) consumed per plan_with_generation
+        #: call; the last entry repeats when the queue runs dry.
+        self.plans: list[tuple[int, str]] = [(plan_exit, plan_stdout)]
+        self.actions: dict[str, tuple[str, ...]] = {}
+        self.apply_added: tuple[str, ...] = ()
+        self.apply_guard_error: ImportGuardViolation | None = None
         self.initialized = False
-        self.planned = False
+        self.plan_calls: list[bool] = []
         self.applied = False
+        self.rebuild_applied = False
         self.baseline_reset = False
         self.config_baseline = True
-        self.state_addresses: frozenset[str] = frozenset()
-
-    def _result(self, code: int) -> TerraformCommandResult:
-        return TerraformCommandResult(
-            command=("terraform",), returncode=code, stdout=self.plan_stdout, stderr=""
-        )
+        self.state_addresses: set[str] = set()
+        self.removed: list[tuple[str, ...]] = []
 
     def prepare_workspace(self) -> Path:
         return self.workdir
 
     def existing_addresses(self) -> frozenset[str]:
-        return self.state_addresses
+        return frozenset(self.state_addresses)
 
     def has_config_baseline(self) -> bool:
         return self.config_baseline
@@ -101,15 +133,37 @@ class StubRunner:
         self.initialized = True
         if self.fail_stage == "init":
             raise TerraformError("terraform init failed with exit code 1: boom")
-        return self._result(0)
+        return TerraformCommandResult(
+            command=("terraform",), returncode=0, stdout="", stderr=""
+        )
 
-    def plan_with_generation(self) -> TerraformCommandResult:
-        self.planned = True
-        return self._result(self.plan_exit)
+    def plan_with_generation(self, save_plan: bool = False) -> TerraformCommandResult:
+        self.plan_calls.append(save_plan)
+        code, stdout = self.plans[0] if len(self.plans) == 1 else self.plans.pop(0)
+        return TerraformCommandResult(
+            command=("terraform",), returncode=code, stdout=stdout, stderr=""
+        )
+
+    def plan_resource_actions(self) -> dict[str, tuple[str, ...]]:
+        return self.actions
+
+    def apply_import_plan(self) -> tuple[str, ...]:
+        if self.apply_guard_error is not None:
+            raise self.apply_guard_error
+        self.applied = True
+        self.state_addresses.update(self.apply_added)
+        return self.apply_added
+
+    def remove_resources(self, addresses: frozenset[str]) -> None:
+        removed = tuple(sorted(addresses))
+        self.removed.append(removed)
+        self.state_addresses.difference_update(removed)
 
     def rebuild_apply(self) -> TerraformCommandResult:
-        self.applied = True
-        return self._result(0)
+        self.rebuild_applied = True
+        return TerraformCommandResult(
+            command=("terraform",), returncode=0, stdout="", stderr=""
+        )
 
 
 def _orchestrator(
@@ -119,6 +173,8 @@ def _orchestrator(
     generator: StubGenerator | None = None,
     plan_stdout: str = "~ delta",
     rebaseline: bool = False,
+    sync: bool = False,
+    confirm_deletions: bool = False,
 ) -> tuple[PipelineOrchestrator, RecordingNotifier, StubProvider, StubRunner]:
     recorder = RecordingNotifier()
     provider = StubProvider()
@@ -131,6 +187,8 @@ def _orchestrator(
         runner=runner,  # type: ignore[arg-type]
         dispatcher=AlertDispatcher([recorder]),
         rebaseline=rebaseline,
+        sync=sync,
+        confirm_deletions=confirm_deletions,
     )
     return orchestrator, recorder, provider, runner
 
@@ -150,14 +208,15 @@ def test_clean_run_fires_only_run_success(tmp_path: Path, api_key: None) -> None
     assert success.details["comparison_performed"] is True
     assert success.details["discovered_assets"] == 0
     assert success.details["unsupported_count"] == 0
+    assert success.details["resources_added_to_state"] == []
     assert summary.drift_detected is False
     assert summary.comparison_skipped is False
     assert summary.imports_written == 2
     assert summary.pending_imports is None  # stub plan has no summary line
     assert summary.organization_id == "org-123"
     assert provider.closed  # context-managed discovery
-    assert runner.planned
-    assert not runner.applied  # read-only: the pipeline never applies
+    assert runner.plan_calls == [False]  # default mode never saves a plan
+    assert not runner.applied  # default mode: the pipeline never applies
 
 
 def test_plan_summary_counts_flow_into_run_summary(
@@ -188,8 +247,30 @@ def test_drift_fires_alert_but_never_applies(tmp_path: Path, api_key: None) -> N
     drift = recorder.events[0]
     assert drift.details["diff"] == "~ delta"
     assert drift.details["workspace"] == str(runner.workdir)
+    assert drift.details["apply_aborted"] is False
     assert summary.drift_detected is True
     assert not runner.applied
+
+
+def test_drift_alert_carries_the_unsupported_runbook(
+    tmp_path: Path, api_key: None
+) -> None:
+    """Contract: drift notifications always carry the manual-rebuild list."""
+    generator = StubGenerator(
+        unsupported=(
+            UnsupportedAsset(api_path="/x", reason="no mapping", identifiers=("N_1",)),
+        )
+    )
+    orchestrator, recorder, _, _ = _orchestrator(
+        tmp_path, plan_exit=2, generator=generator
+    )
+    orchestrator.run("org-123")
+    drift = recorder.events[0]
+    assert drift.event_type is EventType.DRIFT_DETECTED
+    assert drift.details["unsupported_count"] == 1
+    assert drift.details["unsupported"] == [
+        {"api_path": "/x", "reason": "no mapping", "identifiers": ["N_1"]}
+    ]
 
 
 def test_missing_api_key_skips_comparison(
@@ -204,7 +285,7 @@ def test_missing_api_key_skips_comparison(
     assert summary.comparison_skipped is True
     assert summary.drift_detected is False
     assert not runner.initialized
-    assert not runner.planned
+    assert runner.plan_calls == []
     assert not runner.applied
 
 
@@ -213,24 +294,25 @@ def test_existing_state_addresses_flow_into_generation(
 ) -> None:
     generator = StubGenerator()
     orchestrator, _, _, runner = _orchestrator(tmp_path, generator=generator)
-    runner.state_addresses = frozenset({"meraki_networks.n_1"})
+    runner.state_addresses = {"meraki_networks.n_1"}
 
     summary = orchestrator.run("org-123")
 
-    assert generator.received_existing == frozenset({"meraki_networks.n_1"})
+    assert generator.calls == [(frozenset({"meraki_networks.n_1"}), True)]
     assert summary.imports_skipped_existing == 1
 
 
 def test_unsupported_assets_warn_for_manual_dr_rebuild(
     tmp_path: Path, api_key: None, caplog: pytest.LogCaptureFixture
 ) -> None:
-    generator = StubGenerator()
-    generator.unsupported = (
-        UnsupportedAsset(
-            api_path="/networks/{networkId}/mystery",
-            reason="No Terraform resource maps to this API path.",
-            identifiers=("N_1",),
-        ),
+    generator = StubGenerator(
+        unsupported=(
+            UnsupportedAsset(
+                api_path="/networks/{networkId}/mystery",
+                reason="No Terraform resource maps to this API path.",
+                identifiers=("N_1",),
+            ),
+        )
     )
     orchestrator, recorder, _, _ = _orchestrator(tmp_path, generator=generator)
     with caplog.at_level("WARNING", logger="meraki2tf.orchestrator"):
@@ -241,7 +323,11 @@ def test_unsupported_assets_warn_for_manual_dr_rebuild(
         "MANUAL rebuild" in record.message and "mystery" in record.message
         for record in caplog.records
     )
-    assert recorder.events[-1].details["unsupported_count"] == 1
+    success = recorder.events[-1]
+    assert success.details["unsupported_count"] == 1
+    assert success.details["unsupported"][0]["api_path"] == (
+        "/networks/{networkId}/mystery"
+    )
 
 
 def test_rebaseline_resets_before_generation(tmp_path: Path, api_key: None) -> None:
@@ -255,7 +341,7 @@ def test_rebaseline_with_tracked_state_is_a_fault(
     tmp_path: Path, api_key: None
 ) -> None:
     orchestrator, recorder, _, runner = _orchestrator(tmp_path, rebaseline=True)
-    runner.state_addresses = frozenset({"meraki_networks.n_1"})
+    runner.state_addresses = {"meraki_networks.n_1"}
     with pytest.raises(PipelineError, match="baseline reset"):
         orchestrator.run("org-123")
     assert recorder.events[0].details["stage"] == "baseline reset"
@@ -267,7 +353,7 @@ def test_tracked_state_without_baseline_warns(
 ) -> None:
     """State-tracked resources with no resources.tf will plan as destroys."""
     orchestrator, _, _, runner = _orchestrator(tmp_path)
-    runner.state_addresses = frozenset({"meraki_networks.n_1"})
+    runner.state_addresses = {"meraki_networks.n_1"}
     runner.config_baseline = False
     with caplog.at_level("WARNING", logger="meraki2tf.orchestrator"):
         orchestrator.run("org-123")
@@ -289,3 +375,280 @@ def test_fault_dispatches_processing_fault_and_raises(
     assert fault.details["stage"] == "terraform init"
     assert "boom" in fault.details["error"]
     assert not runner.applied
+
+
+# ---------------------------------------------------------------------------
+# Sync mode: guarded import-only state materialization
+# ---------------------------------------------------------------------------
+
+
+def test_sync_applies_import_only_plan_and_reports_growth(
+    tmp_path: Path, api_key: None
+) -> None:
+    orchestrator, recorder, _, runner = _orchestrator(
+        tmp_path, plan_exit=2, plan_stdout=PLAN_IMPORT_ONLY, sync=True
+    )
+    runner.apply_added = ("meraki_devices.q2ab", "meraki_networks.n_1")
+    summary = orchestrator.run("org-123")
+
+    assert runner.applied
+    assert runner.plan_calls == [True]  # sync saves the plan for classification
+    assert summary.resources_added_to_state == (
+        "meraki_devices.q2ab", "meraki_networks.n_1",
+    )
+    assert summary.apply_aborted is False
+    assert summary.pending_imports == 0  # everything applied, nothing pending
+    assert [e.event_type for e in recorder.events] == [EventType.RUN_SUCCESS]
+    success = recorder.events[0]
+    assert success.details["resources_added_to_state"] == [
+        "meraki_devices.q2ab", "meraki_networks.n_1",
+    ]
+
+
+def test_sync_with_no_changes_never_invokes_apply(
+    tmp_path: Path, api_key: None
+) -> None:
+    orchestrator, _, _, runner = _orchestrator(tmp_path, plan_exit=0, sync=True)
+    summary = orchestrator.run("org-123")
+    assert not runner.applied
+    assert summary.resources_added_to_state == ()
+
+
+def test_sync_aborts_on_non_regenerable_mutations(
+    tmp_path: Path, api_key: None
+) -> None:
+    """Destroys (or creates from Meraki deletions) always stop the apply."""
+    orchestrator, recorder, _, runner = _orchestrator(
+        tmp_path,
+        plan_exit=2,
+        plan_stdout="Plan: 0 to import, 0 to add, 0 to change, 1 to destroy.",
+        sync=True,
+    )
+    runner.actions = {"meraki_networks.gone": ("delete",)}
+    summary = orchestrator.run("org-123")
+
+    assert not runner.applied
+    assert summary.apply_aborted is True
+    assert summary.drift_detected is True
+    assert [e.event_type for e in recorder.events] == [
+        EventType.DRIFT_DETECTED,
+        EventType.RUN_SUCCESS,
+    ]
+    assert recorder.events[0].details["apply_aborted"] is True
+
+
+def test_sync_aborts_on_unclassifiable_drift(tmp_path: Path, api_key: None) -> None:
+    """A drifting plan with no classifiable actions errs toward aborting."""
+    orchestrator, recorder, _, runner = _orchestrator(
+        tmp_path, plan_exit=2, plan_stdout="~ mystery delta", sync=True
+    )
+    summary = orchestrator.run("org-123")
+    assert not runner.applied
+    assert summary.apply_aborted is True
+    assert recorder.events[0].details["apply_aborted"] is True
+
+
+def test_sync_regenerates_modified_objects_then_applies(
+    tmp_path: Path, api_key: None
+) -> None:
+    """Meraki is truth: modified objects are re-imported with fresh HCL."""
+    generator = StubGenerator()
+    orchestrator, recorder, _, runner = _orchestrator(
+        tmp_path, generator=generator, sync=True
+    )
+    runner.state_addresses = {"meraki_networks.n_1"}
+    runner.plans = [(2, PLAN_WITH_CHANGES), (2, PLAN_IMPORT_ONLY)]
+    runner.actions = {"meraki_networks.n_1": ("update",)}
+    runner.apply_added = ("meraki_networks.n_1",)
+    summary = orchestrator.run("org-123")
+
+    assert runner.removed == [("meraki_networks.n_1",)]
+    # Second generation pass runs against the pruned state without
+    # re-dispatching the exception audit.
+    assert generator.calls[0] == (frozenset({"meraki_networks.n_1"}), True)
+    assert generator.calls[1] == (frozenset(), False)
+    assert runner.plan_calls == [True, True]
+    assert runner.applied
+    assert summary.regenerated_addresses == ("meraki_networks.n_1",)
+    assert summary.apply_aborted is False
+    assert summary.drift_detected is True
+    assert [e.event_type for e in recorder.events] == [
+        EventType.DRIFT_DETECTED,
+        EventType.RUN_SUCCESS,
+    ]
+    drift = recorder.events[0]
+    assert drift.details["apply_aborted"] is False
+    assert drift.details["regenerated_addresses"] == ["meraki_networks.n_1"]
+
+
+def test_sync_aborts_when_drift_survives_regeneration(
+    tmp_path: Path, api_key: None
+) -> None:
+    orchestrator, recorder, _, runner = _orchestrator(tmp_path, sync=True)
+    runner.state_addresses = {"meraki_networks.n_1"}
+    runner.plans = [(2, PLAN_WITH_CHANGES), (2, PLAN_WITH_CHANGES)]
+    runner.actions = {"meraki_networks.n_1": ("update",)}
+    summary = orchestrator.run("org-123")
+
+    assert not runner.applied
+    assert summary.apply_aborted is True
+    assert [e.event_type for e in recorder.events] == [
+        EventType.DRIFT_DETECTED,  # regeneration announcement
+        EventType.DRIFT_DETECTED,  # persistent drift → abort
+        EventType.RUN_SUCCESS,
+    ]
+    assert recorder.events[1].details["apply_aborted"] is True
+
+
+def test_runner_guard_violation_aborts_with_alert_not_fault(
+    tmp_path: Path, api_key: None
+) -> None:
+    """Belt-and-suspenders: if the runner's own guard refuses, the run
+    aborts with a drift alert instead of dying."""
+    orchestrator, recorder, _, runner = _orchestrator(
+        tmp_path, plan_exit=2, plan_stdout=PLAN_IMPORT_ONLY, sync=True
+    )
+    runner.apply_guard_error = ImportGuardViolation(
+        "mutations detected", plan_output="Plan: 1 to add"
+    )
+    summary = orchestrator.run("org-123")
+
+    assert summary.apply_aborted is True
+    assert summary.resources_added_to_state == ()
+    assert [e.event_type for e in recorder.events] == [
+        EventType.DRIFT_DETECTED,
+        EventType.RUN_SUCCESS,
+    ]
+    drift = recorder.events[0]
+    assert drift.details["apply_aborted"] is True
+    assert drift.details["diff"] == "Plan: 1 to add"
+
+
+# ---------------------------------------------------------------------------
+# Deletion review: alert-only unless a human confirms
+# ---------------------------------------------------------------------------
+
+
+def test_meraki_deletions_are_alert_only(tmp_path: Path, api_key: None) -> None:
+    orchestrator, recorder, _, runner = _orchestrator(tmp_path)
+    runner.state_addresses = {"meraki_networks.n_1", "meraki_networks.deleted"}
+    summary = orchestrator.run("org-123")
+
+    assert runner.removed == []  # never silently synced out of the kit
+    assert summary.deletions_pending == ("meraki_networks.deleted",)
+    assert summary.deletions_removed == ()
+    assert [e.event_type for e in recorder.events] == [
+        EventType.DELETION_PENDING_CONFIRMATION,
+        EventType.RUN_SUCCESS,
+    ]
+    pending = recorder.events[0]
+    assert pending.details["addresses"] == ["meraki_networks.deleted"]
+    assert recorder.events[1].details["deletions_pending_confirmation"] == [
+        "meraki_networks.deleted"
+    ]
+
+
+def test_deletions_detected_even_without_api_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The deletion check reads state + discovery, so air-gapped dump
+    runs still alert on kit resources missing from Meraki."""
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    orchestrator, recorder, _, runner = _orchestrator(tmp_path)
+    runner.state_addresses = {"meraki_networks.deleted"}
+    summary = orchestrator.run("org-123")
+    assert summary.deletions_pending == ("meraki_networks.deleted",)
+    assert recorder.events[0].event_type is EventType.DELETION_PENDING_CONFIRMATION
+
+
+def test_confirm_deletions_removes_from_kit_and_state(
+    tmp_path: Path, api_key: None
+) -> None:
+    orchestrator, recorder, _, runner = _orchestrator(
+        tmp_path, confirm_deletions=True
+    )
+    runner.state_addresses = {"meraki_networks.n_1", "meraki_networks.deleted"}
+    summary = orchestrator.run("org-123")
+
+    assert runner.removed == [("meraki_networks.deleted",)]
+    assert runner.initialized  # state rm needs an initialized backend
+    assert summary.deletions_removed == ("meraki_networks.deleted",)
+    assert summary.deletions_pending == ()
+    # Confirmed removals need no pending-confirmation alert.
+    assert [e.event_type for e in recorder.events] == [EventType.RUN_SUCCESS]
+
+
+def test_confirm_deletions_is_a_noop_without_deletions(
+    tmp_path: Path, api_key: None
+) -> None:
+    orchestrator, _, _, runner = _orchestrator(tmp_path, confirm_deletions=True)
+    summary = orchestrator.run("org-123")
+    assert runner.removed == []
+    assert summary.deletions_removed == ()
+
+
+# ---------------------------------------------------------------------------
+# Coverage manifest: the "what is / isn't in Terraform" guarantee
+# ---------------------------------------------------------------------------
+
+
+def test_coverage_manifest_written_every_run(tmp_path: Path, api_key: None) -> None:
+    generator = StubGenerator(
+        unsupported=(
+            UnsupportedAsset(api_path="/x", reason="no mapping", identifiers=("N_1",)),
+        )
+    )
+    orchestrator, recorder, _, runner = _orchestrator(tmp_path, generator=generator)
+    runner.state_addresses = {"meraki_networks.n_1"}
+    summary = orchestrator.run("org-123")
+
+    manifest = json.loads(
+        (tmp_path / COVERAGE_JSON_FILENAME).read_text(encoding="utf-8")
+    )
+    assert manifest["organization_id"] == "org-123"
+    assert manifest["totals"] == {
+        "discovered": 3,
+        "imported": 1,
+        "pending_import": 1,
+        "unsupported": 1,
+    }
+    statuses = {
+        entry.get("address", entry["api_path"]): entry["status"]
+        for entry in manifest["objects"]
+    }
+    assert statuses["meraki_networks.n_1"] == "imported"
+    assert statuses["meraki_devices.q2ab"] == "pending-import"
+    assert statuses["/x"] == "unsupported"
+    assert summary.coverage_percent == manifest["coverage_percent"]
+    assert recorder.events[-1].details["coverage_percent"] == (
+        manifest["coverage_percent"]
+    )
+    summary_text = (tmp_path / COVERAGE_SUMMARY_FILENAME).read_text(encoding="utf-8")
+    assert "manual DR runbook" in summary_text.lower() or "MANUAL" in summary_text
+
+
+def test_coverage_manifest_reflects_sync_applied_imports(
+    tmp_path: Path, api_key: None
+) -> None:
+    """Freshly materialized imports count as imported, not pending."""
+    orchestrator, _, _, runner = _orchestrator(
+        tmp_path, plan_exit=2, plan_stdout=PLAN_IMPORT_ONLY, sync=True
+    )
+    runner.apply_added = ("meraki_devices.q2ab", "meraki_networks.n_1")
+    orchestrator.run("org-123")
+    manifest = json.loads(
+        (tmp_path / COVERAGE_JSON_FILENAME).read_text(encoding="utf-8")
+    )
+    assert manifest["totals"]["imported"] == 2
+    assert manifest["totals"]["pending_import"] == 0
+    assert manifest["coverage_percent"] == 100.0
+
+
+def test_coverage_manifest_written_for_keyless_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    orchestrator, _, _, _ = _orchestrator(tmp_path)
+    orchestrator.run("org-123")
+    assert (tmp_path / COVERAGE_JSON_FILENAME).exists()
+    assert (tmp_path / COVERAGE_SUMMARY_FILENAME).exists()

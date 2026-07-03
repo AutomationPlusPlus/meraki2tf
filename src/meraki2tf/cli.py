@@ -3,7 +3,16 @@
 Built for both ad-hoc invocation and unattended scheduled runs (e.g. a
 weekly cron job): every input arrives via flags or environment
 variables, no interactive prompts, and the exit code reports outcome
-(0 = clean aggregation, 1 = pipeline fault, 2 = usage error).
+(0 = clean aggregation, 1 = pipeline fault, 2 = usage error,
+3 = coverage gaps with --fail-on-gaps).
+
+Mode gating: the default invocation is the ad-hoc/open-source mode —
+strictly read-only end-to-end (kit generation, speculative plan,
+alerts), safe for anyone to run against any org. ``--sync`` opts into
+DR automation: guarded import-only state materialization and
+modified-object baseline regeneration. Meraki itself is never mutated
+by either mode; only the explicit ``--rebuild --confirm`` action ever
+changes the organization.
 """
 
 from __future__ import annotations
@@ -111,6 +120,39 @@ def build_parser() -> argparse.ArgumentParser:
         "--confirm",
         action="store_true",
         help="Escalate --rebuild from a read-only preview to a real terraform apply.",
+    )
+    parser.add_argument(
+        "--sync",
+        action="store_true",
+        help=(
+            "Opt-in disaster-recovery mode for the scheduled job: after the "
+            "speculative plan, auto-apply it ONLY when it is 100%% imports "
+            "(0 to add, 0 to change, 0 to destroy) to grow the Terraform "
+            "state, and regenerate the HCL baseline of modified objects to "
+            "mirror current Meraki. Any mutating plan aborts with a drift "
+            "alert. Meraki itself is never touched. Requires "
+            f"{API_KEY_ENV_VAR}."
+        ),
+    )
+    parser.add_argument(
+        "--confirm-deletions",
+        action="store_true",
+        help=(
+            "Human confirmation to remove resources that were deleted in "
+            "Meraki from the DR kit and the Terraform state. Without this "
+            "flag deletions are alert-only and the kit keeps them, so an "
+            "accidental clickops deletion cannot silently poison the "
+            "rebuild baseline."
+        ),
+    )
+    parser.add_argument(
+        "--fail-on-gaps",
+        action="store_true",
+        help=(
+            "Exit with code 3 when the run discovers objects Terraform "
+            "cannot rebuild (coverage gaps), so schedulers and CI can gate "
+            "on full coverage."
+        ),
     )
     parser.add_argument(
         "--rebaseline",
@@ -294,12 +336,35 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "--rebuild operates on an existing --workdir; it cannot be "
                 "combined with --from-dump or --dump-to."
             )
+        if config.sync or config.confirm_deletions or config.fail_on_gaps:
+            arg_parser.error(
+                "--rebuild cannot be combined with the pipeline flags "
+                "--sync, --confirm-deletions, or --fail-on-gaps."
+            )
         logger.info("meraki2tf starting in rebuild (disaster recovery) mode.")
         return _rebuild(config)
+    if config.dump_to is not None and (
+        config.sync or config.confirm_deletions or config.fail_on_gaps
+    ):
+        arg_parser.error(
+            "--dump-to only exports a snapshot; it cannot be combined with "
+            "--sync, --confirm-deletions, or --fail-on-gaps."
+        )
     if config.mode is ExecutionMode.LIVE and not config.org_id:
         arg_parser.error("--org-id is required in live mode.")
     if config.sanitize and config.dump_to is None:
         arg_parser.error("--sanitize requires --dump-to.")
+    if config.sync and not api_key_present():
+        # Sync exists to materialize state unattended; silently skipping
+        # the apply would leave the weekly DR job believing it built
+        # state when it did not. Fail loudly so the scheduler notices.
+        logger.critical(
+            "--sync requires %s: state materialization runs terraform "
+            "plan/apply, which must authenticate against the Meraki "
+            "dashboard.",
+            API_KEY_ENV_VAR,
+        )
+        return 1
 
     logger.info("meraki2tf starting in %s mode.", config.mode.value)
     try:
@@ -318,6 +383,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             dispatcher=dispatcher,
             rebaseline=config.rebaseline,
+            sync=config.sync,
+            confirm_deletions=config.confirm_deletions,
         )
         summary = orchestrator.run(config.org_id)
     except PipelineError as exc:
@@ -328,6 +395,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     _report(summary)
+    if config.fail_on_gaps and summary.unsupported_count > 0:
+        logger.error(
+            "--fail-on-gaps: %d discovered object(s) cannot be rebuilt by "
+            "Terraform; exiting nonzero. See coverage.json in the workdir "
+            "for the manual-rebuild list.",
+            summary.unsupported_count,
+        )
+        return 3
     return 0
 
 
@@ -338,6 +413,8 @@ def _report(summary: RunSummary) -> None:
         drift_status = "DETECTED"
     else:
         drift_status = "not detected"
+    if summary.apply_aborted:
+        drift_status += " (sync auto-apply ABORTED for human review)"
     if summary.pending_imports is not None:
         pending_status = (
             f"{summary.pending_imports} import(s) pending state aggregation"
@@ -347,16 +424,40 @@ def _report(summary: RunSummary) -> None:
     logger.info(
         "Run complete for organization %s: %d/%d asset(s) captured as "
         "Terraform (%d new import(s), %d already in state), %d unsupported "
-        "asset(s) needing manual DR rebuild, %s, drift %s.",
+        "asset(s) needing manual DR rebuild, %.2f%% coverage, %s, drift %s.",
         summary.organization_id,
         summary.imports_written + summary.imports_skipped_existing,
         summary.discovered_assets,
         summary.imports_written,
         summary.imports_skipped_existing,
         summary.unsupported_count,
+        summary.coverage_percent,
         pending_status,
         drift_status,
     )
+    if summary.resources_added_to_state:
+        logger.info(
+            "State grew by %d resource(s): %s",
+            len(summary.resources_added_to_state),
+            ", ".join(summary.resources_added_to_state),
+        )
+    if summary.regenerated_addresses:
+        logger.info(
+            "HCL baseline regenerated to mirror Meraki for: %s",
+            ", ".join(summary.regenerated_addresses),
+        )
+    if summary.deletions_removed:
+        logger.info(
+            "Confirmed deletion(s) removed from the DR kit: %s",
+            ", ".join(summary.deletions_removed),
+        )
+    if summary.deletions_pending:
+        logger.warning(
+            "%d deletion(s) in Meraki await human confirmation "
+            "(re-run with --confirm-deletions after review): %s",
+            len(summary.deletions_pending),
+            ", ".join(summary.deletions_pending),
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised via the console script

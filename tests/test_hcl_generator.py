@@ -278,3 +278,49 @@ def test_empty_graph_writes_header_only_file(
     )
     assert report.imports_written == 0
     assert "import {" not in report.imports_file.read_text(encoding="utf-8")
+
+
+def test_captured_assets_carry_addresses_for_coverage(
+    generator: HclImportGenerator, tmp_path: Path
+) -> None:
+    """Every capturable asset lands in the report with its resolved
+    address, so the coverage manifest and deletion detector see the
+    full discovery picture — including state-tracked skips."""
+    report = generator.generate(
+        _graph(),
+        tmp_path,
+        existing_addresses=frozenset({"meraki_networks.n_1"}),
+    )
+    by_address = {asset.address: asset for asset in report.captured}
+    assert set(by_address) == {
+        "meraki_networks.n_1",
+        "meraki_devices.q2ab_cdef_ghij",
+        "meraki_networks_appliance_vlans.n_1_10",
+    }
+    assert report.captured_addresses == frozenset(by_address)
+    assert by_address["meraki_networks.n_1"].already_in_state is True
+    assert by_address["meraki_networks.n_1"].api_path == "/networks/{networkId}"
+    assert by_address["meraki_devices.q2ab_cdef_ghij"].already_in_state is False
+    assert by_address["meraki_networks_appliance_vlans.n_1_10"].import_id == "N_1,10"
+
+
+def test_quiet_reaudit_suppresses_alerts_but_still_reports(
+    generator: HclImportGenerator,
+    tmp_path: Path,
+    recorder: RecordingNotifier,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """audit=False (same-run regeneration) must not re-dispatch findings."""
+    graph = _graph(
+        features=(
+            FeatureConfiguration("/networks/{networkId}/unknownFeature", ("N_1",)),
+        )
+    )
+    with caplog.at_level(logging.ERROR, logger="meraki2tf.hcl_generator"):
+        report = generator.generate(graph, tmp_path, audit=False)
+
+    assert len(report.unsupported) == 1  # the finding itself is never hidden
+    assert recorder.events == []
+    assert not any(
+        "UNSUPPORTED FEATURE" in record.message for record in caplog.records
+    )

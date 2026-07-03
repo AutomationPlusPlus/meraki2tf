@@ -1,6 +1,7 @@
 """CLI entry point: argument surface, assembly, and dump-mode integration."""
 
 import json
+import logging
 import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
@@ -584,3 +585,254 @@ def test_rebuild_apply_failure_exits_one(
     monkeypatch.setattr(terraform_runner.subprocess, "run", fake_run)
 
     assert main(["--rebuild", "--confirm", "--workdir", str(workdir)]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Mode gating: --sync, --confirm-deletions, --fail-on-gaps
+# ---------------------------------------------------------------------------
+
+
+def test_new_flags_default_off(spec_file: Path) -> None:
+    """The default invocation stays the strictly read-only ad-hoc mode."""
+    config = _config(["--spec", str(spec_file)])
+    assert not config.sync
+    assert not config.confirm_deletions
+    assert not config.fail_on_gaps
+
+
+def test_sync_rejected_with_dump_to(dump_file: Path) -> None:
+    with pytest.raises(SystemExit):
+        main(["--from-dump", str(dump_file), "--dump-to", "out.json", "--sync"])
+
+
+def test_rebuild_rejects_pipeline_flags() -> None:
+    for flag in ("--sync", "--confirm-deletions", "--fail-on-gaps"):
+        with pytest.raises(SystemExit):
+            main(["--rebuild", flag])
+
+
+def test_sync_without_api_key_fails_loudly(
+    dump_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Silently skipping the apply would let the weekly DR job believe it
+    materialized state; sync must fail so the scheduler notices."""
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    assert main(["--from-dump", str(dump_file), "--sync"]) == 1
+
+
+def test_fail_on_gaps_exits_three_when_unsupported_objects_exist(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _no_network(monkeypatch)
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    from conftest import DUMP_DOCUMENT
+
+    document = json.loads(json.dumps(DUMP_DOCUMENT))
+    document["features"].append(
+        {"apiPath": "/networks/{networkId}/unknownFeature", "pathValues": ["N_1"]}
+    )
+    dump = tmp_path / "gappy.json"
+    dump.write_text(json.dumps(document), encoding="utf-8")
+    workdir = tmp_path / "workspace"
+
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(dump),
+         "--workdir", str(workdir), "--fail-on-gaps"]
+    )
+
+    assert exit_code == 3
+    manifest = json.loads((workdir / "coverage.json").read_text(encoding="utf-8"))
+    assert manifest["totals"]["unsupported"] == 1
+
+
+def test_fail_on_gaps_passes_a_fully_covered_run(
+    spec_file: Path,
+    dump_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _no_network(monkeypatch)
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    workdir = tmp_path / "workspace"
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(dump_file),
+         "--workdir", str(workdir), "--fail-on-gaps"]
+    )
+    assert exit_code == 0
+
+
+def test_coverage_manifest_is_part_of_every_kit(
+    spec_file: Path,
+    dump_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _no_network(monkeypatch)
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    workdir = tmp_path / "workspace"
+    assert main(
+        ["--spec", str(spec_file), "--from-dump", str(dump_file),
+         "--workdir", str(workdir)]
+    ) == 0
+    manifest = json.loads((workdir / "coverage.json").read_text(encoding="utf-8"))
+    assert manifest["totals"]["discovered"] == 4
+    assert manifest["totals"]["pending_import"] == 4
+    assert (workdir / "coverage.txt").exists()
+
+
+def test_sync_end_to_end_applies_import_only_plan(
+    spec_file: Path,
+    dump_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The weekly DR job: plan → verify import-only → apply → report growth."""
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    _no_network(monkeypatch)
+    workdir = tmp_path / "workspace"
+    state = workdir / "terraform.tfstate"
+    terraform_calls: list[tuple[str, ...]] = []
+
+    def fake_run(command: tuple[str, ...], **kwargs: Any) -> SimpleNamespace:
+        terraform_calls.append(command)
+        if command[1] == "plan":
+            return SimpleNamespace(
+                returncode=2,
+                stdout="Plan: 4 to import, 0 to add, 0 to change, 0 to destroy.",
+                stderr="",
+            )
+        if command[1] == "apply":
+            state.write_text(
+                json.dumps(
+                    {
+                        "resources": [
+                            {"mode": "managed", "type": "meraki_networks",
+                             "name": "n_1"},
+                            {"mode": "managed", "type": "meraki_devices",
+                             "name": "q2ab_cdef_ghij"},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    delivered: list[dict[str, Any]] = []
+
+    def fake_urlopen(request: urllib.request.Request, timeout: float) -> FakeResponse:
+        delivered.append(json.loads(request.data.decode("utf-8")))
+        return FakeResponse()
+
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake_run)
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(dump_file),
+         "--workdir", str(workdir), "--sync",
+         "--webhook-url", "https://hooks.example/alerts"]
+    )
+
+    assert exit_code == 0
+    # init → generation plan → guard plan → apply of the verified plan file.
+    assert [call[1] for call in terraform_calls] == ["init", "plan", "plan", "apply"]
+    assert terraform_calls[-1][-1] == "meraki2tf-sync.tfplan"
+    assert [event["event_type"] for event in delivered] == ["RUN_SUCCESS"]
+    success = delivered[0]["details"]
+    assert success["resources_added_to_state"] == [
+        "meraki_devices.q2ab_cdef_ghij", "meraki_networks.n_1",
+    ]
+    assert success["pending_imports"] == 0
+    manifest = json.loads((workdir / "coverage.json").read_text(encoding="utf-8"))
+    assert manifest["totals"]["imported"] == 2
+    assert manifest["totals"]["pending_import"] == 2
+
+
+def test_sync_end_to_end_aborts_mutating_plan(
+    spec_file: Path,
+    dump_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A destroy in the plan must abort the auto-apply with a drift alert."""
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    _no_network(monkeypatch)
+    workdir = tmp_path / "workspace"
+    terraform_calls: list[tuple[str, ...]] = []
+
+    def fake_run(command: tuple[str, ...], **kwargs: Any) -> SimpleNamespace:
+        terraform_calls.append(command)
+        if command[1] == "plan":
+            return SimpleNamespace(
+                returncode=2,
+                stdout="Plan: 0 to import, 0 to add, 0 to change, 1 to destroy.",
+                stderr="",
+            )
+        if command[1] == "show":
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "resource_changes": [
+                            {"address": "meraki_networks.n_1",
+                             "change": {"actions": ["delete"]}}
+                        ]
+                    }
+                ),
+                stderr="",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    delivered: list[dict[str, Any]] = []
+
+    def fake_urlopen(request: urllib.request.Request, timeout: float) -> FakeResponse:
+        delivered.append(json.loads(request.data.decode("utf-8")))
+        return FakeResponse()
+
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake_run)
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(dump_file),
+         "--workdir", str(workdir), "--sync",
+         "--webhook-url", "https://hooks.example/alerts"]
+    )
+
+    assert exit_code == 0
+    assert "apply" not in [call[1] for call in terraform_calls]
+    assert [event["event_type"] for event in delivered] == [
+        "DRIFT_DETECTED", "RUN_SUCCESS",
+    ]
+    assert delivered[0]["details"]["apply_aborted"] is True
+
+
+def test_report_surfaces_every_dr_outcome(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from meraki2tf.cli import _report
+    from meraki2tf.orchestrator import RunSummary
+
+    summary = RunSummary(
+        organization_id="org-123",
+        discovered_assets=5,
+        imports_written=1,
+        imports_skipped_existing=2,
+        unsupported_count=1,
+        drift_detected=True,
+        comparison_skipped=False,
+        pending_imports=0,
+        resources_added_to_state=("meraki_networks.n_1",),
+        apply_aborted=True,
+        deletions_pending=("meraki_devices.gone",),
+        deletions_removed=("meraki_devices.confirmed",),
+        regenerated_addresses=("meraki_networks.n_1",),
+        coverage_percent=80.0,
+    )
+    with caplog.at_level(logging.INFO, logger="meraki2tf.cli"):
+        _report(summary)
+    text = " ".join(record.getMessage() for record in caplog.records)
+    assert "sync auto-apply ABORTED" in text
+    assert "State grew by 1 resource(s)" in text
+    assert "regenerated to mirror Meraki" in text
+    assert "meraki_devices.confirmed" in text
+    assert "--confirm-deletions" in text and "meraki_devices.gone" in text
+    assert "80.00% coverage" in text
