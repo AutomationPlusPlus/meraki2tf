@@ -9,7 +9,7 @@ from meraki2tf.alerts import AlertDispatcher, AlertEvent, EventType, Notifier
 from meraki2tf.config import API_KEY_ENV_VAR
 from meraki2tf.coverage import COVERAGE_JSON_FILENAME, COVERAGE_SUMMARY_FILENAME
 from meraki2tf.hcl_generator import CapturedAsset, GenerationReport, UnsupportedAsset
-from meraki2tf.models import NetworkGraph
+from meraki2tf.models import FeatureConfiguration, NetworkGraph
 from meraki2tf.orchestrator import PipelineError, PipelineOrchestrator
 from meraki2tf.providers.base import MerakiDataProvider
 from meraki2tf.terraform_runner import (
@@ -751,4 +751,129 @@ def test_unmanaged_secrets_reach_summary_manifest_and_notification(
     assert success.details["unmanaged_secret_attribute_count"] == 1
     assert success.details["unmanaged_secret_attributes"] == {
         "meraki_devices.q2ab": ["psk"]
+    }
+
+
+class SecretPayloadProvider(StubProvider):
+    """Graph with one feature whose payload carries a secret value."""
+
+    def fetch_network_graph(
+        self, organization_id: str | None = None
+    ) -> NetworkGraph:
+        return NetworkGraph(
+            organization_id=organization_id or "org-123",
+            networks=(),
+            devices=(),
+            features=(
+                FeatureConfiguration(
+                    api_path="/stub/{id}",
+                    path_values=("q2ab",),
+                    payload={"psk": "hunter2", "name": "Guest"},
+                ),
+            ),
+        )
+
+
+class IdentifiedStubGenerator(StubGenerator):
+    """StubGenerator whose captured assets carry their path identifiers."""
+
+    def generate(
+        self,
+        graph: NetworkGraph,
+        workdir: Path,
+        existing_addresses: frozenset[str] = frozenset(),
+        audit: bool = True,
+    ) -> GenerationReport:
+        report = super().generate(graph, workdir, existing_addresses, audit)
+        captured = tuple(
+            CapturedAsset(
+                address=asset.address,
+                api_path=asset.api_path,
+                import_id=asset.import_id,
+                already_in_state=asset.already_in_state,
+                identifiers=(asset.address.rsplit(".", 1)[1],),
+            )
+            for asset in report.captured
+        )
+        return GenerationReport(
+            imports_file=report.imports_file,
+            imports_written=report.imports_written,
+            unsupported=report.unsupported,
+            skipped_existing=report.skipped_existing,
+            captured=captured,
+        )
+
+
+def _secret_payload_orchestrator(
+    tmp_path: Path,
+) -> tuple[PipelineOrchestrator, RecordingNotifier, StubRunner]:
+    """Pipeline whose discovery payload holds a psk the plan never reports."""
+    recorder = RecordingNotifier()
+    runner = StubRunner(tmp_path, plan_exit=0, plan_stdout="No changes.")
+    orchestrator = PipelineOrchestrator(
+        provider=SecretPayloadProvider(),
+        generator=IdentifiedStubGenerator(),  # type: ignore[arg-type]
+        runner=runner,  # type: ignore[arg-type]
+        dispatcher=AlertDispatcher([recorder]),
+    )
+    return orchestrator, recorder, runner
+
+
+def test_secret_reporting_survives_quiet_plan(
+    tmp_path: Path, api_key: None
+) -> None:
+    """Once resources are in state the plan stops mentioning secrets;
+    the payload scan must keep them in the manifest and notification."""
+    orchestrator, recorder, runner = _secret_payload_orchestrator(tmp_path)
+    assert not runner.reconciliation_secrets  # the plan reports nothing
+    summary = orchestrator.run("org-123")
+
+    assert summary.unmanaged_secret_attributes == {
+        "meraki_devices.q2ab": ("psk",)
+    }
+    manifest = json.loads(
+        (tmp_path / COVERAGE_JSON_FILENAME).read_text(encoding="utf-8")
+    )
+    assert manifest["unmanaged_secret_attributes"] == {
+        "meraki_devices.q2ab": ["psk"]
+    }
+    success = [
+        e for e in recorder.events if e.event_type is EventType.RUN_SUCCESS
+    ][0]
+    assert success.details["unmanaged_secret_attributes"] == {
+        "meraki_devices.q2ab": ["psk"]
+    }
+
+
+def test_secret_reporting_survives_airgapped_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Air-gapped runs never plan; the scan alone must report secrets."""
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    orchestrator, recorder, _ = _secret_payload_orchestrator(tmp_path)
+    summary = orchestrator.run("org-123")
+
+    assert summary.comparison_skipped is True
+    assert summary.unmanaged_secret_attributes == {
+        "meraki_devices.q2ab": ("psk",)
+    }
+    manifest = json.loads(
+        (tmp_path / COVERAGE_JSON_FILENAME).read_text(encoding="utf-8")
+    )
+    assert manifest["unmanaged_secret_attributes"] == {
+        "meraki_devices.q2ab": ["psk"]
+    }
+
+
+def test_plan_derived_secrets_override_payload_scan(
+    tmp_path: Path, api_key: None
+) -> None:
+    """When the plan does report a resource, its attribute list wins."""
+    orchestrator, _, runner = _secret_payload_orchestrator(tmp_path)
+    runner.reconciliation_secrets = {
+        "meraki_devices.q2ab": ("psk", "radius_secret")
+    }
+    summary = orchestrator.run("org-123")
+    assert summary.unmanaged_secret_attributes == {
+        "meraki_devices.q2ab": ("psk", "radius_secret")
     }
