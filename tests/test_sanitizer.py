@@ -221,6 +221,53 @@ def test_numeric_item_path_values_are_preserved() -> None:
     assert sanitize_graph(graph).features[0].path_values == ("net-0001", "10")
 
 
+def test_long_numeric_item_path_values_are_identity() -> None:
+    """All-numeric object IDs (adminId, optInId) must not survive."""
+    graph = NetworkGraph(
+        organization_id="org-123",
+        networks=(),
+        devices=(),
+        features=(
+            FeatureConfiguration(
+                api_path="/organizations/{organizationId}/admins/{adminId}",
+                path_values=("org-123", "2038677"),
+                payload={"id": "2038677", "email": "a@b.c"},
+            ),
+        ),
+    )
+    sanitized = sanitize_graph(graph).features[0]
+    assert sanitized.path_values[1].startswith("id-")
+    # The payload's own echo of the ID maps to the same pseudonym.
+    assert sanitized.payload["id"] == sanitized.path_values[1]
+
+
+def test_payload_id_references_are_pseudonymized_consistently() -> None:
+    """Opaque IDs seen only under *Id/*Ids payload keys must map too."""
+    graph = NetworkGraph(
+        organization_id="org-123",
+        networks=(),
+        devices=(),
+        features=(
+            FeatureConfiguration(
+                api_path="/networks/{networkId}/appliance/vpn/bgp",
+                path_values=("N_1",),
+                payload={
+                    "interfaceId": "1112223334445556679",
+                    "policyIds": ["1112223334445556679", "opaque-ref"],
+                    "vlanId": "10",  # short numeric stays structural
+                    "ssid": "guest-net",  # not an ID-reference key
+                },
+            ),
+        ),
+    )
+    payload = sanitize_graph(graph).features[0].payload
+    assert payload["interfaceId"].startswith("id-")
+    assert payload["policyIds"][0] == payload["interfaceId"]
+    assert payload["policyIds"][1].startswith("id-")
+    assert payload["vlanId"] == "10"
+    assert payload["ssid"] == "guest-net"
+
+
 def test_ipv6_addresses_are_pseudonymized() -> None:
     graph = NetworkGraph(
         organization_id="org-123",
