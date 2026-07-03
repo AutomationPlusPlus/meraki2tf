@@ -3,15 +3,52 @@
 ## Core Mission & Architecture
 A robust, secure, and schedulable CLI tool written in Python to extract Cisco Meraki configurations, map them to Terraform structures using the Meraki OpenAPI specification, evaluate state drift, generate import blocks for new resources, and flag unsupported parameters.
 
-**Disaster-Recovery Mission:** meraki2tf continuously converts a Meraki organization into runnable Terraform artifacts so the environment can be rebuilt after a major incident. The pipeline is therefore **strictly read-only toward Meraki: it must never execute `terraform apply`**. The only permissible apply path is the explicit, human-invoked `--rebuild --confirm` disaster-recovery action.
+**Primary Disaster-Recovery Mission:** The owning team manages Meraki via clickops; meraki2tf is the safety net. Run on a schedule (typically weekly), it dumps **everything** out of the Meraki tenant, converts it into runnable Terraform artifacts, and materializes a Terraform state from them — so the environment can be rebuilt after a major incident. Meraki (the dashboard) is the source of truth in this mode; Terraform trails it, never leads it.
+
+**Secondary Ad-hoc Mission:** As an open-source tool, meraki2tf must remain equally useful for one-shot users who want to generate Terraform for an org once and then own/maintain it themselves. The default invocation therefore stays conservative (see Mode Gating below); DR automation is opt-in.
+
+### The Two Cardinal Rules
+1. **Meraki is never mutated.** No run — scheduled, ad-hoc, live, or dump — may ever change anything in the Meraki organization. The sole exception is the explicit, human-invoked `--rebuild --confirm` disaster-recovery action.
+2. **Nothing Terraform can't rebuild goes unreported.** The operator must always be able to answer "what is and isn't covered by Terraform?" with 100% certainty. Every discovered Meraki object that cannot be represented/imported (unsupported by the provider, skipped, or errored) must surface in the coverage manifest and in notifications — that list is the manual-rebuild runbook after a disaster.
 
 ### Core Pipeline Steps
 1. **Dynamic Spec Ingestion:** Parse the Meraki OpenAPI JSON schema dynamically (either via a local file or pulling the latest release) to programmatically build the API-to-Terraform resource registry. **Hard-coded mapping tables are strictly prohibited**; the engine must dynamically derive resources and compound ID paths from the spec metadata to stay future-proof.
-2. **Configuration Discovery:** Ingest network infrastructure schemas via dual input modalities (Live Cloud API or Offline JSON Dump).
+2. **Configuration Discovery:** Ingest the *entire* organization via dual input modalities (Live Cloud API or Offline JSON Dump). Completeness matters more than speed — a DR kit missing objects is a false sense of security.
 3. **HCL Construction:** Write clean, declarative configuration structures natively utilizing modern Terraform `import` blocks.
-4. **State Orchestration & Drift Alerting:** Compare discovered configurations against the existing state file via a read-only speculative `terraform plan` (skipped gracefully when no API key is available, e.g. air-gapped dump runs). Pending imports are normal snapshot growth, not drift; when real add/change/destroy differences are found, compile a diff payload and **trigger a drift alert** via configured notification channels.
-5. **Artifact Completion & Success Notification:** Leave a complete rebuild kit (`imports.tf`, `provider.tf`, and the accumulated `resources.tf` configuration baseline) in the workspace. Upon absolute execution success, **dispatch a success notification** confirming a clean run. The pipeline itself never applies anything into state or into Meraki.
-6. **Exception Auditing:** Flag parameters or features completely unsupported by the Terraform provider, and emit structured payloads to alerting endpoints.
+4. **State Orchestration & Drift Alerting:** Compare discovered configurations against the existing state file via a read-only speculative `terraform plan` (skipped gracefully when no API key is available, e.g. air-gapped dump runs). Pending imports are normal snapshot growth, not drift. In sync/DR mode, import-only plans are auto-applied to grow the state (see State Materialization). Real add/change/destroy differences produce a diff payload and **trigger a drift alert** via configured notification channels.
+5. **Artifact Completion & Success Notification:** Leave a complete rebuild kit (`imports.tf`, `provider.tf`, the accumulated `resources.tf` baseline, and the coverage manifest) in the workspace. Upon absolute execution success, **dispatch a success notification** confirming a clean run and summarizing what changed since the last run (resources added to state, drift observed, coverage gaps).
+6. **Exception Auditing & Coverage Manifest:** Flag parameters or features unsupported by the Terraform provider, emit structured payloads to alerting endpoints, and write the per-run coverage manifest (see Coverage Guarantee).
+
+---
+
+## State Materialization (Guarded Import-Only Apply)
+
+The weekly DR job must build real Terraform state unattended, which requires applying import blocks. This is permitted under a strict guard, because `import` blocks only write state — they never touch Meraki:
+
+- In sync/DR mode, after the speculative plan, the pipeline may run `terraform apply` **only when the plan is 100% imports (0 to add, 0 to change, 0 to destroy)**.
+- If the plan contains *any* mutation, the apply is **aborted** and a drift alert fires with the diff. A human decides what happens next.
+- Every auto-applied run must report exactly which resources were added to state (in the log and in the success notification), so weekly reruns tell the operator what grew.
+- Default (non-sync) runs keep today's behavior: generate the kit, plan speculatively, never apply. State building is then a human/CI step outside the tool.
+
+### Drift Handling Defaults (DR mode)
+- **New objects in Meraki:** auto-generated, auto-imported into state, reported in the run summary/notification.
+- **Modified objects:** the HCL baseline is regenerated to mirror current Meraki (Meraki is truth) and the diff is dispatched via alerts.
+- **Deleted objects:** **alert-only.** Deletions are never silently synced out of the DR kit — an accidental clickops deletion must not quietly poison the rebuild baseline. A human reviews the alert and confirms removal (e.g. via `--rebaseline` or an explicit confirmation flag).
+
+### Mode Gating
+- **Default invocation** = ad-hoc/open-source mode: strictly read-only end-to-end (kit generation + speculative plan + alerts). Safe for anyone to run against any org.
+- **`--sync` (opt-in DR mode):** enables the guarded import-only auto-apply and modified-object HCL regeneration described above. This is the flag the scheduled weekly job passes.
+
+---
+
+## Coverage Guarantee ("what is / isn't in Terraform")
+
+- **Per-run coverage manifest:** every run writes a machine-readable `coverage.json` (and human-readable summary) into the workdir listing **every** discovered Meraki object with a status: `imported` (in state), `pending-import` (in kit, not yet in state), or `unsupported` (cannot be rebuilt by Terraform — include the reason). Include totals and a coverage percentage.
+- **Unsupported objects are pushed, not just stored:** success and drift notifications always carry the count and list of objects Terraform cannot rebuild, so the manual-rebuild list reaches the operator every week without them checking disk.
+- Optional CI gate: a flag (e.g. `--fail-on-gaps`) makes the run exit nonzero when unsupported objects exist, so schedulers can gate on full coverage.
+
+### Implementation Status Note
+The `--sync` guarded auto-apply, deletion-confirmation flow, coverage manifest, and `--fail-on-gaps` describe the **target contract**; verify against the current CLI (`src/meraki2tf/cli.py`) before assuming they exist. Anything already implemented (read-only pipeline, `--rebuild --confirm`, `--rebaseline`, dump/live providers, webhook/email alerts) must not regress while these land.
 
 ---
 
@@ -56,9 +93,10 @@ Do NOT install, generate configurations for, or utilize:
 - Pre-approved: `meraki` (SDK), `pre-commit`, `flake8`, `mypy`, `tox`, `pytest`, `pytest-cov`, and Python standard library utilities.
 - **CRITICAL:** The agent must explicitly halt and request human operational authorization before introducing *any* other external pip module.
 
-### 🔒 Read-Only Guarantee (Terraform Apply Ban)
-- The pipeline (scheduled or ad-hoc runs, live or dump mode) must **never** run `terraform apply` or otherwise mutate the Meraki organization or the Terraform state.
-- The sole apply path is the explicit disaster-recovery action `--rebuild --confirm`; `--rebuild` alone must remain a read-only plan preview.
+### 🔒 Meraki Read-Only Guarantee (Apply Guard)
+- No run may **ever** mutate the Meraki organization. The sole path that touches Meraki is the explicit disaster-recovery action `--rebuild --confirm`; `--rebuild` alone must remain a read-only plan preview.
+- `terraform apply` against *state* is permitted only via the sync-mode guard: the plan must be verified as import-only (0 add / 0 change / 0 destroy) immediately before applying, and any violation aborts with an alert. Default (non-sync) runs never apply anything.
+- Belt-and-suspenders: the guard check must live in `terraform_runner`, not just the orchestrator, so no future call path can bypass it.
 
 ### 🛡️ Security First Principle
 - **Secret Handling:** Zero tolerance for plaintext token parameters, hardcoded API variables, or hardcoded organization credentials in the repository, state logs, or output fields.
@@ -76,6 +114,7 @@ Do NOT install, generate configurations for, or utilize:
 ### 📢 Notification & Alerting Infrastructure
 - Build decoupled modular notifier plugins (Webhook targets, Email placeholders).
 - **Trigger alert/notification dispatching on:**
-  - Detection of configuration drift/differences during the comparison phase.
-  - Successful finalization and aggregation of a new state file run.
+  - Detection of configuration drift/differences during the comparison phase (including aborted auto-applies).
+  - Successful finalization of a run — including the list of resources newly added to state and the current unsupported/coverage summary.
   - Identification of unsupported Meraki features or critical script processing faults.
+  - Deletions detected in Meraki that await human confirmation.
