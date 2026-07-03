@@ -141,6 +141,31 @@ class ImportGuardViolation(TerraformError):
 _hcl_quote = hcl_quote
 
 
+def _attr_pairs(
+    kind: str, mapping: dict[str, tuple[str, ...]]
+) -> set[tuple[str, str, str]]:
+    """(kind, address, attribute) triples for progress comparison.
+
+    Progress is tracked per attribute, not per address: a second
+    reconciliation pass that touches a *new* attribute of an
+    already-edited resource is progress; re-proposing an
+    already-applied edit is not.
+    """
+    return {
+        (kind, address, attr)
+        for address, attrs in mapping.items()
+        for attr in attrs
+    }
+
+
+def _merge_attr_map(
+    into: dict[str, tuple[str, ...]], new: dict[str, tuple[str, ...]]
+) -> None:
+    """Merge attribute tuples per address (sorted, deduplicated)."""
+    for address, attrs in new.items():
+        into[address] = tuple(sorted({*into.get(address, ()), *attrs}))
+
+
 @dataclass(frozen=True)
 class PlanCounts:
     """Change counts parsed from a terraform plan summary line."""
@@ -428,20 +453,23 @@ class TerraformRunner:
                 reconciliation,
                 (GENERATED_CONFIG_FILENAME, AGGREGATED_CONFIG_FILENAME),
             )
-            if not (
-                set(new_ignored) - set(ignored)
-                or set(new_normalized) - set(normalized)
-            ):
-                # The proposed remediations were all applied before yet
-                # the diff persists — re-editing would loop forever, so
-                # surface whatever remains as drift instead.
+            proposed = _attr_pairs("ignore", new_ignored) | _attr_pairs(
+                "normalize", new_normalized
+            )
+            applied = _attr_pairs("ignore", ignored) | _attr_pairs(
+                "normalize", normalized
+            )
+            if not proposed - applied:
+                # Every proposed (address, attribute) remediation was
+                # applied before yet the diff persists — re-editing
+                # would loop forever, so surface it as drift instead.
                 logger.warning(
                     "Reconciliation made no further progress; reporting "
                     "the remaining plan changes as drift."
                 )
                 break
-            ignored.update(new_ignored)
-            normalized.update(new_normalized)
+            _merge_attr_map(ignored, new_ignored)
+            _merge_attr_map(normalized, new_normalized)
             self._log_reconciliation(reconciliation, new_ignored, new_normalized)
         return ReconciledPlanResult(
             result=result,

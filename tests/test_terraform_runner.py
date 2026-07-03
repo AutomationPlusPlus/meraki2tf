@@ -764,6 +764,51 @@ def test_reconciliation_suppresses_secret_nulls_then_replans(
     assert [c[1] for c in scripted.calls] == ["plan", "show", "plan"]
 
 
+def test_reconciliation_new_attribute_on_same_address_is_progress(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Progress is tracked per (address, attribute): a second pass
+    proposing a different attribute of an already-edited resource must
+    keep the loop going, and the report merges the attribute tuples."""
+    second_attr_json = json.dumps(
+        {
+            "resource_changes": [
+                {
+                    "address": "meraki_network_snmp.l_1",
+                    "change": {
+                        "actions": ["update"],
+                        "before": {"users_string": "u"},
+                        "after": {"users_string": None},
+                        "before_sensitive": {"users_string": True},
+                        "after_sensitive": {},
+                    },
+                }
+            ]
+        }
+    )
+    runner.prepare_workspace()
+    (runner.workdir / AGGREGATED_CONFIG_FILENAME).write_text(
+        SNMP_BLOCK, encoding="utf-8"
+    )
+    changes = "Plan: 0 to import, 0 to add, 1 to change, 0 to destroy."
+    scripted = ScriptedSubprocess(
+        (2, changes, None),
+        (0, SECRET_PLAN_JSON, None),  # pass 1: community_string
+        (2, changes, None),
+        (0, second_attr_json, None),  # pass 2: users_string -> progress
+        (0, "Plan: 1 to import, 0 to add, 0 to change, 0 to destroy.", None),
+    )
+    monkeypatch.setattr(terraform_runner.subprocess, "run", scripted.run)
+    outcome = runner.plan_with_generation()
+    assert outcome.ignored_secrets == {
+        "meraki_network_snmp.l_1": ("community_string", "users_string")
+    }
+    assert outcome.has_drift is False
+    assert [c[1] for c in scripted.calls] == [
+        "plan", "show", "plan", "show", "plan",
+    ]
+
+
 def test_reconciliation_stops_when_remediations_make_no_progress(
     runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:

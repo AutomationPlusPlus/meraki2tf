@@ -110,8 +110,11 @@ in Meraki. Unhandled, those phantom changes would fire a drift alert on
 every scheduled run and permanently block the sync-mode guard (which
 only auto-applies 100% import plans). `plan_reconciler.py` classifies
 every diffed attribute of every planned update and converges the
-workspace in a bounded plan → classify → edit → re-plan loop (at most
-three plan invocations):
+workspace in a plan → classify → edit → re-plan loop. Every iteration
+must make progress — drop a rejected resource or remediate an
+(address, attribute) pair it has not touched before — or the loop ends
+and whatever remains is reported as drift (a hard attempt cap guards
+against pathological plans):
 
 - **Unexpressible values** — the provider's validators reject values
   its own Read returns. Example from live testing: firmware upgrade
@@ -126,11 +129,17 @@ three plan invocations):
   phantom diff, and the attributes are reported as *unmanaged secrets*
   in `coverage.json`, `coverage.txt`, and the success notification —
   restore them manually after any rebuild.
-- **Value normalization** — state strings differing from the generated
-  expression only in JSON whitespace (`jsonencode()` output), or empty
-  strings the generator omitted (`"" → null`), are rewritten/injected
-  into the configuration as the exact state value, keeping real future
-  drift on those attributes visible.
+- **Value normalization** — state values that are JSON-equivalent to
+  what the generated expression evaluates to but textually different:
+  `jsonencode()` emits alphabetized keys and no whitespace, while
+  Meraki stores its own key order and formatting. The whole attribute
+  is re-synthesized in HCL directly from the state value (string
+  leaves byte-exact, never via `jsonencode()`), which covers both
+  whitespace and key-order diffs at any nesting depth. Empty strings
+  the generator omitted (`"" → null`) are injected the same way. Real
+  future drift on those attributes stays visible. Attributes with any
+  sensitive leaf are never synthesized — that would write secret
+  material into the workspace — and surface as drift instead.
 
 A resource is only remediated when *every* diffed attribute is provably
 phantom; a single unexplained diff leaves the whole resource alone so

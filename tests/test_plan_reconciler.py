@@ -8,12 +8,14 @@ from meraki2tf.plan_reconciler import (
     ResourceRemediation,
     apply_remediations,
     classify_plan,
+    deep_json_equal,
     drop_import_blocks,
     drop_resource_blocks,
     hcl_quote,
     inject_attribute,
     insert_ignore_changes,
-    rewrite_jsonencode_spans,
+    replace_attribute_value,
+    synthesize_hcl,
     validation_failures,
 )
 
@@ -90,11 +92,11 @@ def test_classify_secret_null_diffs_become_ignores() -> None:
     assert plan.real_changes == ()
     (remediation,) = plan.remediations
     assert remediation.secret_attrs == ("community_string",)
-    assert remediation.json_rewrites == {}
+    assert remediation.normalize_attrs == {}
     assert remediation.inject_attrs == {}
 
 
-def test_classify_whitespace_json_diffs_collect_exact_state_strings() -> None:
+def test_classify_whitespace_json_diffs_collect_exact_state_values() -> None:
     pretty = '{\n  "a": 1\n}'
     compact = '{"a":1}'
     document = {
@@ -107,28 +109,62 @@ def test_classify_whitespace_json_diffs_collect_exact_state_strings() -> None:
         ]
     }
     (remediation,) = classify_plan(document).remediations
-    assert remediation.json_rewrites == {"body": (pretty,)}
+    assert remediation.normalize_attrs == {"body": pretty}
     assert remediation.normalized_attrs == ("body",)
 
 
-def test_classify_nested_whitespace_diffs_keep_span_order() -> None:
-    """Only the list elements the plan proved whitespace-diffed get a
-    rewrite decision; matching elements map to None (span kept)."""
-    pretty = '{\n  "x": 2\n}'
-    same = '{"y":3}'
+def test_classify_key_order_diffs_record_the_whole_attribute() -> None:
+    """The live alerts case: jsonencode alphabetizes keys, Meraki does
+    not — the whole attribute is recorded for synthesis, including the
+    elements that matched (their exact strings must survive)."""
+    state_order = (
+        '{"smartSensitivity":"medium","smartEnabled":false,'
+        '"eventReminderPeriodSecs":10800}'
+    )
+    alphabetized = (
+        '{"eventReminderPeriodSecs":10800,"smartEnabled":false,'
+        '"smartSensitivity":"medium"}'
+    )
+    before_alerts = [
+        {"filters_selector": None, "type": "a"},
+        {"filters_selector": "any port", "type": "b"},
+        {"filters_selector": state_order, "type": "c"},
+    ]
+    after_alerts = [
+        {"filters_selector": None, "type": "a"},
+        {"filters_selector": "any port", "type": "b"},
+        {"filters_selector": alphabetized, "type": "c"},
+    ]
     document = {
         "resource_changes": [
             _update(
                 "meraki_network_alerts_settings.l_1",
-                {"alerts": [{"filters_selector": same},
-                            {"filters_selector": pretty}]},
-                {"alerts": [{"filters_selector": same},
-                            {"filters_selector": '{"x":2}'}]},
+                {"alerts": before_alerts},
+                {"alerts": after_alerts},
             )
         ]
     }
     (remediation,) = classify_plan(document).remediations
-    assert remediation.json_rewrites == {"filters_selector": (None, pretty)}
+    assert remediation.normalize_attrs == {"alerts": before_alerts}
+    assert remediation.normalized_attrs == ("alerts",)
+
+
+def test_deep_json_equal_edges() -> None:
+    # scalar-parsing strings never count as equal
+    assert deep_json_equal("Mon", "mon") is False
+    assert deep_json_equal("123", "123.0") is False
+    assert deep_json_equal("true", "true ") is False
+    # object/array documents differing in whitespace or key order do
+    assert deep_json_equal('{"b":2,"a":1}', '{\n"a": 1, "b": 2}') is True
+    assert deep_json_equal("[1, 2]", "[1,2]") is True
+    # nested containers recurse; unequal content stays unequal
+    assert deep_json_equal(
+        [{"note": '{"x":1}'}], [{"note": '{ "x" : 1 }'}]
+    ) is True
+    assert deep_json_equal('{"x":1}', '{"x":2}') is False
+    assert deep_json_equal({"a": 1}, {"a": 1, "b": 2}) is False
+    assert deep_json_equal([1], [1, 2]) is False
+    assert deep_json_equal("not json", "not json either") is False
 
 
 def test_classify_empty_null_scalars_become_injections() -> None:
@@ -185,6 +221,24 @@ def test_classify_tolerates_malformed_documents() -> None:
         ]
     }
     assert classify_plan(creates) == ReconciliationPlan()
+
+
+def test_classify_without_sensitivity_masks() -> None:
+    """Plan documents may omit the sensitivity masks entirely."""
+    document = {
+        "resource_changes": [
+            {
+                "address": "meraki_organization_saml.r_1",
+                "change": {
+                    "actions": ["update"],
+                    "before": {"sp_initiated_idp_id": ""},
+                    "after": {"sp_initiated_idp_id": None},
+                },
+            }
+        ]
+    }
+    (remediation,) = classify_plan(document).remediations
+    assert remediation.inject_attrs == {"sp_initiated_idp_id": ""}
 
 
 def test_classify_non_object_before_after_is_real_drift() -> None:
@@ -247,26 +301,99 @@ def test_inject_attribute_replaces_existing_assignment() -> None:
     assert "  enabled                = true\n" in injected
 
 
-def test_rewrite_jsonencode_spans_by_occurrence() -> None:
+def test_synthesize_hcl_covers_all_json_shapes() -> None:
+    assert synthesize_hcl(None) == "null"
+    assert synthesize_hcl(True) == "true"
+    assert synthesize_hcl(False) == "false"
+    assert synthesize_hcl(10800) == "10800"
+    assert synthesize_hcl(1.5) == "1.5"
+    assert synthesize_hcl("plain") == '"plain"'
+    assert synthesize_hcl({}) == "{}"
+    assert synthesize_hcl([]) == "[]"
+    obj = synthesize_hcl({"enabled": True, "weird key": "v"}, indent=4)
+    assert obj == '{\n    enabled = true\n    "weird key" = "v"\n  }'
+    lst = synthesize_hcl(["a", {"b": 1}], indent=4)
+    assert lst.startswith("[\n    \"a\",\n    {\n")
+    assert lst.endswith("\n  ]")
+
+
+def test_synthesize_hcl_falls_back_to_quoted_repr() -> None:
+    """Non-JSON leaf types cannot occur in a plan document, but the
+    fallback must still emit valid HCL rather than crash."""
+    assert synthesize_hcl(complex(1, 2)) == '"(1+2j)"'
+
+
+def test_replace_attribute_value_at_end_of_text() -> None:
+    block = 'resource "meraki_x" "r" {\n  body = null'
+    edited = replace_attribute_value(block, "body", '"v"')
+    assert edited == 'resource "meraki_x" "r" {\n  body = "v"'
+
+
+def test_synthesize_hcl_keeps_string_leaves_byte_exact() -> None:
+    """State strings pass through hcl_quote untouched — key order and
+    whitespace inside JSON-document strings survive synthesis."""
+    state_order = '{"z": 1,\n "a": 2}'
+    out = synthesize_hcl([{"filters_selector": state_order}], indent=4)
+    assert hcl_quote(state_order) in out
+
+
+def test_replace_attribute_value_handles_every_value_shape() -> None:
+    block = (
+        'resource "meraki_x" "r" {\n'
+        "  a_null   = null\n"
+        "  a_number = 5\n"
+        '  a_string = "keep (parens) and {braces} and \\"${escaped}\\""\n'
+        "  a_list = [\n"
+        "    1,\n"
+        "    2,\n"
+        "  ]\n"
+        '  a_json = jsonencode({\n    x = 1\n  })\n'
+        "  trailing = true\n"
+        "}\n"
+    )
+    for attr in ("a_null", "a_number", "a_string", "a_list", "a_json"):
+        edited = replace_attribute_value(block, attr, '"NEW"')
+        assert edited is not None
+        assert f'{attr} = "NEW"' in edited.replace("   ", " ").replace("  ", " ")
+        # neighbours survive the surgery intact
+        assert "  trailing = true\n" in edited
+        assert edited.count("resource ") == 1
+    assert replace_attribute_value(block, "absent", '"x"') is None
+
+
+def test_replace_attribute_value_is_quote_aware() -> None:
+    """Brackets and quotes inside string literals must not derail the
+    value-span scan (the old balanced-paren scan corrupted these)."""
+    tricky = hcl_quote('body ( with { unbalanced ] and " tricks')
+    block = (
+        'resource "meraki_x" "r" {\n'
+        f'  body     = "{tricky}"\n'
+        "  after_it = 1\n"
+        "}\n"
+    )
+    edited = replace_attribute_value(block, "body", '"replaced"')
+    assert edited is not None
+    assert '  body     = "replaced"\n' in edited
+    assert "  after_it = 1\n" in edited
+
+
+def test_replace_attribute_value_only_touches_top_level() -> None:
+    """A same-named attribute nested in a list element (indented deeper)
+    is out of reach; only the two-space top-level assignment matches."""
     block = (
         'resource "meraki_network_alerts_settings" "l_1" {\n'
         "  alerts = [\n"
         "    {\n"
-        '      filters_selector = jsonencode({"y" = 3})\n'
-        "    },\n"
-        "    {\n"
-        '      filters_selector = jsonencode({"x" = (2)})\n'
+        '      filters_selector = "nested"\n'
         "    },\n"
         "  ]\n"
         "}\n"
     )
-    pretty = '{\n  "x": 2\n}'
-    edited = rewrite_jsonencode_spans(
-        block, "filters_selector", (None, pretty)
-    )
-    assert 'jsonencode({"y" = 3})' in edited  # None keeps the span
-    assert 'jsonencode({"x" = (2)})' not in edited  # balanced parens honored
-    assert f'filters_selector = "{hcl_quote(pretty)}"' in edited
+    assert replace_attribute_value(block, "filters_selector", '"x"') is None
+    edited = replace_attribute_value(block, "alerts", "[]")
+    assert edited is not None
+    assert "  alerts = []\n" in edited
+    assert "nested" not in edited
 
 
 def test_drop_resource_blocks_and_import_blocks(tmp_path: Path) -> None:
@@ -376,7 +503,7 @@ def test_classification_matches_real_plan_shapes() -> None:
     assert by_address["meraki_wireless_ssid.l_a_0"].secret_attrs == ("psk",)
     assert "body" in by_address[
         "meraki_network_webhook_payload_template.l_a_wpt"
-    ].json_rewrites
+    ].normalize_attrs
     assert by_address["meraki_organization_saml.r_1"].inject_attrs == {
         "sp_initiated_idp_id": ""
     }
@@ -397,7 +524,10 @@ def test_json_helpers_ignore_non_json_strings() -> None:
 
 
 def test_sensitivity_mask_shapes() -> None:
-    """Nested masks: True mid-path, list-indexed masks, out-of-range."""
+    """Nested masks: True mid-path, list-indexed masks. An attribute
+    containing ANY sensitive leaf is never synthesized to disk — even
+    when its diff is provably formatting-only — because synthesis
+    writes state values (secret material included) into the config."""
     document = {
         "resource_changes": [
             _update(
@@ -415,12 +545,12 @@ def test_sensitivity_mask_shapes() -> None:
         ]
     }
     plan = classify_plan(document)
-    # whole-subtree sensitive diff is nested (len(path)>1) → real drift
+    assert plan.remediations == ()
+    # whole-subtree sensitive diff (value not null-ed) → real drift
     assert "meraki_x.whole_subtree" in plan.real_changes
-    # the list-masked resource's only diff is whitespace → remediated
-    (remediation,) = plan.remediations
-    assert remediation.address == "meraki_x.list_mask"
-    assert "note" in remediation.json_rewrites
+    # formatting-only diff, but the attribute carries a secret leaf →
+    # conservative real drift, never written to the workspace
+    assert "meraki_x.list_mask" in plan.real_changes
 
 
 def test_block_span_at_end_of_file_without_trailing_newline(
@@ -455,7 +585,7 @@ def test_apply_remediations_combines_all_edit_kinds(tmp_path: Path) -> None:
             ResourceRemediation(
                 address="meraki_organization_saml.r_1",
                 secret_attrs=("certificate",),
-                json_rewrites={"body": (pretty,)},
+                normalize_attrs={"body": pretty},
                 inject_attrs={"sp_initiated_idp_id": ""},
             ),
         )
@@ -467,6 +597,7 @@ def test_apply_remediations_combines_all_edit_kinds(tmp_path: Path) -> None:
     assert "ignore_changes = [certificate]" in text
     assert 'sp_initiated_idp_id = ""' in text
     assert "jsonencode" not in text
+    assert f'body    = "{hcl_quote(pretty)}"' in text
     assert normalized == {
         "meraki_organization_saml.r_1": ("body", "sp_initiated_idp_id")
     }

@@ -22,12 +22,17 @@ editing the workspace files and re-planning:
   block suppresses the phantom change; the attributes are reported as
   *unmanaged secrets* so the operator knows to restore them manually
   after a rebuild.
-* **Value normalization** — the state holds strings that differ from
-  the generated expression only in formatting (``jsonencode()``
-  whitespace), or holds empty strings the generator omitted entirely
-  (plan: ``"" -> null``). The configuration is rewritten to the exact
-  state value, so the diff disappears while real future drift on the
-  same attribute stays visible.
+* **Value normalization** — the state holds JSON-document strings that
+  differ from what the generated expression evaluates to only in
+  formatting: whitespace *or key order* (``jsonencode()`` alphabetizes
+  keys; Meraki stores its own ordering), or holds empty strings the
+  generator omitted entirely (plan: ``"" -> null``). The whole
+  attribute is re-synthesized in HCL from the exact state value —
+  byte-for-byte for every string leaf — so the diff disappears while
+  real future drift on the same attribute stays visible. Attributes
+  containing *any* sensitive leaf are never synthesized (that would
+  write secret material into the workspace files); they surface as
+  drift instead.
 
 Anything the classifier cannot prove to be one of these classes is left
 untouched and surfaces as ordinary drift. All edits are local file
@@ -90,9 +95,10 @@ class ResourceRemediation:
     address: str
     #: Top-level sensitive attributes whose only diff is state → null.
     secret_attrs: tuple[str, ...] = ()
-    #: attr → ordered per-occurrence decisions for its ``jsonencode()``
-    #: spans: the exact state string to substitute, or None to keep.
-    json_rewrites: dict[str, tuple[str | None, ...]] = field(default_factory=dict)
+    #: Top-level attributes whose config value is JSON-equivalent to
+    #: state but textually different (whitespace/key order): attr →
+    #: the full state value to re-synthesize the attribute from.
+    normalize_attrs: dict[str, Any] = field(default_factory=dict)
     #: Top-level scalar attributes the generator omitted (plan shows
     #: state-value → null): attr → exact state value to inject.
     inject_attrs: dict[str, Any] = field(default_factory=dict)
@@ -100,12 +106,7 @@ class ResourceRemediation:
     @property
     def normalized_attrs(self) -> tuple[str, ...]:
         """Attribute names whose values get rewritten or injected."""
-        rewritten = tuple(
-            attr
-            for attr, decisions in sorted(self.json_rewrites.items())
-            if any(d is not None for d in decisions)
-        )
-        return rewritten + tuple(sorted(self.inject_attrs))
+        return tuple(sorted({*self.normalize_attrs, *self.inject_attrs}))
 
 
 @dataclass(frozen=True)
@@ -149,83 +150,66 @@ def validation_failures(diagnostics: str) -> dict[str, str]:
     return failures
 
 
-def _diff_leaves(
-    before: Any, after: Any, path: tuple[Any, ...] = ()
-) -> list[tuple[tuple[Any, ...], Any, Any]]:
-    """Differing leaves of two parallel JSON trees, in generated-config
-    order (list index order; dict keys alphabetical, matching how
-    terraform emits generated attributes)."""
+def _attr_sensitive(mask: Any, attr: str) -> bool:
+    """Whether the sensitivity mask marks the whole top-level attribute."""
+    if mask is True:
+        return True
+    if isinstance(mask, dict):
+        return mask.get(attr) is True
+    return False
+
+
+def _mask_marks_within(mask: Any) -> bool:
+    """Whether a sensitivity (sub)mask marks anything at or below it."""
+    if mask is True:
+        return True
+    if isinstance(mask, dict):
+        return any(_mask_marks_within(value) for value in mask.values())
+    if isinstance(mask, list):
+        return any(_mask_marks_within(item) for item in mask)
+    return False
+
+
+def _mask_subtree(mask: Any, attr: str) -> Any:
+    return mask.get(attr) if isinstance(mask, dict) else mask
+
+
+def deep_json_equal(before: Any, after: Any) -> bool:
+    """Recursive equality where two unequal string leaves still count
+    as equal iff both parse to a JSON *object or array* (never a
+    scalar — ``"Mon"`` vs ``"mon"`` must stay unequal) with deep-equal
+    content. This is exactly the class of diff ``jsonencode()``
+    round-tripping produces: same document, different whitespace or
+    key order."""
+    if before == after:
+        return True
     if isinstance(before, dict) and isinstance(after, dict):
-        leaves: list[tuple[tuple[Any, ...], Any, Any]] = []
-        for key in sorted(set(before) | set(after)):
-            leaves.extend(_diff_leaves(before.get(key), after.get(key), path + (key,)))
-        return leaves
-    if (
-        isinstance(before, list)
-        and isinstance(after, list)
-        and len(before) == len(after)
-    ):
-        leaves = []
-        for index, (b_item, a_item) in enumerate(zip(before, after)):
-            leaves.extend(_diff_leaves(b_item, a_item, path + (index,)))
-        return leaves
-    if before != after:
-        return [(path, before, after)]
-    return []
-
-
-def _string_leaves(node: Any, attr: str, path: tuple[Any, ...] = ()) -> list[
-    tuple[tuple[Any, ...], str]
-]:
-    """String-valued leaves named ``attr``, in generated-config order."""
-    if isinstance(node, dict):
-        leaves: list[tuple[tuple[Any, ...], str]] = []
-        for key in sorted(node):
-            value = node[key]
-            if key == attr and isinstance(value, str):
-                leaves.append((path + (key,), value))
-            else:
-                leaves.extend(_string_leaves(value, attr, path + (key,)))
-        return leaves
-    if isinstance(node, list):
-        leaves = []
-        for index, item in enumerate(node):
-            leaves.extend(_string_leaves(item, attr, path + (index,)))
-        return leaves
-    return []
-
-
-def _is_sensitive(mask: Any, path: tuple[Any, ...]) -> bool:
-    """Whether the sensitivity mask marks ``path`` (or a parent) sensitive."""
-    node = mask
-    for step in path:
-        if node is True:
-            return True
-        if isinstance(node, dict):
-            node = node.get(step)
-        elif isinstance(node, list) and isinstance(step, int) and step < len(node):
-            node = node[step]
-        else:
+        return set(before) == set(after) and all(
+            deep_json_equal(value, after[key]) for key, value in before.items()
+        )
+    if isinstance(before, list) and isinstance(after, list):
+        return len(before) == len(after) and all(
+            deep_json_equal(b_item, a_item)
+            for b_item, a_item in zip(before, after)
+        )
+    if isinstance(before, str) and isinstance(after, str):
+        try:
+            b_doc, a_doc = json.loads(before), json.loads(after)
+        except ValueError:
             return False
-    return node is True
-
-
-def _json_equal_strings(before: Any, after: Any) -> bool:
-    """True when both values are JSON documents differing only in text."""
-    if not isinstance(before, str) or not isinstance(after, str):
-        return False
-    try:
-        return bool(json.loads(before) == json.loads(after))
-    except ValueError:
-        return False
+        if not isinstance(b_doc, (dict, list)) or not isinstance(a_doc, (dict, list)):
+            return False
+        return deep_json_equal(b_doc, a_doc)
+    return False
 
 
 def classify_plan(document: Any) -> ReconciliationPlan:
     """Split a plan's update actions into phantom classes vs real drift.
 
-    A resource is only remediated when *every* diffed leaf falls into a
-    provable phantom class; one unexplained leaf makes the whole
-    resource real drift (conservative — never mask a genuine change).
+    Classification is per top-level attribute; a resource is only
+    remediated when *every* diffed attribute falls into a provable
+    phantom class — one unexplained attribute makes the whole resource
+    real drift (conservative: never mask a genuine change).
     """
     remediations: list[ResourceRemediation] = []
     real: list[str] = []
@@ -243,48 +227,47 @@ def classify_plan(document: Any) -> ReconciliationPlan:
         if not isinstance(before, dict) or not isinstance(after, dict):
             real.append(address)
             continue
+        before_mask = body.get("before_sensitive")
+        after_mask = body.get("after_sensitive")
         secret_attrs: list[str] = []
-        whitespace_attrs: dict[str, set[tuple[Any, ...]]] = {}
+        normalize_attrs: dict[str, Any] = {}
         inject_attrs: dict[str, Any] = {}
         explainable = True
-        for path, b_leaf, a_leaf in _diff_leaves(before, after):
-            attr = path[-1] if path else ""
-            sensitive = _is_sensitive(
-                body.get("before_sensitive"), path
-            ) or _is_sensitive(body.get("after_sensitive"), path)
-            if a_leaf is None and b_leaf is not None and sensitive and len(path) == 1:
-                secret_attrs.append(str(attr))
-            elif _json_equal_strings(b_leaf, a_leaf):
-                whitespace_attrs.setdefault(str(attr), set()).add(path)
+        for attr in sorted(set(before) | set(after)):
+            b_value, a_value = before.get(attr), after.get(attr)
+            if b_value == a_value:
+                continue
+            sensitive = _attr_sensitive(before_mask, attr) or _attr_sensitive(
+                after_mask, attr
+            )
+            #: normalization writes the state value into the config
+            #: files verbatim — never do that when anything under the
+            #: attribute is marked sensitive.
+            sensitive_within = _mask_marks_within(
+                _mask_subtree(before_mask, attr)
+            ) or _mask_marks_within(_mask_subtree(after_mask, attr))
+            if a_value is None and b_value is not None and sensitive:
+                secret_attrs.append(attr)
+            elif not sensitive_within and deep_json_equal(b_value, a_value):
+                normalize_attrs[attr] = b_value
             elif (
-                a_leaf is None
-                and isinstance(b_leaf, _SCALAR_TYPES)
+                a_value is None
+                and isinstance(b_value, _SCALAR_TYPES)
                 and not sensitive
-                and len(path) == 1
             ):
-                inject_attrs[str(attr)] = b_leaf
+                inject_attrs[attr] = b_value
             else:
                 explainable = False
                 break
         if not explainable:
             real.append(address)
             continue
-        json_rewrites: dict[str, tuple[str | None, ...]] = {}
-        for attr, diff_paths in whitespace_attrs.items():
-            # every jsonencode() span of this attribute in the generated
-            # block, in text order == tree order; rewrite only the
-            # occurrences the plan proved to be whitespace-only diffs
-            decisions = tuple(
-                before_value if leaf_path in diff_paths else None
-                for leaf_path, before_value in _string_leaves(before, attr)
-            )
-            json_rewrites[attr] = decisions
-        if secret_attrs or json_rewrites or inject_attrs:
+        if secret_attrs or normalize_attrs or inject_attrs:
             remediations.append(
                 ResourceRemediation(
                     address=address,
                     secret_attrs=tuple(sorted(set(secret_attrs))),
-                    json_rewrites=json_rewrites,
+                    normalize_attrs=normalize_attrs,
                     inject_attrs=inject_attrs,
                 )
             )
@@ -397,70 +380,111 @@ def insert_ignore_changes(block: str, attrs: tuple[str, ...]) -> str:
     return head + newline + lifecycle + tail
 
 
+_BARE_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def synthesize_hcl(value: Any, indent: int = 2) -> str:
+    """HCL expression for a state value, string leaves byte-exact.
+
+    Strings are emitted as quoted literals (``hcl_quote`` escaping),
+    never ``jsonencode()`` — that is the whole point: ``jsonencode``
+    re-serializes with alphabetical keys and no whitespace, which is
+    what caused the round-trip diff being remediated.
+    """
+    pad = " " * indent
+    closing = " " * max(indent - 2, 0)
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return f'"{hcl_quote(value)}"'
+    if isinstance(value, (int, float)):
+        return json.dumps(value)
+    if isinstance(value, dict):
+        if not value:
+            return "{}"
+        lines = []
+        for key, item in value.items():
+            key_text = (
+                key
+                if isinstance(key, str) and _BARE_KEY_RE.match(key)
+                else f'"{hcl_quote(str(key))}"'
+            )
+            lines.append(f"{pad}{key_text} = {synthesize_hcl(item, indent + 2)}")
+        return "{\n" + "\n".join(lines) + f"\n{closing}}}"
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return "[]"
+        lines = [f"{pad}{synthesize_hcl(item, indent + 2)}," for item in value]
+        return "[\n" + "\n".join(lines) + f"\n{closing}]"
+    # JSON documents have no other leaf types; repr the stragglers as
+    # strings so the edit never emits invalid HCL.
+    return f'"{hcl_quote(str(value))}"'
+
+
+def _value_span_end(block: str, start: int) -> int:
+    """End offset of the attribute value beginning at ``start``.
+
+    Quote-aware scan: double-quoted strings (backslash escapes honored)
+    never contribute to nesting, ``()[]{}`` outside strings do, and the
+    value ends at the first newline once nesting is balanced. Generated
+    values are literals — interpolations are escaped ``$${`` — so no
+    template grammar is needed.
+    """
+    depth = 0
+    in_string = False
+    index = start
+    while index < len(block):
+        char = block[index]
+        if in_string:
+            if char == "\\":
+                index += 2
+                continue
+            if char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif char == "\n" and depth <= 0:
+            return index
+        index += 1
+    return index
+
+
+def replace_attribute_value(block: str, attr: str, value_hcl: str) -> str | None:
+    """Replace the top-level ``attr = <value>`` assignment's value.
+
+    Top-level attributes in terraform-emitted blocks are indented by
+    exactly two spaces, which keeps same-named nested attributes (list
+    elements carry their own ``filters_selector``) out of reach.
+    Returns None when the block has no top-level assignment.
+    """
+    opener = re.compile(r"^ {2}%s\s*=\s*" % re.escape(attr), re.MULTILINE)
+    match = opener.search(block)
+    if match is None:
+        return None
+    end = _value_span_end(block, match.end())
+    return block[: match.end()] + value_hcl + block[end:]
+
+
 def inject_attribute(block: str, attr: str, value: Any) -> str:
-    """Set ``attr = <literal>`` so the config matches state exactly.
+    """Set ``attr = <synthesized literal>`` so config matches state.
 
     Replaces the attribute's existing top-level assignment when the
     generated config already carries one (e.g. an explicit ``null``);
     otherwise inserts it at the top of the block. Terraform rejects
     duplicate arguments, so replace-or-insert is mandatory.
     """
-    if isinstance(value, bool):
-        literal = "true" if value else "false"
-    elif isinstance(value, str):
-        literal = f'"{hcl_quote(value)}"'
-    else:
-        literal = json.dumps(value)
-    existing = re.compile(
-        r"^(\s+%s\s*=\s*).*$" % re.escape(attr), re.MULTILINE
-    )
-    match = existing.search(block)
-    if match is not None:
-        return (
-            block[: match.start()]
-            + f"{match.group(1)}{literal}"
-            + block[match.end():]
-        )
+    literal = synthesize_hcl(value, indent=4)
+    replaced = replace_attribute_value(block, attr, literal)
+    if replaced is not None:
+        return replaced
     head, newline, tail = block.partition("\n")
     return f"{head}{newline}  {attr} = {literal}\n{tail}"
-
-
-def rewrite_jsonencode_spans(
-    block: str, attr: str, decisions: tuple[str | None, ...]
-) -> str:
-    """Replace the k-th ``attr = jsonencode( … )`` span with the exact
-    state string from ``decisions[k]`` (None keeps the span).
-
-    Occurrence order in the generated text matches the plan tree's
-    walk order — list elements in order, attributes alphabetical —
-    which is how ``classify_plan`` built the decision tuple.
-    """
-    opener = re.compile(r"%s\s*=\s*jsonencode\(" % re.escape(attr))
-    result: list[str] = []
-    cursor = 0
-    occurrence = 0
-    while True:
-        match = opener.search(block, cursor)
-        if match is None:
-            break
-        # balanced-paren scan from the opening parenthesis
-        depth = 1
-        index = match.end()
-        while index < len(block) and depth:
-            depth += {"(": 1, ")": -1}.get(block[index], 0)
-            index += 1
-        decision = (
-            decisions[occurrence] if occurrence < len(decisions) else None
-        )
-        result.append(block[cursor:match.start()])
-        if decision is None:
-            result.append(block[match.start():index])
-        else:
-            result.append(f'{attr} = "{hcl_quote(decision)}"')
-        cursor = index
-        occurrence += 1
-    result.append(block[cursor:])
-    return "".join(result)
 
 
 def apply_remediations(
@@ -479,8 +503,8 @@ def apply_remediations(
     normalized: dict[str, tuple[str, ...]] = {}
     for remediation in plan.remediations:
         def edit(block: str, remediation: ResourceRemediation = remediation) -> str:
-            for attr, decisions in sorted(remediation.json_rewrites.items()):
-                block = rewrite_jsonencode_spans(block, attr, decisions)
+            for attr, value in sorted(remediation.normalize_attrs.items()):
+                block = inject_attribute(block, attr, value)
             for attr, value in sorted(remediation.inject_attrs.items()):
                 block = inject_attribute(block, attr, value)
             if remediation.secret_attrs:
