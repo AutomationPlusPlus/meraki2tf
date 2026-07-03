@@ -398,13 +398,29 @@ def insert_ignore_changes(block: str, attrs: tuple[str, ...]) -> str:
 
 
 def inject_attribute(block: str, attr: str, value: Any) -> str:
-    """Insert ``attr = <literal>`` so the config matches state exactly."""
+    """Set ``attr = <literal>`` so the config matches state exactly.
+
+    Replaces the attribute's existing top-level assignment when the
+    generated config already carries one (e.g. an explicit ``null``);
+    otherwise inserts it at the top of the block. Terraform rejects
+    duplicate arguments, so replace-or-insert is mandatory.
+    """
     if isinstance(value, bool):
         literal = "true" if value else "false"
     elif isinstance(value, str):
         literal = f'"{hcl_quote(value)}"'
     else:
         literal = json.dumps(value)
+    existing = re.compile(
+        r"^(\s+%s\s*=\s*).*$" % re.escape(attr), re.MULTILINE
+    )
+    match = existing.search(block)
+    if match is not None:
+        return (
+            block[: match.start()]
+            + f"{match.group(1)}{literal}"
+            + block[match.end():]
+        )
     head, newline, tail = block.partition("\n")
     return f"{head}{newline}  {attr} = {literal}\n{tail}"
 

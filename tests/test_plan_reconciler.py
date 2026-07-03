@@ -231,6 +231,22 @@ def test_inject_attribute_literals_and_escaping() -> None:
     assert '  template = "say \\"$${hi}\\""\n' in injected
 
 
+def test_inject_attribute_replaces_existing_assignment() -> None:
+    """Generated config may already carry the attribute (as null);
+    terraform rejects duplicate arguments, so injection must replace."""
+    block = (
+        'resource "meraki_organization_saml" "r_1" {\n'
+        "  enabled                = true\n"
+        "  sp_initiated_idp_id    = null\n"
+        "}\n"
+    )
+    injected = inject_attribute(block, "sp_initiated_idp_id", "")
+    assert injected.count("sp_initiated_idp_id") == 1
+    assert '  sp_initiated_idp_id    = ""\n' in injected
+    # untouched attributes keep their lines
+    assert "  enabled                = true\n" in injected
+
+
 def test_rewrite_jsonencode_spans_by_occurrence() -> None:
     block = (
         'resource "meraki_network_alerts_settings" "l_1" {\n'
