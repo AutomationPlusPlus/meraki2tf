@@ -11,8 +11,13 @@ editing the workspace files and re-planning:
 
 * **Unexpressible values** — the provider's own validators reject the
   values its own Read returns (e.g. ``upgrade_window_day_of_week``
-  must be lowercase ``"mon"`` while Meraki returns ``"Mon"``). The
-  configuration cannot round-trip at all, so the resource is dropped
+  must be lowercase ``"mon"`` while Meraki returns ``"Mon"``). When
+  the rejection is a pure enum *case* mismatch (a case-insensitive
+  match exists in the validator's allowed list) the value is repaired
+  to the provider's casing and the attribute is pinned with
+  ``ignore_changes`` — the state keeps the API casing, so the
+  case-only diff that would otherwise follow is provably phantom.
+  Anything else cannot round-trip at all, so the resource is dropped
   from the kit (import block + config block) and reported as
   *unsupported* — the coverage manifest is the manual-rebuild runbook.
 * **Secret attributes** — generated configuration never carries
@@ -148,6 +153,89 @@ def validation_failures(diagnostics: str) -> dict[str, str]:
         # first error per address wins; later duplicates add nothing
         failures.setdefault(address, reason)
     return failures
+
+
+#: Terraform's enum-validator diagnostic, as flattened into a
+#: ``validation_failures`` reason string: ``Attribute <attr> value must
+#: be one of: ["a" "b" …], got: "X"``.
+_ENUM_MISMATCH_RE = re.compile(
+    r'Attribute (?P<attr>[A-Za-z_][A-Za-z0-9_]*) value must be one of:'
+    r'\s*\[(?P<allowed>[^\]]*)\],\s*got:\s*"(?P<got>[^"]*)"'
+)
+
+
+def enum_case_repairs(
+    failures: dict[str, str],
+) -> dict[str, dict[str, str]]:
+    """Repairable enum-case mismatches among validation failures.
+
+    Returns ``{address: {attribute: replacement}}`` for every failure
+    whose diagnostic is an enum-validator rejection where the offending
+    value matches an allowed value case-insensitively (preferring the
+    plain lowercase form when the list offers several spellings).
+    Failures without such a match are absent — they stay unexpressible.
+    """
+    repairs: dict[str, dict[str, str]] = {}
+    for address, reason in failures.items():
+        match = _ENUM_MISMATCH_RE.search(reason)
+        if match is None:
+            continue
+        got = match["got"]
+        allowed = re.findall(r'"([^"]*)"', match["allowed"])
+        candidates = [
+            value for value in allowed if value.lower() == got.lower()
+        ]
+        if got in allowed or not candidates:
+            continue
+        replacement = (
+            got.lower() if got.lower() in candidates else candidates[0]
+        )
+        repairs[address] = {match["attr"]: replacement}
+    return repairs
+
+
+def apply_enum_case_repairs(
+    workdir: Path,
+    repairs: dict[str, dict[str, str]],
+    config_filenames: tuple[str, ...],
+) -> dict[str, tuple[str, ...]]:
+    """Rewrite enum values to the provider's casing in the workspace.
+
+    Each repaired attribute is additionally pinned with
+    ``ignore_changes``: the provider keeps the API's casing in state
+    while rejecting it in configuration, so once the value is repaired
+    the plan would forever propose the case-only flip back. Returns
+    ``{address: (attributes…,)}`` for the blocks actually edited;
+    addresses whose block (or attribute) cannot be located are absent
+    and remain ordinary unexpressible failures.
+    """
+    config_files = tuple(workdir / name for name in config_filenames)
+    repaired: dict[str, tuple[str, ...]] = {}
+    for address, attrs in sorted(repairs.items()):
+        edited_attrs: list[str] = []
+
+        def edit(block: str, attrs: dict[str, str] = attrs) -> str:
+            for attr, replacement in sorted(attrs.items()):
+                replaced = replace_attribute_value(
+                    block, attr, f'"{hcl_quote(replacement)}"'
+                )
+                if replaced is None:
+                    continue
+                block = replaced
+                edited_attrs.append(attr)
+            if edited_attrs:
+                block = insert_ignore_changes(block, tuple(edited_attrs))
+            return block
+
+        if (
+            any(
+                _edit_resource_block(path, address, edit)
+                for path in config_files
+            )
+            and edited_attrs
+        ):
+            repaired[address] = tuple(sorted(set(edited_attrs)))
+    return repaired
 
 
 def _attr_sensitive(mask: Any, attr: str) -> bool:

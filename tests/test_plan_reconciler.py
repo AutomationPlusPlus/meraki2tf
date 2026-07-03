@@ -6,11 +6,13 @@ from typing import Any
 from meraki2tf.plan_reconciler import (
     ReconciliationPlan,
     ResourceRemediation,
+    apply_enum_case_repairs,
     apply_remediations,
     classify_plan,
     deep_json_equal,
     drop_import_blocks,
     drop_resource_blocks,
+    enum_case_repairs,
     hcl_quote,
     inject_attribute,
     insert_ignore_changes,
@@ -75,6 +77,97 @@ def test_validation_failures_parses_every_error_block() -> None:
 def test_validation_failures_without_resource_blocks_is_empty() -> None:
     assert validation_failures("Error: Unable to find API key\n\nboom\n") == {}
     assert validation_failures("") == {}
+
+
+def test_enum_case_repairs_extracts_case_insensitive_matches() -> None:
+    """``"Mon"`` has the lowercase ``"mon"`` in the allowed list and is
+    repairable; ``"Sun"`` matches nothing and stays unexpressible."""
+    repairs = enum_case_repairs(validation_failures(VALIDATION_STDERR))
+    assert repairs == {
+        "meraki_network_firmware_upgrades.l_1": {
+            "upgrade_window_day_of_week": "mon"
+        }
+    }
+
+
+def test_enum_case_repairs_prefers_plain_lowercase_spelling() -> None:
+    failures = {
+        "meraki_x.a": (
+            "Invalid Attribute Value Match: Attribute day value must be "
+            'one of: ["sunday" "sun"], got: "Sun"'
+        ),
+        "meraki_x.b": (
+            "Invalid Attribute Value Match: Attribute day value must be "
+            'one of: ["SUNDAY"], got: "Sunday"'
+        ),
+    }
+    repairs = enum_case_repairs(failures)
+    assert repairs["meraki_x.a"] == {"day": "sun"}
+    # no plain-lowercase spelling offered → first case-insensitive match
+    assert repairs["meraki_x.b"] == {"day": "SUNDAY"}
+
+
+def test_enum_case_repairs_ignores_non_enum_and_exact_values() -> None:
+    failures = {
+        "meraki_x.a": "Invalid Attribute Value: some other diagnostic",
+        # value already allowed — nothing to repair (defensive; the
+        # validator would not have failed)
+        "meraki_x.b": (
+            'Attribute day value must be one of: ["mon"], got: "mon"'
+        ),
+    }
+    assert enum_case_repairs(failures) == {}
+
+
+FIRMWARE_CASE_BLOCK = """\
+resource "meraki_network_firmware_upgrades" "l_1" {
+  network_id                 = "L_1"
+  upgrade_window_day_of_week = "Mon"
+}
+"""
+
+
+def test_apply_enum_case_repairs_recases_and_pins(tmp_path: Path) -> None:
+    config = tmp_path / "resources.tf"
+    config.write_text(FIRMWARE_CASE_BLOCK, encoding="utf-8")
+    repaired = apply_enum_case_repairs(
+        tmp_path,
+        {
+            "meraki_network_firmware_upgrades.l_1": {
+                "upgrade_window_day_of_week": "mon"
+            }
+        },
+        ("absent.tf", "resources.tf"),
+    )
+    assert repaired == {
+        "meraki_network_firmware_upgrades.l_1": (
+            "upgrade_window_day_of_week",
+        )
+    }
+    text = config.read_text(encoding="utf-8")
+    assert 'upgrade_window_day_of_week = "mon"' in text
+    assert "ignore_changes = [upgrade_window_day_of_week]" in text
+    assert '"Mon"' not in text
+
+
+def test_apply_enum_case_repairs_skips_unlocatable_targets(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "resources.tf"
+    config.write_text(FIRMWARE_CASE_BLOCK, encoding="utf-8")
+    repaired = apply_enum_case_repairs(
+        tmp_path,
+        {
+            # block exists but the attribute does not
+            "meraki_network_firmware_upgrades.l_1": {"absent_attr": "x"},
+            # block does not exist at all
+            "meraki_network_firmware_upgrades.l_9": {"day": "mon"},
+        },
+        ("resources.tf",),
+    )
+    assert repaired == {}
+    text = config.read_text(encoding="utf-8")
+    assert "ignore_changes" not in text
 
 
 def test_classify_secret_null_diffs_become_ignores() -> None:

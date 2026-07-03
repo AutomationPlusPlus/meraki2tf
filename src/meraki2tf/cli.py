@@ -621,7 +621,8 @@ def _report(summary: RunSummary) -> None:
         logger.info(
             "Plan reconciliation: %d resource(s) dropped as unexpressible, "
             "%d resource(s) with unmanaged secret attribute(s), "
-            "%d resource(s) normalized to state values.",
+            "%d resource(s) with values normalized for provider "
+            "round-trip.",
             len(summary.reconciliation_dropped),
             len(summary.unmanaged_secret_attributes),
             len(summary.normalized_addresses),

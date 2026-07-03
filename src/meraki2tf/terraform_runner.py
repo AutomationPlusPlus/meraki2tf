@@ -47,10 +47,12 @@ from .config import API_KEY_ENV_VAR
 from .fsperms import restrict_to_owner
 from .plan_reconciler import (
     ReconciliationPlan,
+    apply_enum_case_repairs,
     apply_remediations,
     classify_plan,
     drop_import_blocks,
     drop_resource_blocks,
+    enum_case_repairs,
     hcl_quote,
     validation_failures,
 )
@@ -455,6 +457,7 @@ class TerraformRunner:
         dropped: dict[str, str] = {}
         ignored: dict[str, tuple[str, ...]] = {}
         normalized: dict[str, tuple[str, ...]] = {}
+        case_repairs_attempted: set[tuple[str, str]] = set()
         args = (
             "plan",
             "-input=false",
@@ -488,8 +491,22 @@ class TerraformRunner:
                         f"{result.returncode}: "
                         f"{result.stderr.strip() or result.stdout.strip()}"
                     )
-                self._drop_unexpressible(failures)
-                dropped.update(failures)
+                repaired = self._repair_enum_case(
+                    failures, case_repairs_attempted
+                )
+                _merge_attr_map(normalized, repaired)
+                remaining = {
+                    address: reason
+                    for address, reason in failures.items()
+                    if address not in repaired
+                }
+                if remaining:
+                    self._drop_unexpressible(remaining)
+                    dropped.update(remaining)
+                    for address in remaining:
+                        # a resource repaired earlier but dropped now is
+                        # unsupported, not normalized — report it once.
+                        normalized.pop(address, None)
                 continue
             if not reconcile or not result.has_drift or final_attempt:
                 # import-only plans are healthy snapshot growth; only
@@ -528,13 +545,60 @@ class TerraformRunner:
             normalized=normalized,
         )
 
+    def _repair_enum_case(
+        self,
+        failures: dict[str, str],
+        attempted: set[tuple[str, str]],
+    ) -> dict[str, tuple[str, ...]]:
+        """Repair validation failures that are pure enum-case mismatches.
+
+        The provider validator wants e.g. lowercase ``"sun"`` while its
+        own Read returned ``"Sun"``; the value is rewritten to the
+        provider's casing and pinned with ``ignore_changes`` (state
+        keeps the API casing, so the case-only flip-back is phantom —
+        see plan_reconciler). ``attempted`` guards the plan loop: a
+        repair proposed twice for the same (address, attribute) did not
+        take, so it is left to be dropped as unexpressible instead of
+        looping forever. Returns the applied repairs for reporting.
+        """
+        fresh = {
+            address: attrs
+            for address, attrs in enum_case_repairs(failures).items()
+            if any((address, attr) not in attempted for attr in attrs)
+        }
+        if not fresh:
+            return {}
+        repaired = apply_enum_case_repairs(
+            self._workdir,
+            fresh,
+            (GENERATED_CONFIG_FILENAME, AGGREGATED_CONFIG_FILENAME),
+        )
+        attempted.update(
+            (address, attr)
+            for address, attrs in repaired.items()
+            for attr in attrs
+        )
+        if repaired:
+            logger.info(
+                "Repaired %d enum case mismatch(es) the provider rejects "
+                "in its own read (attribute value recased and pinned via "
+                "ignore_changes): %s",
+                len(repaired),
+                "; ".join(
+                    f"{address}: {', '.join(attrs)}"
+                    for address, attrs in sorted(repaired.items())
+                ),
+            )
+        return repaired
+
     def _drop_unexpressible(self, failures: dict[str, str]) -> None:
         """Remove kit artifacts for resources the provider rejects.
 
         The provider's validators refused the configuration generated
-        from its own Read (e.g. enum case the API does not emit) — the
-        resource cannot round-trip, so it leaves the kit and is
-        reported as unsupported by the orchestrator.
+        from its own Read and no automatic repair applies (see
+        ``_repair_enum_case``) — the resource cannot round-trip, so it
+        leaves the kit and is reported as unsupported by the
+        orchestrator.
         """
         addresses = set(failures)
         logger.warning(

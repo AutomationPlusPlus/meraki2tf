@@ -746,12 +746,30 @@ Error: Invalid Attribute Value Match
   on generated_resources.tf line 30:
   (source code not available)
 
+Attribute upgrade_window_day_of_week value must be one of: ["mon"], got: "Never"
+"""
+
+#: Same failure shape but a pure case mismatch — repairable in place.
+CASE_VALIDATION_STDERR = """\
+Error: Invalid Attribute Value Match
+
+  with meraki_network_firmware_upgrades.l_1,
+  on generated_resources.tf line 30:
+  (source code not available)
+
 Attribute upgrade_window_day_of_week value must be one of: ["mon"], got: "Mon"
 """
 
 FIRMWARE_BLOCK = (
     'resource "meraki_network_firmware_upgrades" "l_1" {\n'
     '  network_id = "L_1"\n'
+    "}\n"
+)
+
+FIRMWARE_CASE_BLOCK = (
+    'resource "meraki_network_firmware_upgrades" "l_1" {\n'
+    '  network_id                 = "L_1"\n'
+    '  upgrade_window_day_of_week = "Mon"\n'
     "}\n"
 )
 FIRMWARE_IMPORT = (
@@ -810,6 +828,65 @@ def test_reconciliation_drops_unexpressible_resources_then_replans(
     imports = (runner.workdir / "imports.tf").read_text(encoding="utf-8")
     assert "firmware_upgrades" not in imports
     assert [c[1] for c in scripted.calls] == ["plan", "plan"]
+
+
+def test_reconciliation_repairs_enum_case_then_replans(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pure enum-case rejection is repaired in place (recased value +
+    ignore_changes pin) and the resource stays in the kit."""
+    runner.prepare_workspace()
+    (runner.workdir / AGGREGATED_CONFIG_FILENAME).write_text(
+        FIRMWARE_CASE_BLOCK, encoding="utf-8"
+    )
+    (runner.workdir / "imports.tf").write_text(FIRMWARE_IMPORT, encoding="utf-8")
+    scripted = ScriptedSubprocess(
+        (1, "", None, CASE_VALIDATION_STDERR),
+        (0, "No changes.", None),
+    )
+    monkeypatch.setattr(terraform_runner.subprocess, "run", scripted.run)
+    outcome = runner.plan_with_generation()
+    assert outcome.dropped == {}
+    assert outcome.normalized == {
+        "meraki_network_firmware_upgrades.l_1": (
+            "upgrade_window_day_of_week",
+        )
+    }
+    baseline = (runner.workdir / AGGREGATED_CONFIG_FILENAME).read_text(
+        encoding="utf-8"
+    )
+    assert 'upgrade_window_day_of_week = "mon"' in baseline
+    assert "ignore_changes = [upgrade_window_day_of_week]" in baseline
+    imports = (runner.workdir / "imports.tf").read_text(encoding="utf-8")
+    assert "firmware_upgrades" in imports  # kit keeps the resource
+    assert [c[1] for c in scripted.calls] == ["plan", "plan"]
+
+
+def test_reconciliation_drops_resource_when_case_repair_does_not_take(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The validator rejecting the same attribute again after a repair
+    means recasing did not help — drop instead of looping forever, and
+    report the resource as dropped, not normalized."""
+    runner.prepare_workspace()
+    (runner.workdir / AGGREGATED_CONFIG_FILENAME).write_text(
+        FIRMWARE_CASE_BLOCK, encoding="utf-8"
+    )
+    (runner.workdir / "imports.tf").write_text(FIRMWARE_IMPORT, encoding="utf-8")
+    scripted = ScriptedSubprocess(
+        (1, "", None, CASE_VALIDATION_STDERR),
+        (1, "", None, CASE_VALIDATION_STDERR),
+        (0, "No changes.", None),
+    )
+    monkeypatch.setattr(terraform_runner.subprocess, "run", scripted.run)
+    outcome = runner.plan_with_generation()
+    assert set(outcome.dropped) == {"meraki_network_firmware_upgrades.l_1"}
+    assert outcome.normalized == {}
+    baseline = (runner.workdir / AGGREGATED_CONFIG_FILENAME).read_text(
+        encoding="utf-8"
+    )
+    assert "firmware_upgrades" not in baseline
+    assert [c[1] for c in scripted.calls] == ["plan", "plan", "plan"]
 
 
 def test_reconciliation_suppresses_secret_nulls_then_replans(
