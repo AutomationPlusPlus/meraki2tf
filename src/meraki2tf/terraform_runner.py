@@ -849,7 +849,19 @@ class TerraformRunner:
                 "path to the binary."
             ) from exc
         if completed.stdout:
-            logger.debug("terraform %s stdout:\n%s", args[0], completed.stdout)
+            if "-json" in args:
+                # Machine-readable output (plan/state JSON) carries
+                # sensitive values in plaintext — never log the body.
+                # Human-readable terraform output masks them itself.
+                logger.debug(
+                    "terraform %s stdout: %d byte(s) of machine-readable "
+                    "JSON (body not logged: may carry sensitive values).",
+                    args[0], len(completed.stdout),
+                )
+            else:
+                logger.debug(
+                    "terraform %s stdout:\n%s", args[0], completed.stdout
+                )
         if completed.stderr:
             logger.debug("terraform %s stderr:\n%s", args[0], completed.stderr)
         if completed.returncode not in allowed:
