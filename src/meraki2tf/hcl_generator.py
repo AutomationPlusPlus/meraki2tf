@@ -80,6 +80,10 @@ class CapturedAsset:
     #: True when the state file already tracked the address, so no new
     #: import block was written for it this run.
     already_in_state: bool
+    #: The asset's raw path values, exactly as discovery addressed it —
+    #: the key that leads back to the discovered payload (the import_id
+    #: above may carry injected org-prefix/force_delete components).
+    identifiers: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -117,6 +121,13 @@ class HclImportGenerator:
         #: be prepared/initialized first — construction time is too early.
         self._catalog_provider = catalog_provider
         self._matches: dict[str, MatchedResource | None] | None = None
+
+    @property
+    def parser(self) -> OpenApiParser:
+        """The spec parser driving generation — shared with the DR
+        runbook/replayer so replay operations derive from the same
+        document (no second source of endpoint truth)."""
+        return self._parser
 
     def _match_table(self) -> dict[str, MatchedResource | None]:
         if self._matches is None:
@@ -217,6 +228,7 @@ class HclImportGenerator:
                     api_path=candidate.api_path,
                     import_id=import_id,
                     already_in_state=already_tracked,
+                    identifiers=candidate.id_values,
                 )
             )
             if already_tracked:

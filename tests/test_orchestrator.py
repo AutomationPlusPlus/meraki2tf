@@ -51,6 +51,13 @@ class StubProvider(MerakiDataProvider):
         self.closed = True
 
 
+class StubParser:
+    """Spec parser stand-in: no endpoints, so no replay operations."""
+
+    def endpoints(self) -> tuple:
+        return ()
+
+
 class StubGenerator:
     """Yields a deterministic GenerationReport over configurable addresses."""
 
@@ -61,6 +68,7 @@ class StubGenerator:
     ) -> None:
         self.addresses = addresses
         self.unsupported = unsupported
+        self.parser = StubParser()
         #: (existing_addresses, audit) per generate() invocation.
         self.calls: list[tuple[frozenset[str], bool]] = []
 

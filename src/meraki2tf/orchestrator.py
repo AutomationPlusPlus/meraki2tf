@@ -52,6 +52,7 @@ from meraki2tf.hcl_generator import (
 )
 from meraki2tf.models import NetworkGraph
 from meraki2tf.providers.base import MerakiDataProvider
+from meraki2tf.runbook import write_runbook
 from meraki2tf.terraform_runner import (
     ImportGuardViolation,
     ReconciledPlanResult,
@@ -307,6 +308,17 @@ class PipelineOrchestrator:
             )
             write_manifest(manifest, self._runner.workdir)
             coverage_percent = float(manifest["coverage_percent"])
+
+            stage = "DR runbook"
+            write_runbook(
+                workdir=self._runner.workdir,
+                organization_id=graph.organization_id,
+                graph=graph,
+                captured=report.captured,
+                unsupported=report.unsupported,
+                unmanaged_secret_attributes=unmanaged_secrets,
+                parser=self._generator.parser,
+            )
 
             logger.info(
                 "Snapshot generation complete; dispatching RUN_SUCCESS "

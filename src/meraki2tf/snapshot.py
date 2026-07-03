@@ -53,8 +53,15 @@ def graph_to_snapshot(graph: NetworkGraph) -> dict[str, Any]:
 
 
 def write_snapshot(graph: NetworkGraph, path: Path) -> Path:
-    """Write the canonical snapshot document for later ``--from-dump`` runs."""
+    """Write the canonical snapshot document for later ``--from-dump`` runs.
+
+    Written owner-only (0600): an unsanitized snapshot carries every
+    credential Meraki returns on GET (SSID PSKs, SNMP community
+    strings, …) — it is the DR kit's secret-bearing artifact.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch(mode=0o600, exist_ok=True)
+    path.chmod(0o600)
     path.write_text(
         json.dumps(graph_to_snapshot(graph), indent=2) + "\n", encoding="utf-8"
     )

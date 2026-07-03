@@ -8,7 +8,7 @@ A robust, secure, and schedulable CLI tool written in Python to extract Cisco Me
 **Secondary Ad-hoc Mission:** As an open-source tool, meraki2tf must remain equally useful for one-shot users who want to generate Terraform for an org once and then own/maintain it themselves. The default invocation therefore stays conservative (see Mode Gating below); DR automation is opt-in.
 
 ### The Two Cardinal Rules
-1. **Meraki is never mutated.** No run — scheduled, ad-hoc, live, or dump — may ever change anything in the Meraki organization. The sole exception is the explicit, human-invoked `--rebuild --confirm` disaster-recovery action.
+1. **Meraki is never mutated.** No run — scheduled, ad-hoc, live, or dump — may ever change anything in the Meraki organization. The sole exceptions are the explicit, human-invoked disaster-recovery actions `--rebuild --confirm` (terraform apply of the kit) and `--replay-gaps --confirm` (snapshot replay of unsupported objects and uncaptured secrets); each flag alone is a read-only preview.
 2. **Nothing Terraform can't rebuild goes unreported.** The operator must always be able to answer "what is and isn't covered by Terraform?" with 100% certainty. Every discovered Meraki object that cannot be represented/imported (unsupported by the provider, skipped, or errored) must surface in the coverage manifest and in notifications — that list is the manual-rebuild runbook after a disaster.
 
 ### Core Pipeline Steps
@@ -16,7 +16,7 @@ A robust, secure, and schedulable CLI tool written in Python to extract Cisco Me
 2. **Configuration Discovery:** Ingest the *entire* organization via dual input modalities (Live Cloud API or Offline JSON Dump). Completeness matters more than speed — a DR kit missing objects is a false sense of security.
 3. **HCL Construction:** Write clean, declarative configuration structures natively utilizing modern Terraform `import` blocks.
 4. **State Orchestration & Drift Alerting:** Compare discovered configurations against the existing state file via a read-only speculative `terraform plan` (skipped gracefully when no API key is available, e.g. air-gapped dump runs). Pending imports are normal snapshot growth, not drift. In sync/DR mode, import-only plans are auto-applied to grow the state (see State Materialization). Real add/change/destroy differences produce a diff payload and **trigger a drift alert** via configured notification channels.
-5. **Artifact Completion & Success Notification:** Leave a complete rebuild kit (`imports.tf`, `provider.tf`, the accumulated `resources.tf` baseline, and the coverage manifest) in the workspace. Upon absolute execution success, **dispatch a success notification** confirming a clean run and summarizing what changed since the last run (resources added to state, drift observed, coverage gaps).
+5. **Artifact Completion & Success Notification:** Leave a complete rebuild kit (`imports.tf`, `provider.tf`, the accumulated `resources.tf` baseline, the coverage manifest, and the per-run `runbook.md` DR runbook) in the workspace. Upon absolute execution success, **dispatch a success notification** confirming a clean run and summarizing what changed since the last run (resources added to state, drift observed, coverage gaps).
 6. **Exception Auditing & Coverage Manifest:** Flag parameters or features unsupported by the Terraform provider, emit structured payloads to alerting endpoints, and write the per-run coverage manifest (see Coverage Guarantee).
 
 ---
@@ -48,7 +48,7 @@ The weekly DR job must build real Terraform state unattended, which requires app
 - Optional CI gate: a flag (e.g. `--fail-on-gaps`) makes the run exit nonzero when unsupported objects exist, so schedulers can gate on full coverage.
 
 ### Implementation Status Note
-The full contract above is implemented as of 2026-07-02: `--sync` guarded auto-apply (guard in `terraform_runner.apply_import_plan`), the deletion flow (`DELETION_PENDING_CONFIRMATION` alert + `--confirm-deletions`), the coverage manifest (`coverage.json`/`coverage.txt`), and `--fail-on-gaps` (exit 3). None of it — nor the earlier surface (read-only pipeline, `--rebuild --confirm`, `--rebaseline`, dump/live providers, webhook/email alerts) — may regress.
+The full contract above is implemented as of 2026-07-02: `--sync` guarded auto-apply (guard in `terraform_runner.apply_import_plan`), the deletion flow (`DELETION_PENDING_CONFIRMATION` alert + `--confirm-deletions`), the coverage manifest (`coverage.json`/`coverage.txt`), and `--fail-on-gaps` (exit 3). As of 2026-07-03 the DR gap surface is implemented too: the per-run `runbook.md` (redacted payloads + replay operations + secret re-entry pointers, regenerated every run in `runbook.py`) and the guarded `--replay-gaps` action (`replayer.py`; preview by default, `--confirm` writes unsupported objects and dump-sourced secrets back via the SDK with name-based network-ID remapping, `GAP_REPLAY_EXECUTED` alert). Secrets at rest: unsanitized snapshots and the Terraform state are written/kept owner-only (0600); artifacts and alerts never carry secret values. None of it — nor the earlier surface (read-only pipeline, `--rebuild --confirm`, `--rebaseline`, dump/live providers, webhook/email alerts) — may regress.
 
 ---
 
@@ -94,13 +94,14 @@ Do NOT install, generate configurations for, or utilize:
 - **CRITICAL:** The agent must explicitly halt and request human operational authorization before introducing *any* other external pip module.
 
 ### 🔒 Meraki Read-Only Guarantee (Apply Guard)
-- No run may **ever** mutate the Meraki organization. The sole path that touches Meraki is the explicit disaster-recovery action `--rebuild --confirm`; `--rebuild` alone must remain a read-only plan preview.
+- No run may **ever** mutate the Meraki organization. The only paths that touch Meraki are the explicit disaster-recovery actions `--rebuild --confirm` and `--replay-gaps --confirm`; each flag alone must remain a read-only preview, and neither may ever run as part of a scheduled/pipeline invocation.
 - `terraform apply` against *state* is permitted only via the sync-mode guard: the plan must be verified as import-only (0 add / 0 change / 0 destroy) immediately before applying, and any violation aborts with an alert. Default (non-sync) runs never apply anything.
 - Belt-and-suspenders: the guard check must live in `terraform_runner`, not just the orchestrator, so no future call path can bypass it.
 
 ### 🛡️ Security First Principle
 - **Secret Handling:** Zero tolerance for plaintext token parameters, hardcoded API variables, or hardcoded organization credentials in the repository, state logs, or output fields.
 - **Verbose Logging Isolation:** Ensure that verbose/debug console and log systems exclude raw `Authorization` HTTP headers or private configuration values.
+- **Secret-Bearing Artifacts:** Exactly two artifacts may hold secret values — the unsanitized snapshot and the Terraform state — and both must be written/kept owner-only (0600). Everything else (HCL kit, coverage manifest, runbook, alerts, logs, replay results) carries attribute names and locators, never values; the gap replayer reads secrets from the snapshot at execution time and holds them only in memory.
 
 ### 🧪 Code Coverage Target
 - Maintain as close to **100% test coverage** as possible for all parsing, structural translation, and alerting engines to eliminate regression bugs.

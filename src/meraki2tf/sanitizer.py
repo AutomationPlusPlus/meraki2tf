@@ -46,10 +46,14 @@ from meraki2tf.models import (
 
 REDACTED = "**REDACTED**"
 
-_SECRET_KEY = re.compile(
+#: Payload keys whose string values are credentials. Public because the
+#: DR runbook and gap replayer must agree with the sanitizer on what
+#: counts as a secret (redact in artifacts, restore from the dump).
+SECRET_KEY_PATTERN = re.compile(
     r"secret|psk|passphrase|password|community|token|api_?key|auth_?key|shared_?key",
     re.IGNORECASE,
 )
+_SECRET_KEY = SECRET_KEY_PATTERN
 _IDENTITY_KEY = re.compile(
     r"name$|names$|email|url$|urls$|address|notes|^mac$|^tags$|serial",
     re.IGNORECASE,

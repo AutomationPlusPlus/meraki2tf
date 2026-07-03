@@ -330,6 +330,7 @@ class TerraformRunner:
             encoding="utf-8",
         )
         if self._state_path.exists():
+            self._restrict_state_permissions()
             logger.info("Reusing existing Terraform state at %s.", self._state_path)
         else:
             logger.info(
@@ -647,6 +648,7 @@ class TerraformRunner:
                 counts.imports,
             )
             self._run("apply", "-input=false", "-no-color", SYNC_PLAN_FILENAME)
+            self._restrict_state_permissions()
         finally:
             plan_file.unlink(missing_ok=True)
         added = tuple(sorted(self.existing_addresses() - before))
@@ -785,7 +787,23 @@ class TerraformRunner:
         read-only toward the Meraki organization. The only caller is the
         human-invoked ``--rebuild --confirm`` CLI action.
         """
-        return self._run("apply", "-input=false", "-no-color", "-auto-approve")
+        result = self._run("apply", "-input=false", "-no-color", "-auto-approve")
+        self._restrict_state_permissions()
+        return result
+
+    def _restrict_state_permissions(self) -> None:
+        """Owner-only (0600) permissions on the state file and its backup.
+
+        Terraform state stores every sensitive attribute in plaintext
+        (SSID PSKs, SNMP community strings, …); terraform itself writes
+        it with default permissions.
+        """
+        for path in (
+            self._state_path,
+            self._state_path.with_name(self._state_path.name + ".backup"),
+        ):
+            if path.exists():
+                path.chmod(0o600)
 
     @staticmethod
     def _subprocess_env() -> dict[str, str]:
