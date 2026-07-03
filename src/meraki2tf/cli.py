@@ -180,7 +180,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Terraform state file to aggregate into. An existing state is "
             "reused so consecutive runs only import the delta; if the file "
             "does not exist it is created on the first apply "
-            "(default: terraform.tfstate inside --workdir)."
+            "(default: meraki2tf.tfstate inside --workdir)."
         ),
     )
     parser.add_argument(

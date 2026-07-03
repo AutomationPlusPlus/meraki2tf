@@ -70,7 +70,15 @@ GENERATED_CONFIG_FILENAME = "generated_resources.tf"
 #: Persistent accumulated configuration: every plan's freshly generated
 #: config is folded in here, so resources keep their HCL across runs.
 AGGREGATED_CONFIG_FILENAME = "resources.tf"
-DEFAULT_STATE_FILENAME = "terraform.tfstate"
+#: The state must NOT be named ``terraform.tfstate`` inside the
+#: workspace: ``terraform init`` treats a file of exactly that name
+#: next to the configuration as pre-backend *legacy state* and
+#: "migrates" it — emptying the file — whenever the backend cache is
+#: absent or ``-reconfigure`` is used. Live-tested: that destroyed a
+#: fully imported state on the second sync run.
+DEFAULT_STATE_FILENAME = "meraki2tf.tfstate"
+#: Terraform's legacy default state name; see DEFAULT_STATE_FILENAME.
+LEGACY_STATE_FILENAME = "terraform.tfstate"
 #: Saved plan file for the sync-mode guard: the plan verified as
 #: import-only is the exact plan that gets applied.
 SYNC_PLAN_FILENAME = "meraki2tf-sync.tfplan"
@@ -290,9 +298,18 @@ class TerraformRunner:
     ) -> None:
         self._workdir = workdir
         self._executable = executable
+        self._default_state = state_path is None
         self._state_path = (
             state_path if state_path is not None else workdir / DEFAULT_STATE_FILENAME
         ).resolve()
+        if self._state_path == (workdir / LEGACY_STATE_FILENAME).resolve():
+            raise TerraformError(
+                f"--state-file must not be named {LEGACY_STATE_FILENAME} "
+                "inside the workspace directory: terraform init treats "
+                "that exact file as legacy state and empties it during "
+                "backend initialization. Choose another name or location "
+                f"(default: {DEFAULT_STATE_FILENAME} in the workdir)."
+            )
 
     @property
     def workdir(self) -> Path:
@@ -306,6 +323,7 @@ class TerraformRunner:
         """Create the execution directory and anchor provider + state backend."""
         self._workdir.mkdir(parents=True, exist_ok=True)
         self._state_path.parent.mkdir(parents=True, exist_ok=True)
+        self._adopt_legacy_state()
         provider_file = self._workdir / PROVIDER_FILENAME
         provider_file.write_text(
             _PROVIDER_TF_TEMPLATE.format(state_path=_hcl_quote(str(self._state_path))),
@@ -322,6 +340,32 @@ class TerraformRunner:
             )
         logger.debug("Workspace prepared at %s", self._workdir)
         return provider_file
+
+    def _adopt_legacy_state(self) -> None:
+        """Rescue state from the old default location.
+
+        Earlier meraki2tf versions kept the state at
+        ``<workdir>/terraform.tfstate`` — the exact filename terraform's
+        legacy-state migration destroys (see DEFAULT_STATE_FILENAME).
+        When the current default location is empty and the legacy file
+        holds a non-empty state, move it so accumulated imports survive
+        the upgrade.
+        """
+        if not self._default_state:
+            return
+        legacy = self._workdir / LEGACY_STATE_FILENAME
+        if (
+            legacy.exists()
+            and legacy.stat().st_size > 0
+            and not self._state_path.exists()
+        ):
+            legacy.rename(self._state_path)
+            logger.info(
+                "Adopted legacy state file %s as %s (terraform init "
+                "would destroy state stored under the legacy name).",
+                legacy,
+                self._state_path,
+            )
 
     def existing_addresses(self) -> frozenset[str]:
         """Resource addresses (``type.name``) already tracked in the state.

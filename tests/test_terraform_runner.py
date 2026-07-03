@@ -163,6 +163,57 @@ def test_custom_state_location_is_anchored_and_parent_created(
     assert f'path = "{state.resolve()}"' in provider_file.read_text(encoding="utf-8")
 
 
+def test_state_default_avoids_terraform_legacy_filename(
+    runner: TerraformRunner,
+) -> None:
+    """terraform init empties a workdir file named terraform.tfstate
+    (legacy-state migration), so the default must never use that name."""
+    assert runner.state_path.name == "meraki2tf.tfstate"
+
+
+def test_state_file_named_like_legacy_state_is_refused(tmp_path: Path) -> None:
+    ws = tmp_path / "ws"
+    with pytest.raises(TerraformError, match="legacy state"):
+        TerraformRunner(ws, state_path=ws / "terraform.tfstate")
+
+
+def test_prepare_workspace_adopts_legacy_default_state(tmp_path: Path) -> None:
+    """State accumulated by older versions at <workdir>/terraform.tfstate
+    is renamed to the safe default before terraform can destroy it."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    legacy = ws / "terraform.tfstate"
+    legacy.write_text('{"resources": []}', encoding="utf-8")
+    runner = TerraformRunner(ws)
+    runner.prepare_workspace()
+    assert not legacy.exists()
+    assert runner.state_path.read_text(encoding="utf-8") == '{"resources": []}'
+
+
+def test_prepare_workspace_ignores_empty_legacy_state(tmp_path: Path) -> None:
+    """A zero-byte legacy file (terraform's leftover) is not adopted."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "terraform.tfstate").write_text("", encoding="utf-8")
+    runner = TerraformRunner(ws)
+    runner.prepare_workspace()
+    assert not runner.state_path.exists()
+
+
+def test_prepare_workspace_keeps_custom_state_over_legacy(tmp_path: Path) -> None:
+    """Legacy adoption only applies to the default location; an explicit
+    --state-file is authoritative."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    legacy = ws / "terraform.tfstate"
+    legacy.write_text('{"resources": []}', encoding="utf-8")
+    custom = tmp_path / "elsewhere" / "org.tfstate"
+    runner = TerraformRunner(ws, state_path=custom)
+    runner.prepare_workspace()
+    assert legacy.exists()  # untouched
+    assert not custom.exists()
+
+
 def test_existing_addresses_empty_when_no_state(runner: TerraformRunner) -> None:
     assert runner.existing_addresses() == frozenset()
 

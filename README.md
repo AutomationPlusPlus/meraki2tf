@@ -237,7 +237,7 @@ Each run leaves a complete rebuild kit in `--workdir`:
 | `resources.tf` | meraki2tf (accumulated from `terraform plan -generate-config-out`) | Full HCL configuration for every captured asset — the actual rebuild material and the drift-comparison baseline |
 | `generated_resources.tf` | terraform (transient) | Freshly generated config for new imports; folded into `resources.tf` after every plan |
 | `coverage.json` / `coverage.txt` | meraki2tf | Per-run coverage manifest: every discovered object with status `imported`, `pending-import`, or `unsupported` (with reason), plus totals and a coverage percentage |
-| `terraform.tfstate` | terraform (`--sync` runs, `--rebuild --confirm`, or a manual apply) | State tracking, once the resources are adopted |
+| `meraki2tf.tfstate` | terraform (`--sync` runs, `--rebuild --confirm`, or a manual apply) | State tracking, once the resources are adopted |
 
 Back up the workdir (and ideally a `--dump-to` snapshot) somewhere that
 survives the disaster you are protecting against.
@@ -355,7 +355,7 @@ Terraform cannot import something that is gone. Adjust the kit first:
 1. Copy the workdir to a fresh directory (keep the original as backup).
 2. Delete `imports.tf` (or just the blocks for destroyed resources) so
    Terraform **creates** instead of imports.
-3. Start from an empty state (delete/relocate `terraform.tfstate` if
+3. Start from an empty state (delete/relocate `meraki2tf.tfstate` if
    the old one references destroyed resources).
 4. `terraform init && terraform plan && terraform apply`.
 
@@ -386,7 +386,7 @@ Quick reference (each flag is described in detail below):
 | `--confirm-deletions` | off | Human confirmation to remove Meraki-deleted resources from the kit and state |
 | `--fail-on-gaps` | off | Exit 3 when unsupported (uncoverable) objects exist — CI coverage gate |
 | `--workdir DIR` | `generated` | Terraform execution workspace |
-| `--state-file PATH` | `<workdir>/terraform.tfstate` | Terraform state to aggregate into across runs |
+| `--state-file PATH` | `<workdir>/meraki2tf.tfstate` | Terraform state to aggregate into across runs |
 | `--webhook-url URL` | — | Webhook alert endpoint (repeatable) |
 | `--alert-email ADDR` | — | Email alert recipient (repeatable) |
 | `--smtp-host` / `--smtp-port` | `localhost` / `25` | SMTP relay for email alerts |
@@ -512,8 +512,14 @@ redacted at every level, so verbose is safe for shared logs.
 State is stored via Terraform's **local backend** at the path anchored
 in the generated `provider.tf`:
 
-- **Default**: `terraform.tfstate` inside `--workdir` (e.g.
-  `generated/terraform.tfstate`).
+- **Default**: `meraki2tf.tfstate` inside `--workdir` (e.g.
+  `generated/meraki2tf.tfstate`). The name is deliberately not
+  `terraform.tfstate`: `terraform init` treats a file of that exact name
+  next to the configuration as pre-backend legacy state and empties it
+  during backend initialization, which would destroy the accumulated
+  imports. A legacy `terraform.tfstate` from older meraki2tf versions is
+  adopted (renamed) automatically, and `--state-file` refuses that
+  filename inside the workdir.
 - **Custom location**: pass `--state-file /path/to/existing.tfstate` to
   point at a state file you already have — parent directories are
   created as needed.

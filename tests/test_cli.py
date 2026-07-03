@@ -709,7 +709,7 @@ def test_sync_end_to_end_applies_import_only_plan(
     monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
     _no_network(monkeypatch)
     workdir = tmp_path / "workspace"
-    state = workdir / "terraform.tfstate"
+    state = workdir / "meraki2tf.tfstate"
     terraform_calls: list[tuple[str, ...]] = []
 
     def fake_run(command: tuple[str, ...], **kwargs: Any) -> SimpleNamespace:
