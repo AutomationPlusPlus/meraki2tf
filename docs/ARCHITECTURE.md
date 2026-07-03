@@ -46,9 +46,17 @@ derived from the OpenAPI document at runtime:
 2. **Derive** — `OpenApiParser` computes entity keys from non-parameter
    path segments, folds parent-scoped collection paths into their
    canonical entity (`/organizations/{organizationId}/networks` →
-   `meraki_networks`), joins snake_cased segments into
-   `CiscoDevNet/meraki` resource names, and orders path parameters into
-   compound import-ID components (`network_id,vlan_id`).
+   the `networks` entity), and orders path parameters into compound
+   import-ID components (`network_id,vlan_id`).
+2b. **Match** — `resource_matcher` assigns each mutable entity its
+   authoritative `CiscoDevNet/meraki` resource type by matching against
+   the provider's resource identity schemas (`provider_catalog`:
+   installed-provider schema dump → workdir cache → bundled fallback).
+   Identity attributes must be satisfiable by the entity's path
+   parameters, name tokens must be compatible with the path's words,
+   scoring is coverage-first, and a global one-to-one assignment
+   guarantees no resource is claimed twice; unmatched entities surface
+   as unsupported coverage gaps.
 3. **Consume** — `providers/discovery.py` selects the spec's
    configuration surfaces (GET endpoints whose entity also exposes a
    mutating verb — read-only telemetry is excluded) and normalizes each
@@ -61,8 +69,10 @@ derived from the OpenAPI document at runtime:
 ## Execution Flow
 
 ```
-OpenAPI spec ──► OpenApiParser ──► endpoint → resource lookup table
-                                              │
+OpenAPI spec ──► OpenApiParser ──► entities ──► resource_matcher ──► endpoint → resource lookup
+                                                     ▲                        │
+                       provider identity schemas ────┘                        │
+                (installed provider / cache / bundled)                        │
 Live SDK ──┐                                  ▼
            ├─► MerakiDataProvider ──► NetworkGraph ──► HclImportGenerator
 JSON dump ─┘   (identical domain models)     │        │            │

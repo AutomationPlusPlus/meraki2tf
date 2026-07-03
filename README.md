@@ -34,13 +34,19 @@ ever apply anything is the explicit, human-invoked
 with every dashboard release. Instead of maintaining a brittle
 hand-written table from API endpoints to Terraform resources, meraki2tf
 ingests the official Meraki OpenAPI JSON document at runtime and derives
-everything from its structure: which paths are resource entities, what
-each one's `CiscoDevNet/meraki` resource name is, and which ordered path
-parameters (`{organizationId}`, `{networkId}`, `{vlanId}`, …) compose
-the comma-separated compound import IDs Terraform needs. Point the tool
-at a newer spec release and new endpoints are picked up with zero code
-changes; anything the provider cannot express is flagged through the
-exception auditor instead of silently dropped.
+the resource entities and their ordered path parameters
+(`{organizationId}`, `{networkId}`, `{vlanId}`, …) from its structure.
+Each entity is then **matched against the installed
+`CiscoDevNet/meraki` provider's own resource identity schemas**
+(`terraform providers schema -json`, cached per workdir with a bundled
+fallback for air-gapped runs), which yields the authoritative resource
+type names (`meraki_appliance_vlan`) and the comma-separated compound
+import IDs Terraform needs — including the provider's conventions of
+prefixing the organization ID where the identity demands it and
+supplying a literal `false` for `force_delete` identities. Point the
+tool at a newer spec release or provider version and new endpoints are
+picked up with zero code changes; anything the provider cannot express
+is flagged through the exception auditor instead of silently dropped.
 
 ## Prerequisites & Installation
 

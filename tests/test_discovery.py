@@ -9,6 +9,7 @@ import pytest
 from meraki2tf.openapi_parser import OpenApiParser
 from meraki2tf.providers.discovery import (
     FeatureSectionMatcher,
+    _collection_id_key,
     config_collection_operations,
     element_id,
     expand_endpoint_payload,
@@ -127,6 +128,33 @@ def test_unidentifiable_elements_surface_as_collection_assets(
     assert unidentifiable.path_values == ("1234567",)
     assert unidentifiable.payload == {"name": "no-id-here"}
     assert identified.path_values == ("1234567", "42424242")
+
+
+def test_collection_id_key_shapes_and_guards(tmp_path: Path) -> None:
+    """Derived <singular>Id fields handle plural forms; non-item and
+    parameter-only shapes derive nothing."""
+    parser = _write_spec(
+        tmp_path,
+        {
+            "/organizations/{organizationId}/adaptivePolicy/policies/{id}": {
+                "get": {"operationId": "getPolicy", "tags": ["organizations"]},
+            },
+            "/networks/{networkId}/appliance/trafficShaping": {
+                "get": {"operationId": "getShaping", "tags": ["appliance"]},
+            },
+            "/organizations/{organizationId}/{itemId}": {
+                "get": {"operationId": "getOpaque", "tags": ["organizations"]},
+            },
+        },
+    )
+    policy = _get_op(
+        parser, "/organizations/{organizationId}/adaptivePolicy/policies/{id}"
+    )
+    assert _collection_id_key(policy) == "policyId"  # ies -> y
+    shaping = _get_op(parser, "/networks/{networkId}/appliance/trafficShaping")
+    assert _collection_id_key(shaping) is None  # not an item path
+    opaque = _get_op(parser, "/organizations/{organizationId}/{itemId}")
+    assert _collection_id_key(opaque) is None  # collection segment is a param
 
 
 def test_element_id_uses_param_name_then_fallbacks(parser: OpenApiParser) -> None:

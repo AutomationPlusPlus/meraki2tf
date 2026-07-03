@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 from meraki2tf.openapi_parser import OpenApiParser
+from meraki2tf.provider_catalog import ProviderCatalog
 
 
 def _op(
@@ -153,6 +154,54 @@ DUMP_DOCUMENT: dict[str, Any] = {
         },
     ],
 }
+
+
+#: Identity-schema catalog mirroring how CiscoDevNet/meraki names the
+#: PIPELINE_SPEC entities. Keys are the provider's resource types; the
+#: attribute sets drive identity-fit matching and import-ID composition
+#: (org prefix for meraki_network, per-item vs blob arity, …).
+FIXTURE_CATALOG_RESOURCES: dict[str, list[str]] = {
+    "meraki_organization": ["id"],
+    "meraki_network": ["id", "organization_id"],
+    "meraki_device": ["serial"],
+    "meraki_appliance_vlan": ["id", "network_id"],
+    "meraki_appliance_traffic_shaping": ["network_id"],
+    "meraki_network_syslog_servers": ["network_id"],
+    "meraki_sensor_relationships": ["network_id"],
+    "meraki_wireless_ssid": ["network_id", "number"],
+    "meraki_appliance_ssid": ["network_id", "number"],
+    "meraki_switch_port": ["port_id", "serial"],
+    "meraki_organization_admin": ["id", "organization_id"],
+}
+
+
+def fixture_catalog() -> ProviderCatalog:
+    return ProviderCatalog(
+        resources={
+            name: frozenset(attrs)
+            for name, attrs in FIXTURE_CATALOG_RESOURCES.items()
+        },
+        source="fixture",
+    )
+
+
+def fixture_schema_document() -> dict[str, Any]:
+    """``terraform providers schema -json`` shape for the fixture catalog."""
+    return {
+        "provider_schemas": {
+            "registry.terraform.io/ciscodevnet/meraki": {
+                "resource_identity_schemas": {
+                    name: {"version": 0, "attributes": {attr: {} for attr in attrs}}
+                    for name, attrs in FIXTURE_CATALOG_RESOURCES.items()
+                },
+            },
+        },
+    }
+
+
+@pytest.fixture()
+def provider_catalog() -> ProviderCatalog:
+    return fixture_catalog()
 
 
 @pytest.fixture()

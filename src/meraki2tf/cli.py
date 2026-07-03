@@ -33,6 +33,7 @@ from meraki2tf.hcl_generator import HclImportGenerator
 from meraki2tf.logging_setup import configure_logging
 from meraki2tf.openapi_parser import OpenApiParser
 from meraki2tf.orchestrator import PipelineError, PipelineOrchestrator, RunSummary
+from meraki2tf.provider_catalog import resolve_catalog
 from meraki2tf.providers import (
     LiveApiDataProvider,
     MerakiDataProvider,
@@ -373,14 +374,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         if config.dump_to is not None:
             return _export_snapshot(provider, config)
         dispatcher = build_dispatcher(config)
+        runner = TerraformRunner(
+            config.workdir,
+            executable=config.terraform_bin,
+            state_path=config.state_file,
+        )
         orchestrator = PipelineOrchestrator(
             provider=provider,
-            generator=HclImportGenerator(spec_parser, dispatcher),
-            runner=TerraformRunner(
-                config.workdir,
-                executable=config.terraform_bin,
-                state_path=config.state_file,
+            generator=HclImportGenerator(
+                spec_parser,
+                dispatcher,
+                # Resolved lazily at generation time: keyed runs read
+                # the installed provider's identity schemas (init +
+                # schema dump, then cached in the workdir); keyless
+                # runs fall back to that cache or the bundled catalog.
+                catalog_provider=lambda: resolve_catalog(
+                    runner, keyed=api_key_present()
+                ),
             ),
+            runner=runner,
             dispatcher=dispatcher,
             rebaseline=config.rebaseline,
             sync=config.sync,

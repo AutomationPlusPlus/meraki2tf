@@ -76,9 +76,37 @@ def test_prepare_workspace_writes_credential_free_provider_anchor(
     assert provider_file.name == PROVIDER_FILENAME
     content = provider_file.read_text(encoding="utf-8")
     assert 'source = "CiscoDevNet/meraki"' in content
+    # identity schemas (the resource-matching ground truth) need >= 1.12
+    assert 'version = ">= 1.12.0"' in content
     assert 'provider "meraki"' in content
     assert "MERAKI_DASHBOARD_API_KEY" in content  # documented, never templated
     assert "api_key" not in content
+
+
+def test_provider_schema_catalog_parses_identity_schemas(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from conftest import fixture_schema_document
+
+    fake = FakeSubprocess(stdout=json.dumps(fixture_schema_document()))
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    catalog = runner.provider_schema_catalog()
+    assert fake.calls[0]["command"] == (
+        "terraform", "providers", "schema", "-json",
+    )
+    assert catalog.resources["meraki_wireless_ssid"] == frozenset(
+        {"network_id", "number"}
+    )
+
+
+@pytest.mark.parametrize("stdout", ["{not json", json.dumps(["not", "an", "object"])])
+def test_provider_schema_catalog_rejects_unparseable_output(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch, stdout: str
+) -> None:
+    fake = FakeSubprocess(stdout=stdout)
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    with pytest.raises(TerraformError):
+        runner.provider_schema_catalog()
 
 
 def test_subprocess_env_bridges_dashboard_key_to_provider_var(

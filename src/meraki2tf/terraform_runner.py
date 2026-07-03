@@ -41,8 +41,12 @@ import subprocess
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .config import API_KEY_ENV_VAR
+
+if TYPE_CHECKING:  # pragma: no cover - import cycle guard, types only
+    from meraki2tf.provider_catalog import ProviderCatalog
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +78,9 @@ terraform {{
   required_providers {{
     meraki = {{
       source = "CiscoDevNet/meraki"
+      # Resource identity schemas (the resource-matching ground truth)
+      # ship from 1.12.0 onward.
+      version = ">= 1.12.0"
     }}
   }}
 }}
@@ -271,6 +278,28 @@ class TerraformRunner:
         # -reconfigure keeps init idempotent when the backend/state path
         # differs from a previous run in the same workspace.
         return self._run("init", "-input=false", "-no-color", "-reconfigure")
+
+    def provider_schema_catalog(self) -> "ProviderCatalog":
+        """Identity-schema catalog of the provider terraform installed.
+
+        Requires an initialized workspace (:meth:`init`). This is the
+        authoritative source for resource matching: the catalog always
+        reflects the provider version terraform actually selected.
+        """
+        from meraki2tf.provider_catalog import ProviderCatalog
+
+        result = self._run("providers", "schema", "-json")
+        try:
+            document = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise TerraformError(
+                f"terraform providers schema produced unparseable output: {exc}"
+            ) from exc
+        if not isinstance(document, dict):
+            raise TerraformError(
+                "terraform providers schema produced a non-object document."
+            )
+        return ProviderCatalog.from_schema_document(document)
 
     def plan_with_generation(self, save_plan: bool = False) -> TerraformCommandResult:
         """Speculative check: plan imports and generate missing config.
