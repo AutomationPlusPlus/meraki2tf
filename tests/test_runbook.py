@@ -10,6 +10,7 @@ from meraki2tf.runbook import (
     build_runbook,
     payload_index,
     redact_payload,
+    secret_attribute_union,
     secret_payload_keys,
     write_operations,
     write_runbook,
@@ -78,6 +79,50 @@ def test_payload_index_keys_by_path_and_values() -> None:
     feature = FeatureConfiguration(VLAN_PATH, ("N_1", "10"), {"name": "Data"})
     index = payload_index(_graph(feature))
     assert index[(VLAN_PATH, ("N_1", "10"))] == {"name": "Data"}
+
+
+def test_secret_attribute_union_scans_payloads_and_prefers_plan() -> None:
+    captured = (
+        CapturedAsset(
+            address="meraki_wireless_ssid.n_1_0",
+            api_path=SSID_PATH,
+            import_id="N_1,0",
+            already_in_state=True,
+            identifiers=("N_1", "0"),
+        ),
+        CapturedAsset(
+            address="meraki_networks.n_1",
+            api_path=VLAN_PATH,
+            import_id="N_1,10",
+            already_in_state=True,
+            identifiers=("N_1", "10"),
+        ),
+    )
+    payloads = payload_index(
+        _graph(
+            FeatureConfiguration(
+                SSID_PATH, ("N_1", "0"), {"psk": "wifi-secret", "name": "Guest"}
+            ),
+            FeatureConfiguration(VLAN_PATH, ("N_1", "10"), {"name": "Data"}),
+        )
+    )
+    # scan alone: only the ssid carries a secret-valued key
+    assert secret_attribute_union(captured, {}, payloads) == {
+        "meraki_wireless_ssid.n_1_0": ("psk",)
+    }
+    # plan-derived findings win for their address and merge in extras
+    union = secret_attribute_union(
+        captured,
+        {
+            "meraki_wireless_ssid.n_1_0": ("psk", "radius_secret"),
+            "meraki_networks.n_1": ("snmp_auth_pass",),
+        },
+        payloads,
+    )
+    assert union == {
+        "meraki_networks.n_1": ("snmp_auth_pass",),
+        "meraki_wireless_ssid.n_1_0": ("psk", "radius_secret"),
+    }
 
 
 def test_build_runbook_covers_gaps_secrets_and_redaction(

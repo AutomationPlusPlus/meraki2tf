@@ -83,6 +83,28 @@ def test_prepare_workspace_writes_credential_free_provider_anchor(
     assert "api_key" not in content
 
 
+def test_run_never_logs_json_stdout_bodies(
+    runner: TerraformRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """terraform's machine-readable JSON (plan/state) carries sensitive
+    values in plaintext; -v logs must never contain the body."""
+    fake = FakeSubprocess(stdout='{"psk": "wifi-secret"}')
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    with caplog.at_level("DEBUG", logger="meraki2tf.terraform_runner"):
+        runner._run("show", "-json", "plan.tfplan")
+    assert "wifi-secret" not in caplog.text
+    assert "machine-readable" in caplog.text
+    caplog.clear()
+    # human-readable output stays logged (terraform masks sensitives)
+    fake_plain = FakeSubprocess(stdout="Plan: 1 to import. (sensitive value)")
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake_plain.run)
+    with caplog.at_level("DEBUG", logger="meraki2tf.terraform_runner"):
+        runner._run("plan")
+    assert "Plan: 1 to import" in caplog.text
+
+
 def test_provider_schema_catalog_parses_identity_schemas(
     runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:

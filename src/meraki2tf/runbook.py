@@ -123,6 +123,33 @@ def _fence(payload: Any) -> str:
     return "```json\n" + json.dumps(payload, indent=2, sort_keys=True) + "\n```"
 
 
+def secret_attribute_union(
+    captured: tuple[CapturedAsset, ...],
+    plan_derived: Mapping[str, tuple[str, ...]],
+    payloads: Mapping[tuple[str, tuple[str, ...]], Mapping[str, Any]],
+) -> dict[str, tuple[str, ...]]:
+    """Secret attributes per resource: plan findings ∪ payload scan.
+
+    The plan reconciliation only reports secrets while the plan still
+    mentions them — once the resources are in state (or on air-gapped
+    runs, which never plan) it goes quiet. The payload scan keeps the
+    list stable across runs, so the coverage manifest, notifications,
+    and runbook always carry the full "restore after a rebuild" set.
+    """
+    merged: dict[str, tuple[str, ...]] = {
+        asset.address: tuple(
+            snake_case(key)
+            for key in secret_payload_keys(
+                payloads.get((asset.api_path, asset.identifiers), {})
+            )
+        )
+        for asset in captured
+    }
+    merged = {address: attrs for address, attrs in merged.items() if attrs}
+    merged.update(plan_derived)
+    return dict(sorted(merged.items()))
+
+
 def _secret_sources(
     captured: tuple[CapturedAsset, ...],
     unmanaged_secret_attributes: Mapping[str, tuple[str, ...]],
@@ -134,23 +161,11 @@ def _secret_sources(
     ``community_string``); the snapshot stores Meraki's camelCase keys
     (``psk``, ``communityString``). The two are joined through
     ``snake_case`` so the operator is pointed at the exact field.
-
-    Sources are the union of the plan reconciliation's findings and a
-    direct payload scan of every captured asset — keyed runs and
-    air-gapped runs (which never plan) must produce the same runbook.
     """
     by_address = {asset.address: asset for asset in captured}
-    merged: dict[str, tuple[str, ...]] = {
-        asset.address: tuple(
-            snake_case(key)
-            for key in secret_payload_keys(
-                payloads.get((asset.api_path, asset.identifiers), {})
-            )
-        )
-        for asset in captured
-    }
-    merged = {address: attrs for address, attrs in merged.items() if attrs}
-    merged.update(unmanaged_secret_attributes)
+    merged = secret_attribute_union(
+        captured, unmanaged_secret_attributes, payloads
+    )
     rows: list[tuple[str, tuple[str, ...], str, str]] = []
     for address in sorted(merged):
         attrs = merged[address]

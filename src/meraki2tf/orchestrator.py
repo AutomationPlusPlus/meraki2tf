@@ -52,7 +52,11 @@ from meraki2tf.hcl_generator import (
 )
 from meraki2tf.models import NetworkGraph
 from meraki2tf.providers.base import MerakiDataProvider
-from meraki2tf.runbook import write_runbook
+from meraki2tf.runbook import (
+    payload_index,
+    secret_attribute_union,
+    write_runbook,
+)
 from meraki2tf.terraform_runner import (
     ImportGuardViolation,
     ReconciledPlanResult,
@@ -297,6 +301,13 @@ class PipelineOrchestrator:
                 normalized_addresses = tuple(sorted(plan.normalized))
 
             stage = "coverage manifest"
+            # Union in a direct payload scan: the plan only mentions
+            # secrets until the resources are in state, and air-gapped
+            # runs never plan — the manifest, notification, and summary
+            # must report the same stable set the runbook does.
+            unmanaged_secrets = secret_attribute_union(
+                report.captured, unmanaged_secrets, payload_index(graph)
+            )
             final_state = self._runner.existing_addresses()
             manifest = build_manifest(
                 organization_id=graph.organization_id,

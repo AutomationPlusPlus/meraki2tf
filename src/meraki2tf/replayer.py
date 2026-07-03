@@ -121,6 +121,15 @@ def plan_replay(
                 )
             )
             continue
+        if _collection_items(payload) == []:
+            skipped.append(
+                SkippedReplay(
+                    asset.api_path,
+                    asset.identifiers,
+                    "Collection was empty at capture — nothing to restore.",
+                )
+            )
+            continue
         actions.append(
             ReplayAction(
                 kind="object",
@@ -312,12 +321,68 @@ class GapReplayer:
         # Path parameters win over any payload field of the same name —
         # the payload echoes the snapshot tenant's identifiers.
         body = {key: value for key, value in payload.items() if key not in params}
+        items = _collection_items(body)
+        if items is not None:
+            field = _single_array_body_field(op)
+            if field is not None:
+                body = {field: items}
+        # GET echoes unset fields as null; the write endpoints reject
+        # them ("'description' must be a string") — unset stays unset.
+        body = _strip_nulls(body)
         accepted = inspect.signature(method).parameters
         if not any(
             p.kind is inspect.Parameter.VAR_KEYWORD for p in accepted.values()
         ):
             body = {key: value for key, value in body.items() if key in accepted}
         return method(**params, **body)
+
+
+def _collection_items(payload: Mapping[str, Any]) -> list[Any] | None:
+    """The wrapped item list when the payload is a collection envelope.
+
+    Paginated GETs return ``{"items": [...], "meta": {...}}``; the
+    envelope itself is never a writable body. Returns ``None`` for
+    ordinary object payloads.
+    """
+    items = payload.get("items")
+    if isinstance(items, list) and set(payload) <= {"items", "meta"}:
+        return items
+    return None
+
+
+def _single_array_body_field(op: OperationSpec) -> str | None:
+    """The write body's sole array field, when the schema has exactly one.
+
+    Some write operations take a bare array body (the spec models it as
+    a single array-typed property, e.g. ``_json`` for staged upgrade
+    stages) — a collection envelope's items map onto it directly.
+    """
+    schema = (
+        op.raw.get("requestBody", {})
+        .get("content", {})
+        .get("application/json", {})
+        .get("schema", {})
+    )
+    properties = schema.get("properties", {})
+    if len(properties) != 1:
+        return None
+    name, sub = next(iter(properties.items()))
+    if isinstance(sub, Mapping) and sub.get("type") == "array":
+        return str(name)
+    return None
+
+
+def _strip_nulls(value: Any) -> Any:
+    """Deep-copy ``value`` without null-valued mapping entries."""
+    if isinstance(value, Mapping):
+        return {
+            key: _strip_nulls(inner)
+            for key, inner in value.items()
+            if inner is not None
+        }
+    if isinstance(value, list):
+        return [_strip_nulls(item) for item in value]
+    return value
 
 
 def _placeholders(path: str) -> tuple[str, ...]:
