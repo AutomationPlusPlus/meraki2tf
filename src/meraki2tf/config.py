@@ -53,6 +53,14 @@ class RuntimeConfig:
     #: Discard the accumulated resources.tf baseline so this run
     #: regenerates configuration from currently discovered data.
     rebaseline: bool
+    #: Opt-in DR mode: guarded import-only auto-apply plus
+    #: modified-object baseline regeneration (the weekly job's flag).
+    sync: bool
+    #: Human confirmation to remove Meraki-deleted resources from the
+    #: DR kit and the state; without it deletions are alert-only.
+    confirm_deletions: bool
+    #: Exit nonzero when unsupported objects exist (CI coverage gate).
+    fail_on_gaps: bool
     workdir: Path
     #: None means "terraform.tfstate inside the workdir".
     state_file: Path | None
@@ -78,6 +86,9 @@ class RuntimeConfig:
             rebuild=args.rebuild,
             confirm=args.confirm,
             rebaseline=args.rebaseline,
+            sync=args.sync,
+            confirm_deletions=args.confirm_deletions,
+            fail_on_gaps=args.fail_on_gaps,
             workdir=Path(args.workdir),
             state_file=Path(args.state_file) if args.state_file else None,
             verbose=args.verbose,
