@@ -263,6 +263,16 @@ aggregated into state) versus real add/change/destroy pressure, which
 fires `DRIFT_DETECTED`. By default the plan stays speculative — nothing
 is applied unless you opt into `--sync`.
 
+The comparison also **reconciles provider round-trip artifacts** before
+judging drift (see `docs/ARCHITECTURE.md`, *Plan Reconciliation*):
+configurations the provider itself refuses to accept are dropped and
+reported `unsupported`; secret attributes the generated config cannot
+carry (Wi-Fi PSKs, SNMP community strings, …) are excluded from
+management and listed as `unmanaged_secret_attributes` in the manifest
+and the success notification — **restore those manually after any
+rebuild**; formatting-only differences are normalized away. Only real
+changes ever fire `DRIFT_DETECTED`.
+
 ### Scheduled DR automation (`--sync`)
 
 The default invocation is the ad-hoc/open-source mode: strictly
@@ -559,7 +569,7 @@ environment itself.
 | Event | Trigger |
 | --- | --- |
 | `DRIFT_DETECTED` | The speculative plan found real changes (add/change/destroy) on tracked resources — pending imports alone don't count. Payload carries the diff, the unsupported list, `apply_aborted` (true when a `--sync` auto-apply was refused), and `regenerated_addresses` (modified objects re-baselined in sync mode) |
-| `RUN_SUCCESS` | Snapshot generation (and comparison, when an API key was available) completed flawlessly. Payload carries the coverage picture: `discovered_assets`, `imports_written`, `imports_already_tracked`, `unsupported_count` plus the full `unsupported` list, `pending_imports` (imports the plan reports as not yet in state; `null` when unknown), `comparison_performed`, `resources_added_to_state` (sync mode), `coverage_percent`, and `deletions_pending_confirmation` |
+| `RUN_SUCCESS` | Snapshot generation (and comparison, when an API key was available) completed flawlessly. Payload carries the coverage picture: `discovered_assets`, `imports_written`, `imports_already_tracked`, `unsupported_count` plus the full `unsupported` list, `pending_imports` (imports the plan reports as not yet in state; `null` when unknown), `comparison_performed`, `resources_added_to_state` (sync mode), `coverage_percent`, `deletions_pending_confirmation`, and `unmanaged_secret_attributes` (secrets the kit cannot carry — restore manually after a rebuild) |
 | `UNSUPPORTED_FEATURE_FLAGGED` | A discovered asset cannot be mapped to a Terraform resource |
 | `DELETION_PENDING_CONFIRMATION` | Resources tracked in the DR kit were not found in Meraki (deleted?); they stay in the kit until a human confirms with `--confirm-deletions` |
 | `PROCESSING_FAULT` | A critical pipeline failure (payload carries the failing stage) |

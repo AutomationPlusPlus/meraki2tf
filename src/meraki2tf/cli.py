@@ -447,6 +447,28 @@ def _report(summary: RunSummary) -> None:
         pending_status,
         drift_status,
     )
+    if (
+        summary.reconciliation_dropped
+        or summary.unmanaged_secret_attributes
+        or summary.normalized_addresses
+    ):
+        logger.info(
+            "Plan reconciliation: %d resource(s) dropped as unexpressible, "
+            "%d resource(s) with unmanaged secret attribute(s), "
+            "%d resource(s) normalized to state values.",
+            len(summary.reconciliation_dropped),
+            len(summary.unmanaged_secret_attributes),
+            len(summary.normalized_addresses),
+        )
+    if summary.unmanaged_secret_attributes:
+        logger.warning(
+            "Secrets not captured in the DR kit (restore manually after a "
+            "rebuild): %s",
+            "; ".join(
+                f"{address}: {', '.join(attrs)}"
+                for address, attrs in summary.unmanaged_secret_attributes.items()
+            ),
+        )
     if summary.resources_added_to_state:
         logger.info(
             "State grew by %d resource(s): %s",

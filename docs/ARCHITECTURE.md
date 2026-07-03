@@ -101,6 +101,42 @@ Meraki organization. The single apply path is the explicit CLI action
 `--rebuild --confirm` (`TerraformRunner.rebuild_apply`), which bypasses
 the orchestrator entirely; `--rebuild` alone is a plan preview.
 
+## Plan Reconciliation
+
+`terraform plan -generate-config-out` builds configuration from what
+the provider reads out of Meraki, but provider round-trip quirks leave
+the very first plan proposing changes that correspond to nothing real
+in Meraki. Unhandled, those phantom changes would fire a drift alert on
+every scheduled run and permanently block the sync-mode guard (which
+only auto-applies 100% import plans). `plan_reconciler.py` classifies
+every diffed attribute of every planned update and converges the
+workspace in a bounded plan → classify → edit → re-plan loop (at most
+three plan invocations):
+
+- **Unexpressible values** — the provider's validators reject values
+  its own Read returns. Example from live testing: firmware upgrade
+  windows, where the API returns `"Mon"` but the provider only accepts
+  lowercase `"mon"` — writing the state value fails validation, writing
+  the lowercase value diffs against state forever. Such resources are
+  dropped from the kit and reported as `unsupported` (they are part of
+  the manual-rebuild runbook, per the coverage guarantee).
+- **Secret attributes** — generated config cannot carry sensitive
+  values (`psk`, `community_string`, …), so the plan wants to null
+  them. A `lifecycle { ignore_changes = […] }` edit suppresses the
+  phantom diff, and the attributes are reported as *unmanaged secrets*
+  in `coverage.json`, `coverage.txt`, and the success notification —
+  restore them manually after any rebuild.
+- **Value normalization** — state strings differing from the generated
+  expression only in JSON whitespace (`jsonencode()` output), or empty
+  strings the generator omitted (`"" → null`), are rewritten/injected
+  into the configuration as the exact state value, keeping real future
+  drift on those attributes visible.
+
+A resource is only remediated when *every* diffed attribute is provably
+phantom; a single unexplained diff leaves the whole resource alone so
+genuine drift is never masked. All remediation is local file surgery —
+Meraki is never touched.
+
 ## Security Posture
 
 - The API token lives only in `MERAKI_DASHBOARD_API_KEY`; it is read at

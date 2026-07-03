@@ -41,9 +41,18 @@ import subprocess
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .config import API_KEY_ENV_VAR
+from .plan_reconciler import (
+    ReconciliationPlan,
+    apply_remediations,
+    classify_plan,
+    drop_import_blocks,
+    drop_resource_blocks,
+    hcl_quote,
+    validation_failures,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle guard, types only
     from meraki2tf.provider_catalog import ProviderCatalog
@@ -127,17 +136,9 @@ class ImportGuardViolation(TerraformError):
         self.plan_output = plan_output
 
 
-def _hcl_quote(value: str) -> str:
-    """Escape a raw value for interpolation into a quoted HCL literal."""
-    return (
-        value.replace("\\", "\\\\")
-        .replace('"', '\\"')
-        .replace("\n", "\\n")
-        .replace("\r", "\\r")
-        .replace("\t", "\\t")
-        .replace("${", "$${")
-        .replace("%{", "%%{")
-    )
+#: HCL escaping lives with the reconciler's file surgery now; the alias
+#: keeps this module's provider.tf templating (and its tests) intact.
+_hcl_quote = hcl_quote
 
 
 @dataclass(frozen=True)
@@ -200,6 +201,57 @@ class TerraformCommandResult:
         if counts is None:
             return self.returncode == _PLAN_CHANGES_PRESENT
         return counts.has_real_changes
+
+
+@dataclass(frozen=True)
+class ReconciledPlanResult:
+    """A generation plan plus everything reconciliation did to converge it.
+
+    Exposes the same read surface as :class:`TerraformCommandResult`
+    (``has_changes``/``has_drift``/``plan_counts``/``stdout``), so plan
+    consumers are agnostic to whether reconciliation ran.
+    """
+
+    result: TerraformCommandResult
+    #: Resources dropped from the kit because the provider's own
+    #: validators reject the configuration terraform generated for
+    #: them: address → operator-facing reason. These must be reported
+    #: as unsupported (Cardinal Rule 2).
+    dropped: dict[str, str]
+    #: Secret attributes now excluded from management per resource —
+    #: the DR kit cannot carry them; restore manually after a rebuild.
+    ignored_secrets: dict[str, tuple[str, ...]]
+    #: Attributes rewritten/injected to match state byte-for-byte.
+    normalized: dict[str, tuple[str, ...]]
+
+    @property
+    def has_changes(self) -> bool:
+        return self.result.has_changes
+
+    @property
+    def plan_counts(self) -> PlanCounts | None:
+        return self.result.plan_counts
+
+    @property
+    def has_drift(self) -> bool:
+        return self.result.has_drift
+
+    @property
+    def stdout(self) -> str:
+        return self.result.stdout
+
+    def merged_with_earlier(self, earlier: "ReconciledPlanResult") -> (
+        "ReconciledPlanResult"
+    ):
+        """This plan's outcome, keeping remediations an earlier pass in
+        the same run already applied (their diffs are suppressed now,
+        so this pass alone would under-report them)."""
+        return ReconciledPlanResult(
+            result=self.result,
+            dropped={**earlier.dropped, **self.dropped},
+            ignored_secrets={**earlier.ignored_secrets, **self.ignored_secrets},
+            normalized={**earlier.normalized, **self.normalized},
+        )
 
 
 class TerraformRunner:
@@ -301,31 +353,127 @@ class TerraformRunner:
             )
         return ProviderCatalog.from_schema_document(document)
 
-    def plan_with_generation(self, save_plan: bool = False) -> TerraformCommandResult:
-        """Speculative check: plan imports and generate missing config.
+    #: Plan invocations one generation call may spend converging: one
+    #: for validation drops, one for change remediation, one to verify.
+    _MAX_PLAN_ATTEMPTS = 3
+
+    def plan_with_generation(
+        self, save_plan: bool = False, reconcile: bool = True
+    ) -> ReconciledPlanResult:
+        """Speculative check: plan imports, generate missing config, and
+        reconcile provider round-trip artifacts (see plan_reconciler).
 
         Returns with ``has_changes`` reflecting the ``-detailed-exitcode``
-        contract (0 = state in sync, 2 = delta present). With
-        ``save_plan`` the plan is also written to the sync plan file so
-        :meth:`plan_resource_actions` can classify it per resource.
+        contract (0 = state in sync, 2 = delta present). The plan is
+        always saved to the sync plan file (reconciliation classifies it
+        via ``show -json``; sync mode re-verifies its own fresh plan
+        before applying regardless). Bounded loop: at most
+        ``_MAX_PLAN_ATTEMPTS`` plan invocations — remaining changes after
+        that are reported as drift, never looped on.
         """
-        # terraform refuses to overwrite an existing generation target;
-        # a leftover file from an interrupted run is absorbed first.
-        self._absorb_generated_config()
-        args = [
+        dropped: dict[str, str] = {}
+        ignored: dict[str, tuple[str, ...]] = {}
+        normalized: dict[str, tuple[str, ...]] = {}
+        args = (
             "plan",
             "-input=false",
             "-no-color",
             "-detailed-exitcode",
             f"-generate-config-out={GENERATED_CONFIG_FILENAME}",
-        ]
-        if save_plan:
-            args.append(f"-out={SYNC_PLAN_FILENAME}")
-        result = self._run(
-            *args, allowed=(_PLAN_NO_CHANGES, _PLAN_CHANGES_PRESENT)
+            f"-out={SYNC_PLAN_FILENAME}",
         )
-        self._absorb_generated_config()
-        return result
+        allowed = (
+            (_PLAN_NO_CHANGES, _PLAN_ERROR, _PLAN_CHANGES_PRESENT)
+            if reconcile
+            else (_PLAN_NO_CHANGES, _PLAN_CHANGES_PRESENT)
+        )
+        attempt = 0
+        while True:
+            attempt += 1
+            # terraform refuses to overwrite an existing generation
+            # target; leftovers (interrupted or prior iteration) are
+            # absorbed first so surgery always edits resources.tf.
+            self._absorb_generated_config()
+            result = self._run(*args, allowed=allowed)
+            self._absorb_generated_config()
+            final_attempt = attempt >= self._MAX_PLAN_ATTEMPTS
+            if result.returncode == _PLAN_ERROR:
+                failures = validation_failures(
+                    result.stderr or result.stdout
+                )
+                if not failures or final_attempt:
+                    raise TerraformError(
+                        f"terraform plan failed with exit code "
+                        f"{result.returncode}: "
+                        f"{result.stderr.strip() or result.stdout.strip()}"
+                    )
+                self._drop_unexpressible(failures)
+                dropped.update(failures)
+                continue
+            if not reconcile or not result.has_drift or final_attempt:
+                # import-only plans are healthy snapshot growth; only
+                # real add/change/destroy pressure warrants classifying.
+                break
+            reconciliation = classify_plan(self._show_plan_document())
+            if not reconciliation.has_remediations:
+                break
+            new_ignored, new_normalized = apply_remediations(
+                self._workdir,
+                reconciliation,
+                (GENERATED_CONFIG_FILENAME, AGGREGATED_CONFIG_FILENAME),
+            )
+            ignored.update(new_ignored)
+            normalized.update(new_normalized)
+            self._log_reconciliation(reconciliation, new_ignored, new_normalized)
+        return ReconciledPlanResult(
+            result=result,
+            dropped=dropped,
+            ignored_secrets=ignored,
+            normalized=normalized,
+        )
+
+    def _drop_unexpressible(self, failures: dict[str, str]) -> None:
+        """Remove kit artifacts for resources the provider rejects.
+
+        The provider's validators refused the configuration generated
+        from its own Read (e.g. enum case the API does not emit) — the
+        resource cannot round-trip, so it leaves the kit and is
+        reported as unsupported by the orchestrator.
+        """
+        addresses = set(failures)
+        logger.warning(
+            "Dropping %d resource(s) whose generated configuration the "
+            "provider itself rejects: %s",
+            len(addresses), ", ".join(sorted(addresses)),
+        )
+        drop_resource_blocks(
+            (
+                self._workdir / GENERATED_CONFIG_FILENAME,
+                self._workdir / AGGREGATED_CONFIG_FILENAME,
+            ),
+            addresses,
+        )
+        from meraki2tf.hcl_generator import IMPORTS_FILENAME
+
+        drop_import_blocks(self._workdir / IMPORTS_FILENAME, addresses)
+
+    @staticmethod
+    def _log_reconciliation(
+        plan: ReconciliationPlan,
+        ignored: dict[str, tuple[str, ...]],
+        normalized: dict[str, tuple[str, ...]],
+    ) -> None:
+        logger.info(
+            "Plan reconciliation: %d secret attribute set(s) marked "
+            "unmanaged, %d resource(s) normalized to state values%s.",
+            len(ignored),
+            len(normalized),
+            (
+                f"; {len(plan.real_changes)} real change(s) left as drift"
+                if plan.real_changes
+                else ""
+            ),
+        )
 
     def plan_resource_actions(self) -> dict[str, tuple[str, ...]]:
         """Per-resource actions from the saved sync plan (``show -json``).
@@ -335,13 +483,7 @@ class TerraformRunner:
         modified objects (Meraki is truth → baseline regeneration) from
         anything else (abort and alert).
         """
-        result = self._run("show", "-json", SYNC_PLAN_FILENAME)
-        try:
-            document = json.loads(result.stdout)
-        except json.JSONDecodeError as exc:
-            raise TerraformError(
-                f"terraform show -json produced unparseable output: {exc}"
-            ) from exc
+        document = self._show_plan_document()
         actions: dict[str, tuple[str, ...]] = {}
         changes = document.get("resource_changes") if isinstance(document, dict) else None
         for change in changes or ():
@@ -351,6 +493,20 @@ class TerraformRunner:
             raw = change_body.get("actions", ()) if isinstance(change_body, dict) else ()
             actions[str(change["address"])] = tuple(str(action) for action in raw)
         return actions
+
+    def _show_plan_document(self) -> Any:
+        """The saved sync plan rendered as a JSON document.
+
+        Consumers guard the document shape themselves (an unexpected
+        non-object tolerantly classifies as "nothing to act on").
+        """
+        result = self._run("show", "-json", SYNC_PLAN_FILENAME)
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise TerraformError(
+                f"terraform show -json produced unparseable output: {exc}"
+            ) from exc
 
     def apply_import_plan(self) -> tuple[str, ...]:
         """Guarded sync-mode apply: grow the state, never touch Meraki.

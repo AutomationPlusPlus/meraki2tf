@@ -197,6 +197,12 @@ def test_dump_mode_end_to_end(
                 stdout=json.dumps(fixture_schema_document()),
                 stderr="",
             )
+        if command[1] == "show":
+            # reconciliation classifies the saved plan; an empty change
+            # set means nothing to remediate (the delta is real drift)
+            return SimpleNamespace(
+                returncode=0, stdout='{"resource_changes": []}', stderr=""
+            )
         exit_code = 2 if command[1] == "plan" else 0
         return SimpleNamespace(
             returncode=exit_code,
@@ -231,9 +237,10 @@ def test_dump_mode_end_to_end(
     assert exit_code == 0
     # Read-only pipeline: terraform apply is never part of a run. The
     # catalog resolution initializes and dumps the provider schema
-    # before generation; the comparison stage re-inits (idempotent).
+    # before generation; the comparison stage re-inits (idempotent) and
+    # reconciliation classifies the changes-present plan via show.
     assert [call[1] for call in terraform_calls] == [
-        "init", "providers", "init", "plan",
+        "init", "providers", "init", "plan", "show",
     ]
 
     imports = (workdir / "imports.tf").read_text(encoding="utf-8")
@@ -719,6 +726,10 @@ def test_sync_end_to_end_applies_import_only_plan(
                 stdout="Plan: 4 to import, 0 to add, 0 to change, 0 to destroy.",
                 stderr="",
             )
+        if command[1] == "show":
+            return SimpleNamespace(
+                returncode=0, stdout='{"resource_changes": []}', stderr=""
+            )
         if command[1] == "apply":
             state.write_text(
                 json.dumps(
@@ -751,8 +762,8 @@ def test_sync_end_to_end_applies_import_only_plan(
     )
 
     assert exit_code == 0
-    # catalog (init + schema) → init → generation plan → guard plan →
-    # apply of the verified plan file.
+    # catalog (init + schema) → init → generation plan (import-only, so
+    # reconciliation classifies nothing) → guard plan → apply.
     assert [call[1] for call in terraform_calls] == [
         "init", "providers", "init", "plan", "plan", "apply",
     ]
@@ -857,3 +868,31 @@ def test_report_surfaces_every_dr_outcome(
     assert "meraki_devices.confirmed" in text
     assert "--confirm-deletions" in text and "meraki_devices.gone" in text
     assert "80.00% coverage" in text
+
+
+def test_report_logs_reconciliation_outcomes(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from meraki2tf.cli import _report
+    from meraki2tf.orchestrator import RunSummary
+
+    summary = RunSummary(
+        organization_id="org-123",
+        discovered_assets=3,
+        imports_written=2,
+        imports_skipped_existing=0,
+        unsupported_count=1,
+        drift_detected=False,
+        comparison_skipped=False,
+        pending_imports=2,
+        reconciliation_dropped=("meraki_network_firmware_upgrades.l_1",),
+        unmanaged_secret_attributes={"meraki_wireless_ssid.s_0": ("psk",)},
+        normalized_addresses=("meraki_network_alerts_settings.l_1",),
+    )
+    with caplog.at_level("INFO", logger="meraki2tf.cli"):
+        _report(summary)
+    text = caplog.text
+    assert "1 resource(s) dropped as unexpressible" in text
+    assert "1 resource(s) with unmanaged secret attribute(s)" in text
+    assert "1 resource(s) normalized to state values" in text
+    assert "meraki_wireless_ssid.s_0: psk" in text

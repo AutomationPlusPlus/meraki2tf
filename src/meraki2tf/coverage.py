@@ -53,6 +53,7 @@ def build_manifest(
     unsupported: tuple[UnsupportedAsset, ...],
     state_addresses: frozenset[str],
     deletions_pending: tuple[str, ...] = (),
+    unmanaged_secret_attributes: dict[str, tuple[str, ...]] | None = None,
 ) -> dict[str, Any]:
     """Assemble the coverage manifest for one completed run.
 
@@ -90,6 +91,14 @@ def build_manifest(
         #: Resources tracked in the DR kit that discovery no longer sees
         #: in Meraki — awaiting human confirmation, never auto-removed.
         "deletions_pending_confirmation": list(deletions_pending),
+        #: Secret attributes the DR kit cannot carry (the provider only
+        #: accepts them write-only): restore manually after a rebuild.
+        "unmanaged_secret_attributes": {
+            address: list(attrs)
+            for address, attrs in sorted(
+                (unmanaged_secret_attributes or {}).items()
+            )
+        },
     }
 
 
@@ -137,5 +146,11 @@ def _render_summary(manifest: dict[str, Any]) -> str:
         lines += ["", "Deletions detected in Meraki awaiting human confirmation:"]
         lines += [
             f"  - {address}" for address in manifest["deletions_pending_confirmation"]
+        ]
+    if manifest.get("unmanaged_secret_attributes"):
+        lines += ["", "Secrets not captured (restore manually after a rebuild):"]
+        lines += [
+            f"  - {address}: {', '.join(attrs)}"
+            for address, attrs in manifest["unmanaged_secret_attributes"].items()
         ]
     return "\n".join(lines) + "\n"
