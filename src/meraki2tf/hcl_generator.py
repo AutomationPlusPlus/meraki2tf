@@ -58,6 +58,18 @@ class UnsupportedAsset:
 
 
 @dataclass(frozen=True)
+class CapturedAsset:
+    """One asset Terraform can rebuild, resolved to its resource address."""
+
+    address: str
+    api_path: str
+    import_id: str
+    #: True when the state file already tracked the address, so no new
+    #: import block was written for it this run.
+    already_in_state: bool
+
+
+@dataclass(frozen=True)
 class GenerationReport:
     """Outcome of one HCL generation pass."""
 
@@ -66,6 +78,14 @@ class GenerationReport:
     unsupported: tuple[UnsupportedAsset, ...]
     #: Assets skipped because the state file already tracks them.
     skipped_existing: int = 0
+    #: Every capturable asset with its resolved address — the coverage
+    #: manifest's raw material and the deletion detector's reference set.
+    captured: tuple[CapturedAsset, ...] = ()
+
+    @property
+    def captured_addresses(self) -> frozenset[str]:
+        """Addresses of every asset discovery found this run."""
+        return frozenset(asset.address for asset in self.captured)
 
 
 class HclImportGenerator:
@@ -80,12 +100,16 @@ class HclImportGenerator:
         graph: NetworkGraph,
         workdir: Path,
         existing_addresses: frozenset[str] = frozenset(),
+        audit: bool = True,
     ) -> GenerationReport:
         """Translate the graph into import blocks under ``workdir``.
 
         ``existing_addresses`` are resources the state file already
         tracks; they are skipped so consecutive runs aggregate only the
-        delta instead of re-importing everything from zero.
+        delta instead of re-importing everything from zero. ``audit``
+        controls the exception auditor's side effects (error logs and
+        UNSUPPORTED_FEATURE_FLAGGED alerts); a same-run regeneration
+        pass disables it so identical findings are not dispatched twice.
         """
         lookup = self._parser.endpoint_lookup()
         mappings = self._parser.resource_mappings()
@@ -94,6 +118,7 @@ class HclImportGenerator:
         #: address → import ID, so identical assets dedupe while distinct
         #: assets whose IDs sanitize to the same label get disambiguated.
         seen_addresses: dict[str, str] = {}
+        captured: list[CapturedAsset] = []
         unsupported: list[UnsupportedAsset] = []
         skipped_existing = 0
 
@@ -101,7 +126,11 @@ class HclImportGenerator:
             terraform_name = lookup.get(candidate.api_path)
             if terraform_name is None:
                 unsupported.append(
-                    self._flag(candidate, "No Terraform resource maps to this API path.")
+                    self._flag(
+                        candidate,
+                        "No Terraform resource maps to this API path.",
+                        audit=audit,
+                    )
                 )
                 continue
             expected = mappings[terraform_name].id_components
@@ -120,6 +149,7 @@ class HclImportGenerator:
                         candidate,
                         f"Import ID needs ({','.join(expected)}); this asset "
                         f"is addressed by ({','.join(provided) or 'none'}).",
+                        audit=audit,
                     )
                 )
                 continue
@@ -130,6 +160,7 @@ class HclImportGenerator:
                         f"Import needs {len(expected)} ID component(s) "
                         f"({','.join(expected)}), asset carries "
                         f"{len(candidate.id_values)}.",
+                        audit=audit,
                     )
                 )
                 continue
@@ -140,7 +171,16 @@ class HclImportGenerator:
                 logger.debug("Skipping duplicate import of id %s", import_id)
                 continue
             seen_addresses[address] = import_id
-            if address in existing_addresses:
+            already_tracked = address in existing_addresses
+            captured.append(
+                CapturedAsset(
+                    address=address,
+                    api_path=candidate.api_path,
+                    import_id=import_id,
+                    already_in_state=already_tracked,
+                )
+            )
+            if already_tracked:
                 skipped_existing += 1
                 logger.debug("Skipping %s; already tracked in state.", address)
                 continue
@@ -163,6 +203,7 @@ class HclImportGenerator:
             imports_written=len(blocks),
             unsupported=tuple(unsupported),
             skipped_existing=skipped_existing,
+            captured=tuple(captured),
         )
 
     @staticmethod
@@ -183,19 +224,22 @@ class HclImportGenerator:
         # not depend on API listing order, which can change between runs.
         return sorted(candidates, key=lambda c: (c.api_path, c.id_values))
 
-    def _flag(self, candidate: ImportCandidate, reason: str) -> UnsupportedAsset:
+    def _flag(
+        self, candidate: ImportCandidate, reason: str, audit: bool = True
+    ) -> UnsupportedAsset:
         """Exception auditor: severe log + UNSUPPORTED_FEATURE_FLAGGED alert."""
-        logger.error(
-            "UNSUPPORTED FEATURE: %s (ids=%s) — %s",
-            candidate.api_path, ",".join(candidate.id_values) or "<none>", reason,
-        )
-        self._dispatcher.dispatch(
-            unsupported_feature_flagged(
-                api_path=candidate.api_path,
-                reason=reason,
-                identifiers=candidate.id_values,
+        if audit:
+            logger.error(
+                "UNSUPPORTED FEATURE: %s (ids=%s) — %s",
+                candidate.api_path, ",".join(candidate.id_values) or "<none>", reason,
             )
-        )
+            self._dispatcher.dispatch(
+                unsupported_feature_flagged(
+                    api_path=candidate.api_path,
+                    reason=reason,
+                    identifiers=candidate.id_values,
+                )
+            )
         return UnsupportedAsset(
             api_path=candidate.api_path,
             reason=reason,
