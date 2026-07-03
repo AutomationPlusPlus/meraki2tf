@@ -598,6 +598,13 @@ Drop `--sync` if you want the job to stay plan-only (state building
 then remains a manual step), and add `--fail-on-gaps` to turn
 unsupported objects into a nonzero exit your scheduler can page on.
 
+Running on Azure? A full deployment guide — Azure Automation with a
+Hybrid Runbook Worker (or a Container Apps Job), the API key in Key
+Vault, and every run's artifacts archived to Blob Storage — lives in
+[`docs/azure-automation.md`](docs/azure-automation.md), with a
+ready-made wrapper runbook in
+[`deploy/azure/runbook.py`](deploy/azure/runbook.py).
+
 ## Contributor Architecture
 
 Package layout and pipeline design live in

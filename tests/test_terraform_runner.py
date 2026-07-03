@@ -17,6 +17,7 @@ from meraki2tf.terraform_runner import (
     SYNC_PLAN_FILENAME,
     ImportGuardViolation,
     TerraformError,
+    TerraformNotFoundError,
     TerraformRunner,
 )
 
@@ -951,3 +952,58 @@ def test_merged_with_earlier_keeps_prior_remediations() -> None:
     assert merged.dropped == {"a.b": "r2"}
     assert merged.ignored_secrets == {"c.d": ("psk",)}
     assert merged.normalized == {"e.f": ("body",)}
+
+
+def test_missing_terraform_binary_raises_friendly_error(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def raise_missing(command: tuple[str, ...], **kwargs: Any) -> SimpleNamespace:
+        raise FileNotFoundError(2, "No such file or directory", "terraform")
+
+    monkeypatch.setattr(terraform_runner.subprocess, "run", raise_missing)
+
+    with pytest.raises(TerraformNotFoundError, match="--terraform-bin") as excinfo:
+        runner.init()
+
+    assert "'terraform'" in str(excinfo.value)
+    assert isinstance(excinfo.value, TerraformError)  # rides existing plumbing
+
+
+def test_custom_terraform_bin_named_in_not_found_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    custom = TerraformRunner(tmp_path / "workspace", executable="/opt/tf/terraform")
+
+    def raise_missing(command: tuple[str, ...], **kwargs: Any) -> SimpleNamespace:
+        raise FileNotFoundError(2, "No such file or directory", "/opt/tf/terraform")
+
+    monkeypatch.setattr(terraform_runner.subprocess, "run", raise_missing)
+
+    with pytest.raises(TerraformNotFoundError, match="/opt/tf/terraform"):
+        custom.init()
+
+
+def test_state_restriction_routes_through_owner_only_helper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Permission enforcement (and its degraded-FS warning) is delegated."""
+    restriction_runner = TerraformRunner(tmp_path / "workspace")
+    restriction_runner.workdir.mkdir(parents=True)
+    state = restriction_runner.workdir / DEFAULT_STATE_FILENAME
+    backup = restriction_runner.workdir / (DEFAULT_STATE_FILENAME + ".backup")
+    state.write_text("{}", encoding="utf-8")
+
+    restricted: list[Path] = []
+    monkeypatch.setattr(
+        terraform_runner,
+        "restrict_to_owner",
+        lambda path: restricted.append(path) or True,
+    )
+
+    restriction_runner._restrict_state_permissions()
+    assert restricted == [state]  # a missing .backup is skipped
+
+    backup.write_text("{}", encoding="utf-8")
+    restricted.clear()
+    restriction_runner._restrict_state_permissions()
+    assert restricted == [state, backup]
