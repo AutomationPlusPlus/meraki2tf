@@ -48,8 +48,13 @@ class RuntimeConfig:
     #: Disaster-recovery action: preview (or, with confirm, execute) a
     #: terraform apply over the artifacts already in the workdir.
     rebuild: bool
-    #: Escalates --rebuild from a read-only preview to a real apply.
+    #: Escalates --rebuild or --replay-gaps from a read-only preview to
+    #: a real write against Meraki.
     confirm: bool
+    #: Disaster-recovery action: preview (or, with confirm, execute)
+    #: replaying Terraform-unsupported objects and uncaptured secret
+    #: attributes from a snapshot back into the Meraki organization.
+    replay_gaps: bool
     #: Discard the accumulated resources.tf baseline so this run
     #: regenerates configuration from currently discovered data.
     rebaseline: bool
@@ -85,6 +90,7 @@ class RuntimeConfig:
             sanitize=args.sanitize,
             rebuild=args.rebuild,
             confirm=args.confirm,
+            replay_gaps=args.replay_gaps,
             rebaseline=args.rebaseline,
             sync=args.sync,
             confirm_deletions=args.confirm_deletions,

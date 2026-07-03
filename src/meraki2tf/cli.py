@@ -11,18 +11,28 @@ strictly read-only end-to-end (kit generation, speculative plan,
 alerts), safe for anyone to run against any org. ``--sync`` opts into
 DR automation: guarded import-only state materialization and
 modified-object baseline regeneration. Meraki itself is never mutated
-by either mode; only the explicit ``--rebuild --confirm`` action ever
-changes the organization.
+by either mode; only the explicit, human-invoked DR actions —
+``--rebuild --confirm`` (terraform apply of the kit) and
+``--replay-gaps --confirm`` (snapshot replay of what Terraform cannot
+carry) — ever change the organization.
 """
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import logging
 import sys
+import tempfile
 from collections.abc import Sequence
+from pathlib import Path
 
-from meraki2tf.alerts import AlertDispatcher, EmailNotifier, WebhookNotifier
+from meraki2tf.alerts import (
+    AlertDispatcher,
+    EmailNotifier,
+    WebhookNotifier,
+    gap_replay_executed,
+)
 from meraki2tf.config import (
     API_KEY_ENV_VAR,
     ExecutionMode,
@@ -34,6 +44,7 @@ from meraki2tf.logging_setup import configure_logging
 from meraki2tf.openapi_parser import OpenApiParser
 from meraki2tf.orchestrator import PipelineError, PipelineOrchestrator, RunSummary
 from meraki2tf.provider_catalog import resolve_catalog
+from meraki2tf.replayer import GapReplayer, plan_replay
 from meraki2tf.providers import (
     LiveApiDataProvider,
     MerakiDataProvider,
@@ -120,7 +131,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--confirm",
         action="store_true",
-        help="Escalate --rebuild from a read-only preview to a real terraform apply.",
+        help=(
+            "Escalate --rebuild or --replay-gaps from a read-only preview "
+            "to a real write against the Meraki organization."
+        ),
+    )
+    parser.add_argument(
+        "--replay-gaps",
+        action="store_true",
+        help=(
+            "Disaster recovery: preview replaying the objects Terraform "
+            "cannot rebuild (and the secret attributes the kit cannot "
+            "carry) from an unsanitized --from-dump snapshot back into the "
+            "organization. Add --confirm to actually write. Runs after "
+            "'--rebuild --confirm' has restored the Terraform-covered "
+            "resources; network IDs are remapped to the rebuilt tenant "
+            "by name."
+        ),
     )
     parser.add_argument(
         "--sync",
@@ -256,6 +283,13 @@ def _export_snapshot(provider: MerakiDataProvider, config: RuntimeConfig) -> int
     if config.sanitize:
         graph = sanitize_graph(graph)
         logger.info("Snapshot sanitized: secrets redacted, identity pseudonymized.")
+    else:
+        logger.warning(
+            "Snapshot is UNSANITIZED: it carries every credential Meraki "
+            "returns on read (SSID PSKs, SNMP community strings, …). It is "
+            "written owner-only (0600) — store it like a password file, and "
+            "use --sanitize for any copy that leaves the DR vault."
+        )
     write_snapshot(graph, config.dump_to)
     return 0
 
@@ -323,14 +357,146 @@ def _rebuild(config: RuntimeConfig) -> int:
     return 0
 
 
+def _replay_gaps(config: RuntimeConfig) -> int:
+    """Explicit DR action: preview or execute a snapshot gap replay.
+
+    Together with ``_rebuild`` these are the only two places meraki2tf
+    can write to Meraki, and both demand an explicit --confirm;
+    --replay-gaps alone is a read-only preview of the planned writes.
+    """
+    assert config.dump_path is not None  # guarded by the caller
+    try:
+        spec_parser = OpenApiParser(resolve_spec(config.spec_path))
+        provider = StaticJsonDataProvider(config.dump_path, parser=spec_parser)
+        with provider as source:
+            graph = source.fetch_network_graph(config.org_id)
+    except Exception as exc:
+        logger.critical("Gap replay could not load the snapshot: %s", exc)
+        return 1
+    dispatcher = build_dispatcher(config)
+    runner = TerraformRunner(
+        config.workdir,
+        executable=config.terraform_bin,
+        state_path=config.state_file,
+    )
+    generator = HclImportGenerator(
+        spec_parser,
+        dispatcher,
+        # Keyless resolution on purpose: replay only needs the coverage
+        # classification, and the workdir cache / bundled catalog is
+        # exactly what generated the kit being recovered.
+        catalog_provider=lambda: resolve_catalog(runner, keyed=False),
+    )
+    with tempfile.TemporaryDirectory(prefix="meraki2tf-replay-") as tmp:
+        # Throwaway target: classification is the goal, not artifacts —
+        # the real workdir's kit must not be touched by a replay.
+        report = generator.generate(graph, Path(tmp), audit=False)
+    actions, skipped = plan_replay(graph, report, spec_parser)
+    target_org = config.org_id or graph.organization_id
+    for item in skipped:
+        logger.warning(
+            "Cannot replay %s (ids=%s): %s",
+            item.api_path, ",".join(item.identifiers) or "<none>", item.reason,
+        )
+    if not actions:
+        logger.info(
+            "Nothing to replay: the snapshot holds no restorable "
+            "unsupported objects or secret attributes."
+        )
+        return 0
+    logger.info(
+        "Gap replay plan for organization %s — %d write(s) from snapshot %s:",
+        target_org, len(actions), config.dump_path,
+    )
+    for action in actions:
+        logger.info("  %s", action.target)
+    if not config.confirm:
+        logger.warning(
+            "Preview only — nothing was written to Meraki. Re-run with "
+            "'--replay-gaps --confirm' to restore these objects from the "
+            "snapshot."
+        )
+        return 0
+    if not api_key_present():
+        logger.critical(
+            "--replay-gaps --confirm requires %s: restoring objects writes "
+            "to the Meraki dashboard API.",
+            API_KEY_ENV_VAR,
+        )
+        return 1
+    replayer = GapReplayer()
+    try:
+        network_ids = replayer.network_id_map(target_org, graph)
+    except Exception as exc:
+        logger.critical("Gap replay could not enumerate live networks: %s", exc)
+        return 1
+    executed, failed = replayer.execute(
+        actions, target_org, graph.organization_id, network_ids
+    )
+    dispatcher.dispatch(
+        gap_replay_executed(
+            organization_id=target_org,
+            executed=executed,
+            failed=failed,
+            skipped=[dataclasses.asdict(item) for item in skipped],
+        )
+    )
+    if failed:
+        logger.error(
+            "Gap replay finished with %d failure(s) (%d restored); the "
+            "runbook in the workdir covers the manual fallback.",
+            len(failed), len(executed),
+        )
+        return 1
+    logger.info(
+        "Gap replay complete: %d object(s)/secret set(s) restored from "
+        "the snapshot.",
+        len(executed),
+    )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     arg_parser = build_parser()
     args = arg_parser.parse_args(argv)
     config = RuntimeConfig.from_args(args)
     configure_logging(verbose=config.verbose)
 
-    if config.confirm and not config.rebuild:
-        arg_parser.error("--confirm is only valid together with --rebuild.")
+    if config.confirm and not (config.rebuild or config.replay_gaps):
+        arg_parser.error(
+            "--confirm is only valid together with --rebuild or --replay-gaps."
+        )
+    if config.rebuild and config.replay_gaps:
+        arg_parser.error(
+            "--rebuild and --replay-gaps are separate DR steps; run "
+            "--rebuild --confirm first, then --replay-gaps."
+        )
+    if config.replay_gaps:
+        if config.dump_path is None:
+            arg_parser.error(
+                "--replay-gaps replays from an offline snapshot; pass the "
+                "unsanitized export via --from-dump."
+            )
+        if config.dump_to is not None or config.sanitize:
+            arg_parser.error(
+                "--replay-gaps cannot be combined with --dump-to or "
+                "--sanitize."
+            )
+        if (
+            config.sync
+            or config.confirm_deletions
+            or config.fail_on_gaps
+            or config.rebaseline
+        ):
+            arg_parser.error(
+                "--replay-gaps cannot be combined with the pipeline flags "
+                "--sync, --confirm-deletions, --fail-on-gaps, or "
+                "--rebaseline."
+            )
+        logger.info(
+            "meraki2tf starting in gap replay (disaster recovery) mode."
+        )
+        return _replay_gaps(config)
     if config.rebuild:
         if config.dump_path is not None or config.dump_to is not None:
             arg_parser.error(

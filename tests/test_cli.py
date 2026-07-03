@@ -896,3 +896,268 @@ def test_report_logs_reconciliation_outcomes(
     assert "1 resource(s) with unmanaged secret attribute(s)" in text
     assert "1 resource(s) normalized to state values" in text
     assert "meraki_wireless_ssid.s_0: psk" in text
+
+
+# ----------------------------------------------------------- --replay-gaps
+
+
+def _secret_dump(tmp_path: Path) -> Path:
+    """DUMP_DOCUMENT plus an SSID whose payload carries a PSK."""
+    from conftest import DUMP_DOCUMENT
+
+    document = json.loads(json.dumps(DUMP_DOCUMENT))
+    document["features"].append(
+        {
+            "apiPath": "/networks/{networkId}/wireless/ssids/{number}",
+            "pathValues": ["N_1", "0"],
+            "payload": {
+                "number": 0,
+                "name": "Corp",
+                "authMode": "psk",
+                "psk": "wifi-secret",
+            },
+        }
+    )
+    # read-only endpoint: unsupported by the provider AND replayable by
+    # no write operation, so replay planning must skip it loudly
+    document["features"].append(
+        {
+            "apiPath": "/networks/{networkId}/clients",
+            "pathValues": ["N_1"],
+            "payload": {"usage": 42},
+        }
+    )
+    path = tmp_path / "secret-snapshot.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    return path
+
+
+def _install_fake_meraki_module(
+    monkeypatch: pytest.MonkeyPatch, fail: bool = False
+) -> dict[str, Any]:
+    """Stub the SDK for replay execution; returns the call recorder."""
+    import sys
+    import types
+
+    recorded: dict[str, Any] = {"ssid": [], "networks": 0}
+
+    class Wireless:
+        @staticmethod
+        def updateNetworkWirelessSsid(**kwargs: Any) -> dict[str, Any]:
+            if fail:
+                raise RuntimeError("ssid update rejected")
+            recorded["ssid"].append(kwargs)
+            return kwargs
+
+    def get_networks(org: str, total_pages: str) -> list[dict[str, str]]:
+        recorded["networks"] += 1
+        return [{"id": "N_1", "name": "HQ"}]
+
+    dashboard = SimpleNamespace(
+        wireless=Wireless(),
+        organizations=SimpleNamespace(getOrganizationNetworks=get_networks),
+    )
+    stub = types.ModuleType("meraki")
+    stub.DashboardAPI = lambda **kwargs: dashboard
+    monkeypatch.setitem(sys.modules, "meraki", stub)
+    return recorded
+
+
+def test_replay_gaps_requires_a_snapshot(
+    spec_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _no_network(monkeypatch)
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--spec", str(spec_file), "--replay-gaps"])
+    assert excinfo.value.code == 2
+
+
+def test_replay_gaps_rejects_incompatible_flags(
+    spec_file: Path, dump_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _no_network(monkeypatch)
+    for extra in (["--sync"], ["--dump-to", "x.json"], ["--fail-on-gaps"],
+                  ["--rebuild"], ["--confirm-deletions"], ["--rebaseline"]):
+        with pytest.raises(SystemExit) as excinfo:
+            main(
+                ["--spec", str(spec_file), "--from-dump", str(dump_file),
+                 "--replay-gaps", *extra]
+            )
+        assert excinfo.value.code == 2
+
+
+def test_confirm_requires_a_dr_action(
+    spec_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _no_network(monkeypatch)
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--spec", str(spec_file), "--confirm"])
+    assert excinfo.value.code == 2
+
+
+def test_replay_gaps_preview_writes_nothing(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _no_network(monkeypatch)
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    dump = _secret_dump(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(dump),
+         "--workdir", str(tmp_path / "ws"), "--replay-gaps"]
+    )
+    console = capsys.readouterr().err
+    assert exit_code == 0
+    assert "Preview only" in console
+    assert "meraki_wireless_ssid" in console
+    assert "Cannot replay /networks/{networkId}/clients" in console
+    assert "wifi-secret" not in console  # previews never print values
+
+
+def test_replay_gaps_reports_nothing_to_replay(
+    spec_file: Path,
+    dump_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _no_network(monkeypatch)
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(dump_file),
+         "--workdir", str(tmp_path / "ws"), "--replay-gaps"]
+    )
+    assert exit_code == 0
+    assert "Nothing to replay" in capsys.readouterr().err
+
+
+def test_replay_gaps_confirm_requires_api_key(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _no_network(monkeypatch)
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    dump = _secret_dump(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(dump),
+         "--workdir", str(tmp_path / "ws"), "--replay-gaps", "--confirm"]
+    )
+    assert exit_code == 1
+
+
+def test_replay_gaps_confirm_restores_secrets_via_sdk(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    recorded = _install_fake_meraki_module(monkeypatch)
+    dump = _secret_dump(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(dump),
+         "--workdir", str(tmp_path / "ws"), "--replay-gaps", "--confirm"]
+    )
+    console = capsys.readouterr().err
+    assert exit_code == 0
+    assert recorded["networks"] == 1  # live networks enumerated for the map
+    (call,) = recorded["ssid"]
+    assert call["networkId"] == "N_1" and call["number"] == "0"
+    assert call["psk"] == "wifi-secret"
+    assert "Gap replay complete" in console
+    assert "wifi-secret" not in console
+
+
+def test_replay_gaps_confirm_reports_failures_nonzero(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    _install_fake_meraki_module(monkeypatch, fail=True)
+    dump = _secret_dump(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(dump),
+         "--workdir", str(tmp_path / "ws"), "--replay-gaps", "--confirm"]
+    )
+    assert exit_code == 1
+
+
+def test_replay_gaps_fails_cleanly_when_live_networks_unreachable(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys
+    import types
+
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+
+    def explode(org: str, total_pages: str) -> list[dict[str, str]]:
+        raise RuntimeError("api unreachable")
+
+    dashboard = SimpleNamespace(
+        organizations=SimpleNamespace(getOrganizationNetworks=explode)
+    )
+    stub = types.ModuleType("meraki")
+    stub.DashboardAPI = lambda **kwargs: dashboard
+    monkeypatch.setitem(sys.modules, "meraki", stub)
+    dump = _secret_dump(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(dump),
+         "--workdir", str(tmp_path / "ws"), "--replay-gaps", "--confirm"]
+    )
+    assert exit_code == 1
+
+
+def test_replay_gaps_fails_cleanly_on_unreadable_snapshot(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _no_network(monkeypatch)
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(tmp_path / "missing.json"),
+         "--replay-gaps"]
+    )
+    assert exit_code == 1
+
+
+def test_runbook_is_part_of_every_kit(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _no_network(monkeypatch)
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    dump = _secret_dump(tmp_path)
+    workdir = tmp_path / "workspace"
+    assert main(
+        ["--spec", str(spec_file), "--from-dump", str(dump),
+         "--workdir", str(workdir)]
+    ) == 0
+    runbook = (workdir / "runbook.md").read_text(encoding="utf-8")
+    assert "Disaster-Recovery Runbook — organization org-123" in runbook
+    assert "wifi-secret" not in runbook
+
+
+def test_snapshot_exports_are_owner_only_and_warned(
+    spec_file: Path,
+    dump_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _no_network(monkeypatch)
+    out = tmp_path / "export.json"
+    assert main(
+        ["--spec", str(spec_file), "--from-dump", str(dump_file),
+         "--dump-to", str(out)]
+    ) == 0
+    assert out.stat().st_mode & 0o777 == 0o600
+    assert "UNSANITIZED" in capsys.readouterr().err
+
+    sanitized = tmp_path / "sanitized.json"
+    assert main(
+        ["--spec", str(spec_file), "--from-dump", str(dump_file),
+         "--dump-to", str(sanitized), "--sanitize"]
+    ) == 0
+    assert "UNSANITIZED" not in capsys.readouterr().err

@@ -28,6 +28,9 @@ class EventType(enum.Enum):
     #: Resources in the DR kit that discovery no longer sees in Meraki;
     #: never auto-removed — a human confirms via --confirm-deletions.
     DELETION_PENDING_CONFIRMATION = "DELETION_PENDING_CONFIRMATION"
+    #: A human-invoked --replay-gaps --confirm wrote unsupported
+    #: objects/secret attributes back to Meraki from a snapshot.
+    GAP_REPLAY_EXECUTED = "GAP_REPLAY_EXECUTED"
 
 
 class EventSeverity(enum.Enum):
@@ -190,6 +193,36 @@ def unsupported_feature_flagged(
             "api_path": api_path,
             "reason": reason,
             "identifiers": list(identifiers),
+        },
+    )
+
+
+def gap_replay_executed(
+    organization_id: str,
+    executed: Sequence[str],
+    failed: Sequence[Sequence[str]],
+    skipped: Sequence[Mapping[str, Any]],
+) -> AlertEvent:
+    """Contract payload for a human-invoked gap replay against Meraki.
+
+    Schema: ``details = {"organization_id", "executed", "failed",
+    "skipped"}``. Entries are value-free target labels — replayed
+    payloads and secret values never leave the process.
+    """
+    severity = EventSeverity.WARNING if failed else EventSeverity.INFO
+    return AlertEvent(
+        event_type=EventType.GAP_REPLAY_EXECUTED,
+        severity=severity,
+        summary=(
+            f"Gap replay against organization {organization_id}: "
+            f"{len(executed)} restored, {len(failed)} failed, "
+            f"{len(skipped)} skipped."
+        ),
+        details={
+            "organization_id": organization_id,
+            "executed": list(executed),
+            "failed": [list(item) for item in failed],
+            "skipped": [dict(item) for item in skipped],
         },
     )
 

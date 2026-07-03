@@ -302,3 +302,28 @@ def test_dispatcher_fans_out_and_isolates_failures() -> None:
     )
     assert delivered == 1
     assert recorder.events[0].event_type is EventType.RUN_SUCCESS
+
+
+def test_gap_replay_executed_shapes_and_severity() -> None:
+    from meraki2tf.alerts import gap_replay_executed
+
+    clean = gap_replay_executed(
+        organization_id="org-1",
+        executed=("secrets: meraki_wireless_ssid.a via updateNetworkWirelessSsid",),
+        failed=(),
+        skipped=({"api_path": "/x", "identifiers": ("1",), "reason": "why"},),
+    )
+    assert clean.event_type is EventType.GAP_REPLAY_EXECUTED
+    assert clean.severity is EventSeverity.INFO
+    assert "1 restored, 0 failed, 1 skipped" in clean.summary
+    assert clean.details["organization_id"] == "org-1"
+    assert clean.details["skipped"][0]["reason"] == "why"
+
+    dirty = gap_replay_executed(
+        organization_id="org-1",
+        executed=(),
+        failed=(("object: /x (ids=1) via createX", "boom"),),
+        skipped=(),
+    )
+    assert dirty.severity is EventSeverity.WARNING
+    assert dirty.details["failed"] == [["object: /x (ids=1) via createX", "boom"]]
