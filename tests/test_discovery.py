@@ -120,14 +120,14 @@ def test_unidentifiable_elements_surface_as_collection_assets(
     )
     op = _get_op(parser, "/organizations/{organizationId}/adaptivePolicy/groups")
     assets = expand_endpoint_payload(
-        parser, op, "1234567", [{"name": "no-id-here"}, {"groupId": "42424242"}]
+        parser, op, "123456", [{"name": "no-id-here"}, {"groupId": "42424242"}]
     )
     assert len(assets) == 2
     unidentifiable, identified = assets
     assert unidentifiable.api_path == op.path
-    assert unidentifiable.path_values == ("1234567",)
+    assert unidentifiable.path_values == ("123456",)
     assert unidentifiable.payload == {"name": "no-id-here"}
-    assert identified.path_values == ("1234567", "42424242")
+    assert identified.path_values == ("123456", "42424242")
 
 
 def test_collection_id_key_shapes_and_guards(tmp_path: Path) -> None:
