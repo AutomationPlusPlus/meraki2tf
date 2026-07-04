@@ -26,9 +26,14 @@ alerts to your configured webhook/email channels.
 never mutates your Meraki organization. Its job is to continuously
 convert your org into runnable Terraform artifacts; in the event of a
 major incident you use those artifacts to rebuild — see
-[Disaster Recovery](#disaster-recovery). The only code path that can
-ever apply anything is the explicit, human-invoked
-`--rebuild --confirm` action.
+[Disaster Recovery](#disaster-recovery). Only two explicit,
+human-invoked disaster-recovery actions ever write anything, and each is
+a read-only preview until you add `--confirm`:
+[`--rebuild --confirm`](#restoring-an-existing-organization-primary-dr-path)
+(a `terraform apply` of the kit) and
+[`--replay-gaps --confirm`](#restoring-what-terraform-cant-rebuild---replay-gaps)
+(restores objects and secrets Terraform cannot carry, via the SDK).
+Every scheduled/automated run stays strictly read-only toward Meraki.
 
 **Why dynamic OpenAPI spec parsing?** The Meraki API surface changes
 with every dashboard release. Instead of maintaining a brittle
@@ -206,8 +211,8 @@ Sanitization is deterministic and preserves referential integrity:
 | Data | Treatment |
 | --- | --- |
 | Organization/network IDs, device serials | Pseudonymized consistently everywhere (`org-0001`, `net-0007`, `dev-0042`) — cross-references and import-block generation keep working |
-| Credential-shaped fields (`psk`, `secret`, `password`, `communityString`, `…token`, `…apiKey`, …) | Replaced with `**REDACTED**` |
-| Names, emails, URLs, addresses, notes, tags, MACs | Stable `<kind>-<digest>` placeholders |
+| Credential-shaped fields (`psk`, `secret`, `password`, `passphrase`, `communityString`, `…token`, `…apiKey`, `authKey`, `sharedKey`, `v3AuthPass`/`v3PrivPass`, `passcode`, `…Pin`, `privateKey`, …) plus any value carrying a PEM private-key block | Replaced with `**REDACTED**` |
+| Names, emails, URLs, addresses, notes, tags, MACs, phone numbers, serials | Stable `<kind>-<digest>` placeholders |
 | URL/FQDN-shaped values under any key (RADIUS hosts, filter patterns, …) | Stable placeholders |
 | IPv4 addresses and CIDRs under any key (subnets, firewall rules, …) | Deterministic fake `10.x.y.z` addresses, prefix length preserved |
 | Coordinates (`lat`/`lng`) | Zeroed |
@@ -233,11 +238,12 @@ Each run leaves a complete rebuild kit in `--workdir`:
 | Artifact | Written by | Purpose |
 | --- | --- | --- |
 | `imports.tf` | meraki2tf | One `import {}` block per discovered asset (compound IDs included) |
-| `provider.tf` | meraki2tf | Credential-free provider + local backend anchor |
+| `provider.tf` | meraki2tf | Credential-free provider + backend anchor (local by default; a partial remote block for `--state-backend`) |
 | `resources.tf` | meraki2tf (accumulated from `terraform plan -generate-config-out`) | Full HCL configuration for every captured asset — the actual rebuild material and the drift-comparison baseline |
 | `generated_resources.tf` | terraform (transient) | Freshly generated config for new imports; folded into `resources.tf` after every plan |
 | `coverage.json` / `coverage.txt` | meraki2tf | Per-run coverage manifest: every discovered object with status `imported`, `pending-import`, or `unsupported` (with reason), plus totals and a coverage percentage |
-| `meraki2tf.tfstate` | terraform (`--sync` runs, `--rebuild --confirm`, or a manual apply) | State tracking, once the resources are adopted |
+| `runbook.md` | meraki2tf | Per-run DR runbook: for each object Terraform can't rebuild — the endpoint, identifiers, reason, redacted payload, and the `--replay-gaps` write op — plus which secret attributes to restore and where in the snapshot they live |
+| `meraki2tf.tfstate` | terraform (`--sync` runs, `--rebuild --confirm`, or a manual apply) | State tracking, once the resources are adopted (local backend; a remote `--state-backend` keeps state in its own store instead) |
 
 Back up the workdir (and ideally a `--dump-to` snapshot) somewhere that
 survives the disaster you are protecting against.
@@ -257,11 +263,16 @@ also rides along on every success and drift notification — those are
 the pieces you would have to rebuild manually in a DR event, so review
 them ahead of time. Pass `--fail-on-gaps` to exit with code 3 whenever
 unsupported objects exist, so CI or your scheduler can gate on full
-coverage. When the plan comparison runs (API key available), the plan's
-own summary is also reported: pending imports (discovered but not yet
-aggregated into state) versus real add/change/destroy pressure, which
-fires `DRIFT_DETECTED`. By default the plan stays speculative — nothing
-is applied unless you opt into `--sync`.
+coverage. Alongside the manifest, every run regenerates `runbook.md` —
+the human DR runbook that, for each uncoverable object, records the
+endpoint, identifiers, reason, a redacted payload, and the exact
+`--replay-gaps` write operation that would restore it (plus which secret
+attributes to re-enter and where in the snapshot they live). When the
+plan comparison runs (API key available), the plan's own summary is also
+reported: pending imports (discovered but not yet aggregated into state)
+versus real add/change/destroy pressure, which fires `DRIFT_DETECTED`.
+By default the plan stays speculative — nothing is applied unless you
+opt into `--sync`.
 
 The comparison also **reconciles provider round-trip artifacts** before
 judging drift (see `docs/ARCHITECTURE.md`, *Plan Reconciliation*):
@@ -368,6 +379,47 @@ Terraform cannot import something that is gone. Adjust the kit first:
 > *same* organization avoids all of this, which is why it is the
 > primary DR path.
 
+### Restoring what Terraform can't rebuild (`--replay-gaps`)
+
+`--rebuild` restores everything the Terraform provider can express. Two
+things it *cannot* carry always remain:
+
+- **Unsupported objects** — Meraki configuration the `CiscoDevNet/meraki`
+  provider has no resource for (listed as `unsupported` in
+  `coverage.json`).
+- **Secret values** — the provider refuses to read secrets back (PSKs,
+  SNMP community strings), so a Terraform rebuild leaves them blank.
+
+`runbook.md` documents every one of these for manual restoration. When
+you'd rather automate it, `--replay-gaps` replays them from your
+unsanitized `--dump-to` snapshot straight to the Meraki API:
+
+```bash
+export MERAKI_DASHBOARD_API_KEY="<your-dashboard-api-key>"
+
+# 1. Preview — read-only, prints exactly what would be written:
+meraki2tf --replay-gaps --from-dump ./snapshots/org-123456.json
+
+# 2. Execute — the second (and last) way meraki2tf writes to Meraki:
+meraki2tf --replay-gaps --confirm --from-dump ./snapshots/org-123456.json
+```
+
+Run it **after** `--rebuild --confirm` has restored the Terraform-covered
+resources. Notes:
+
+- **Inert by default.** `--replay-gaps` alone is a preview; nothing is
+  written without `--confirm`.
+- **Snapshot must be unsanitized.** Replay reads the real secret values
+  from the snapshot; a `--sanitize`d snapshot has them masked and those
+  entries are skipped (and reported).
+- **New-org remapping.** A rebuilt organization issues new network IDs;
+  snapshot path values are remapped to the live tenant by network
+  name before each call. Values embedded *inside* payloads are not
+  rewritten — per-object failures are reported, and `runbook.md` remains
+  the manual fallback.
+- Success dispatches a `GAP_REPLAY_EXECUTED` notification summarizing
+  what was restored, skipped, and (if any) failed.
+
 ## Configuration Options
 
 Quick reference (each flag is described in detail below):
@@ -380,7 +432,8 @@ Quick reference (each flag is described in detail below):
 | `--dump-to PATH` | — | Export discovery output as a snapshot instead of running Terraform |
 | `--sanitize` | off | Redact secrets/identity in the `--dump-to` snapshot |
 | `--rebuild` | off | Disaster recovery: preview a rebuild apply of the workdir artifacts |
-| `--confirm` | off | Escalate `--rebuild` from preview to a real `terraform apply` |
+| `--replay-gaps` | off | Disaster recovery: preview restoring objects/secrets Terraform can't rebuild, from an unsanitized snapshot |
+| `--confirm` | off | Escalate `--rebuild` or `--replay-gaps` from preview to a real write against Meraki |
 | `--rebaseline` | off | Accept current reality: discard `resources.tf` so this run regenerates the baseline |
 | `--sync` | off | DR automation: guarded import-only auto-apply + modified-object baseline regeneration |
 | `--confirm-deletions` | off | Human confirmation to remove Meraki-deleted resources from the kit and state |
@@ -435,9 +488,23 @@ what an apply would do. Read-only on its own; requires
 Cannot be combined with `--from-dump`/`--dump-to`. See
 [Disaster Recovery](#disaster-recovery).
 
-**`--confirm`** — escalates `--rebuild` to actually execute
-`terraform apply`. This flag pair is the *only* way meraki2tf ever
-applies anything; every other invocation is read-only toward Meraki.
+**`--replay-gaps`** — disaster-recovery action: restore the pieces
+Terraform cannot rebuild — objects the provider can't express, plus the
+secret attributes the kit deliberately never carries (SSID PSKs, SNMP
+community strings, …) — by replaying them from an unsanitized
+`--from-dump` snapshot straight to the Meraki API (via the SDK, not
+`terraform`). Read-only preview on its own; requires
+`MERAKI_DASHBOARD_API_KEY` only when you add `--confirm`. Run it *after*
+`--rebuild --confirm` has restored the Terraform-covered resources;
+network IDs are remapped to the rebuilt tenant by name. Secrets are read
+from the snapshot at execution time and held only in memory. See
+[Restoring what Terraform can't rebuild](#restoring-what-terraform-cant-rebuild---replay-gaps).
+
+**`--confirm`** — escalates `--rebuild` (a `terraform apply` of the kit)
+or `--replay-gaps` (SDK writes from the snapshot) from a read-only
+preview to a real write. These two disaster-recovery actions are the
+*only* ways meraki2tf ever changes Meraki; every other invocation —
+including every scheduled run — is read-only toward your organization.
 
 **`--rebaseline`** — discard the accumulated `resources.tf`
 configuration baseline so this run regenerates it from currently
@@ -648,6 +715,7 @@ environment itself.
 | `RUN_SUCCESS` | Snapshot generation (and comparison, when an API key was available) completed flawlessly. Payload carries the coverage picture: `discovered_assets`, `imports_written`, `imports_already_tracked`, `unsupported_count` plus the full `unsupported` list, `pending_imports` (imports the plan reports as not yet in state; `null` when unknown), `comparison_performed`, `resources_added_to_state` (sync mode), `coverage_percent`, `deletions_pending_confirmation`, and `unmanaged_secret_attributes` (secrets the kit cannot carry — restore manually after a rebuild) |
 | `UNSUPPORTED_FEATURE_FLAGGED` | A discovered asset cannot be mapped to a Terraform resource |
 | `DELETION_PENDING_CONFIRMATION` | Resources tracked in the DR kit were not found in Meraki (deleted?); they stay in the kit until a human confirms with `--confirm-deletions` |
+| `GAP_REPLAY_EXECUTED` | A human-invoked `--replay-gaps --confirm` wrote unsupported objects and/or secret attributes back to Meraki from a snapshot. Payload carries the executed, skipped, and failed operations (identifiers/endpoints only — never secret values) |
 | `PROCESSING_FAULT` | A critical pipeline failure (payload carries the failing stage) |
 
 ### Scheduled (cron) execution
