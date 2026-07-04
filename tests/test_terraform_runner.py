@@ -9,10 +9,12 @@ from typing import Any
 import pytest
 
 from meraki2tf import terraform_runner
+from meraki2tf.config import BackendConfig, StateBackend
 from meraki2tf.terraform_runner import (
     AGGREGATED_CONFIG_FILENAME,
     DEFAULT_STATE_FILENAME,
     GENERATED_CONFIG_FILENAME,
+    LEGACY_STATE_FILENAME,
     PROVIDER_FILENAME,
     SYNC_PLAN_FILENAME,
     ImportGuardViolation,
@@ -20,6 +22,19 @@ from meraki2tf.terraform_runner import (
     TerraformNotFoundError,
     TerraformRunner,
 )
+
+
+def _azurerm_runner(workspace: Path) -> TerraformRunner:
+    backend = BackendConfig(
+        backend=StateBackend.AZURERM,
+        settings=(
+            ("storage_account_name", "sa"),
+            ("container_name", "tfstate"),
+            ("key", "org.tfstate"),
+        ),
+    )
+    return TerraformRunner(workspace, executable="terraform", backend=backend)
+
 
 PLAN_IMPORT_ONLY = "Plan: 2 to import, 0 to add, 0 to change, 0 to destroy."
 
@@ -271,6 +286,141 @@ def test_unreadable_state_is_a_hard_error(tmp_path: Path) -> None:
     runner = TerraformRunner(tmp_path / "ws", state_path=state)
     with pytest.raises(TerraformError, match="unreadable"):
         runner.existing_addresses()
+
+
+# --- Remote (azurerm) backend --------------------------------------------
+
+
+def test_azurerm_prepare_workspace_writes_partial_backend(tmp_path: Path) -> None:
+    runner = _azurerm_runner(tmp_path / "ws")
+    provider_file = runner.prepare_workspace()
+    content = provider_file.read_text(encoding="utf-8")
+    assert 'backend "azurerm" {' in content
+    assert "path =" not in content  # no local state path leaks into the block
+    # No local state file is created/anchored for a remote backend.
+    assert not (runner.workdir / DEFAULT_STATE_FILENAME).exists()
+
+
+def test_azurerm_does_not_refuse_legacy_state_filename(tmp_path: Path) -> None:
+    """The terraform.tfstate legacy-name guard is a local-backend concern;
+    a remote backend never writes a local file, so it must not trip it."""
+    ws = tmp_path / "ws"
+    backend = BackendConfig(
+        backend=StateBackend.AZURERM,
+        settings=(("container_name", "c"), ("storage_account_name", "s"), ("key", "k")),
+    )
+    # Would raise for a local backend; must be accepted for a remote one.
+    TerraformRunner(ws, state_path=ws / LEGACY_STATE_FILENAME, backend=backend)
+
+
+def test_azurerm_init_passes_backend_config_args(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = _azurerm_runner(tmp_path / "ws")
+    fake = FakeSubprocess(stdout="Initialized")
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    runner.init()
+    assert fake.calls[0]["command"] == (
+        "terraform", "init", "-input=false", "-no-color", "-reconfigure",
+        "-backend-config=storage_account_name=sa",
+        "-backend-config=container_name=tfstate",
+        "-backend-config=key=org.tfstate",
+    )
+
+
+def test_backend_config_file_is_passed_to_init(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = BackendConfig(
+        backend=StateBackend.AZURERM, config_file=Path("azure.tfbackend")
+    )
+    runner = TerraformRunner(tmp_path / "ws", backend=backend)
+    fake = FakeSubprocess(stdout="Initialized")
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    runner.init()
+    assert "-backend-config=azure.tfbackend" in fake.calls[0]["command"]
+
+
+def test_init_is_cached_and_runs_once_per_runner(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeSubprocess(stdout="Initialized")
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    first = runner.init()
+    second = runner.init()
+    assert first is second  # cached result
+    assert len(fake.calls) == 1  # only one terraform init subprocess
+
+
+def test_azurerm_existing_addresses_read_via_show_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = _azurerm_runner(tmp_path / "ws")
+    state_json = json.dumps(
+        {
+            "values": {
+                "root_module": {
+                    "resources": [
+                        {"mode": "managed", "type": "meraki_networks", "name": "n_1"},
+                        {"mode": "managed", "type": "meraki_devices", "name": "q2ab"},
+                        {"mode": "data", "type": "meraki_networks", "name": "lookup"},
+                    ]
+                }
+            }
+        }
+    )
+    # init returns "Initialized"; show returns the state JSON.
+    script = ScriptedSubprocess(
+        (0, "Initialized", None),
+        (0, state_json, None),
+    )
+    monkeypatch.setattr(terraform_runner.subprocess, "run", script.run)
+    assert runner.existing_addresses() == frozenset(
+        {"meraki_networks.n_1", "meraki_devices.q2ab"}
+    )
+    # Self-initialized before reading, then read state without a plan file.
+    assert script.calls[0][1] == "init"
+    assert script.calls[1][:2] == ("terraform", "show")
+    assert SYNC_PLAN_FILENAME not in script.calls[1]
+
+
+def test_azurerm_existing_addresses_empty_when_no_remote_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An uninitialized/empty remote state has no 'values' key."""
+    script = ScriptedSubprocess(
+        (0, "Initialized", None),
+        (0, json.dumps({"format_version": "1.0"}), None),
+    )
+    monkeypatch.setattr(terraform_runner.subprocess, "run", script.run)
+    runner = _azurerm_runner(tmp_path / "ws")
+    assert runner.existing_addresses() == frozenset()
+
+
+def test_azurerm_existing_addresses_rejects_unparseable_show(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    script = ScriptedSubprocess(
+        (0, "Initialized", None),
+        (0, "{not json", None),
+    )
+    monkeypatch.setattr(terraform_runner.subprocess, "run", script.run)
+    runner = _azurerm_runner(tmp_path / "ws")
+    with pytest.raises(TerraformError, match="unparseable state"):
+        runner.existing_addresses()
+
+
+def test_azurerm_state_permissions_are_a_no_op(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Remote backends keep no local state file, so the 0600 guard must
+    short-circuit before ever touching the filesystem."""
+    def boom(_path: Path) -> bool:
+        raise AssertionError("remote backend must not chmod a local state file")
+
+    monkeypatch.setattr(terraform_runner, "restrict_to_owner", boom)
+    runner = _azurerm_runner(tmp_path / "ws")
+    runner._restrict_state_permissions()  # returns early; no exception
 
 
 def test_init_invokes_terraform_with_safe_flags(

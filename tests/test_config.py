@@ -7,11 +7,21 @@ import pytest
 from meraki2tf.cli import build_parser
 from meraki2tf.config import (
     API_KEY_ENV_VAR,
+    BackendConfig,
+    BackendConfigError,
     ExecutionMode,
     MissingApiKeyError,
     RuntimeConfig,
+    StateBackend,
     read_api_key,
 )
+
+_AZURERM_MIN = [
+    "--state-backend", "azurerm",
+    "--backend-config", "storage_account_name=sa",
+    "--backend-config", "container_name=tfstate",
+    "--backend-config", "key=org.tfstate",
+]
 
 
 def _config(argv: list[str]) -> RuntimeConfig:
@@ -65,3 +75,59 @@ def test_read_api_key_rejects_missing_or_blank(
         monkeypatch.setenv(API_KEY_ENV_VAR, value)
     with pytest.raises(MissingApiKeyError):
         read_api_key()
+
+
+def test_backend_defaults_to_local() -> None:
+    backend = _config([]).backend
+    assert backend.backend is StateBackend.LOCAL
+    assert not backend.is_remote
+    assert backend.init_args() == ()
+
+
+def test_azurerm_backend_parses_settings_into_init_args() -> None:
+    backend = _config([*_AZURERM_MIN, "--backend-config", "resource_group_name=rg"]).backend
+    assert backend.backend is StateBackend.AZURERM
+    assert backend.is_remote
+    assert backend.init_args() == (
+        "-backend-config=storage_account_name=sa",
+        "-backend-config=container_name=tfstate",
+        "-backend-config=key=org.tfstate",
+        "-backend-config=resource_group_name=rg",
+    )
+
+
+def test_backend_config_file_leads_init_args_and_skips_required_check() -> None:
+    # A config file may supply the required settings out of band, so the
+    # required-key check is skipped and the file arg comes first.
+    backend = _config(
+        ["--state-backend", "azurerm", "--backend-config-file", "azure.tfbackend"]
+    ).backend
+    assert backend.is_remote
+    assert backend.init_args()[0] == "-backend-config=azure.tfbackend"
+
+
+@pytest.mark.parametrize("secret_key", ["access_key", "sas_token", "client_secret"])
+def test_backend_config_rejects_credential_keys(secret_key: str) -> None:
+    with pytest.raises(BackendConfigError, match="credential"):
+        _config([*_AZURERM_MIN, "--backend-config", f"{secret_key}=super-secret"])
+
+
+def test_backend_config_requires_key_value_form() -> None:
+    with pytest.raises(BackendConfigError, match="KEY=VALUE"):
+        _config([*_AZURERM_MIN, "--backend-config", "not-a-pair"])
+
+
+def test_backend_config_rejected_for_local_backend() -> None:
+    with pytest.raises(BackendConfigError, match="remote"):
+        _config(["--backend-config", "container_name=tfstate"])
+
+
+def test_azurerm_backend_requires_core_settings() -> None:
+    with pytest.raises(BackendConfigError, match="container_name"):
+        _config(["--state-backend", "azurerm", "--backend-config", "key=org.tfstate"])
+
+
+def test_from_cli_rejects_unknown_backend() -> None:
+    # argparse's choices normally guards this; from_cli is defensive too.
+    with pytest.raises(BackendConfigError, match="unknown"):
+        BackendConfig.from_cli("consul", None, None)

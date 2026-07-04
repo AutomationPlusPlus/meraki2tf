@@ -386,7 +386,10 @@ Quick reference (each flag is described in detail below):
 | `--confirm-deletions` | off | Human confirmation to remove Meraki-deleted resources from the kit and state |
 | `--fail-on-gaps` | off | Exit 3 when unsupported (uncoverable) objects exist — CI coverage gate |
 | `--workdir DIR` | `generated` | Terraform execution workspace |
-| `--state-file PATH` | `<workdir>/meraki2tf.tfstate` | Terraform state to aggregate into across runs |
+| `--state-file PATH` | `<workdir>/meraki2tf.tfstate` | Terraform state to aggregate into across runs (local backend only) |
+| `--state-backend {local,azurerm}` | `local` | Where Terraform keeps state; `azurerm` stores it in Azure Blob Storage |
+| `--backend-config KEY=VALUE` | — | Remote-backend setting (repeatable); e.g. azurerm `storage_account_name`, `container_name`, `key` |
+| `--backend-config-file PATH` | — | File of remote-backend settings (composes with `--backend-config`) |
 | `--webhook-url URL` | — | Webhook alert endpoint (repeatable) |
 | `--alert-email ADDR` | — | Email alert recipient (repeatable) |
 | `--smtp-host` / `--smtp-port` | `localhost` / `25` | SMTP relay for email alerts |
@@ -471,8 +474,31 @@ here, and Terraform adds its `.terraform/` directory. This is your
 disaster-recovery kit — back it up. Use one workdir per organization if
 you manage several.
 
-**`--state-file PATH`** — where Terraform state lives; see
-[Terraform state management](#terraform-state-management).
+**`--state-file PATH`** — where Terraform state lives with the default
+local backend; see [Terraform state management](#terraform-state-management).
+Ignored/refused with a remote `--state-backend` (the remote backend
+addresses its own state, e.g. the azurerm `key` setting).
+
+**`--state-backend {local,azurerm}`** — the Terraform state backend.
+`local` (default) keeps state on disk in `--workdir`/`--state-file`,
+exactly as before. `azurerm` stores state in Azure Blob Storage —
+durable, locked, and off-box, which is what a scheduled DR job wants (a
+local state file lives on the very machine the DR job protects). Remote
+backends take their settings from `--backend-config` /
+`--backend-config-file`; see
+[Remote state backends](#remote-state-backends).
+
+**`--backend-config KEY=VALUE`** *(repeatable)* — a setting passed to
+`terraform init -backend-config` for a remote `--state-backend`. For
+azurerm: `resource_group_name`, `storage_account_name`, `container_name`,
+`key`. **Credential-shaped keys are refused** (`access_key`, `sas_token`,
+`client_secret`, …): terraform reads those from the environment
+(`ARM_ACCESS_KEY`, `ARM_SAS_TOKEN`) or a managed identity, so a secret
+never lands in a flag, a process listing, or a log.
+
+**`--backend-config-file PATH`** — a file of remote-backend settings
+passed to `terraform init -backend-config=PATH` (composes with repeated
+`--backend-config`). Useful for keeping a `*.tfbackend` file per org.
 
 **`--webhook-url URL`** *(repeatable)* — HTTP endpoint(s) receiving
 each alert as a JSON POST (`Content-Type: application/json`). Repeat
@@ -509,8 +535,9 @@ redacted at every level, so verbose is safe for shared logs.
 
 ### Terraform state management
 
-State is stored via Terraform's **local backend** at the path anchored
-in the generated `provider.tf`:
+By default state is stored via Terraform's **local backend** at the path
+anchored in the generated `provider.tf` (for a durable off-box option,
+see [Remote state backends](#remote-state-backends)):
 
 - **Default**: `meraki2tf.tfstate` inside `--workdir` (e.g.
   `generated/meraki2tf.tfstate`). The name is deliberately not
@@ -544,6 +571,49 @@ meraki2tf --org-id 123456 --state-file /var/lib/meraki2tf/org-123456.tfstate
 
 Treat the state file like any Terraform state: back it up, and never
 commit it (the repository `.gitignore` already excludes `*.tfstate`).
+
+#### Remote state backends
+
+The default local backend keeps state on the same host that runs the
+job — fine for ad-hoc use, but the weakest link for a DR tool: the state
+sits on the very machine you are protecting against losing. Point
+`--state-backend` at a remote backend to store state durably off-box
+instead. `azurerm` (Azure Blob Storage) is the supported and recommended
+target for scheduled DR; it gives you geo-redundancy, RBAC, encryption at
+rest, and native state locking:
+
+```bash
+export MERAKI_DASHBOARD_API_KEY="<your-dashboard-api-key>"
+# terraform reads the storage credential from the environment (or a
+# managed identity) — never from a flag:
+export ARM_ACCESS_KEY="<storage-account-key>"   # or use MSI / az login
+
+meraki2tf --org-id 123456 --sync \
+  --state-backend azurerm \
+  --backend-config resource_group_name=rg-meraki-dr \
+  --backend-config storage_account_name=merakidrstate \
+  --backend-config container_name=tfstate \
+  --backend-config key=org-123456.tfstate
+```
+
+Notes:
+
+- **Credentials stay in the environment.** meraki2tf refuses
+  credential-shaped `--backend-config` keys (`access_key`, `sas_token`,
+  `client_secret`, …); terraform's azurerm backend reads them from
+  `ARM_ACCESS_KEY` / `ARM_SAS_TOKEN` or a managed identity. Nothing
+  secret touches a flag, a process listing, or a log.
+- **At-rest protection moves to the backend.** The owner-only (0600)
+  guarantee applies to the *local* state file; with a remote backend,
+  encryption and access control are the Storage Account's responsibility
+  (RBAC + service-side encryption). The unsanitized snapshot remains
+  0600 either way.
+- `--state-file` is a local-backend concept and is refused alongside a
+  remote `--state-backend`; the remote backend addresses its state via
+  its own settings (the azurerm `key`).
+- Prefer keeping the backend settings in a file? Pass
+  `--backend-config-file org-123456.tfbackend` instead of (or alongside)
+  the individual `--backend-config` flags.
 
 ### OpenAPI spec resolution
 

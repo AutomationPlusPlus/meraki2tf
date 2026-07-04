@@ -111,6 +111,37 @@ def test_sanitize_requires_dump_to(spec_file: Path) -> None:
         main(["--spec", str(spec_file), "--org-id", "org-123", "--sanitize"])
 
 
+def test_state_file_rejected_with_remote_backend(spec_file: Path) -> None:
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "--spec", str(spec_file), "--org-id", "org-123",
+                "--state-backend", "azurerm",
+                "--backend-config", "storage_account_name=sa",
+                "--backend-config", "container_name=tfstate",
+                "--backend-config", "key=org.tfstate",
+                "--state-file", "/var/lib/meraki2tf/org.tfstate",
+            ]
+        )
+
+
+def test_backend_config_error_surfaces_as_usage_error(spec_file: Path) -> None:
+    # A credential in --backend-config must abort as a usage error (exit 2),
+    # never reach a run that could log or transmit it.
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            [
+                "--spec", str(spec_file), "--org-id", "org-123",
+                "--state-backend", "azurerm",
+                "--backend-config", "storage_account_name=sa",
+                "--backend-config", "container_name=tfstate",
+                "--backend-config", "key=org.tfstate",
+                "--backend-config", "access_key=super-secret",
+            ]
+        )
+    assert excinfo.value.code == 2
+
+
 def test_dump_to_exports_snapshot_without_running_terraform(
     spec_file: Path,
     dump_file: Path,
@@ -236,11 +267,12 @@ def test_dump_mode_end_to_end(
 
     assert exit_code == 0
     # Read-only pipeline: terraform apply is never part of a run. The
-    # catalog resolution initializes and dumps the provider schema
-    # before generation; the comparison stage re-inits (idempotent) and
-    # reconciliation classifies the changes-present plan via show.
+    # catalog resolution initializes (once per run — later init calls are
+    # cached no-ops) and dumps the provider schema before generation; the
+    # comparison stage plans and reconciliation classifies the
+    # changes-present plan via show.
     assert [call[1] for call in terraform_calls] == [
-        "init", "providers", "init", "plan", "show",
+        "init", "providers", "plan", "show",
     ]
 
     imports = (workdir / "imports.tf").read_text(encoding="utf-8")
@@ -783,10 +815,11 @@ def test_sync_end_to_end_applies_import_only_plan(
     )
 
     assert exit_code == 0
-    # catalog (init + schema) → init → generation plan (import-only, so
-    # reconciliation classifies nothing) → guard plan → apply.
+    # catalog (init once + schema) → generation plan (import-only, so
+    # reconciliation classifies nothing) → guard plan → apply. The
+    # comparison stage's init is a cached no-op after the catalog init.
     assert [call[1] for call in terraform_calls] == [
-        "init", "providers", "init", "plan", "plan", "apply",
+        "init", "providers", "plan", "plan", "apply",
     ]
     assert terraform_calls[-1][-1] == "meraki2tf-sync.tfplan"
     assert [event["event_type"] for event in delivered] == ["RUN_SUCCESS"]
