@@ -24,6 +24,124 @@ class ExecutionMode(enum.Enum):
     DUMP = "dump"
 
 
+class StateBackend(enum.Enum):
+    """Where Terraform keeps its state for the execution workspace."""
+
+    #: A file on the local disk (the default; behaviour is unchanged).
+    LOCAL = "local"
+    #: Azure Blob Storage via Terraform's built-in ``azurerm`` backend.
+    AZURERM = "azurerm"
+
+
+#: ``--backend-config`` keys whose values are credentials. Terraform's
+#: backends read these from the environment instead (``ARM_ACCESS_KEY``,
+#: ``ARM_SAS_TOKEN``, ``ARM_CLIENT_SECRET`` — or a managed identity), so
+#: meraki2tf refuses them on the command line: argv, process listings,
+#: and debug logs must never carry a secret (see CLAUDE.md).
+SECRET_BACKEND_KEYS = frozenset(
+    {
+        "access_key",
+        "sas_token",
+        "client_secret",
+        "client_certificate_password",
+        "secret_key",
+        "password",
+    }
+)
+
+#: Settings azurerm always needs to address a state blob. Enforced only
+#: when they are not supplied out-of-band via ``--backend-config-file``.
+_AZURERM_REQUIRED_KEYS = ("storage_account_name", "container_name", "key")
+
+
+class BackendConfigError(ValueError):
+    """A ``--state-backend`` / ``--backend-config`` combination is invalid."""
+
+
+@dataclass(frozen=True)
+class BackendConfig:
+    """Resolved Terraform backend selection for a run.
+
+    ``local`` (the default) keeps the historical on-disk state file. Any
+    other backend is *remote*: its settings ride ``terraform init
+    -backend-config`` arguments (Terraform forbids interpolation inside a
+    ``backend`` block, so a partial block plus ``-backend-config`` is the
+    idiomatic way to parameterise one), and credentials come from the
+    environment, never from meraki2tf.
+    """
+
+    backend: StateBackend = StateBackend.LOCAL
+    #: Ordered ``(key, value)`` settings for ``-backend-config=key=value``.
+    settings: tuple[tuple[str, str], ...] = ()
+    #: Optional ``-backend-config=FILE`` path (composes with ``settings``).
+    config_file: Path | None = None
+
+    @property
+    def is_remote(self) -> bool:
+        return self.backend is not StateBackend.LOCAL
+
+    def init_args(self) -> tuple[str, ...]:
+        """The ``-backend-config`` arguments to pass to ``terraform init``."""
+        args: list[str] = []
+        if self.config_file is not None:
+            args.append(f"-backend-config={self.config_file}")
+        args.extend(f"-backend-config={key}={value}" for key, value in self.settings)
+        return tuple(args)
+
+    @classmethod
+    def from_cli(
+        cls,
+        backend_name: str,
+        config_items: list[str] | None,
+        config_file: str | None,
+    ) -> "BackendConfig":
+        """Parse and validate the backend flags, or raise ``BackendConfigError``."""
+        try:
+            backend = StateBackend(backend_name)
+        except ValueError:
+            choices = ", ".join(member.value for member in StateBackend)
+            raise BackendConfigError(
+                f"unknown --state-backend {backend_name!r}; choose one of: {choices}."
+            ) from None
+
+        settings: list[tuple[str, str]] = []
+        for item in config_items or ():
+            key, sep, value = item.partition("=")
+            key = key.strip()
+            if not sep or not key:
+                raise BackendConfigError(
+                    f"--backend-config {item!r} must be in KEY=VALUE form."
+                )
+            if key.lower() in SECRET_BACKEND_KEYS:
+                raise BackendConfigError(
+                    f"--backend-config {key!r} is a credential and must not be "
+                    "passed on the command line; terraform reads it from the "
+                    "environment instead (e.g. ARM_ACCESS_KEY / ARM_SAS_TOKEN, "
+                    "or use a managed identity)."
+                )
+            settings.append((key, value))
+
+        file_path = Path(config_file) if config_file else None
+
+        if backend is StateBackend.LOCAL and (settings or file_path is not None):
+            raise BackendConfigError(
+                "--backend-config / --backend-config-file only apply to a remote "
+                "--state-backend; the default local backend uses --state-file."
+            )
+
+        resolved = cls(backend=backend, settings=tuple(settings), config_file=file_path)
+
+        if backend is StateBackend.AZURERM and file_path is None:
+            supplied = {key.lower() for key, _ in settings}
+            missing = [key for key in _AZURERM_REQUIRED_KEYS if key not in supplied]
+            if missing:
+                raise BackendConfigError(
+                    "--state-backend azurerm requires --backend-config settings: "
+                    f"{', '.join(missing)} (or supply them via --backend-config-file)."
+                )
+        return resolved
+
+
 class MissingApiKeyError(RuntimeError):
     """Raised when live mode is requested without an API token in the environment."""
 
@@ -69,6 +187,8 @@ class RuntimeConfig:
     workdir: Path
     #: None means "terraform.tfstate inside the workdir".
     state_file: Path | None
+    #: Terraform state backend selection (default: on-disk local).
+    backend: BackendConfig
     verbose: bool
     webhook_urls: tuple[str, ...]
     alert_emails: tuple[str, ...]
@@ -79,8 +199,15 @@ class RuntimeConfig:
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> "RuntimeConfig":
-        """Derive the run configuration from parsed CLI arguments."""
+        """Derive the run configuration from parsed CLI arguments.
+
+        Raises :class:`BackendConfigError` for an invalid backend
+        selection; the CLI turns that into a usage error.
+        """
         dump_path = Path(args.from_dump) if args.from_dump else None
+        backend = BackendConfig.from_cli(
+            args.state_backend, args.backend_config, args.backend_config_file
+        )
         return cls(
             mode=ExecutionMode.DUMP if dump_path else ExecutionMode.LIVE,
             org_id=args.org_id,
@@ -97,6 +224,7 @@ class RuntimeConfig:
             fail_on_gaps=args.fail_on_gaps,
             workdir=Path(args.workdir),
             state_file=Path(args.state_file) if args.state_file else None,
+            backend=backend,
             verbose=args.verbose,
             webhook_urls=tuple(args.webhook_url or ()),
             alert_emails=tuple(args.alert_email or ()),

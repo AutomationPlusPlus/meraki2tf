@@ -68,11 +68,14 @@ sudo unzip /tmp/terraform.zip -d /usr/local/bin
 ```
 
 `/var/lib/meraki2tf` is the persistent workspace. It accumulates the
-`resources.tf` baseline and `meraki2tf.tfstate` across weeks — do not
-put it on ephemeral/temp storage, and keep it out of any cleanup jobs.
-Losing it does not lose data (the kit is re-derivable and the state
-re-materializes via imports) but the next run would re-import the whole
-org from scratch.
+`resources.tf` baseline across weeks — do not put it on ephemeral/temp
+storage, and keep it out of any cleanup jobs. Losing it does not lose
+data (the kit is re-derivable) but the next run would regenerate it from
+scratch. **State durability is better handled by a remote backend** (see
+[Step 3b](#step-3b--terraform-state-backend-recommended)): with
+`--state-backend azurerm` the Terraform state lives in Blob Storage —
+durable, locked, and independent of the VM — so even a total worker loss
+does not force a full re-import.
 
 Register the VM as a Hybrid Runbook Worker (extension-based):
 
@@ -118,8 +121,49 @@ az role assignment create \
 After every run the wrapper uploads, under a `runs/<timestamp>/`
 prefix: `snapshot.json`, `resources.tf`, `imports.tf`, `provider.tf`,
 `coverage.json`, `coverage.txt`, and `runbook.md`. The Terraform state
-is deliberately **not** uploaded — it is secret-bearing and fully
-re-materializable from the kit (`terraform init` + the import blocks).
+is deliberately **not** placed in this artifact prefix — it is
+secret-bearing. With the local backend it stays `0600` on the worker and
+is re-materializable from the kit; with the azurerm backend (Step 3b) it
+lives in its own container, encrypted and RBAC-locked, and Terraform
+manages it directly.
+
+## Step 3b — Terraform state backend (recommended)
+
+Give Terraform a dedicated, private container for state and let the
+`azurerm` backend manage it. This is durable (GRS), locked (blob-lease
+state locking prevents two runs colliding), and off-box:
+
+```bash
+az storage container create --account-name stmerakidr \
+  --name tfstate --auth-mode login
+# The job identity already has Storage Blob Data Contributor on the
+# account from Step 3; that covers the tfstate container too.
+```
+
+Then pass the backend through the wrapper's pass-through flags (after
+`--`). The managed identity authenticates via AAD — no storage key on
+disk or in a flag:
+
+```bash
+# In the runbook/job environment (the wrapper already sets these style
+# vars for the MSI; ARM_USE_MSI lets terraform reuse the VM identity):
+export ARM_USE_MSI=true
+export ARM_SUBSCRIPTION_ID=<sub> ARM_TENANT_ID=<tenant>
+
+python3 runbook.py ... -- \
+  --sync --webhook-url https://hooks.example.com/meraki2tf --fail-on-gaps \
+  --state-backend azurerm \
+  --backend-config use_azuread_auth=true \
+  --backend-config resource_group_name=rg-netops \
+  --backend-config storage_account_name=stmerakidr \
+  --backend-config container_name=tfstate \
+  --backend-config key=org-123456.tfstate
+```
+
+meraki2tf refuses credential-shaped `--backend-config` keys, so the
+storage credential can only come from the environment/identity — keeping
+the tool's no-secret-on-the-command-line contract intact. Use one
+distinct `key=` per organization if you protect several.
 
 ### Snapshot security posture
 
@@ -132,7 +176,9 @@ only exists on the VM does not survive the disaster it exists for.
 Protection here is **access control + Azure server-side encryption**:
 shared-key access disabled, public access disabled, RBAC grants limited
 to the job identity and break-glass operators, GRS for regional loss.
-On the VM itself meraki2tf keeps the snapshot and state `0600`. If your
+On the VM itself meraki2tf keeps the snapshot (and, with the local
+backend, the state) `0600`; with the azurerm backend the state is held
+in Blob under the same account controls instead. If your
 threat model requires the blob copy to be ciphertext even against a
 storage-plane compromise, add client-side encryption in the wrapper
 (e.g. an `openssl`/`age` step with a Key Vault–held key) before upload

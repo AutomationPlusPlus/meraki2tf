@@ -35,8 +35,10 @@ from meraki2tf.alerts import (
 )
 from meraki2tf.config import (
     API_KEY_ENV_VAR,
+    BackendConfigError,
     ExecutionMode,
     RuntimeConfig,
+    StateBackend,
     api_key_present,
 )
 from meraki2tf.hcl_generator import HclImportGenerator
@@ -211,6 +213,40 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--state-backend",
+        choices=[member.value for member in StateBackend],
+        default=StateBackend.LOCAL.value,
+        help=(
+            "Terraform state backend (default: %(default)s). 'local' keeps "
+            "state on disk in --workdir/--state-file; 'azurerm' stores it in "
+            "Azure Blob Storage for durable, locked, off-box state (recommended "
+            "for scheduled DR). Remote backends take their settings from "
+            "--backend-config / --backend-config-file."
+        ),
+    )
+    parser.add_argument(
+        "--backend-config",
+        action="append",
+        metavar="KEY=VALUE",
+        help=(
+            "Remote backend setting passed to 'terraform init -backend-config'; "
+            "repeat for several. For azurerm: resource_group_name, "
+            "storage_account_name, container_name, key. Credentials are refused "
+            "here — terraform reads them from the environment (ARM_ACCESS_KEY, "
+            "ARM_SAS_TOKEN, or a managed identity)."
+        ),
+    )
+    parser.add_argument(
+        "--backend-config-file",
+        metavar="PATH",
+        default=None,
+        help=(
+            "File of remote backend settings passed to "
+            "'terraform init -backend-config=PATH' (composes with "
+            "--backend-config)."
+        ),
+    )
+    parser.add_argument(
         "--webhook-url",
         action="append",
         metavar="URL",
@@ -320,6 +356,7 @@ def _rebuild(config: RuntimeConfig) -> int:
         config.workdir,
         executable=config.terraform_bin,
         state_path=config.state_file,
+        backend=config.backend,
     )
     if config.state_file is not None:
         # Re-anchor the backend at the explicitly requested state file;
@@ -378,6 +415,7 @@ def _replay_gaps(config: RuntimeConfig) -> int:
         config.workdir,
         executable=config.terraform_bin,
         state_path=config.state_file,
+        backend=config.backend,
     )
     generator = HclImportGenerator(
         spec_parser,
@@ -459,8 +497,19 @@ def _replay_gaps(config: RuntimeConfig) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     arg_parser = build_parser()
     args = arg_parser.parse_args(argv)
-    config = RuntimeConfig.from_args(args)
+    try:
+        config = RuntimeConfig.from_args(args)
+    except BackendConfigError as exc:
+        arg_parser.error(str(exc))
     configure_logging(verbose=config.verbose)
+
+    if config.backend.is_remote and config.state_file is not None:
+        arg_parser.error(
+            "--state-file names a local state path and cannot be combined with "
+            f"a remote --state-backend ({config.backend.backend.value}); the "
+            "remote backend's state location comes from --backend-config "
+            "(e.g. the azurerm 'key' setting)."
+        )
 
     if config.confirm and not (config.rebuild or config.replay_gaps):
         arg_parser.error(
@@ -544,6 +593,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             config.workdir,
             executable=config.terraform_bin,
             state_path=config.state_file,
+            backend=config.backend,
         )
         orchestrator = PipelineOrchestrator(
             provider=provider,
