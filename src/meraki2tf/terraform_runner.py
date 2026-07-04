@@ -140,6 +140,13 @@ _PLAN_SUMMARY_RE = re.compile(
     r"(?P<change>\d+) to change, (?P<destroy>\d+) to destroy"
 )
 
+#: Terraform prints this instead of a ``Plan:`` summary line when the
+#: state already matches the configuration exactly (nothing left to
+#: import, add, change, or destroy).
+_PLAN_NO_CHANGES_SENTENCE = (
+    "No changes. Your infrastructure matches the configuration."
+)
+
 #: Top-level resource block opener in terraform-generated configuration.
 _RESOURCE_BLOCK_RE = re.compile(r'^resource\s+"(?P<type>[^"]+)"\s+"(?P<name>[^"]+)"\s*\{')
 
@@ -230,9 +237,15 @@ class TerraformCommandResult:
 
         Lets the orchestrator report exactly how much of the snapshot is
         still pending aggregation into state versus real change pressure.
+        A converged plan prints no ``Plan:`` line at all, only the
+        no-changes sentence — that is a definitive zero on every count,
+        not an unknown, so idempotent reruns report "0 pending" instead
+        of "pending imports unknown".
         """
         match = _PLAN_SUMMARY_RE.search(self.stdout)
         if match is None:
+            if _PLAN_NO_CHANGES_SENTENCE in self.stdout:
+                return PlanCounts(imports=0, add=0, change=0, destroy=0)
             return None
         return PlanCounts(
             imports=int(match.group("imports") or 0),

@@ -502,6 +502,30 @@ def test_unparseable_plan_falls_back_to_exit_code(
     assert result.plan_counts is None
 
 
+def test_converged_plan_reports_zero_counts_not_unknown(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fully converged plan has no ``Plan:`` line, only the no-changes
+    sentence — that is a definitive zero, so idempotent reruns must not
+    degrade the run summary to "pending imports unknown"."""
+    fake = FakeSubprocess(
+        returncode=0,
+        stdout=(
+            "No changes. Your infrastructure matches the configuration.\n\n"
+            "Terraform has compared your real infrastructure against your "
+            "configuration and found no differences, so no changes are "
+            "needed.\n"
+        ),
+    )
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    result = runner.plan_with_generation(reconcile=False)
+    counts = result.plan_counts
+    assert counts is not None
+    assert (counts.imports, counts.add, counts.change, counts.destroy) == (0, 0, 0, 0)
+    assert counts.has_real_changes is False
+    assert result.has_drift is False
+
+
 def test_plan_counts_expose_pending_imports_and_changes(
     runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
