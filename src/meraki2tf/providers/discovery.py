@@ -142,16 +142,23 @@ def expand_endpoint_payload(
 
     Singleton configs (dict payloads) address themselves at the
     endpoint's own path; listed collections expand to one asset per
-    element at the corresponding item path. Both ingestion modalities
-    run their raw data through this one function, which is what
-    guarantees structural parity between them.
+    element at the corresponding item path. Paginated ``{items, meta}``
+    envelopes (the newer Meraki collection shape) are unwrapped to their
+    element list first — recognized from the operation's declared
+    response schema, so a genuine singleton that happens to carry an
+    ``items`` field is never misread. Both ingestion modalities run
+    their raw data through this one function, which is what guarantees
+    structural parity between them.
     """
     if isinstance(payload, Mapping):
-        return [
-            FeatureConfiguration(
-                api_path=op.path, path_values=(scope_value,), payload=payload
-            )
-        ]
+        elements = _envelope_elements(op, payload)
+        if elements is None:
+            return [
+                FeatureConfiguration(
+                    api_path=op.path, path_values=(scope_value,), payload=payload
+                )
+            ]
+        payload = elements
     item_op = item_operation_for(parser, op)
     if item_op is None:
         logger.debug("Collection %s has no item endpoint; keeping one record.", op.path)
@@ -197,13 +204,55 @@ def expand_endpoint_payload(
     return expanded
 
 
-def _response_schema_properties(op: OperationSpec) -> frozenset[str]:
-    """Top-level property names of the operation's 200-response schema."""
+def _response_schema(op: OperationSpec) -> Mapping[str, Any] | None:
+    """The operation's declared 200-response JSON schema, if any."""
     node: Any = op.raw
     for key in ("responses", "200", "content", "application/json", "schema"):
         node = node.get(key) if isinstance(node, Mapping) else None
         if node is None:
-            return frozenset()
+            return None
+    return node if isinstance(node, Mapping) else None
+
+
+def _envelope_elements(op: OperationSpec, payload: Mapping[str, Any]) -> Any:
+    """The element list of a paginated ``{items, meta}`` envelope, or None.
+
+    Newer Meraki collection endpoints wrap their elements in an object
+    whose ``items`` property is the real collection. Two signals
+    identify it: the response schema declared in the spec (an object
+    schema declaring ``items`` as an array), or — because the published
+    spec still declares a plain array for several endpoints that
+    actually respond enveloped (observed live: the org DNS profile and
+    record collections) — the payload being exactly the wrapper shape:
+    nothing but ``items`` (a list) and optionally ``meta`` (an object).
+    A singleton config carrying an ``items`` field among other real
+    attributes matches neither signal and stays a singleton.
+    """
+    elements = payload.get("items")
+    if not isinstance(elements, list):
+        return None
+    schema = _response_schema(op)
+    if schema is not None:
+        properties = schema.get("properties")
+        if isinstance(properties, Mapping):
+            items_schema = properties.get("items")
+            if (
+                isinstance(items_schema, Mapping)
+                and items_schema.get("type") == "array"
+            ):
+                return elements
+    if set(payload) <= {"items", "meta"} and isinstance(
+        payload.get("meta", {}), Mapping
+    ):
+        return elements
+    return None
+
+
+def _response_schema_properties(op: OperationSpec) -> frozenset[str]:
+    """Top-level property names of the operation's 200-response schema."""
+    node = _response_schema(op)
+    if node is None:
+        return frozenset()
     properties = node.get("properties")
     if not isinstance(properties, Mapping):
         items = node.get("items")

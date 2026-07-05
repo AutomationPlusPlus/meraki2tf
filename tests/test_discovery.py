@@ -197,6 +197,148 @@ def test_expand_endpoint_payload_shapes(parser: OpenApiParser) -> None:
     assert kept[0].payload == {"items": [{"host": "10.0.0.1"}]}
 
 
+def _envelope_spec(tmp_path: Path) -> OpenApiParser:
+    """An org-scoped collection using the paginated {items, meta} envelope."""
+    envelope_schema = {
+        "type": "object",
+        "properties": {
+            "items": {"type": "array", "items": {"properties": {"profileId": {}}}},
+            "meta": {"type": "object"},
+        },
+    }
+    return _write_spec(
+        tmp_path,
+        {
+            "/organizations/{organizationId}/appliance/dns/local/profiles": {
+                "get": {
+                    "operationId": "getProfiles",
+                    "tags": ["appliance"],
+                    "responses": {
+                        "200": {
+                            "content": {
+                                "application/json": {"schema": envelope_schema}
+                            }
+                        }
+                    },
+                },
+                "post": {"operationId": "createProfile", "tags": ["appliance"]},
+            },
+            "/organizations/{organizationId}/appliance/dns/local/profiles/{profileId}": {
+                "put": {"operationId": "updateProfile", "tags": ["appliance"]},
+                "delete": {"operationId": "deleteProfile", "tags": ["appliance"]},
+            },
+        },
+    )
+
+
+def test_envelope_collections_expand_to_item_assets(tmp_path: Path) -> None:
+    """{items, meta} pagination envelopes are collections, not singletons:
+    each element becomes an addressable per-item asset."""
+    parser = _envelope_spec(tmp_path)
+    op = _get_op(
+        parser, "/organizations/{organizationId}/appliance/dns/local/profiles"
+    )
+    assets = expand_endpoint_payload(
+        parser,
+        op,
+        "123456",
+        {
+            "items": [{"profileId": "10", "name": "a"}, {"profileId": "11"}],
+            "meta": {"counts": {"items": {"total": 2}}},
+        },
+    )
+    assert [(f.api_path, f.path_values) for f in assets] == [
+        (
+            "/organizations/{organizationId}/appliance/dns/local/profiles/{profileId}",
+            ("123456", "10"),
+        ),
+        (
+            "/organizations/{organizationId}/appliance/dns/local/profiles/{profileId}",
+            ("123456", "11"),
+        ),
+    ]
+    assert assets[0].payload == {"profileId": "10", "name": "a"}
+
+
+def test_envelope_without_item_list_stays_singleton(tmp_path: Path) -> None:
+    """A declared envelope whose payload carries no list is left intact
+    (never guessed into an empty collection)."""
+    parser = _envelope_spec(tmp_path)
+    op = _get_op(
+        parser, "/organizations/{organizationId}/appliance/dns/local/profiles"
+    )
+    assets = expand_endpoint_payload(parser, op, "123456", {"items": "oops"})
+    assert len(assets) == 1
+    assert assets[0].api_path == op.path
+    assert assets[0].payload == {"items": "oops"}
+
+
+def test_items_key_among_real_attributes_stays_singleton(
+    tmp_path: Path,
+) -> None:
+    """A dict payload carrying ``items`` next to other real attributes is
+    a singleton config, not an envelope."""
+    parser = _write_spec(
+        tmp_path,
+        {
+            "/networks/{networkId}/wireless/billing": {
+                "get": {"operationId": "getBilling", "tags": ["wireless"]},
+                "put": {"operationId": "updateBilling", "tags": ["wireless"]},
+            },
+        },
+    )
+    op = _get_op(parser, "/networks/{networkId}/wireless/billing")
+    assets = expand_endpoint_payload(
+        parser, op, "N_1", {"items": [{"id": "1"}], "currency": "USD"}
+    )
+    assert len(assets) == 1
+    assert assets[0].api_path == op.path
+
+
+def test_undeclared_envelope_recognized_by_exact_shape(tmp_path: Path) -> None:
+    """Several endpoints respond enveloped although the spec declares a
+    plain array (observed live for org DNS profiles/records); the exact
+    {items, meta} wrapper shape is unwrapped even without schema help."""
+    parser = _write_spec(
+        tmp_path,
+        {
+            "/organizations/{organizationId}/appliance/dns/local/records": {
+                "get": {"operationId": "getRecords", "tags": ["appliance"]},
+                "post": {"operationId": "createRecord", "tags": ["appliance"]},
+            },
+            "/organizations/{organizationId}/appliance/dns/local/records/{recordId}": {
+                "put": {"operationId": "updateRecord", "tags": ["appliance"]},
+                "delete": {"operationId": "deleteRecord", "tags": ["appliance"]},
+            },
+        },
+    )
+    op = _get_op(
+        parser, "/organizations/{organizationId}/appliance/dns/local/records"
+    )
+    assets = expand_endpoint_payload(
+        parser,
+        op,
+        "123456",
+        {
+            "items": [{"recordId": "7", "hostname": "a.corp.example"}],
+            "meta": {"counts": {"items": {"total": 1, "remaining": 0}}},
+        },
+    )
+    assert [(f.api_path, f.path_values) for f in assets] == [
+        (
+            "/organizations/{organizationId}/appliance/dns/local/records/{recordId}",
+            ("123456", "7"),
+        ),
+    ]
+    # An empty envelope expands to zero assets rather than one
+    # unimportable collection blob.
+    empty = expand_endpoint_payload(
+        parser, op, "123456",
+        {"items": [], "meta": {"counts": {"items": {"total": 0}}}},
+    )
+    assert empty == []
+
+
 def test_matcher_resolves_exact_and_tokenized_sections(
     parser: OpenApiParser,
 ) -> None:
