@@ -159,6 +159,22 @@ def expand_endpoint_payload(
                 )
             ]
         payload = elements
+    if not payload:
+        if _whole_collection_put(parser, op):
+            # The collection itself is one config object (its PUT
+            # replaces the whole list), so even an empty list is a real,
+            # importable configuration.
+            return [
+                FeatureConfiguration(
+                    api_path=op.path,
+                    path_values=(scope_value,),
+                    payload={"items": []},
+                )
+            ]
+        # A per-item collection with zero items discovers zero objects;
+        # keeping a placeholder record would manufacture phantom
+        # coverage gaps.
+        return []
     item_op = item_operation_for(parser, op)
     if item_op is None:
         logger.debug("Collection %s has no item endpoint; keeping one record.", op.path)
@@ -202,6 +218,28 @@ def expand_endpoint_payload(
             )
         )
     return expanded
+
+
+def _whole_collection_put(parser: OpenApiParser, op: OperationSpec) -> bool:
+    """Whether ``op``'s path carries a PUT that replaces the whole list.
+
+    Such endpoints (VPN peer SLAs, staged upgrade stages, …) declare a
+    request body with exactly one array-typed property — the collection
+    itself is a single configuration object. Per-item endpoints instead
+    PUT individual selector fields (a serial, a network, …).
+    """
+    for candidate in parser.endpoints():
+        if candidate.path != op.path or candidate.method != "put":
+            continue
+        node: Any = candidate.raw
+        for key in ("requestBody", "content", "application/json", "schema"):
+            node = node.get(key) if isinstance(node, Mapping) else None
+        properties = node.get("properties") if isinstance(node, Mapping) else None
+        if not isinstance(properties, Mapping) or len(properties) != 1:
+            return False
+        only = next(iter(properties.values()))
+        return isinstance(only, Mapping) and only.get("type") == "array"
+    return False
 
 
 def _response_schema(op: OperationSpec) -> Mapping[str, Any] | None:

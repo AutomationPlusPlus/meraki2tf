@@ -73,6 +73,7 @@ from meraki2tf.providers.discovery import (
     FeatureSectionMatcher,
     expand_endpoint_payload,
 )
+from meraki2tf.spec.engine import OperationSpec
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +97,7 @@ class StaticJsonDataProvider(MerakiDataProvider):
         self._path = dump_path
         self._parser = parser
         self._matchers: dict[str, FeatureSectionMatcher] = {}
+        self._get_ops: dict[str, OperationSpec] | None = None
         try:
             document = json.loads(dump_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
@@ -131,8 +133,9 @@ class StaticJsonDataProvider(MerakiDataProvider):
             for item in coerce_sequence(self._document.get("devices"), "'devices'")
         )
         features = tuple(
-            self._feature(item)
+            normalized
             for item in coerce_sequence(self._document.get("features"), "'features'")
+            for normalized in self._normalized_contract_features(self._feature(item))
         )
         graph = NetworkGraph(
             organization_id=org_id,
@@ -142,6 +145,41 @@ class StaticJsonDataProvider(MerakiDataProvider):
         )
         self._log_graph(graph)
         return graph
+
+    def _normalized_contract_features(
+        self, feature: FeatureConfiguration
+    ) -> list[FeatureConfiguration]:
+        """Replay a stored feature through the shared expansion path.
+
+        Canonical snapshots written before paginated ``{items, meta}``
+        envelopes were understood store whole envelope collections as one
+        scope-addressed asset. Re-expanding dict payloads recorded at a
+        single-scope collection endpoint heals those snapshots into the
+        per-item assets live discovery now produces — and is an identity
+        transform for snapshots captured after the fix (genuine singleton
+        payloads expand to themselves).
+        """
+        if self._parser is None or not isinstance(feature.payload, dict):
+            return [feature]
+        if len(feature.path_values) != 1:
+            return [feature]
+        op = self._collection_get_ops().get(feature.api_path)
+        if op is None:
+            return [feature]
+        return expand_endpoint_payload(
+            self._parser, op, feature.path_values[0], feature.payload
+        )
+
+    def _collection_get_ops(self) -> dict[str, OperationSpec]:
+        """Single-scope GET operations by path, built once per snapshot."""
+        if self._get_ops is None:
+            assert self._parser is not None  # guarded by the caller
+            self._get_ops = {
+                op.path: op
+                for op in self._parser.endpoints()
+                if op.method == "get" and len(op.path_params) == 1
+            }
+        return self._get_ops
 
     def _feature(self, item: Any) -> FeatureConfiguration:
         if not isinstance(item, dict) or not str(item.get("apiPath") or "").strip():

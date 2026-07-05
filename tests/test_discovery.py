@@ -195,6 +195,8 @@ def test_expand_endpoint_payload_shapes(parser: OpenApiParser) -> None:
     syslog = _get_op(parser, "/networks/{networkId}/syslogServers")
     kept = expand_endpoint_payload(parser, syslog, "N_1", [{"host": "10.0.0.1"}])
     assert kept[0].payload == {"items": [{"host": "10.0.0.1"}]}
+    # An empty per-item collection discovers zero objects.
+    assert expand_endpoint_payload(parser, vlans, "N_1", []) == []
 
 
 def _envelope_spec(tmp_path: Path) -> OpenApiParser:
@@ -337,6 +339,66 @@ def test_undeclared_envelope_recognized_by_exact_shape(tmp_path: Path) -> None:
         {"items": [], "meta": {"counts": {"items": {"total": 0}}}},
     )
     assert empty == []
+
+
+def test_empty_collections_kept_only_for_whole_collection_puts(
+    tmp_path: Path,
+) -> None:
+    """An empty list at an endpoint whose PUT replaces the whole
+    collection (VPN peer SLAs, staged stages) is one real — empty —
+    config object; an empty per-item collection discovers nothing."""
+    whole_put = {
+        "operationId": "updateSlas",
+        "tags": ["appliance"],
+        "requestBody": {
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {"items": {"type": "array"}},
+                    }
+                }
+            }
+        },
+    }
+    per_item_put = {
+        "operationId": "updateStatuses",
+        "tags": ["camera"],
+        "requestBody": {
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {"serial": {}, "sent": {}},
+                    }
+                }
+            }
+        },
+    }
+    parser = _write_spec(
+        tmp_path,
+        {
+            "/organizations/{organizationId}/vpn/slas": {
+                "get": {"operationId": "getSlas", "tags": ["appliance"]},
+                "put": whole_put,
+            },
+            "/organizations/{organizationId}/onboarding/statuses": {
+                "get": {"operationId": "getStatuses", "tags": ["camera"]},
+                "put": per_item_put,
+            },
+        },
+    )
+    slas = _get_op(parser, "/organizations/{organizationId}/vpn/slas")
+    kept = expand_endpoint_payload(
+        parser, slas, "123456", {"items": [], "meta": {}}
+    )
+    assert [(f.api_path, f.path_values, f.payload) for f in kept] == [
+        ("/organizations/{organizationId}/vpn/slas", ("123456",), {"items": []}),
+    ]
+    statuses = _get_op(
+        parser, "/organizations/{organizationId}/onboarding/statuses"
+    )
+    assert expand_endpoint_payload(parser, statuses, "123456", {"items": []}) == []
 
 
 def test_matcher_resolves_exact_and_tokenized_sections(
