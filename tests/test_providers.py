@@ -110,6 +110,94 @@ def test_dump_provider_honors_org_override(dump_file: Path) -> None:
     assert graph.organization_id == "org-999"
 
 
+def _canonical_snapshot(tmp_path: Path, features: list[dict[str, Any]]) -> Path:
+    path = tmp_path / "canonical.json"
+    path.write_text(
+        json.dumps(
+            {"organizationId": "org-123", "networks": [], "devices": [],
+             "features": features}
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_dump_provider_heals_stored_envelope_collections(
+    tmp_path: Path, spec_parser: OpenApiParser
+) -> None:
+    """Canonical snapshots written before {items, meta} envelopes were
+    understood store a whole collection as one scope-addressed asset;
+    replaying features through the shared expansion yields the per-item
+    assets live discovery now produces."""
+    path = _canonical_snapshot(
+        tmp_path,
+        [
+            {
+                "apiPath": "/organizations/{organizationId}/admins",
+                "pathValues": ["org-123"],
+                "payload": {
+                    "items": [{"id": "A_1", "name": "Jordan Sample"}],
+                    "meta": {"counts": {"items": {"total": 1}}},
+                },
+            },
+            {
+                "apiPath": "/organizations/{organizationId}/admins",
+                "pathValues": ["org-123"],
+                "payload": {"items": [], "meta": {}},
+            },
+        ],
+    )
+    graph = StaticJsonDataProvider(path, parser=spec_parser).fetch_network_graph()
+    # The populated envelope became one per-item asset; the empty one vanished.
+    assert [(f.api_path, f.path_values) for f in graph.features] == [
+        ("/organizations/{organizationId}/admins/{adminId}", ("org-123", "A_1")),
+    ]
+
+
+def test_dump_provider_keeps_stored_features_verbatim_without_parser(
+    tmp_path: Path,
+) -> None:
+    envelope = {"items": [], "meta": {}}
+    path = _canonical_snapshot(
+        tmp_path,
+        [
+            {
+                "apiPath": "/organizations/{organizationId}/admins",
+                "pathValues": ["org-123"],
+                "payload": envelope,
+            }
+        ],
+    )
+    graph = StaticJsonDataProvider(path).fetch_network_graph()
+    assert len(graph.features) == 1
+    assert graph.features[0].payload == envelope
+
+
+def test_dump_provider_keeps_item_and_singleton_features_intact(
+    tmp_path: Path, spec_parser: OpenApiParser
+) -> None:
+    path = _canonical_snapshot(
+        tmp_path,
+        [
+            {
+                "apiPath": "/networks/{networkId}/appliance/vlans/{vlanId}",
+                "pathValues": ["N_1", "10"],
+                "payload": {"id": 10, "name": "Data"},
+            },
+            {
+                "apiPath": "/networks/{networkId}/appliance/trafficShaping",
+                "pathValues": ["N_1"],
+                "payload": {"globalBandwidthLimits": {"limitUp": 0}},
+            },
+        ],
+    )
+    graph = StaticJsonDataProvider(path, parser=spec_parser).fetch_network_graph()
+    assert [(f.api_path, f.path_values) for f in graph.features] == [
+        ("/networks/{networkId}/appliance/vlans/{vlanId}", ("N_1", "10")),
+        ("/networks/{networkId}/appliance/trafficShaping", ("N_1",)),
+    ]
+
+
 def test_dump_provider_requires_some_org_id(tmp_path: Path) -> None:
     path = tmp_path / "no-org.json"
     path.write_text(json.dumps({"networks": []}), encoding="utf-8")
