@@ -552,13 +552,19 @@ class _FakeApiError(Exception):
         self.status = status
 
 
-def test_try_call_aborts_when_throttle_survives_retries(
+def test_try_call_aborts_when_throttle_survives_every_backoff(
     live_provider: LiveApiDataProvider,
     spec_parser: OpenApiParser,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A 429 that escapes the SDK's generous waits is missing data, not
-    an inapplicable feature — swallowing it would ship a snapshot that
-    is silently incomplete but looks complete."""
+    """A 429 that outlasts the SDK's waits AND the extended outer
+    backoffs is missing data, not an inapplicable feature — swallowing
+    it would ship a snapshot that is silently incomplete but looks
+    complete."""
+    sleeps: list[float] = []
+    monkeypatch.setattr(
+        "meraki2tf.providers.live.time.sleep", sleeps.append
+    )
     op = next(
         o for o in spec_parser.endpoints()
         if o.operation_id == "getOrganizationAdmins"
@@ -573,6 +579,45 @@ def test_try_call_aborts_when_throttle_survives_retries(
         live_provider._try_call(
             dashboard, op, "organizationId", "org-123", set()
         )
+    # Every extended pause was honored before giving up.
+    assert sleeps == [30.0, 60.0, 120.0]
+
+
+def test_try_call_rides_out_throttle_bursts_with_outer_backoff(
+    live_provider: LiveApiDataProvider,
+    spec_parser: OpenApiParser,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Meraki answers 429 with Retry-After: 1, so the SDK's whole retry
+    budget burns in seconds — useless while another integration
+    saturates the shared org budget for minutes. The outer backoff must
+    wait out the burst and then succeed."""
+    sleeps: list[float] = []
+    monkeypatch.setattr(
+        "meraki2tf.providers.live.time.sleep", sleeps.append
+    )
+    op = next(
+        o for o in spec_parser.endpoints()
+        if o.operation_id == "getOrganizationAdmins"
+    )
+    attempts = {"n": 0}
+
+    class BurstThrottled:
+        def getOrganizationAdmins(self, organizationId: str) -> list[dict[str, Any]]:
+            attempts["n"] += 1
+            if attempts["n"] <= 2:
+                raise _FakeApiError(429)
+            return [{"id": "A_1"}]
+
+    dashboard = types.SimpleNamespace(organizations=BurstThrottled())
+    with caplog.at_level("WARNING", logger="meraki2tf.providers.live"):
+        result = live_provider._try_call(
+            dashboard, op, "organizationId", "org-123", set()
+        )
+    assert result == [{"id": "A_1"}]
+    assert sleeps == [30.0, 60.0]
+    assert sum("still throttled" in r.message for r in caplog.records) == 2
 
 
 @pytest.mark.parametrize("status", [500, 502, 503, 504])
