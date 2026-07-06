@@ -14,6 +14,7 @@ from meraki2tf.openapi_parser import OpenApiParser
 from meraki2tf.providers import (
     LiveApiDataProvider,
     LiveDispatchError,
+    LiveRetryExhaustedError,
     MalformedDumpError,
     StaticJsonDataProvider,
 )
@@ -87,6 +88,10 @@ def live_provider(
         constructed.append(kwargs)
         assert kwargs["suppress_logging"] is True
         assert kwargs["print_console"] is False
+        # The org-wide rate budget is shared with other API consumers;
+        # the SDK must wait out 429s far past its 2-retry default.
+        assert kwargs["wait_on_rate_limit"] is True
+        assert kwargs["maximum_retries"] == 10
         return FakeDashboard()
 
     stub = types.ModuleType("meraki")
@@ -514,6 +519,60 @@ def test_try_call_skips_operations_already_known_undispatchable(
         object(), op, "organizationId", "org-123", undispatchable
     )
     assert result is None  # short-circuited, no dispatch attempted
+
+
+class _FakeApiError(Exception):
+    """Mimics meraki.exceptions.APIError's ``status`` attribute."""
+
+    def __init__(self, status: int) -> None:
+        super().__init__(f"HTTP {status}")
+        self.status = status
+
+
+@pytest.mark.parametrize("status", [429, 500, 502, 503, 504])
+def test_try_call_aborts_when_transient_failure_survives_retries(
+    live_provider: LiveApiDataProvider,
+    spec_parser: OpenApiParser,
+    status: int,
+) -> None:
+    """A throttle/server error that escapes the SDK's retries is missing
+    data, not an inapplicable feature — swallowing it would ship a
+    snapshot that is silently incomplete but looks complete."""
+    op = next(
+        o for o in spec_parser.endpoints()
+        if o.operation_id == "getOrganizationAdmins"
+    )
+
+    class Throttled:
+        def getOrganizationAdmins(self, organizationId: str) -> list[dict[str, Any]]:
+            raise _FakeApiError(status)
+
+    dashboard = types.SimpleNamespace(organizations=Throttled())
+    with pytest.raises(LiveRetryExhaustedError, match=f"HTTP {status}"):
+        live_provider._try_call(
+            dashboard, op, "organizationId", "org-123", set()
+        )
+
+
+def test_try_call_still_skips_scope_refusals_with_status(
+    live_provider: LiveApiDataProvider, spec_parser: OpenApiParser
+) -> None:
+    """A 400 product-type refusal stays a quiet skip even when the
+    exception carries an HTTP status attribute like APIError does."""
+    op = next(
+        o for o in spec_parser.endpoints()
+        if o.operation_id == "getOrganizationAdmins"
+    )
+
+    class Refusing:
+        def getOrganizationAdmins(self, organizationId: str) -> list[dict[str, Any]]:
+            raise _FakeApiError(400)
+
+    dashboard = types.SimpleNamespace(organizations=Refusing())
+    result = live_provider._try_call(
+        dashboard, op, "organizationId", "org-123", set()
+    )
+    assert result is None
 
 
 def test_live_provider_without_parser_skips_features(

@@ -6,7 +6,11 @@ Security and contract notes:
   client-construction time and passed straight into the SDK — never
   retained on this object. SDK-side logging of the key is suppressed.
 * The 10 req/s endpoint budget is honored natively by the SDK's
-  built-in rate-limit handler.
+  built-in rate-limit handler. The per-organization budget is shared
+  with every other API consumer of the tenant, so the client is
+  configured to wait and retry generously on 429; a throttle that
+  survives all retries aborts discovery instead of shrinking the
+  snapshot (completeness over speed).
 * Feature discovery is spec-driven: the endpoints to call come from the
   :class:`~meraki2tf.openapi_parser.OpenApiParser` via the shared
   :mod:`~meraki2tf.providers.discovery` helpers, and each operation
@@ -42,6 +46,24 @@ class LiveDispatchError(RuntimeError):
     """A spec operation could not be resolved onto the Meraki SDK surface."""
 
 
+class LiveRetryExhaustedError(RuntimeError):
+    """A transient API failure (throttle/server error) survived every retry.
+
+    Continuing would silently drop the affected objects from the snapshot
+    — a false sense of DR coverage — so discovery aborts loudly instead.
+    """
+
+
+#: SDK retry budget for rate-limited calls. The organization-wide limit is
+#: shared with other API consumers, so transient 429 storms are expected on
+#: busy tenants; each retry honors the Retry-After header.
+_SDK_MAXIMUM_RETRIES = 10
+
+#: HTTP statuses that mean "the data exists but this attempt failed" —
+#: never "this feature does not apply to that scope".
+_TRANSIENT_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
+
+
 class LiveApiDataProvider(MerakiDataProvider):
     """Fetches the domain graph from the Meraki cloud."""
 
@@ -60,6 +82,8 @@ class LiveApiDataProvider(MerakiDataProvider):
                 suppress_logging=True,
                 print_console=False,
                 output_log=False,
+                wait_on_rate_limit=True,
+                maximum_retries=_SDK_MAXIMUM_RETRIES,
             )
             logger.debug("Meraki dashboard client initialized (logging suppressed).")
         return self._client
@@ -182,13 +206,16 @@ class LiveApiDataProvider(MerakiDataProvider):
         scope_value: str,
         undispatchable: set[str],
     ) -> Any:
-        """One endpoint call; refusals are data, dispatch gaps are loud.
+        """One endpoint call; refusals are data, transient failures are fatal.
 
-        A product-type refusal for one network is normal and logged at
-        DEBUG, but an operation the installed SDK cannot dispatch at all
-        would silently drop that endpoint's assets from every scope —
+        A product-type refusal for one network (400/404) is normal and
+        logged at DEBUG. An operation the installed SDK cannot dispatch at
+        all would silently drop that endpoint's assets from every scope —
         that is missing DR coverage, so it warns once and is skipped for
-        the rest of the run.
+        the rest of the run. A throttle or server error that survived the
+        SDK's retries is neither: the objects exist but this run cannot
+        see them, so discovery aborts rather than emit an incomplete
+        snapshot that looks complete.
         """
         if op.operation_id in undispatchable:
             return None
@@ -204,6 +231,16 @@ class LiveApiDataProvider(MerakiDataProvider):
             )
             return None
         except Exception as exc:
+            status = getattr(exc, "status", None)
+            if status in _TRANSIENT_HTTP_STATUSES:
+                raise LiveRetryExhaustedError(
+                    f"Feature endpoint {op.path} for {scope_param} "
+                    f"{scope_value} failed with HTTP {status} after the SDK "
+                    "exhausted its retries; aborting discovery because the "
+                    "snapshot would be silently incomplete. Rerun once the "
+                    "API is responsive (the per-organization rate budget is "
+                    "shared with other API consumers)."
+                ) from exc
             logger.debug(
                 "Feature endpoint %s unavailable for %s %s: %s",
                 op.path, scope_param, scope_value, exc,
