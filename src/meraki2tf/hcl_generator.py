@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from meraki2tf.alerts import AlertDispatcher, unsupported_feature_flagged
-from meraki2tf.models import NetworkGraph
+from meraki2tf.models import UNREADABLE_MARKER, NetworkGraph
 from meraki2tf.openapi_parser import OpenApiParser, snake_case
 from meraki2tf.provider_catalog import ProviderCatalog
 from meraki2tf.resource_matcher import MatchedResource, path_matches
@@ -59,6 +59,11 @@ class ImportCandidate:
 
     api_path: str
     id_values: tuple[str, ...]
+    #: Reason discovery could not read the endpoint, when it could not.
+    #: Such an asset has no payload to build configuration from and its
+    #: provider Read would fail the same way, so it must be audited as
+    #: unsupported instead of imported.
+    unreadable: str | None = None
 
 
 @dataclass(frozen=True)
@@ -161,6 +166,17 @@ class HclImportGenerator:
         skipped_existing = 0
 
         for candidate in self._candidates(graph):
+            if candidate.unreadable is not None:
+                unsupported.append(
+                    self._flag(
+                        candidate,
+                        "Endpoint could not be read during discovery "
+                        f"({candidate.unreadable}); its objects are absent "
+                        "from the kit and must be verified manually.",
+                        audit=audit,
+                    )
+                )
+                continue
             if candidate.api_path not in matches:
                 unsupported.append(
                     self._flag(
@@ -288,7 +304,11 @@ class HclImportGenerator:
             for device in graph.devices
         )
         candidates.extend(
-            ImportCandidate(feature.api_path, feature.path_values)
+            ImportCandidate(
+                feature.api_path,
+                feature.path_values,
+                unreadable=feature.payload.get(UNREADABLE_MARKER),
+            )
             for feature in graph.features
         )
         # Sorted so collision-suffix assignment in _resolve_address does

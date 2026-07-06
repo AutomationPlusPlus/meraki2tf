@@ -26,6 +26,7 @@ from typing import Any
 
 from meraki2tf.config import read_api_key
 from meraki2tf.models import (
+    UNREADABLE_MARKER,
     FeatureConfiguration,
     MerakiDevice,
     MerakiNetwork,
@@ -47,10 +48,22 @@ class LiveDispatchError(RuntimeError):
 
 
 class LiveRetryExhaustedError(RuntimeError):
-    """A transient API failure (throttle/server error) survived every retry.
+    """A throttle survived every retry the SDK was willing to make.
 
-    Continuing would silently drop the affected objects from the snapshot
-    — a false sense of DR coverage — so discovery aborts loudly instead.
+    The SDK waits out 429s honoring Retry-After, so exhausting its budget
+    means the API is pathologically saturated. Continuing would silently
+    drop the affected objects from the snapshot — a false sense of DR
+    coverage — so discovery aborts loudly instead.
+    """
+
+
+class _EndpointUnreadable(Exception):
+    """One endpoint persistently server-errors; its content is unknowable.
+
+    Meraki is known to return deterministic 500s for specific endpoints
+    on specific network configurations, so — unlike a throttle — this is
+    not cured by waiting and must not abort the whole run. The caller
+    records the endpoint as a coverage gap instead.
     """
 
 
@@ -59,9 +72,10 @@ class LiveRetryExhaustedError(RuntimeError):
 #: busy tenants; each retry honors the Retry-After header.
 _SDK_MAXIMUM_RETRIES = 10
 
-#: HTTP statuses that mean "the data exists but this attempt failed" —
-#: never "this feature does not apply to that scope".
-_TRANSIENT_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
+#: Statuses meaning "the API refused this attempt", never "this feature
+#: does not apply to that scope".
+_THROTTLE_HTTP_STATUSES = frozenset({429})
+_SERVER_ERROR_HTTP_STATUSES = frozenset({500, 502, 503, 504})
 
 
 class LiveApiDataProvider(MerakiDataProvider):
@@ -137,10 +151,36 @@ class LiveApiDataProvider(MerakiDataProvider):
         if self._parser is None:
             logger.debug("No OpenAPI parser supplied; skipping feature discovery.")
             return []
+        parser = self._parser
         undispatchable: set[str] = set()
         features: list[FeatureConfiguration] = []
-        mappings = self._parser.resource_mappings()
-        lookup = self._parser.endpoint_lookup()
+        mappings = parser.resource_mappings()
+        lookup = parser.endpoint_lookup()
+
+        def _collect(op: OperationSpec, scope_param: str, scope_value: str) -> None:
+            try:
+                payload = self._try_call(
+                    dashboard, op, scope_param, scope_value, undispatchable
+                )
+            except _EndpointUnreadable as exc:
+                logger.warning(
+                    "Feature endpoint %s for %s %s could not be read (%s); "
+                    "recorded as a coverage gap — its objects are missing "
+                    "from this snapshot.",
+                    op.path, scope_param, scope_value, exc,
+                )
+                features.append(
+                    FeatureConfiguration(
+                        api_path=op.path,
+                        path_values=(scope_value,),
+                        payload={UNREADABLE_MARKER: str(exc)},
+                    )
+                )
+                return
+            if payload is not None:
+                features.extend(
+                    expand_endpoint_payload(parser, op, scope_value, payload)
+                )
 
         def _folds_elsewhere(op: OperationSpec) -> bool:
             # Collections that fold into another entity list first-class
@@ -152,50 +192,26 @@ class LiveApiDataProvider(MerakiDataProvider):
                 op.path
             )
 
-        for op in config_collection_operations(self._parser, "organizationId"):
+        for op in config_collection_operations(parser, "organizationId"):
             if _folds_elsewhere(op):
                 continue
-            payload = self._try_call(
-                dashboard, op, "organizationId", organization_id, undispatchable
-            )
-            if payload is not None:
-                features.extend(
-                    expand_endpoint_payload(
-                        self._parser, op, organization_id, payload
-                    )
-                )
+            _collect(op, "organizationId", organization_id)
         network_ops = tuple(
             op
-            for op in config_collection_operations(self._parser)
+            for op in config_collection_operations(parser)
             if not _folds_elsewhere(op)
         )
         for network in networks:
             for op in network_ops:
-                payload = self._try_call(
-                    dashboard, op, "networkId", network.network_id, undispatchable
-                )
-                if payload is not None:
-                    features.extend(
-                        expand_endpoint_payload(
-                            self._parser, op, network.network_id, payload
-                        )
-                    )
+                _collect(op, "networkId", network.network_id)
         serial_ops = tuple(
             op
-            for op in config_collection_operations(self._parser, "serial")
+            for op in config_collection_operations(parser, "serial")
             if not _folds_elsewhere(op)
         )
         for device in devices:
             for op in serial_ops:
-                payload = self._try_call(
-                    dashboard, op, "serial", device.serial, undispatchable
-                )
-                if payload is not None:
-                    features.extend(
-                        expand_endpoint_payload(
-                            self._parser, op, device.serial, payload
-                        )
-                    )
+                _collect(op, "serial", device.serial)
         return features
 
     def _try_call(
@@ -206,16 +222,17 @@ class LiveApiDataProvider(MerakiDataProvider):
         scope_value: str,
         undispatchable: set[str],
     ) -> Any:
-        """One endpoint call; refusals are data, transient failures are fatal.
+        """One endpoint call; refusals are data, API failures never are.
 
         A product-type refusal for one network (400/404) is normal and
         logged at DEBUG. An operation the installed SDK cannot dispatch at
         all would silently drop that endpoint's assets from every scope —
         that is missing DR coverage, so it warns once and is skipped for
-        the rest of the run. A throttle or server error that survived the
-        SDK's retries is neither: the objects exist but this run cannot
-        see them, so discovery aborts rather than emit an incomplete
-        snapshot that looks complete.
+        the rest of the run. A throttle that survived the SDK's retries
+        aborts discovery (LiveRetryExhaustedError) rather than emit an
+        incomplete snapshot that looks complete. A persistent server
+        error raises _EndpointUnreadable so the caller records that one
+        endpoint as a coverage gap without losing the rest of the run.
         """
         if op.operation_id in undispatchable:
             return None
@@ -232,7 +249,7 @@ class LiveApiDataProvider(MerakiDataProvider):
             return None
         except Exception as exc:
             status = getattr(exc, "status", None)
-            if status in _TRANSIENT_HTTP_STATUSES:
+            if status in _THROTTLE_HTTP_STATUSES:
                 raise LiveRetryExhaustedError(
                     f"Feature endpoint {op.path} for {scope_param} "
                     f"{scope_value} failed with HTTP {status} after the SDK "
@@ -240,6 +257,10 @@ class LiveApiDataProvider(MerakiDataProvider):
                     "snapshot would be silently incomplete. Rerun once the "
                     "API is responsive (the per-organization rate budget is "
                     "shared with other API consumers)."
+                ) from exc
+            if status in _SERVER_ERROR_HTTP_STATUSES:
+                raise _EndpointUnreadable(
+                    f"HTTP {status} from the Meraki API after every retry"
                 ) from exc
             logger.debug(
                 "Feature endpoint %s unavailable for %s %s: %s",

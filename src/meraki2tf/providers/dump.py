@@ -61,6 +61,7 @@ from pathlib import Path
 from typing import Any
 
 from meraki2tf.models import (
+    UNREADABLE_MARKER,
     FeatureConfiguration,
     MerakiDevice,
     MerakiNetwork,
@@ -160,6 +161,11 @@ class StaticJsonDataProvider(MerakiDataProvider):
         payloads expand to themselves).
         """
         if self._parser is None or not isinstance(feature.payload, dict):
+            return [feature]
+        if UNREADABLE_MARKER in feature.payload:
+            # A coverage-gap record for an endpoint discovery could not
+            # read; there is nothing to expand and it must survive the
+            # round trip verbatim so the gap keeps being reported.
             return [feature]
         if len(feature.path_values) != 1:
             return [feature]
