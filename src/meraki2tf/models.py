@@ -61,6 +61,14 @@ class MerakiDevice:
         )
 
 
+#: Payload key marking an asset whose endpoint could not be read during
+#: discovery (persistent server error after every retry). Such an asset
+#: must surface as a coverage gap — never as an importable resource, a
+#: replayable payload, or an expandable collection envelope. The value
+#: is the human-readable reason.
+UNREADABLE_MARKER = "__meraki2tf_unreadable__"
+
+
 @dataclass(frozen=True)
 class FeatureConfiguration:
     """One discovered feature asset, addressed by its OpenAPI path template.

@@ -35,7 +35,7 @@ from typing import Any
 
 from meraki2tf.config import read_api_key
 from meraki2tf.hcl_generator import GenerationReport
-from meraki2tf.models import NetworkGraph
+from meraki2tf.models import UNREADABLE_MARKER, NetworkGraph
 from meraki2tf.openapi_parser import OpenApiParser
 from meraki2tf.runbook import payload_index, secret_payload_keys, write_operations
 from meraki2tf.sanitizer import REDACTED
@@ -118,6 +118,16 @@ def plan_replay(
                     asset.api_path,
                     asset.identifiers,
                     "No payload captured in the snapshot for this asset.",
+                )
+            )
+            continue
+        if UNREADABLE_MARKER in payload:
+            skipped.append(
+                SkippedReplay(
+                    asset.api_path,
+                    asset.identifiers,
+                    "Endpoint was unreadable at capture time — nothing "
+                    "was recorded to restore; verify it manually.",
                 )
             )
             continue

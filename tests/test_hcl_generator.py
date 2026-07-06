@@ -9,6 +9,7 @@ import pytest
 from meraki2tf.alerts import AlertDispatcher, AlertEvent, EventType, Notifier
 from meraki2tf.hcl_generator import HclImportGenerator
 from meraki2tf.models import (
+    UNREADABLE_MARKER,
     FeatureConfiguration,
     MerakiDevice,
     MerakiNetwork,
@@ -61,6 +62,37 @@ def _graph(**overrides: tuple) -> NetworkGraph:  # type: ignore[type-arg]
     }
     values.update(overrides)
     return NetworkGraph(organization_id="org-123", **values)
+
+
+def test_unreadable_endpoint_is_audited_never_imported(
+    generator: HclImportGenerator, tmp_path: Path, recorder: RecordingNotifier
+) -> None:
+    """An asset discovery could not read has no payload to rebuild from
+    and its provider Read would fail identically during import — it must
+    land in the coverage manifest as unsupported, not in imports.tf."""
+    reason = "HTTP 500 from the Meraki API after every retry"
+    report = generator.generate(
+        _graph(
+            features=(
+                FeatureConfiguration(
+                    "/networks/{networkId}/appliance/vlans",
+                    ("N_1",),
+                    {UNREADABLE_MARKER: reason},
+                ),
+            )
+        ),
+        tmp_path,
+    )
+    (gap,) = report.unsupported
+    assert reason in gap.reason
+    assert "could not be read" in gap.reason
+    assert gap.identifiers == ("N_1",)
+    content = report.imports_file.read_text(encoding="utf-8")
+    assert "vlans" not in content
+    assert any(
+        event.event_type is EventType.UNSUPPORTED_FEATURE_FLAGGED
+        for event in recorder.events
+    )
 
 
 def test_generates_import_blocks_for_all_mapped_assets(

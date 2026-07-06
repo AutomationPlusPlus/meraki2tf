@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from meraki2tf.config import API_KEY_ENV_VAR, MissingApiKeyError
-from meraki2tf.models import FeatureConfiguration, NetworkGraph
+from meraki2tf.models import UNREADABLE_MARKER, FeatureConfiguration, NetworkGraph
 from meraki2tf.openapi_parser import OpenApiParser
 from meraki2tf.providers import (
     LiveApiDataProvider,
@@ -156,6 +156,29 @@ def test_dump_provider_heals_stored_envelope_collections(
     # The populated envelope became one per-item asset; the empty one vanished.
     assert [(f.api_path, f.path_values) for f in graph.features] == [
         ("/organizations/{organizationId}/admins/{adminId}", ("org-123", "A_1")),
+    ]
+
+
+def test_dump_provider_preserves_unreadable_gap_records(
+    tmp_path: Path, spec_parser: OpenApiParser
+) -> None:
+    """An unreadable-endpoint coverage gap captured live must survive the
+    snapshot round trip verbatim — not be expanded like an envelope —
+    so offline runs keep reporting the same gap."""
+    marker_payload = {UNREADABLE_MARKER: "HTTP 500 from the Meraki API after every retry"}
+    path = _canonical_snapshot(
+        tmp_path,
+        [
+            {
+                "apiPath": "/organizations/{organizationId}/admins",
+                "pathValues": ["org-123"],
+                "payload": marker_payload,
+            }
+        ],
+    )
+    graph = StaticJsonDataProvider(path, parser=spec_parser).fetch_network_graph()
+    assert [(f.api_path, f.path_values, dict(f.payload)) for f in graph.features] == [
+        ("/organizations/{organizationId}/admins", ("org-123",), marker_payload),
     ]
 
 
@@ -529,15 +552,13 @@ class _FakeApiError(Exception):
         self.status = status
 
 
-@pytest.mark.parametrize("status", [429, 500, 502, 503, 504])
-def test_try_call_aborts_when_transient_failure_survives_retries(
+def test_try_call_aborts_when_throttle_survives_retries(
     live_provider: LiveApiDataProvider,
     spec_parser: OpenApiParser,
-    status: int,
 ) -> None:
-    """A throttle/server error that escapes the SDK's retries is missing
-    data, not an inapplicable feature — swallowing it would ship a
-    snapshot that is silently incomplete but looks complete."""
+    """A 429 that escapes the SDK's generous waits is missing data, not
+    an inapplicable feature — swallowing it would ship a snapshot that
+    is silently incomplete but looks complete."""
     op = next(
         o for o in spec_parser.endpoints()
         if o.operation_id == "getOrganizationAdmins"
@@ -545,13 +566,44 @@ def test_try_call_aborts_when_transient_failure_survives_retries(
 
     class Throttled:
         def getOrganizationAdmins(self, organizationId: str) -> list[dict[str, Any]]:
-            raise _FakeApiError(status)
+            raise _FakeApiError(429)
 
     dashboard = types.SimpleNamespace(organizations=Throttled())
-    with pytest.raises(LiveRetryExhaustedError, match=f"HTTP {status}"):
+    with pytest.raises(LiveRetryExhaustedError, match="HTTP 429"):
         live_provider._try_call(
             dashboard, op, "organizationId", "org-123", set()
         )
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+def test_persistent_server_error_becomes_coverage_gap(
+    live_provider: LiveApiDataProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    status: int,
+) -> None:
+    """Meraki returns deterministic 500s for some endpoints on some
+    network configurations; that must not abort the run (waiting cannot
+    cure it) nor be swallowed (the objects exist). The endpoint becomes
+    an unreadable-marker asset so it rides the unsupported-coverage rail."""
+
+    def _explode(self: Any, organizationId: str) -> list[dict[str, Any]]:
+        raise _FakeApiError(status)
+
+    monkeypatch.setattr(FakeOrganizations, "getOrganizationAdmins", _explode)
+    with caplog.at_level("WARNING", logger="meraki2tf.providers.live"):
+        graph = live_provider.fetch_network_graph("org-123")
+
+    gaps = [
+        f for f in graph.features if UNREADABLE_MARKER in f.payload
+    ]
+    assert len(gaps) == 1
+    assert gaps[0].api_path.endswith("/admins")
+    assert gaps[0].path_values == ("org-123",)
+    assert f"HTTP {status}" in gaps[0].payload[UNREADABLE_MARKER]
+    assert any("could not be read" in r.message for r in caplog.records)
+    # The rest of discovery survived the broken endpoint.
+    assert len(graph.features) > 1
 
 
 def test_try_call_still_skips_scope_refusals_with_status(

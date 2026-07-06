@@ -13,7 +13,12 @@ from meraki2tf.hcl_generator import (
     GenerationReport,
     UnsupportedAsset,
 )
-from meraki2tf.models import FeatureConfiguration, NetworkGraph, MerakiNetwork
+from meraki2tf.models import (
+    UNREADABLE_MARKER,
+    FeatureConfiguration,
+    MerakiNetwork,
+    NetworkGraph,
+)
 from meraki2tf.openapi_parser import OpenApiParser
 from meraki2tf.replayer import (
     GapReplayer,
@@ -137,6 +142,27 @@ def test_plan_replay_skips_dashboard_only_and_payloadless(
     reasons = {item.api_path: item.reason for item in skipped}
     assert "dashboard-only" in reasons[CLIENTS_PATH]
     assert "No payload" in reasons[VLAN_PATH]
+
+
+def test_plan_replay_skips_unreadable_gap_records(
+    spec_parser: OpenApiParser,
+) -> None:
+    """An endpoint that server-errored at capture recorded no payload —
+    there is nothing to write back, only a manual-verification pointer."""
+    graph = _graph(
+        FeatureConfiguration(
+            VLAN_PATH,
+            ("N_1", "10"),
+            {UNREADABLE_MARKER: "HTTP 500 from the Meraki API after every retry"},
+        )
+    )
+    report = _report(
+        unsupported=(UnsupportedAsset(VLAN_PATH, "unreadable", ("N_1", "10")),)
+    )
+    actions, skipped = plan_replay(graph, report, spec_parser)
+    assert actions == ()
+    (skip,) = skipped
+    assert "unreadable at capture" in skip.reason
 
 
 def test_plan_replay_skips_empty_collection_envelopes(
