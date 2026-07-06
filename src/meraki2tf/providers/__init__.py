@@ -7,11 +7,16 @@ domain models, so downstream components stay data-source agnostic.
 
 from meraki2tf.providers.base import MerakiDataProvider
 from meraki2tf.providers.dump import MalformedDumpError, StaticJsonDataProvider
-from meraki2tf.providers.live import LiveApiDataProvider, LiveDispatchError
+from meraki2tf.providers.live import (
+    LiveApiDataProvider,
+    LiveDispatchError,
+    LiveRetryExhaustedError,
+)
 
 __all__ = [
     "LiveApiDataProvider",
     "LiveDispatchError",
+    "LiveRetryExhaustedError",
     "MalformedDumpError",
     "MerakiDataProvider",
     "StaticJsonDataProvider",
