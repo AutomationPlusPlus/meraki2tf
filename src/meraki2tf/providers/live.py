@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import time
 from typing import Any
 
 from meraki2tf.config import read_api_key
@@ -48,12 +49,12 @@ class LiveDispatchError(RuntimeError):
 
 
 class LiveRetryExhaustedError(RuntimeError):
-    """A throttle survived every retry the SDK was willing to make.
+    """A throttle survived the SDK's retries and every extended backoff.
 
-    The SDK waits out 429s honoring Retry-After, so exhausting its budget
-    means the API is pathologically saturated. Continuing would silently
-    drop the affected objects from the snapshot — a false sense of DR
-    coverage — so discovery aborts loudly instead.
+    That means minutes of sustained saturation of the shared
+    per-organization budget. Continuing would silently drop the affected
+    objects from the snapshot — a false sense of DR coverage — so
+    discovery aborts loudly instead.
     """
 
 
@@ -76,6 +77,14 @@ _SDK_MAXIMUM_RETRIES = 10
 #: does not apply to that scope".
 _THROTTLE_HTTP_STATUSES = frozenset({429})
 _SERVER_ERROR_HTTP_STATUSES = frozenset({500, 502, 503, 504})
+
+#: Outer waits applied when the SDK's whole retry budget is consumed by
+#: a throttle. Meraki answers 429 with ``Retry-After: 1``, so the SDK's
+#: retries all burn within seconds — useless against another integration
+#: saturating the shared per-organization budget for minutes. These
+#: pauses let the competing consumer's burst pass; only after all of
+#: them fail does discovery abort. Completeness over speed.
+_THROTTLE_BACKOFF_WAITS = (30.0, 60.0, 120.0)
 
 
 class LiveApiDataProvider(MerakiDataProvider):
@@ -236,37 +245,51 @@ class LiveApiDataProvider(MerakiDataProvider):
         """
         if op.operation_id in undispatchable:
             return None
-        try:
-            return self._call(dashboard, op, **{scope_param: scope_value})
-        except LiveDispatchError as exc:
-            undispatchable.add(op.operation_id)
-            logger.warning(
-                "Endpoint %s cannot be dispatched onto the installed meraki "
-                "SDK (%s); its assets will be missing from this snapshot. "
-                "Upgrade the SDK or pin a matching --spec release.",
-                op.path, exc,
-            )
-            return None
-        except Exception as exc:
-            status = getattr(exc, "status", None)
-            if status in _THROTTLE_HTTP_STATUSES:
-                raise LiveRetryExhaustedError(
-                    f"Feature endpoint {op.path} for {scope_param} "
-                    f"{scope_value} failed with HTTP {status} after the SDK "
-                    "exhausted its retries; aborting discovery because the "
-                    "snapshot would be silently incomplete. Rerun once the "
-                    "API is responsive (the per-organization rate budget is "
-                    "shared with other API consumers)."
-                ) from exc
-            if status in _SERVER_ERROR_HTTP_STATUSES:
-                raise _EndpointUnreadable(
-                    f"HTTP {status} from the Meraki API after every retry"
-                ) from exc
-            logger.debug(
-                "Feature endpoint %s unavailable for %s %s: %s",
-                op.path, scope_param, scope_value, exc,
-            )
-            return None
+        waits = iter(_THROTTLE_BACKOFF_WAITS)
+        while True:
+            try:
+                return self._call(dashboard, op, **{scope_param: scope_value})
+            except LiveDispatchError as exc:
+                undispatchable.add(op.operation_id)
+                logger.warning(
+                    "Endpoint %s cannot be dispatched onto the installed meraki "
+                    "SDK (%s); its assets will be missing from this snapshot. "
+                    "Upgrade the SDK or pin a matching --spec release.",
+                    op.path, exc,
+                )
+                return None
+            except Exception as exc:
+                status = getattr(exc, "status", None)
+                if status in _THROTTLE_HTTP_STATUSES:
+                    wait = next(waits, None)
+                    if wait is not None:
+                        logger.warning(
+                            "Feature endpoint %s for %s %s is still throttled "
+                            "after the SDK's own retries; pausing %.0f s for "
+                            "the competing API consumer to back off, then "
+                            "retrying.",
+                            op.path, scope_param, scope_value, wait,
+                        )
+                        time.sleep(wait)
+                        continue
+                    raise LiveRetryExhaustedError(
+                        f"Feature endpoint {op.path} for {scope_param} "
+                        f"{scope_value} failed with HTTP {status} after the "
+                        "SDK's retries and every extended backoff; aborting "
+                        "discovery because the snapshot would be silently "
+                        "incomplete. Rerun once the API is responsive (the "
+                        "per-organization rate budget is shared with other "
+                        "API consumers)."
+                    ) from exc
+                if status in _SERVER_ERROR_HTTP_STATUSES:
+                    raise _EndpointUnreadable(
+                        f"HTTP {status} from the Meraki API after every retry"
+                    ) from exc
+                logger.debug(
+                    "Feature endpoint %s unavailable for %s %s: %s",
+                    op.path, scope_param, scope_value, exc,
+                )
+                return None
 
     def _call(self, dashboard: Any, op: OperationSpec, **params: str) -> Any:
         """Resolve ``dashboard.<first tag>.<operationId>`` dynamically."""
