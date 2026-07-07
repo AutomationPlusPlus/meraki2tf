@@ -155,6 +155,79 @@ def validation_failures(diagnostics: str) -> dict[str, str]:
     return failures
 
 
+#: The provider's REST client failure once its 429 retries are spent.
+#: Terraform wraps diagnostic lines, so the status code may sit on the
+#: line after "StatusCode".
+_THROTTLE_429_RE = re.compile(r"StatusCode\s+429\b")
+
+
+def plan_throttled(diagnostics: str) -> bool:
+    """True when the plan failed because the API rate-limited the
+    provider (its REST client exhausted every 429 retry). Transient by
+    definition — the plan is retryable once the shared per-organization
+    budget frees up."""
+    return bool(_THROTTLE_429_RE.search(diagnostics))
+
+
+#: Terraform's set-uniqueness violation. The framework emits it while
+#: decoding provider data, so — unlike validation errors — it names no
+#: resource, only the duplicated value.
+_DUPLICATE_SET_RE = re.compile(
+    r"^Error: Duplicate Set Element\n"
+    r"(?P<body>(?:.*\n?)*?)(?=^Error: |\Z)",
+    re.MULTILINE,
+)
+_TFTYPES_STRING_RE = re.compile(r'tftypes\.String<"(?P<value>[^"]*)">')
+
+
+def duplicate_set_values(diagnostics: str) -> tuple[str, ...]:
+    """Duplicated literals named by Duplicate Set Element diagnostics.
+
+    The API can return the same string twice in a list the provider
+    models as a Set (observed live: a duplicated content-filtering URL
+    pattern); terraform reports only the value, never the resource.
+    """
+    values: list[str] = []
+    for match in _DUPLICATE_SET_RE.finditer(diagnostics):
+        for literal in _TFTYPES_STRING_RE.finditer(match["body"]):
+            if literal["value"] not in values:
+                values.append(literal["value"])
+    return tuple(values)
+
+
+def locate_duplicate_value_resources(
+    config_files: tuple[Path, ...], values: tuple[str, ...]
+) -> dict[str, str]:
+    """Resolve address-less Duplicate Set Element errors to resources.
+
+    The owner is whichever generated resource block carries the
+    duplicated literal more than once. Returns ``{address: reason}`` in
+    ``validation_failures`` shape so the owners ride the normal
+    drop-and-report-unsupported rail.
+    """
+    failures: dict[str, str] = {}
+    for path in config_files:
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8")
+        for opener in re.finditer(_RESOURCE_BLOCK_RE.pattern, text, re.MULTILINE):
+            address = f"{opener['type']}.{opener['name']}"
+            span = _block_span(text, address)
+            if span is None:
+                continue
+            block = text[span[0]:span[1]]
+            for value in values:
+                if block.count(f'"{hcl_quote(value)}"') >= 2:
+                    failures.setdefault(
+                        address,
+                        "Duplicate Set Element: the API returns "
+                        f"{value!r} more than once in a set-typed "
+                        "attribute, which the provider cannot represent.",
+                    )
+                    break
+    return failures
+
+
 #: Terraform's enum-validator diagnostic, as flattened into a
 #: ``validation_failures`` reason string: ``Attribute <attr> value must
 #: be one of: ["a" "b" …], got: "X"``.

@@ -181,6 +181,35 @@ def test_subprocess_env_without_any_key_adds_nothing(
     assert "MERAKI_API_KEY" not in fake.calls[0]["env"]
 
 
+def test_subprocess_env_injects_throttle_resilience_defaults(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The provider's REST client defaults to 3 retries — seconds of
+    tolerance against an org budget other integrations saturate for
+    minutes. Every terraform subprocess gets a generous budget."""
+    monkeypatch.delenv("MERAKI_RETRIES", raising=False)
+    monkeypatch.delenv("MERAKI_REQUESTS_PER_SECOND", raising=False)
+    fake = FakeSubprocess(stdout="Initialized")
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    runner.init()
+    env = fake.calls[0]["env"]
+    assert env["MERAKI_RETRIES"] == "30"
+    assert env["MERAKI_REQUESTS_PER_SECOND"] == "5"
+
+
+def test_subprocess_env_never_overrides_operator_throttle_settings(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MERAKI_RETRIES", "7")
+    monkeypatch.setenv("MERAKI_REQUESTS_PER_SECOND", "2")
+    fake = FakeSubprocess(stdout="Initialized")
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    runner.init()
+    env = fake.calls[0]["env"]
+    assert env["MERAKI_RETRIES"] == "7"
+    assert env["MERAKI_REQUESTS_PER_SECOND"] == "2"
+
+
 def test_state_defaults_into_workdir_backend(runner: TerraformRunner) -> None:
     provider_file = runner.prepare_workspace()
     expected = (runner.workdir / DEFAULT_STATE_FILENAME).resolve()
@@ -1199,6 +1228,116 @@ def test_validation_errors_without_addresses_still_raise(
     monkeypatch.setattr(terraform_runner.subprocess, "run", scripted.run)
     with pytest.raises(TerraformError, match="Unable to find API key"):
         runner.plan_with_generation()
+
+
+THROTTLED_PLAN_STDERR = (
+    "Error: Client Error\n"
+    "\n"
+    "Failed to retrieve object (GET), got error: HTTP Request failed: StatusCode\n"
+    '429, {"errors":["API rate limit exceeded for organization"]}\n'
+)
+
+
+def test_plan_retries_when_only_throttled(
+    runner: TerraformRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A plan that failed purely because the provider was rate-limited
+    is transient — retried, never surfaced as a pipeline fault."""
+    runner.prepare_workspace()
+    scripted = ScriptedSubprocess(
+        (1, "", None, THROTTLED_PLAN_STDERR),
+        (0, "No changes.", None),
+    )
+    monkeypatch.setattr(terraform_runner.subprocess, "run", scripted.run)
+    with caplog.at_level("WARNING", logger="meraki2tf.terraform_runner"):
+        outcome = runner.plan_with_generation()
+    assert outcome.has_changes is False
+    assert outcome.dropped == {}
+    assert [c[1] for c in scripted.calls] == ["plan", "plan"]
+    assert any("rate-limited" in r.message for r in caplog.records)
+
+
+def test_plan_throttled_on_final_attempt_still_raises(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner.prepare_workspace()
+    steps = [
+        (1, "", None, THROTTLED_PLAN_STDERR)
+        for _ in range(runner._MAX_PLAN_ATTEMPTS)
+    ]
+    scripted = ScriptedSubprocess(*steps)
+    monkeypatch.setattr(terraform_runner.subprocess, "run", scripted.run)
+    with pytest.raises(TerraformError, match="StatusCode"):
+        runner.plan_with_generation()
+
+
+def test_plan_with_persistent_failures_raises_on_final_attempt(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failure that survives dropping every attempt (e.g. the same
+    diagnostic re-emitted for config outside the runner's reach) stops
+    at the attempt cap instead of looping."""
+    runner.prepare_workspace()
+    steps = [
+        (1, "", None, VALIDATION_STDERR)
+        for _ in range(runner._MAX_PLAN_ATTEMPTS)
+    ]
+    scripted = ScriptedSubprocess(*steps)
+    monkeypatch.setattr(terraform_runner.subprocess, "run", scripted.run)
+    with pytest.raises(TerraformError, match="terraform plan failed"):
+        runner.plan_with_generation()
+
+
+CONTENT_FILTERING_BLOCK = (
+    'resource "meraki_appliance_content_filtering" "l_1" {\n'
+    "  allowed_url_patterns = [\n"
+    '    "content-autofill.example.com",\n'
+    '    "content-autofill.example.com",\n'
+    "  ]\n"
+    "}\n"
+)
+CONTENT_FILTERING_IMPORT = (
+    "import {\n"
+    "  to = meraki_appliance_content_filtering.l_1\n"
+    '  id = "L_1"\n'
+    "}\n"
+)
+DUPLICATE_SET_STDERR = (
+    "Error: Duplicate Set Element\n"
+    "\n"
+    "This attribute contains duplicate values of:\n"
+    'tftypes.String<"content-autofill.example.com">\n'
+)
+
+
+def test_plan_drops_duplicate_set_resources_by_locating_the_literal(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Set-uniqueness violations name no resource; the owner is found
+    in the generated config and dropped as unexpressible."""
+    runner.prepare_workspace()
+    (runner.workdir / AGGREGATED_CONFIG_FILENAME).write_text(
+        CONTENT_FILTERING_BLOCK, encoding="utf-8"
+    )
+    (runner.workdir / "imports.tf").write_text(
+        CONTENT_FILTERING_IMPORT, encoding="utf-8"
+    )
+    scripted = ScriptedSubprocess(
+        (1, "", None, DUPLICATE_SET_STDERR),
+        (0, "No changes.", None),
+    )
+    monkeypatch.setattr(terraform_runner.subprocess, "run", scripted.run)
+    outcome = runner.plan_with_generation()
+    assert set(outcome.dropped) == {"meraki_appliance_content_filtering.l_1"}
+    assert "Duplicate Set Element" in outcome.dropped[
+        "meraki_appliance_content_filtering.l_1"
+    ]
+    baseline = (runner.workdir / AGGREGATED_CONFIG_FILENAME).read_text(
+        encoding="utf-8"
+    )
+    assert "content_filtering" not in baseline
 
 
 def test_merged_with_earlier_keeps_prior_remediations() -> None:
