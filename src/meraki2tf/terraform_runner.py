@@ -52,8 +52,11 @@ from .plan_reconciler import (
     classify_plan,
     drop_import_blocks,
     drop_resource_blocks,
+    duplicate_set_values,
     enum_case_repairs,
     hcl_quote,
+    locate_duplicate_value_resources,
+    plan_throttled,
     validation_failures,
 )
 
@@ -67,6 +70,17 @@ logger = logging.getLogger(__name__)
 #: ``MERAKI_DASHBOARD_API_KEY`` (the Meraki SDK convention), so the
 #: runner bridges the two at subprocess launch.
 PROVIDER_API_KEY_ENV_VAR = "MERAKI_API_KEY"
+
+#: Throttle-resilience defaults for the provider's REST client. Its
+#: 3-retry default burns within seconds against Meraki's
+#: ``Retry-After: 1``, while the per-organization rate budget is shared
+#: with every other API consumer of the tenant — a plan over thousands
+#: of resources must wait bursts out, and pace itself so it provokes
+#: fewer of them. Injected only when the operator has not set them.
+PROVIDER_THROTTLE_ENV_DEFAULTS = (
+    ("MERAKI_RETRIES", "30"),
+    ("MERAKI_REQUESTS_PER_SECOND", "5"),
+)
 
 PROVIDER_FILENAME = "provider.tf"
 GENERATED_CONFIG_FILENAME = "generated_resources.tf"
@@ -592,10 +606,37 @@ class TerraformRunner:
             self._absorb_generated_config()
             final_attempt = attempt >= self._MAX_PLAN_ATTEMPTS
             if result.returncode == _PLAN_ERROR:
-                failures = validation_failures(
-                    result.stderr or result.stdout
-                )
-                if not failures or final_attempt:
+                diagnostics = result.stderr or result.stdout
+                failures = validation_failures(diagnostics)
+                duplicated = duplicate_set_values(diagnostics)
+                if duplicated:
+                    # terraform names no resource for set-uniqueness
+                    # violations; the owner is found in the generated
+                    # config and dropped like any unexpressible asset.
+                    for address, reason in locate_duplicate_value_resources(
+                        (
+                            self._workdir / GENERATED_CONFIG_FILENAME,
+                            self._workdir / AGGREGATED_CONFIG_FILENAME,
+                        ),
+                        duplicated,
+                    ).items():
+                        failures.setdefault(address, reason)
+                if not failures:
+                    if plan_throttled(diagnostics) and not final_attempt:
+                        logger.warning(
+                            "terraform plan failed only because the API "
+                            "rate-limited the provider (HTTP 429 after "
+                            "all client retries); retrying the plan "
+                            "(attempt %d/%d).",
+                            attempt + 1, self._MAX_PLAN_ATTEMPTS,
+                        )
+                        continue
+                    raise TerraformError(
+                        f"terraform plan failed with exit code "
+                        f"{result.returncode}: "
+                        f"{result.stderr.strip() or result.stdout.strip()}"
+                    )
+                if final_attempt:
                     raise TerraformError(
                         f"terraform plan failed with exit code "
                         f"{result.returncode}: "
@@ -997,12 +1038,17 @@ class TerraformRunner:
         convention of ``MERAKI_DASHBOARD_API_KEY``. Bridge the two so
         the speculative plan and guarded applies can authenticate,
         keeping the credential out of every file the runner writes. An
-        explicitly set ``MERAKI_API_KEY`` always wins.
+        explicitly set ``MERAKI_API_KEY`` always wins. Throttle
+        resilience defaults (``PROVIDER_THROTTLE_ENV_DEFAULTS``) are
+        injected the same way: only when the operator left them unset.
         """
         env = dict(os.environ)
         dashboard_key = env.get(API_KEY_ENV_VAR, "").strip()
         if dashboard_key and not env.get(PROVIDER_API_KEY_ENV_VAR, "").strip():
             env[PROVIDER_API_KEY_ENV_VAR] = dashboard_key
+        for var, default in PROVIDER_THROTTLE_ENV_DEFAULTS:
+            if not env.get(var, "").strip():
+                env[var] = default
         return env
 
     def _run(

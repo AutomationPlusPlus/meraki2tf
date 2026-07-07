@@ -12,10 +12,13 @@ from meraki2tf.plan_reconciler import (
     deep_json_equal,
     drop_import_blocks,
     drop_resource_blocks,
+    duplicate_set_values,
     enum_case_repairs,
     hcl_quote,
     inject_attribute,
     insert_ignore_changes,
+    locate_duplicate_value_resources,
+    plan_throttled,
     replace_attribute_value,
     synthesize_hcl,
     validation_failures,
@@ -76,6 +79,75 @@ def test_validation_failures_parses_every_error_block() -> None:
 
 def test_validation_failures_without_resource_blocks_is_empty() -> None:
     assert validation_failures("Error: Unable to find API key\n\nboom\n") == {}
+
+
+THROTTLED_STDERR = """\
+Error: Client Error
+
+Failed to retrieve object (GET), got error: HTTP Request failed: StatusCode
+429, {"errors":["API rate limit exceeded for organization"]}
+"""
+
+DUPLICATE_SET_STDERR = """\
+Error: Duplicate Set Element
+
+This attribute contains duplicate values of:
+tftypes.String<"content-autofill.example.com">
+
+Error: Duplicate Set Element
+
+This attribute contains duplicate values of:
+tftypes.String<"content-autofill.example.com">
+"""
+
+
+def test_plan_throttled_detects_the_wrapped_429_signature() -> None:
+    assert plan_throttled(THROTTLED_STDERR) is True
+    assert plan_throttled(VALIDATION_STDERR) is False
+
+
+def test_duplicate_set_values_extracts_and_dedupes_literals() -> None:
+    assert duplicate_set_values(DUPLICATE_SET_STDERR) == (
+        "content-autofill.example.com",
+    )
+    assert duplicate_set_values(THROTTLED_STDERR) == ()
+
+
+def test_locate_duplicate_value_resources_finds_the_owning_block(
+    tmp_path: Path,
+) -> None:
+    """Terraform names no resource for set-uniqueness violations; the
+    owner is whichever generated block carries the literal twice."""
+    config = tmp_path / "resources.tf"
+    config.write_text(
+        'resource "meraki_appliance_content_filtering" "l_1" {\n'
+        "  allowed_url_patterns = [\n"
+        '    "content-autofill.example.com",\n'
+        '    "content-autofill.example.com",\n'
+        "  ]\n"
+        "}\n"
+        'resource "meraki_appliance_content_filtering" "l_2" {\n'
+        "  allowed_url_patterns = [\n"
+        '    "content-autofill.example.com",\n'
+        "  ]\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    truncated = tmp_path / "generated_resources.tf"
+    truncated.write_text(
+        # An opener whose block never closes — spanless, skipped.
+        'resource "meraki_appliance_content_filtering" "l_3" {\n'
+        '  allowed_url_patterns = ["content-autofill.example.com",',
+        encoding="utf-8",
+    )
+    failures = locate_duplicate_value_resources(
+        (config, truncated, tmp_path / "missing.tf"),
+        ("content-autofill.example.com",),
+    )
+    assert set(failures) == {"meraki_appliance_content_filtering.l_1"}
+    reason = failures["meraki_appliance_content_filtering.l_1"]
+    assert "Duplicate Set Element" in reason
+    assert "content-autofill.example.com" in reason
     assert validation_failures("") == {}
 
 
