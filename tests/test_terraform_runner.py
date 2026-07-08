@@ -1312,6 +1312,38 @@ DUPLICATE_SET_STDERR = (
 )
 
 
+def test_plan_drops_duplicate_set_resources_via_payload_locator(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A duplicate that breaks the provider's own Read never generates
+    config, so the text-scan finds nothing; the payload-side locator
+    installed by the orchestrator attributes it and the import drops."""
+    runner.prepare_workspace()
+    (runner.workdir / "imports.tf").write_text(
+        "import {\n"
+        "  to = meraki_network_group_policy.n_1_100\n"
+        '  id = "N_1,100,false"\n'
+        "}\n",
+        encoding="utf-8",
+    )
+    runner.set_duplicate_value_locator(
+        lambda values: {
+            "meraki_network_group_policy.n_1_100": (
+                f"Duplicate Set Element: {values[0]!r} appears twice."
+            )
+        }
+    )
+    scripted = ScriptedSubprocess(
+        (1, "", None, DUPLICATE_SET_STDERR),
+        (0, "No changes.", None),
+    )
+    monkeypatch.setattr(terraform_runner.subprocess, "run", scripted.run)
+    outcome = runner.plan_with_generation()
+    assert set(outcome.dropped) == {"meraki_network_group_policy.n_1_100"}
+    imports = (runner.workdir / "imports.tf").read_text(encoding="utf-8")
+    assert "group_policy" not in imports
+
+
 def test_plan_drops_duplicate_set_resources_by_locating_the_literal(
     runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:

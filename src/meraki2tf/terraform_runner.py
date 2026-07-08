@@ -38,7 +38,7 @@ import logging
 import os
 import re
 import subprocess
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -356,6 +356,15 @@ class TerraformRunner:
         #: result is returned on subsequent calls so a remote state read
         #: can self-initialize without re-initializing the backend later.
         self._init_result: TerraformCommandResult | None = None
+        #: Optional fallback that resolves a Duplicate Set Element
+        #: literal to resource addresses from the discovered payloads.
+        #: Needed because a duplicate that breaks the provider's own
+        #: Read fails before terraform generates any configuration, so
+        #: the literal never appears in a config file for the
+        #: text-scan to find (see plan loop).
+        self._duplicate_value_locator: (
+            Callable[[tuple[str, ...]], dict[str, str]] | None
+        ) = None
         if (
             not self._backend.is_remote
             and self._state_path == (workdir / LEGACY_STATE_FILENAME).resolve()
@@ -367,6 +376,13 @@ class TerraformRunner:
                 "backend initialization. Choose another name or location "
                 f"(default: {DEFAULT_STATE_FILENAME} in the workdir)."
             )
+
+    def set_duplicate_value_locator(
+        self, locator: Callable[[tuple[str, ...]], dict[str, str]]
+    ) -> None:
+        """Install the payload-side duplicate resolver (orchestrator
+        provides it once the discovery graph and capture report exist)."""
+        self._duplicate_value_locator = locator
 
     @property
     def workdir(self) -> Path:
@@ -612,14 +628,23 @@ class TerraformRunner:
                 if duplicated:
                     # terraform names no resource for set-uniqueness
                     # violations; the owner is found in the generated
-                    # config and dropped like any unexpressible asset.
-                    for address, reason in locate_duplicate_value_resources(
+                    # config — or, when the duplicate broke the
+                    # provider's own Read before any config was
+                    # generated, in the discovered payloads — and
+                    # dropped like any unexpressible asset.
+                    located = locate_duplicate_value_resources(
                         (
                             self._workdir / GENERATED_CONFIG_FILENAME,
                             self._workdir / AGGREGATED_CONFIG_FILENAME,
                         ),
                         duplicated,
-                    ).items():
+                    )
+                    if self._duplicate_value_locator is not None:
+                        for address, reason in self._duplicate_value_locator(
+                            duplicated
+                        ).items():
+                            located.setdefault(address, reason)
+                    for address, reason in located.items():
                         failures.setdefault(address, reason)
                 if not failures:
                     if plan_throttled(diagnostics) and not final_attempt:

@@ -51,6 +51,10 @@ from meraki2tf.hcl_generator import (
     UnsupportedAsset,
 )
 from meraki2tf.models import NetworkGraph
+from meraki2tf.plan_reconciler import (
+    duplicate_set_reason,
+    payload_carries_duplicate,
+)
 from meraki2tf.providers.base import MerakiDataProvider
 from meraki2tf.runbook import (
     payload_index,
@@ -187,6 +191,14 @@ class PipelineOrchestrator:
             stage = "HCL construction"
             report = self._generator.generate(
                 graph, self._runner.workdir, existing_addresses=existing
+            )
+
+            # A Duplicate Set Element that breaks the provider's own
+            # Read fails before terraform generates any configuration,
+            # so the plan loop cannot attribute it from config text —
+            # only the discovered payloads still carry the duplicate.
+            self._runner.set_duplicate_value_locator(
+                _payload_duplicate_locator(graph, report)
             )
 
             stage = "coverage audit"
@@ -595,3 +607,36 @@ class PipelineOrchestrator:
                 len(added), ", ".join(added),
             )
         return added, False
+
+
+def _payload_duplicate_locator(
+    graph: NetworkGraph, report: GenerationReport
+) -> Any:
+    """Resolver mapping duplicate-set literals to resource addresses.
+
+    Captured assets carry the (api_path, identifiers) key straight back
+    to the discovered payload, so a duplicated element the provider
+    cannot decode is attributed by scanning those payloads — the only
+    place it exists when the provider's Read fails before terraform
+    generates configuration for the resource.
+    """
+    address_by_key = {
+        (asset.api_path, asset.identifiers): asset.address
+        for asset in report.captured
+    }
+
+    def locate(values: tuple[str, ...]) -> dict[str, str]:
+        found: dict[str, str] = {}
+        for feature in graph.features:
+            address = address_by_key.get(
+                (feature.api_path, feature.path_values)
+            )
+            if address is None:
+                continue
+            for value in values:
+                if payload_carries_duplicate(feature.payload, value):
+                    found.setdefault(address, duplicate_set_reason(value))
+                    break
+        return found
+
+    return locate

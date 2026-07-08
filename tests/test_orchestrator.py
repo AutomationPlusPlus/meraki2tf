@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -130,6 +131,9 @@ class StubRunner:
 
     def prepare_workspace(self) -> Path:
         return self.workdir
+
+    def set_duplicate_value_locator(self, locator: Any) -> None:
+        self.duplicate_value_locator = locator
 
     def existing_addresses(self) -> frozenset[str]:
         return frozenset(self.state_addresses)
@@ -877,3 +881,63 @@ def test_plan_derived_secrets_override_payload_scan(
     assert summary.unmanaged_secret_attributes == {
         "meraki_devices.q2ab": ("psk", "radius_secret")
     }
+
+
+def test_payload_duplicate_locator_attributes_duplicates_to_addresses() -> None:
+    """A duplicate that breaks the provider's own Read never reaches the
+    generated config; the locator attributes it from the discovered
+    payload via the captured-asset key."""
+    from meraki2tf.orchestrator import _payload_duplicate_locator
+
+    path = "/networks/{networkId}/groupPolicies/{groupPolicyId}"
+    graph = NetworkGraph(
+        organization_id="org-123",
+        networks=(),
+        devices=(),
+        features=(
+            FeatureConfiguration(
+                path,
+                ("N_1", "100"),
+                {"contentFiltering": {"allowedUrlPatterns": {
+                    "patterns": ["dup.example", "dup.example"]}}},
+            ),
+            FeatureConfiguration(
+                path,
+                ("N_1", "101"),
+                {"contentFiltering": {"allowedUrlPatterns": {
+                    "patterns": ["dup.example"]}}},
+            ),
+            # Discovered but not captured (unsupported): no address to
+            # attribute to, silently skipped by the locator.
+            FeatureConfiguration(
+                "/networks/{networkId}/clients", ("N_1",),
+                {"values": ["dup.example", "dup.example"]},
+            ),
+        ),
+    )
+    report = GenerationReport(
+        imports_file=Path("imports.tf"),
+        imports_written=2,
+        unsupported=(),
+        captured=(
+            CapturedAsset(
+                address="meraki_network_group_policy.n_1_100",
+                api_path=path,
+                import_id="N_1,100",
+                already_in_state=False,
+                identifiers=("N_1", "100"),
+            ),
+            CapturedAsset(
+                address="meraki_network_group_policy.n_1_101",
+                api_path=path,
+                import_id="N_1,101",
+                already_in_state=False,
+                identifiers=("N_1", "101"),
+            ),
+        ),
+    )
+    locate = _payload_duplicate_locator(graph, report)
+    found = locate(("dup.example",))
+    assert set(found) == {"meraki_network_group_policy.n_1_100"}
+    assert "dup.example" in found["meraki_network_group_policy.n_1_100"]
+    assert locate(("absent.example",)) == {}
