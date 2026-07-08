@@ -49,6 +49,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -195,6 +196,35 @@ def duplicate_set_values(diagnostics: str) -> tuple[str, ...]:
     return tuple(values)
 
 
+def payload_carries_duplicate(node: Any, value: str) -> bool:
+    """True when any list anywhere in the payload holds ``value`` twice.
+
+    This is the discovery-side mirror of the provider's Set decoding:
+    a duplicated element that breaks the provider's own Read exists in
+    the raw API payload, and — because the Read fails before terraform
+    generates any configuration — the payload is the only place the
+    duplicate can be attributed from.
+    """
+    if isinstance(node, list):
+        if sum(1 for item in node if item == value) >= 2:
+            return True
+        return any(payload_carries_duplicate(item, value) for item in node)
+    if isinstance(node, Mapping):
+        return any(
+            payload_carries_duplicate(child, value) for child in node.values()
+        )
+    return False
+
+
+def duplicate_set_reason(value: str) -> str:
+    """Operator-facing unsupported reason for a duplicate set element."""
+    return (
+        "Duplicate Set Element: the API returns "
+        f"{value!r} more than once in a set-typed "
+        "attribute, which the provider cannot represent."
+    )
+
+
 def locate_duplicate_value_resources(
     config_files: tuple[Path, ...], values: tuple[str, ...]
 ) -> dict[str, str]:
@@ -218,12 +248,7 @@ def locate_duplicate_value_resources(
             block = text[span[0]:span[1]]
             for value in values:
                 if block.count(f'"{hcl_quote(value)}"') >= 2:
-                    failures.setdefault(
-                        address,
-                        "Duplicate Set Element: the API returns "
-                        f"{value!r} more than once in a set-typed "
-                        "attribute, which the provider cannot represent.",
-                    )
+                    failures.setdefault(address, duplicate_set_reason(value))
                     break
     return failures
 

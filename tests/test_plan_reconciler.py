@@ -14,6 +14,7 @@ from meraki2tf.plan_reconciler import (
     drop_resource_blocks,
     duplicate_set_values,
     enum_case_repairs,
+    payload_carries_duplicate,
     hcl_quote,
     inject_attribute,
     insert_ignore_changes,
@@ -111,6 +112,22 @@ def test_duplicate_set_values_extracts_and_dedupes_literals() -> None:
         "content-autofill.example.com",
     )
     assert duplicate_set_values(THROTTLED_STDERR) == ()
+
+
+def test_payload_carries_duplicate_walks_nested_structures() -> None:
+    payload = {
+        "contentFiltering": {
+            "allowedUrlPatterns": {
+                "patterns": ["a.example", "b.example", "a.example"]
+            }
+        },
+        "rules": [{"values": ["x"]}],
+    }
+    assert payload_carries_duplicate(payload, "a.example") is True
+    assert payload_carries_duplicate(payload, "b.example") is False
+    assert payload_carries_duplicate(payload, "x") is False
+    assert payload_carries_duplicate([["y"], ["y", "y"]], "y") is True
+    assert payload_carries_duplicate("scalar", "scalar") is False
 
 
 def test_locate_duplicate_value_resources_finds_the_owning_block(
