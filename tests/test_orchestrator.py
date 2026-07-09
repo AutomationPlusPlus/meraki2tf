@@ -72,6 +72,8 @@ class StubGenerator:
         self.parser = StubParser()
         #: (existing_addresses, audit) per generate() invocation.
         self.calls: list[tuple[frozenset[str], bool]] = []
+        #: suppress_addresses per generate() invocation.
+        self.suppressed: list[frozenset[str]] = []
 
     def generate(
         self,
@@ -79,8 +81,10 @@ class StubGenerator:
         workdir: Path,
         existing_addresses: frozenset[str] = frozenset(),
         audit: bool = True,
+        suppress_addresses: frozenset[str] = frozenset(),
     ) -> GenerationReport:
         self.calls.append((existing_addresses, audit))
+        self.suppressed.append(suppress_addresses)
         captured = tuple(
             CapturedAsset(
                 address=address,
@@ -114,6 +118,8 @@ class StubRunner:
         #: call; the last entry repeats when the queue runs dry.
         self.plans: list[tuple[int, str]] = [(plan_exit, plan_stdout)]
         self.actions: dict[str, tuple[str, ...]] = {}
+        #: Per-call plan_resource_actions queue (falls back to .actions).
+        self.actions_queue: list[dict[str, tuple[str, ...]]] = []
         self.apply_added: tuple[str, ...] = ()
         self.apply_guard_error: ImportGuardViolation | None = None
         self.initialized = False
@@ -169,6 +175,8 @@ class StubRunner:
         )
 
     def plan_resource_actions(self) -> dict[str, tuple[str, ...]]:
+        if self.actions_queue:
+            return self.actions_queue.pop(0)
         return self.actions
 
     def apply_import_plan(self) -> tuple[str, ...]:
@@ -503,6 +511,84 @@ def test_sync_regenerates_modified_objects_then_applies(
     drift = recorder.events[0]
     assert drift.details["apply_aborted"] is False
     assert drift.details["regenerated_addresses"] == ["meraki_networks.n_1"]
+
+
+def test_sync_heals_successive_drift_rounds_then_applies(
+    tmp_path: Path, api_key: None
+) -> None:
+    """New clickops edits landing during each multi-hour plan round are
+    healed one round at a time until a plan converges — a single-pass
+    heal would race a busy organization forever."""
+    generator = StubGenerator()
+    orchestrator, recorder, _, runner = _orchestrator(
+        tmp_path, generator=generator, sync=True
+    )
+    runner.state_addresses = {"meraki_networks.n_1", "meraki_devices.q2ab"}
+    runner.plans = [
+        (2, PLAN_WITH_CHANGES),
+        (2, PLAN_WITH_CHANGES),
+        (2, PLAN_IMPORT_ONLY),
+    ]
+    runner.actions_queue = [
+        {"meraki_networks.n_1": ("update",)},
+        {"meraki_devices.q2ab": ("update",)},
+    ]
+    runner.reconciliation_dropped = {"meraki_widget.broken": "unexpressible"}
+    runner.apply_added = ("meraki_networks.n_1", "meraki_devices.q2ab")
+    summary = orchestrator.run("org-123")
+
+    assert runner.removed == [
+        ("meraki_networks.n_1",), ("meraki_devices.q2ab",)
+    ]
+    assert runner.applied
+    assert summary.apply_aborted is False
+    assert summary.regenerated_addresses == (
+        "meraki_networks.n_1", "meraki_devices.q2ab",
+    )
+    # Regeneration passes must not resurrect the dropped import blocks.
+    assert generator.suppressed[1] == frozenset({"meraki_widget.broken"})
+    assert generator.suppressed[2] == frozenset({"meraki_widget.broken"})
+    assert [e.event_type for e in recorder.events] == [
+        EventType.DRIFT_DETECTED,   # round 1 regeneration announcement
+        EventType.DRIFT_DETECTED,   # round 2 regeneration announcement
+        EventType.RUN_SUCCESS,
+    ]
+    assert all(
+        e.details["apply_aborted"] is False
+        for e in recorder.events
+        if e.event_type is EventType.DRIFT_DETECTED
+    )
+
+
+def test_sync_heal_round_cap_aborts_for_human_review(
+    tmp_path: Path, api_key: None
+) -> None:
+    """Fresh drift on every round eventually exhausts the heal budget."""
+    generator = StubGenerator(addresses=("a.a", "b.b", "c.c", "d.d"))
+    orchestrator, recorder, _, runner = _orchestrator(
+        tmp_path, generator=generator, sync=True
+    )
+    runner.state_addresses = {"a.a", "b.b", "c.c", "d.d"}
+    runner.plans = [(2, PLAN_WITH_CHANGES)] * 4
+    runner.actions_queue = [
+        {"a.a": ("update",)},
+        {"b.b": ("update",)},
+        {"c.c": ("update",)},
+        {"d.d": ("update",)},
+    ]
+    summary = orchestrator.run("org-123")
+
+    assert not runner.applied
+    assert summary.apply_aborted is True
+    assert summary.regenerated_addresses == ("a.a", "b.b", "c.c")
+    assert [e.event_type for e in recorder.events] == [
+        EventType.DRIFT_DETECTED,   # regen round 1
+        EventType.DRIFT_DETECTED,   # regen round 2
+        EventType.DRIFT_DETECTED,   # regen round 3
+        EventType.DRIFT_DETECTED,   # budget exhausted → abort
+        EventType.RUN_SUCCESS,
+    ]
+    assert recorder.events[3].details["apply_aborted"] is True
 
 
 def test_sync_aborts_when_drift_survives_regeneration(

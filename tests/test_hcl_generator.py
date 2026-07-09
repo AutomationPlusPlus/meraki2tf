@@ -95,6 +95,27 @@ def test_unreadable_endpoint_is_audited_never_imported(
     )
 
 
+def test_suppressed_addresses_keep_capture_but_lose_import_blocks(
+    generator: HclImportGenerator, tmp_path: Path
+) -> None:
+    """A regeneration pass must not write import blocks back for
+    resources the plan loop already dropped as unexpressible — but they
+    stay captured so coverage/deletion accounting is unchanged."""
+    baseline = generator.generate(_graph(), tmp_path)
+    (target,) = [
+        asset.address
+        for asset in baseline.captured
+        if asset.address.startswith("meraki_appliance_vlan")
+    ]
+    report = generator.generate(
+        _graph(), tmp_path, suppress_addresses=frozenset({target})
+    )
+    assert report.imports_written == baseline.imports_written - 1
+    assert target in {asset.address for asset in report.captured}
+    content = report.imports_file.read_text(encoding="utf-8")
+    assert target not in content
+
+
 def test_generates_import_blocks_for_all_mapped_assets(
     generator: HclImportGenerator, tmp_path: Path, recorder: RecordingNotifier
 ) -> None:
