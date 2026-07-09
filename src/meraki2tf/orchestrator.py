@@ -134,6 +134,12 @@ class PipelineOrchestrator:
     #: pending imports are pulled from the kit so the import-only
     #: remainder applies (monotone state growth); they import next run.
     _MAX_DEFER_ROUNDS = 2
+    #: Chunk size for batched state materialization. A full-kit plan
+    #: over tens of thousands of resources is a multi-hour sampling
+    #: window that a busy organization races with fresh clickops edits;
+    #: a chunk this size plans in minutes, making the per-window race
+    #: probability small instead of near-certain.
+    _MATERIALIZE_CHUNK_SIZE = 1000
 
     def __init__(
         self,
@@ -319,13 +325,33 @@ class PipelineOrchestrator:
                 else:
                     logger.info("State comparison found no drift.")
 
-                if self._sync and not apply_aborted and plan.has_changes:
+                if self._sync and plan.has_changes:
                     stage = "state materialization (guarded import-only apply)"
-                    added, apply_aborted = self._materialize_state(
-                        unsupported_details
-                    )
-                    if added:
-                        pending_imports = 0
+                    if not apply_aborted and not plan.has_drift:
+                        # Converged full plan: one guarded apply covers
+                        # everything.
+                        added, apply_aborted = self._materialize_state(
+                            unsupported_details
+                        )
+                        if added:
+                            pending_imports = 0
+                    else:
+                        # The full plan still carries update pressure (a
+                        # busy org races every multi-hour window): bank
+                        # each clean import through short targeted
+                        # windows instead of waiting for one globally
+                        # clean plan that may never come.
+                        stage = (
+                            "state materialization (guarded targeted applies)"
+                        )
+                        added, batch_deferred, pending_imports = (
+                            self._materialize_state_batched(
+                                report, plan, deferred, unsupported_details
+                            )
+                        )
+                        deferred = tuple(
+                            dict.fromkeys((*deferred, *batch_deferred))
+                        )
 
                 recon_dropped = tuple(sorted(plan.dropped))
                 unmanaged_secrets = dict(sorted(plan.ignored_secrets.items()))
@@ -718,6 +744,148 @@ class PipelineOrchestrator:
             if not plan.has_drift:
                 return plan, tuple(deferred), False
         return plan, tuple(deferred), True
+
+    def _materialize_state_batched(
+        self,
+        report: GenerationReport,
+        plan: ReconciledPlanResult,
+        already_deferred: tuple[str, ...],
+        unsupported_details: list[dict[str, Any]],
+    ) -> tuple[tuple[str, ...], tuple[str, ...], int]:
+        """Bank clean imports through short targeted plan windows.
+
+        Waiting for one globally clean full-kit plan is a race a busy
+        organization wins: every multi-hour window catches a few fresh
+        clickops edits somewhere in tens of thousands of resources.
+        Chunked targeted plans shrink the window to minutes, so each
+        chunk independently passes the import-only guard and applies. A
+        chunk that catches an edit defers the racy pending import and
+        retries once; a chunk that still is not pure imports is skipped
+        and its resources stay honestly pending for the next run. State
+        growth is monotone and nothing mutating is ever applied.
+
+        Returns ``(added, deferred, still_pending_count)``.
+        """
+        tracked = self._runner.existing_addresses()
+        excluded = set(plan.dropped) | set(already_deferred)
+        pending = [
+            asset.address
+            for asset in report.captured
+            if asset.address not in tracked and asset.address not in excluded
+        ]
+        size = self._MATERIALIZE_CHUNK_SIZE
+        chunk_list = [pending[i:i + size] for i in range(0, len(pending), size)]
+        logger.info(
+            "Materializing state through %d targeted window(s) of up to %d "
+            "import(s) each (%d pending).",
+            len(chunk_list), size, len(pending),
+        )
+        added: list[str] = []
+        deferred: list[str] = []
+        skipped = 0
+        for index, chunk in enumerate(chunk_list, start=1):
+            chunk_added = self._apply_targeted_chunk(
+                index, len(chunk_list), chunk, deferred, unsupported_details
+            )
+            if chunk_added is None:
+                skipped += 1
+                continue
+            added.extend(chunk_added)
+        if skipped:
+            logger.warning(
+                "%d targeted window(s) could not be applied cleanly this "
+                "run; their imports stay pending and import on the next run.",
+                skipped,
+            )
+        logger.info(
+            "Batched materialization added %d resource(s) to state "
+            "(%d deferred, %d still pending).",
+            len(added), len(deferred), len(pending) - len(added),
+        )
+        return tuple(added), tuple(deferred), len(pending) - len(added)
+
+    def _apply_targeted_chunk(
+        self,
+        index: int,
+        total: int,
+        chunk: list[str],
+        deferred: list[str],
+        unsupported_details: list[dict[str, Any]],
+    ) -> tuple[str, ...] | None:
+        """One targeted window: plan, guard, apply; defer-and-retry once.
+
+        Returns the addresses applied, or ``None`` when the chunk was
+        skipped (its resources stay pending).
+        """
+        workspace = str(self._runner.workdir)
+        for attempt in range(2):
+            result = self._runner.plan_targeted(chunk)
+            counts = result.plan_counts
+            if counts is None:
+                logger.warning(
+                    "Targeted window %d/%d produced no readable plan "
+                    "summary; skipping it this run.", index, total,
+                )
+                return None
+            if not counts.has_real_changes:
+                if counts.imports == 0:
+                    return ()
+                try:
+                    applied = self._runner.apply_import_plan()
+                except ImportGuardViolation as exc:
+                    logger.error(
+                        "Targeted window %d/%d refused by the apply "
+                        "guard: %s", index, total, exc,
+                    )
+                    self._dispatcher.dispatch(
+                        drift_detected(
+                            diff=exc.plan_output or str(exc),
+                            workspace=workspace,
+                            unsupported=unsupported_details,
+                            apply_aborted=True,
+                        )
+                    )
+                    return None
+                logger.info(
+                    "Targeted window %d/%d: %d import(s) applied.",
+                    index, total, len(applied),
+                )
+                return applied
+            if attempt == 0:
+                tracked = self._runner.existing_addresses()
+                actions = self._runner.plan_resource_actions()
+                racy = tuple(
+                    sorted(
+                        address
+                        for address, acts in actions.items()
+                        if not set(acts) <= _HARMLESS_ACTIONS
+                        and acts == ("update",)
+                        and address not in tracked
+                    )
+                )
+                if racy:
+                    logger.warning(
+                        "Targeted window %d/%d caught %d clickops-racy "
+                        "pending import(s); deferring and retrying: %s",
+                        index, total, len(racy), ", ".join(racy),
+                    )
+                    self._dispatcher.dispatch(
+                        drift_detected(
+                            diff=result.stdout,
+                            workspace=workspace,
+                            unsupported=unsupported_details,
+                            deferred_addresses=racy,
+                        )
+                    )
+                    self._runner.defer_resources(frozenset(racy))
+                    deferred.extend(racy)
+                    continue
+            logger.warning(
+                "Targeted window %d/%d still proposes mutations after "
+                "deferral; skipping it this run.", index, total,
+            )
+            return None
+        return None  # pragma: no cover - every loop arm returns/continues
 
     def _materialize_state(
         self, unsupported_details: list[dict[str, Any]]

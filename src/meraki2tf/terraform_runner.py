@@ -781,6 +781,33 @@ class TerraformRunner:
             )
         return repaired
 
+    def plan_targeted(self, addresses: Iterable[str]) -> TerraformCommandResult:
+        """Speculative plan restricted to the given resource addresses.
+
+        The batched state-materialization path uses this to shrink the
+        clickops race window from a full-kit multi-hour read pass to a
+        few minutes per chunk: import blocks outside the target set are
+        ignored by terraform, and the saved plan file is guard-verified
+        as import-only by :meth:`apply_import_plan` exactly like a full
+        plan. Read-only toward Meraki, like every plan.
+        """
+        self._absorb_generated_config()
+        args = [
+            "plan",
+            "-input=false",
+            "-no-color",
+            "-detailed-exitcode",
+            f"-generate-config-out={GENERATED_CONFIG_FILENAME}",
+            f"-out={SYNC_PLAN_FILENAME}",
+        ]
+        args.extend(f"-target={address}" for address in addresses)
+        result = self._run(
+            *args,
+            allowed=(_PLAN_NO_CHANGES, _PLAN_ERROR, _PLAN_CHANGES_PRESENT),
+        )
+        self._absorb_generated_config()
+        return result
+
     def defer_resources(self, addresses: frozenset[str]) -> None:
         """Remove kit artifacts for pending imports deferred to the next run.
 

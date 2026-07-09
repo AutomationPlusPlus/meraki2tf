@@ -122,6 +122,13 @@ class StubRunner:
         self.actions_queue: list[dict[str, tuple[str, ...]]] = []
         #: Addresses handed to defer_resources, per call.
         self.deferred_kit: list[tuple[str, ...]] = []
+        #: Targeted-plan steps (code, stdout) consumed per plan_targeted
+        #: call; empty queue answers "no changes" so chunks no-op.
+        self.targeted_plans: list[tuple[int, str]] = []
+        #: Chunks handed to plan_targeted, in order.
+        self.targeted_calls: list[tuple[str, ...]] = []
+        #: Per-call apply_import_plan results (falls back to apply_added).
+        self.apply_added_queue: list[tuple[str, ...]] = []
         self.apply_added: tuple[str, ...] = ()
         self.apply_guard_error: ImportGuardViolation | None = None
         self.initialized = False
@@ -181,12 +188,28 @@ class StubRunner:
             return self.actions_queue.pop(0)
         return self.actions
 
+    def plan_targeted(self, addresses: list[str]) -> TerraformCommandResult:
+        self.targeted_calls.append(tuple(addresses))
+        code, stdout = (
+            self.targeted_plans.pop(0)
+            if self.targeted_plans
+            else (0, "No changes. Your infrastructure matches the configuration.")
+        )
+        return TerraformCommandResult(
+            command=("terraform",), returncode=code, stdout=stdout, stderr=""
+        )
+
     def apply_import_plan(self) -> tuple[str, ...]:
         if self.apply_guard_error is not None:
             raise self.apply_guard_error
         self.applied = True
-        self.state_addresses.update(self.apply_added)
-        return self.apply_added
+        added = (
+            self.apply_added_queue.pop(0)
+            if self.apply_added_queue
+            else self.apply_added
+        )
+        self.state_addresses.update(added)
+        return added
 
     def remove_resources(self, addresses: frozenset[str]) -> None:
         removed = tuple(sorted(addresses))
@@ -621,6 +644,161 @@ def test_sync_never_defers_blocking_mutations(
     assert runner.deferred_kit == []
     assert summary.apply_aborted is True
     assert summary.deferred_addresses == ()
+
+
+PLAN_ONE_IMPORT = "Plan: 1 to import, 0 to add, 0 to change, 0 to destroy."
+
+
+def test_sync_banks_imports_through_targeted_windows_when_full_plan_races(
+    tmp_path: Path,
+    api_key: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A busy org never yields a globally clean full plan; each chunk's
+    minutes-wide targeted window passes the guard and applies anyway —
+    monotone state growth."""
+    monkeypatch.setattr(
+        PipelineOrchestrator, "_MATERIALIZE_CHUNK_SIZE", 1
+    )
+    orchestrator, recorder, _, runner = _orchestrator(
+        tmp_path, plan_exit=2, plan_stdout=PLAN_WITH_CHANGES, sync=True
+    )
+    # Full-plan drift that healing cannot resolve (non-update mutation).
+    runner.actions = {"meraki_networks.ghost": ("delete",)}
+    runner.targeted_plans = [(2, PLAN_ONE_IMPORT), (2, PLAN_ONE_IMPORT)]
+    runner.apply_added_queue = [
+        ("meraki_devices.q2ab",), ("meraki_networks.n_1",)
+    ]
+    summary = orchestrator.run("org-123")
+
+    assert runner.targeted_calls == [
+        ("meraki_devices.q2ab",), ("meraki_networks.n_1",)
+    ]
+    assert summary.resources_added_to_state == (
+        "meraki_devices.q2ab", "meraki_networks.n_1",
+    )
+    assert summary.pending_imports == 0
+    assert summary.apply_aborted is True  # the mutating full plan itself
+    assert [e.event_type for e in recorder.events] == [
+        EventType.DRIFT_DETECTED,   # full-plan abort (non-regenerable)
+        EventType.RUN_SUCCESS,
+    ]
+    assert recorder.events[1].details["resources_added_to_state"] == [
+        "meraki_devices.q2ab", "meraki_networks.n_1",
+    ]
+
+
+def test_targeted_window_defers_racy_import_and_retries(
+    tmp_path: Path,
+    api_key: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        PipelineOrchestrator, "_MATERIALIZE_CHUNK_SIZE", 2
+    )
+    orchestrator, recorder, _, runner = _orchestrator(
+        tmp_path, plan_exit=2, plan_stdout=PLAN_WITH_CHANGES, sync=True
+    )
+    runner.actions_queue = [
+        {"meraki_networks.ghost": ("delete",)},   # heal: blocking → abort
+        {"meraki_networks.n_1": ("update",)},     # chunk catch → defer
+    ]
+    runner.targeted_plans = [
+        (2, PLAN_WITH_CHANGES),   # chunk attempt 1: racy
+        (2, PLAN_ONE_IMPORT),     # retry after deferral: clean
+    ]
+    runner.apply_added = ("meraki_devices.q2ab",)
+    summary = orchestrator.run("org-123")
+
+    assert runner.deferred_kit == [("meraki_networks.n_1",)]
+    assert summary.deferred_addresses == ("meraki_networks.n_1",)
+    assert summary.resources_added_to_state == ("meraki_devices.q2ab",)
+    assert summary.pending_imports == 1  # the deferred one
+    deferral_alerts = [
+        e for e in recorder.events
+        if e.event_type is EventType.DRIFT_DETECTED
+        and e.details.get("deferred_addresses")
+    ]
+    assert len(deferral_alerts) == 1
+
+
+def test_targeted_window_skipped_when_still_dirty_after_deferral(
+    tmp_path: Path,
+    api_key: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A window that will not come clean is skipped, not fatal — its
+    imports stay pending and the run still succeeds."""
+    monkeypatch.setattr(
+        PipelineOrchestrator, "_MATERIALIZE_CHUNK_SIZE", 2
+    )
+    orchestrator, recorder, _, runner = _orchestrator(
+        tmp_path, plan_exit=2, plan_stdout=PLAN_WITH_CHANGES, sync=True
+    )
+    runner.actions_queue = [
+        {"meraki_networks.ghost": ("delete",)},   # heal: blocking → abort
+        {"meraki_networks.n_1": ("update",)},     # chunk catch → defer
+    ]
+    runner.targeted_plans = [
+        (2, PLAN_WITH_CHANGES),   # chunk attempt 1: racy
+        (2, PLAN_WITH_CHANGES),   # retry: still dirty → skip
+    ]
+    summary = orchestrator.run("org-123")
+
+    assert not runner.applied
+    assert summary.resources_added_to_state == ()
+    assert summary.pending_imports == 2
+    assert summary.deferred_addresses == ("meraki_networks.n_1",)
+
+
+def test_targeted_window_guard_violation_alerts_and_skips(
+    tmp_path: Path,
+    api_key: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Belt-and-suspenders: the runner's own guard refusing a chunk
+    dispatches the drift alert and skips that window only."""
+    monkeypatch.setattr(
+        PipelineOrchestrator, "_MATERIALIZE_CHUNK_SIZE", 2
+    )
+    orchestrator, recorder, _, runner = _orchestrator(
+        tmp_path, plan_exit=2, plan_stdout=PLAN_WITH_CHANGES, sync=True
+    )
+    runner.actions = {"meraki_networks.ghost": ("delete",)}
+    runner.targeted_plans = [(2, PLAN_ONE_IMPORT)]
+    runner.apply_guard_error = ImportGuardViolation(
+        "mutations detected", plan_output="Plan: 1 to add"
+    )
+    summary = orchestrator.run("org-123")
+
+    assert summary.resources_added_to_state == ()
+    assert summary.pending_imports == 2
+    aborts = [
+        e for e in recorder.events
+        if e.event_type is EventType.DRIFT_DETECTED
+        and e.details.get("apply_aborted")
+    ]
+    assert len(aborts) == 2  # full-plan abort + chunk guard refusal
+
+
+def test_targeted_window_with_unreadable_summary_is_skipped(
+    tmp_path: Path,
+    api_key: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        PipelineOrchestrator, "_MATERIALIZE_CHUNK_SIZE", 2
+    )
+    orchestrator, recorder, _, runner = _orchestrator(
+        tmp_path, plan_exit=2, plan_stdout=PLAN_WITH_CHANGES, sync=True
+    )
+    runner.actions = {"meraki_networks.ghost": ("delete",)}
+    runner.targeted_plans = [(1, "gibberish with no plan summary")]
+    summary = orchestrator.run("org-123")
+
+    assert not runner.applied
+    assert summary.resources_added_to_state == ()
+    assert summary.pending_imports == 2
 
 
 def test_sync_defer_round_cap_aborts_for_human_review(
