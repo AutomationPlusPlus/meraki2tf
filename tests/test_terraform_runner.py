@@ -752,9 +752,27 @@ def _write_state(path: Path, *addresses: str) -> None:
 def test_apply_import_plan_verifies_then_applies_the_saved_plan(
     runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The guard inspects the saved plan document itself — never a fresh
+    full-kit re-plan, which is a multi-hour read window a busy org races
+    with new edits — then applies that exact file."""
     runner.prepare_workspace()
+    (runner.workdir / SYNC_PLAN_FILENAME).write_bytes(b"opaque-plan")
+    show_json = json.dumps(
+        {
+            "resource_changes": [
+                {
+                    "address": "meraki_networks.n_1",
+                    "change": {"actions": ["no-op"], "importing": {"id": "N_1"}},
+                },
+                {
+                    "address": "meraki_devices.q2ab",
+                    "change": {"actions": ["no-op"], "importing": {"id": "Q2AB"}},
+                },
+            ]
+        }
+    )
     scripted = ScriptedSubprocess(
-        (2, PLAN_IMPORT_ONLY, None),
+        (0, show_json, None),
         (
             0,
             "Apply complete!",
@@ -766,9 +784,8 @@ def test_apply_import_plan_verifies_then_applies_the_saved_plan(
     monkeypatch.setattr(terraform_runner.subprocess, "run", scripted.run)
     added = runner.apply_import_plan()
 
-    plan_command, apply_command = scripted.calls
-    assert plan_command[1] == "plan"
-    assert f"-out={SYNC_PLAN_FILENAME}" in plan_command
+    show_command, apply_command = scripted.calls
+    assert show_command[1] == "show"
     # The verified plan file is applied verbatim — no TOCTOU window.
     assert apply_command == (
         "terraform", "apply", "-input=false", "-no-color", SYNC_PLAN_FILENAME,
@@ -781,36 +798,61 @@ def test_apply_import_plan_noop_when_state_is_current(
     runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runner.prepare_workspace()
-    scripted = ScriptedSubprocess((0, "No changes.", None))
+    (runner.workdir / SYNC_PLAN_FILENAME).write_bytes(b"opaque-plan")
+    scripted = ScriptedSubprocess(
+        (0, json.dumps({"resource_changes": []}), None)
+    )
     monkeypatch.setattr(terraform_runner.subprocess, "run", scripted.run)
     assert runner.apply_import_plan() == ()
-    assert len(scripted.calls) == 1  # plan only; nothing to apply
+    assert len(scripted.calls) == 1  # show only; nothing to apply
 
 
-def test_guard_refuses_plans_with_mutations(
+def test_guard_refuses_saved_plans_with_mutations(
     runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runner.prepare_workspace()
-    scripted = ScriptedSubprocess(
-        (2, "Plan: 5 to import, 1 to add, 0 to change, 0 to destroy.", None)
+    (runner.workdir / SYNC_PLAN_FILENAME).write_bytes(b"opaque-plan")
+    show_json = json.dumps(
+        {
+            "resource_changes": [
+                {
+                    "address": "meraki_networks.n_1",
+                    "change": {"actions": ["no-op"], "importing": {"id": "N_1"}},
+                },
+                {
+                    "address": "meraki_network_snmp.l_1",
+                    "change": {"actions": ["update"]},
+                },
+            ]
+        }
     )
+    scripted = ScriptedSubprocess((0, show_json, None))
     monkeypatch.setattr(terraform_runner.subprocess, "run", scripted.run)
-    with pytest.raises(ImportGuardViolation, match="1 to add") as excinfo:
+    with pytest.raises(ImportGuardViolation, match="mutations") as excinfo:
         runner.apply_import_plan()
     assert len(scripted.calls) == 1  # refused before any apply
-    assert "1 to add" in excinfo.value.plan_output
+    assert "meraki_network_snmp.l_1" in excinfo.value.plan_output
 
 
 def test_guard_refuses_unverifiable_plans(
     runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """No parseable summary → fail safe, never apply."""
+    """Unparseable show output → fail safe, never apply."""
     runner.prepare_workspace()
-    scripted = ScriptedSubprocess((2, "~ mystery delta", None))
+    (runner.workdir / SYNC_PLAN_FILENAME).write_bytes(b"opaque-plan")
+    scripted = ScriptedSubprocess((0, "~ not json", None))
     monkeypatch.setattr(terraform_runner.subprocess, "run", scripted.run)
-    with pytest.raises(ImportGuardViolation, match="could not be parsed"):
+    with pytest.raises(ImportGuardViolation, match="could not be verified"):
         runner.apply_import_plan()
     assert len(scripted.calls) == 1
+
+
+def test_guard_refuses_when_no_saved_plan_exists(
+    runner: TerraformRunner,
+) -> None:
+    runner.prepare_workspace()
+    with pytest.raises(ImportGuardViolation, match="no saved plan"):
+        runner.apply_import_plan()
 
 
 def test_guard_violation_is_a_terraform_error() -> None:

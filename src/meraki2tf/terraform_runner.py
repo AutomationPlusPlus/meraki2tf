@@ -885,16 +885,7 @@ class TerraformRunner:
         modified objects (Meraki is truth → baseline regeneration) from
         anything else (abort and alert).
         """
-        document = self._show_plan_document()
-        actions: dict[str, tuple[str, ...]] = {}
-        changes = document.get("resource_changes") if isinstance(document, dict) else None
-        for change in changes or ():
-            if not isinstance(change, dict) or not change.get("address"):
-                continue
-            change_body = change.get("change")
-            raw = change_body.get("actions", ()) if isinstance(change_body, dict) else ()
-            actions[str(change["address"])] = tuple(str(action) for action in raw)
-        return actions
+        return _document_resource_actions(self._show_plan_document())
 
     def _show_plan_document(self) -> Any:
         """The saved sync plan rendered as a JSON document.
@@ -910,53 +901,74 @@ class TerraformRunner:
                 f"terraform show -json produced unparseable output: {exc}"
             ) from exc
 
+    #: Plan actions that mutate nothing (imports render as no-op).
+    _HARMLESS_PLAN_ACTIONS = frozenset({"no-op", "read"})
+
     def apply_import_plan(self) -> tuple[str, ...]:
         """Guarded sync-mode apply: grow the state, never touch Meraki.
 
         Belt-and-suspenders contract enforcement — regardless of what
-        the caller believes about the plan, this method re-verifies
-        immediately before applying: it saves a fresh plan, refuses with
-        :class:`ImportGuardViolation` unless the summary parses as
-        import-only (0 to add, 0 to change, 0 to destroy — an
-        unparseable summary also refuses), and then applies that exact
-        saved plan file, so nothing can change between verification and
-        execution. Returns the resource addresses the apply added to
-        the state, sorted, so every run reports exactly how the state
-        grew.
+        the caller believes about the plan, this method verifies the
+        **saved plan document itself** (``terraform show -json`` on the
+        plan file, a local read) immediately before applying that exact
+        file: it refuses with :class:`ImportGuardViolation` unless every
+        planned action is harmless (no-op/read — imports render as
+        no-op). Applying a saved plan executes only the actions recorded
+        in it — terraform never recomputes a diff at apply time, and
+        refuses the plan wholesale if the state changed underneath — so
+        nothing mutating can slip between verification and execution.
+        Deliberately NOT a fresh re-plan: a full-kit re-plan is a
+        multi-hour read window that a busy organization races with new
+        clickops edits, starving the apply forever.
+
+        Returns the resource addresses the apply added to the state,
+        sorted, so every run reports exactly how the state grew.
         """
         before = self.existing_addresses()
         plan_file = self._workdir / SYNC_PLAN_FILENAME
-        try:
-            result = self._run(
-                "plan",
-                "-input=false",
-                "-no-color",
-                "-detailed-exitcode",
-                f"-out={SYNC_PLAN_FILENAME}",
-                allowed=(_PLAN_NO_CHANGES, _PLAN_CHANGES_PRESENT),
+        if not plan_file.exists():
+            raise ImportGuardViolation(
+                "Refusing to apply: no saved plan file exists to verify.",
+                plan_output="",
             )
-            if result.returncode == _PLAN_NO_CHANGES:
-                logger.info("State already aggregates every import; nothing to apply.")
+        try:
+            try:
+                document = self._show_plan_document()
+            except TerraformError as exc:
+                raise ImportGuardViolation(
+                    "Refusing to apply: the saved plan could not be "
+                    f"verified: {exc}",
+                    plan_output="",
+                ) from exc
+            actions = _document_resource_actions(document)
+            mutations = {
+                address: acts
+                for address, acts in actions.items()
+                if not set(acts) <= self._HARMLESS_PLAN_ACTIONS
+            }
+            if mutations:
+                raise ImportGuardViolation(
+                    "Refusing to apply: the saved plan proposes mutations "
+                    "(" + ", ".join(
+                        f"{address}={'+'.join(acts)}"
+                        for address, acts in sorted(mutations.items())
+                    ) + "); only 100% import plans may be applied "
+                    "unattended.",
+                    plan_output="\n".join(
+                        f"{address}: {'+'.join(acts)}"
+                        for address, acts in sorted(mutations.items())
+                    ),
+                )
+            imports = _document_import_count(document)
+            if imports == 0:
+                logger.info(
+                    "State already aggregates every import; nothing to apply."
+                )
                 return ()
-            counts = result.plan_counts
-            if counts is None:
-                raise ImportGuardViolation(
-                    "Refusing to apply: the plan summary could not be parsed, so "
-                    "it cannot be verified as import-only.",
-                    plan_output=result.stdout,
-                )
-            if counts.has_real_changes:
-                raise ImportGuardViolation(
-                    "Refusing to apply: the plan proposes mutations "
-                    f"({counts.add} to add, {counts.change} to change, "
-                    f"{counts.destroy} to destroy); only 100% import plans may "
-                    "be applied unattended.",
-                    plan_output=result.stdout,
-                )
             logger.info(
-                "Import-only plan verified (%d import(s), 0 to add, 0 to "
-                "change, 0 to destroy); applying to materialize state.",
-                counts.imports,
+                "Import-only plan verified from the saved plan document "
+                "(%d import(s), 0 mutations); applying to materialize state.",
+                imports,
             )
             self._run("apply", "-input=false", "-no-color", SYNC_PLAN_FILENAME)
             self._restrict_state_permissions()
@@ -1190,3 +1202,28 @@ class TerraformRunner:
             stdout=completed.stdout,
             stderr=completed.stderr,
         )
+
+
+def _document_resource_actions(document: Any) -> dict[str, tuple[str, ...]]:
+    """Per-resource action tuples from a shown plan document."""
+    actions: dict[str, tuple[str, ...]] = {}
+    changes = document.get("resource_changes") if isinstance(document, dict) else None
+    for change in changes or ():
+        if not isinstance(change, dict) or not change.get("address"):
+            continue
+        change_body = change.get("change")
+        raw = change_body.get("actions", ()) if isinstance(change_body, dict) else ()
+        actions[str(change["address"])] = tuple(str(action) for action in raw)
+    return actions
+
+
+def _document_import_count(document: Any) -> int:
+    """How many resources a shown plan document imports (``importing``)."""
+    changes = document.get("resource_changes") if isinstance(document, dict) else None
+    return sum(
+        1
+        for change in changes or ()
+        if isinstance(change, dict)
+        and isinstance(change.get("change"), dict)
+        and change["change"].get("importing")
+    )

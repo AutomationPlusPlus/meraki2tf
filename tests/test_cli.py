@@ -774,6 +774,8 @@ def test_sync_end_to_end_applies_import_only_plan(
                 stderr="",
             )
         if command[1] == "plan":
+            # terraform writes the -out plan file; the guard verifies it.
+            (workdir / "meraki2tf-sync.tfplan").write_bytes(b"opaque-plan")
             return SimpleNamespace(
                 returncode=2,
                 stdout="Plan: 4 to import, 0 to add, 0 to change, 0 to destroy.",
@@ -781,7 +783,21 @@ def test_sync_end_to_end_applies_import_only_plan(
             )
         if command[1] == "show":
             return SimpleNamespace(
-                returncode=0, stdout='{"resource_changes": []}', stderr=""
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "resource_changes": [
+                            {
+                                "address": "meraki_network.n_1",
+                                "change": {
+                                    "actions": ["no-op"],
+                                    "importing": {"id": "N_1"},
+                                },
+                            }
+                        ]
+                    }
+                ),
+                stderr="",
             )
         if command[1] == "apply":
             state.write_text(
@@ -816,10 +832,12 @@ def test_sync_end_to_end_applies_import_only_plan(
 
     assert exit_code == 0
     # catalog (init once + schema) → generation plan (import-only, so
-    # reconciliation classifies nothing) → guard plan → apply. The
-    # comparison stage's init is a cached no-op after the catalog init.
+    # reconciliation classifies nothing) → guard verification of the
+    # saved plan document (show -json, no fresh read window) → apply.
+    # The comparison stage's init is a cached no-op after the catalog
+    # init.
     assert [call[1] for call in terraform_calls] == [
-        "init", "providers", "plan", "plan", "apply",
+        "init", "providers", "plan", "show", "apply",
     ]
     assert terraform_calls[-1][-1] == "meraki2tf-sync.tfplan"
     assert [event["event_type"] for event in delivered] == ["RUN_SUCCESS"]
