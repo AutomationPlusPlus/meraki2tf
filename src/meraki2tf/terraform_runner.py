@@ -473,8 +473,22 @@ class TerraformRunner:
             return self._remote_existing_addresses()
         if not self._state_path.exists():
             return frozenset()
+        raw = ""
         try:
-            document = json.loads(self._state_path.read_text(encoding="utf-8"))
+            raw = self._state_path.read_text(encoding="utf-8")
+            if not raw.strip():
+                # terraform creates the file before first writing state;
+                # an interrupted run leaves this 0-byte placeholder
+                # behind. There is nothing in it to lose, so the next
+                # (unattended) run must not die on it — anything else
+                # unparseable still refuses loudly below.
+                logger.warning(
+                    "State file %s exists but is empty (interrupted "
+                    "earlier run?); treating it as no state.",
+                    self._state_path,
+                )
+                return frozenset()
+            document = json.loads(raw)
         except (OSError, json.JSONDecodeError) as exc:
             raise TerraformError(
                 f"Existing state file {self._state_path} is unreadable: {exc}"
