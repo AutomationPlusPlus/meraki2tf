@@ -911,6 +911,7 @@ def test_report_surfaces_every_dr_outcome(
         deletions_pending=("meraki_devices.gone",),
         deletions_removed=("meraki_devices.confirmed",),
         regenerated_addresses=("meraki_networks.n_1",),
+        deferred_addresses=("meraki_wireless_ssid.racy_1",),
         coverage_percent=80.0,
     )
     with caplog.at_level(logging.INFO, logger="meraki2tf.cli"):
@@ -919,6 +920,8 @@ def test_report_surfaces_every_dr_outcome(
     assert "sync auto-apply ABORTED" in text
     assert "State grew by 1 resource(s)" in text
     assert "regenerated to mirror Meraki" in text
+    assert "deferred to the next run" in text
+    assert "meraki_wireless_ssid.racy_1" in text
     assert "meraki_devices.confirmed" in text
     assert "--confirm-deletions" in text and "meraki_devices.gone" in text
     assert "80.00% coverage" in text

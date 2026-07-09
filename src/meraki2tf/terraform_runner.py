@@ -767,6 +767,31 @@ class TerraformRunner:
             )
         return repaired
 
+    def defer_resources(self, addresses: frozenset[str]) -> None:
+        """Remove kit artifacts for pending imports deferred to the next run.
+
+        Sync mode calls this when a handful of not-yet-imported
+        resources keep drifting inside every plan window: pulling them
+        from this run's kit lets the import-only remainder apply
+        (monotone state growth), and the deferred few — reported in
+        alerts — import on the next run. Local file surgery only; state
+        and Meraki are untouched.
+        """
+        logger.warning(
+            "Deferring %d racy pending import(s) to the next run: %s",
+            len(addresses), ", ".join(sorted(addresses)),
+        )
+        drop_resource_blocks(
+            (
+                self._workdir / GENERATED_CONFIG_FILENAME,
+                self._workdir / AGGREGATED_CONFIG_FILENAME,
+            ),
+            set(addresses),
+        )
+        from meraki2tf.hcl_generator import IMPORTS_FILENAME
+
+        drop_import_blocks(self._workdir / IMPORTS_FILENAME, set(addresses))
+
     def _drop_unexpressible(self, failures: dict[str, str]) -> None:
         """Remove kit artifacts for resources the provider rejects.
 
