@@ -145,6 +145,7 @@ class HclImportGenerator:
         workdir: Path,
         existing_addresses: frozenset[str] = frozenset(),
         audit: bool = True,
+        suppress_addresses: frozenset[str] = frozenset(),
     ) -> GenerationReport:
         """Translate the graph into import blocks under ``workdir``.
 
@@ -154,6 +155,13 @@ class HclImportGenerator:
         controls the exception auditor's side effects (error logs and
         UNSUPPORTED_FEATURE_FLAGGED alerts); a same-run regeneration
         pass disables it so identical findings are not dispatched twice.
+        ``suppress_addresses`` are resources the plan loop already
+        dropped as unexpressible this run: a regeneration pass must not
+        write their import blocks back, or every heal round re-pays the
+        validation failures and an extra full plan. They stay in
+        ``captured`` so downstream accounting (coverage, deletion
+        detection) is unchanged — the reconciliation drop report is
+        what marks them unsupported.
         """
         matches = self._match_table()
 
@@ -250,6 +258,12 @@ class HclImportGenerator:
             if already_tracked:
                 skipped_existing += 1
                 logger.debug("Skipping %s; already tracked in state.", address)
+                continue
+            if address in suppress_addresses:
+                logger.debug(
+                    "Skipping %s; dropped as unexpressible earlier this run.",
+                    address,
+                )
                 continue
             blocks.append(
                 f'import {{\n  to = {address}\n'

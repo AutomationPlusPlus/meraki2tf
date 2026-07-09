@@ -122,6 +122,12 @@ class RunSummary:
 class PipelineOrchestrator:
     """Executes the full meraki2tf cycle against injected components."""
 
+    #: Bounded Meraki-is-truth regeneration rounds per sync run. Each
+    #: round converts the previous round's clickops edits into clean
+    #: imports; the cap (plus the no-new-addresses progress guard)
+    #: keeps a busy organization from looping the run forever.
+    _MAX_HEAL_ROUNDS = 3
+
     def __init__(
         self,
         provider: MerakiDataProvider,
@@ -504,80 +510,120 @@ class PipelineOrchestrator:
         baseline corruption, replaces, or an unclassifiable plan) aborts
         the auto-apply and leaves the decision to a human.
 
+        On an actively-administered organization, new clickops edits land
+        while each multi-hour plan round runs — a single regeneration
+        pass would race those edits forever and the weekly job would
+        never materialize state. The regen cycle therefore repeats up to
+        ``_MAX_HEAL_ROUNDS`` times, but only while it makes progress:
+        a round whose modified set contains nothing new means the last
+        regeneration did not take, and a human must look.
+
         Returns ``(plan, report, regenerated_addresses, apply_aborted)``.
         """
-        actions = self._runner.plan_resource_actions()
-        mutated = {
-            address: acts
-            for address, acts in actions.items()
-            if not set(acts) <= _HARMLESS_ACTIONS
-        }
-        modified = tuple(
-            sorted(
-                address for address, acts in mutated.items() if acts == ("update",)
-            )
-        )
-        blocking = {
-            address: acts for address, acts in mutated.items() if acts != ("update",)
-        }
         workspace = str(self._runner.workdir)
-        if blocking or not modified:
-            logger.error(
-                "Sync auto-apply ABORTED: the plan proposes mutations that "
-                "cannot be resolved by baseline regeneration (%s). A human "
-                "must review the drift alert.",
-                ", ".join(
-                    f"{address}={'+'.join(acts)}"
-                    for address, acts in sorted(blocking.items())
+        regenerated: list[str] = []
+        for _ in range(self._MAX_HEAL_ROUNDS):
+            actions = self._runner.plan_resource_actions()
+            mutated = {
+                address: acts
+                for address, acts in actions.items()
+                if not set(acts) <= _HARMLESS_ACTIONS
+            }
+            modified = tuple(
+                sorted(
+                    address
+                    for address, acts in mutated.items()
+                    if acts == ("update",)
                 )
-                or "unclassifiable plan",
+            )
+            blocking = {
+                address: acts
+                for address, acts in mutated.items()
+                if acts != ("update",)
+            }
+            if blocking or not modified:
+                logger.error(
+                    "Sync auto-apply ABORTED: the plan proposes mutations "
+                    "that cannot be resolved by baseline regeneration (%s). "
+                    "A human must review the drift alert.",
+                    ", ".join(
+                        f"{address}={'+'.join(acts)}"
+                        for address, acts in sorted(blocking.items())
+                    )
+                    or "unclassifiable plan",
+                )
+                self._dispatcher.dispatch(
+                    drift_detected(
+                        diff=plan.stdout,
+                        workspace=workspace,
+                        unsupported=unsupported_details,
+                        apply_aborted=True,
+                        regenerated_addresses=tuple(regenerated),
+                    )
+                )
+                return plan, report, tuple(regenerated), True
+            if not set(modified) - set(regenerated):
+                # Every drifting resource was already regenerated this
+                # run: the regeneration did not take, so another round
+                # would loop, not converge.
+                logger.error(
+                    "Drift persists on already-regenerated resource(s) "
+                    "(%s); aborting the sync auto-apply for human review.",
+                    ", ".join(modified),
+                )
+                self._dispatcher.dispatch(
+                    drift_detected(
+                        diff=plan.stdout,
+                        workspace=workspace,
+                        unsupported=unsupported_details,
+                        apply_aborted=True,
+                        regenerated_addresses=tuple(regenerated),
+                    )
+                )
+                return plan, report, tuple(regenerated), True
+            logger.warning(
+                "Meraki is truth: regenerating the HCL baseline for %d "
+                "modified resource(s): %s",
+                len(modified), ", ".join(modified),
             )
             self._dispatcher.dispatch(
                 drift_detected(
                     diff=plan.stdout,
                     workspace=workspace,
                     unsupported=unsupported_details,
-                    apply_aborted=True,
+                    regenerated_addresses=modified,
                 )
             )
-            return plan, report, (), True
-        logger.warning(
-            "Meraki is truth: regenerating the HCL baseline for %d modified "
-            "resource(s): %s",
-            len(modified), ", ".join(modified),
+            self._runner.remove_resources(modified)
+            refreshed = self._runner.existing_addresses()
+            report = self._generator.generate(
+                graph,
+                self._runner.workdir,
+                existing_addresses=refreshed,
+                audit=False,
+                suppress_addresses=frozenset(plan.dropped),
+            )
+            plan = self._runner.plan_with_generation(
+                save_plan=True
+            ).merged_with_earlier(plan)
+            regenerated.extend(modified)
+            if not plan.has_drift:
+                return plan, report, tuple(regenerated), False
+        logger.error(
+            "Drift persists after %d baseline regeneration round(s); "
+            "aborting the sync auto-apply for human review.",
+            self._MAX_HEAL_ROUNDS,
         )
         self._dispatcher.dispatch(
             drift_detected(
                 diff=plan.stdout,
                 workspace=workspace,
                 unsupported=unsupported_details,
-                regenerated_addresses=modified,
+                apply_aborted=True,
+                regenerated_addresses=tuple(regenerated),
             )
         )
-        self._runner.remove_resources(modified)
-        refreshed = self._runner.existing_addresses()
-        report = self._generator.generate(
-            graph, self._runner.workdir, existing_addresses=refreshed, audit=False
-        )
-        plan = self._runner.plan_with_generation(save_plan=True).merged_with_earlier(
-            plan
-        )
-        if plan.has_drift:
-            logger.error(
-                "Drift persists after baseline regeneration; aborting the "
-                "sync auto-apply for human review."
-            )
-            self._dispatcher.dispatch(
-                drift_detected(
-                    diff=plan.stdout,
-                    workspace=workspace,
-                    unsupported=unsupported_details,
-                    apply_aborted=True,
-                    regenerated_addresses=modified,
-                )
-            )
-            return plan, report, modified, True
-        return plan, report, modified, False
+        return plan, report, tuple(regenerated), True
 
     def _materialize_state(
         self, unsupported_details: list[dict[str, Any]]
