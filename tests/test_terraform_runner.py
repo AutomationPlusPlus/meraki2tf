@@ -1326,6 +1326,26 @@ DUPLICATE_SET_STDERR = (
 )
 
 
+def test_plan_targeted_passes_target_flags_and_saves_the_plan(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner.prepare_workspace()
+    scripted = ScriptedSubprocess(
+        (2, "Plan: 2 to import, 0 to add, 0 to change, 0 to destroy.", None),
+    )
+    monkeypatch.setattr(terraform_runner.subprocess, "run", scripted.run)
+    result = runner.plan_targeted(
+        ["meraki_networks.n_1", "meraki_devices.q2ab"]
+    )
+    command = scripted.calls[0]
+    assert "-target=meraki_networks.n_1" in command
+    assert "-target=meraki_devices.q2ab" in command
+    assert any(arg.startswith("-out=") for arg in command)
+    counts = result.plan_counts
+    assert counts is not None
+    assert (counts.imports, counts.has_real_changes) == (2, False)
+
+
 def test_defer_resources_removes_config_and_import_blocks(
     runner: TerraformRunner,
 ) -> None:
