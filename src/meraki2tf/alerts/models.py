@@ -62,6 +62,7 @@ def drift_detected(
     unsupported: Sequence[Mapping[str, Any]] = (),
     apply_aborted: bool = False,
     regenerated_addresses: Sequence[str] = (),
+    deferred_addresses: Sequence[str] = (),
 ) -> AlertEvent:
     """Contract payload for drift discovered during state comparison.
 
@@ -69,8 +70,11 @@ def drift_detected(
     refused because the plan proposed mutations — a human decides what
     happens next. ``regenerated_addresses`` lists modified objects whose
     HCL baseline was regenerated to mirror current Meraki (Meraki is
-    truth in DR mode). The unsupported list rides along on every drift
-    alert so the manual-rebuild runbook always reaches the operator.
+    truth in DR mode). ``deferred_addresses`` lists pending imports that
+    kept drifting during the run's plan windows and were pulled from
+    this run's kit so the rest could apply — they import on the next
+    run. The unsupported list rides along on every drift alert so the
+    manual-rebuild runbook always reaches the operator.
     """
     return AlertEvent(
         event_type=EventType.DRIFT_DETECTED,
@@ -86,6 +90,7 @@ def drift_detected(
             "workspace": workspace,
             "apply_aborted": apply_aborted,
             "regenerated_addresses": list(regenerated_addresses),
+            "deferred_addresses": list(deferred_addresses),
             "unsupported_count": len(unsupported),
             "unsupported": [dict(entry) for entry in unsupported],
         },
@@ -105,6 +110,7 @@ def run_success(
     coverage_percent: float | None = None,
     deletions_pending: Sequence[str] = (),
     unmanaged_secret_attributes: Mapping[str, Sequence[str]] | None = None,
+    deferred_addresses: Sequence[str] = (),
 ) -> AlertEvent:
     """Contract payload for a flawless snapshot-generation run.
 
@@ -146,6 +152,7 @@ def run_success(
                 address: list(attrs)
                 for address, attrs in (unmanaged_secret_attributes or {}).items()
             },
+            "deferred_addresses": list(deferred_addresses),
         },
     )
 

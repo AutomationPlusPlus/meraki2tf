@@ -697,6 +697,12 @@ def _report(summary: RunSummary) -> None:
             "HCL baseline regenerated to mirror Meraki for: %s",
             ", ".join(summary.regenerated_addresses),
         )
+    if summary.deferred_addresses:
+        logger.warning(
+            "Drift-racy pending import(s) deferred to the next run so the "
+            "rest of the kit could apply: %s",
+            ", ".join(summary.deferred_addresses),
+        )
     if summary.deletions_removed:
         logger.info(
             "Confirmed deletion(s) removed from the DR kit: %s",

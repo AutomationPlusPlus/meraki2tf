@@ -104,6 +104,9 @@ class RunSummary:
     deletions_removed: tuple[str, ...] = ()
     #: Modified objects whose HCL baseline was regenerated (sync mode).
     regenerated_addresses: tuple[str, ...] = ()
+    #: Racy pending imports pulled from this run's kit so the rest could
+    #: apply; they import on the next run (sync mode).
+    deferred_addresses: tuple[str, ...] = ()
     #: Share of discovered objects Terraform can rebuild, per manifest.
     coverage_percent: float = 100.0
     #: Resources reconciliation dropped because the provider rejects its
@@ -127,6 +130,10 @@ class PipelineOrchestrator:
     #: imports; the cap (plus the no-new-addresses progress guard)
     #: keeps a busy organization from looping the run forever.
     _MAX_HEAL_ROUNDS = 3
+    #: Bounded deferral rounds after the heal budget is spent: racy
+    #: pending imports are pulled from the kit so the import-only
+    #: remainder applies (monotone state growth); they import next run.
+    _MAX_DEFER_ROUNDS = 2
 
     def __init__(
         self,
@@ -241,6 +248,7 @@ class PipelineOrchestrator:
             added: tuple[str, ...] = ()
             apply_aborted = False
             regenerated: tuple[str, ...] = ()
+            deferred: tuple[str, ...] = ()
             recon_dropped: tuple[str, ...] = ()
             unmanaged_secrets: dict[str, tuple[str, ...]] = {}
             normalized_addresses: tuple[str, ...] = ()
@@ -283,10 +291,14 @@ class PipelineOrchestrator:
                     logger.debug("Full drift diff:\n%s", plan.stdout)
                     if self._sync:
                         stage = "sync drift handling"
-                        plan, report, regenerated, apply_aborted = (
-                            self._handle_sync_drift(
-                                plan, graph, report, unsupported_details
-                            )
+                        (
+                            plan,
+                            report,
+                            regenerated,
+                            deferred,
+                            apply_aborted,
+                        ) = self._handle_sync_drift(
+                            plan, graph, report, unsupported_details
                         )
                         # regeneration re-plans, so reconciliation may
                         # have dropped/suppressed again — re-audit.
@@ -369,6 +381,7 @@ class PipelineOrchestrator:
                     coverage_percent=coverage_percent,
                     deletions_pending=deletions_pending,
                     unmanaged_secret_attributes=unmanaged_secrets,
+                    deferred_addresses=deferred,
                 )
             )
             return RunSummary(
@@ -385,6 +398,7 @@ class PipelineOrchestrator:
                 deletions_pending=deletions_pending,
                 deletions_removed=deletions_removed,
                 regenerated_addresses=regenerated,
+                deferred_addresses=deferred,
                 coverage_percent=coverage_percent,
                 reconciliation_dropped=recon_dropped,
                 unmanaged_secret_attributes=unmanaged_secrets,
@@ -500,7 +514,13 @@ class PipelineOrchestrator:
         graph: NetworkGraph,
         report: GenerationReport,
         unsupported_details: list[dict[str, Any]],
-    ) -> tuple[ReconciledPlanResult, GenerationReport, tuple[str, ...], bool]:
+    ) -> tuple[
+        ReconciledPlanResult,
+        GenerationReport,
+        tuple[str, ...],
+        tuple[str, ...],
+        bool,
+    ]:
         """DR-mode drift decision: regenerate modified objects, abort the rest.
 
         Meraki is the source of truth, so purely *modified* objects get
@@ -518,7 +538,15 @@ class PipelineOrchestrator:
         a round whose modified set contains nothing new means the last
         regeneration did not take, and a human must look.
 
-        Returns ``(plan, report, regenerated_addresses, apply_aborted)``.
+        When the heal budget is spent and everything still drifting is
+        update-only on *not-yet-imported* resources, those few are
+        deferred — pulled from this run's kit so the import-only
+        remainder can apply (monotone state growth); they import on the
+        next run. Tracked-resource drift and non-update mutations are
+        never deferred.
+
+        Returns ``(plan, report, regenerated_addresses,
+        deferred_addresses, apply_aborted)``.
         """
         workspace = str(self._runner.workdir)
         regenerated: list[str] = []
@@ -561,26 +589,18 @@ class PipelineOrchestrator:
                         regenerated_addresses=tuple(regenerated),
                     )
                 )
-                return plan, report, tuple(regenerated), True
+                return plan, report, tuple(regenerated), (), True
             if not set(modified) - set(regenerated):
                 # Every drifting resource was already regenerated this
                 # run: the regeneration did not take, so another round
-                # would loop, not converge.
-                logger.error(
+                # would loop, not converge. Deferral is the remaining
+                # move before a human has to look.
+                logger.warning(
                     "Drift persists on already-regenerated resource(s) "
-                    "(%s); aborting the sync auto-apply for human review.",
+                    "(%s); attempting deferral.",
                     ", ".join(modified),
                 )
-                self._dispatcher.dispatch(
-                    drift_detected(
-                        diff=plan.stdout,
-                        workspace=workspace,
-                        unsupported=unsupported_details,
-                        apply_aborted=True,
-                        regenerated_addresses=tuple(regenerated),
-                    )
-                )
-                return plan, report, tuple(regenerated), True
+                break
             logger.warning(
                 "Meraki is truth: regenerating the HCL baseline for %d "
                 "modified resource(s): %s",
@@ -608,10 +628,15 @@ class PipelineOrchestrator:
             ).merged_with_earlier(plan)
             regenerated.extend(modified)
             if not plan.has_drift:
-                return plan, report, tuple(regenerated), False
+                return plan, report, tuple(regenerated), (), False
+        plan, deferred, defer_aborted = self._defer_racy_pending(
+            plan, unsupported_details, tuple(regenerated), workspace
+        )
+        if not defer_aborted:
+            return plan, report, tuple(regenerated), deferred, False
         logger.error(
-            "Drift persists after %d baseline regeneration round(s); "
-            "aborting the sync auto-apply for human review.",
+            "Drift persists after %d baseline regeneration round(s) and "
+            "deferral; aborting the sync auto-apply for human review.",
             self._MAX_HEAL_ROUNDS,
         )
         self._dispatcher.dispatch(
@@ -621,9 +646,78 @@ class PipelineOrchestrator:
                 unsupported=unsupported_details,
                 apply_aborted=True,
                 regenerated_addresses=tuple(regenerated),
+                deferred_addresses=deferred,
             )
         )
-        return plan, report, tuple(regenerated), True
+        return plan, report, tuple(regenerated), deferred, True
+
+    def _defer_racy_pending(
+        self,
+        plan: ReconciledPlanResult,
+        unsupported_details: list[dict[str, Any]],
+        regenerated: tuple[str, ...],
+        workspace: str,
+    ) -> tuple[ReconciledPlanResult, tuple[str, ...], bool]:
+        """Pull racy pending imports from the kit so the rest can apply.
+
+        Eligible only when every remaining mutation is an update on a
+        resource that is *not yet in state* — those cannot poison
+        anything by waiting one more run, whereas blocking their 22k
+        import-only siblings forever starves the weekly job. Tracked
+        drift and non-update mutations abort as before.
+
+        Returns ``(plan, deferred_addresses, aborted)``.
+        """
+        tracked = self._runner.existing_addresses()
+        deferred: list[str] = []
+        for _ in range(self._MAX_DEFER_ROUNDS):
+            actions = self._runner.plan_resource_actions()
+            mutated = {
+                address: acts
+                for address, acts in actions.items()
+                if not set(acts) <= _HARMLESS_ACTIONS
+            }
+            racy = tuple(
+                sorted(
+                    address
+                    for address, acts in mutated.items()
+                    if acts == ("update",) and address not in tracked
+                )
+            )
+            blocking = {
+                address: acts
+                for address, acts in mutated.items()
+                if acts != ("update",) or address in tracked
+            }
+            if blocking or not racy:
+                return plan, tuple(deferred), True
+            if not set(racy) - set(deferred):
+                # Deferral removed these from the kit yet they still
+                # plan as updates — the surgery did not take; a human
+                # must look rather than loop.
+                return plan, tuple(deferred), True
+            logger.warning(
+                "Deferring %d drift-racy pending import(s) so the "
+                "import-only remainder can apply this run: %s",
+                len(racy), ", ".join(racy),
+            )
+            self._dispatcher.dispatch(
+                drift_detected(
+                    diff=plan.stdout,
+                    workspace=workspace,
+                    unsupported=unsupported_details,
+                    regenerated_addresses=regenerated,
+                    deferred_addresses=racy,
+                )
+            )
+            self._runner.defer_resources(frozenset(racy))
+            deferred.extend(racy)
+            plan = self._runner.plan_with_generation(
+                save_plan=True
+            ).merged_with_earlier(plan)
+            if not plan.has_drift:
+                return plan, tuple(deferred), False
+        return plan, tuple(deferred), True
 
     def _materialize_state(
         self, unsupported_details: list[dict[str, Any]]

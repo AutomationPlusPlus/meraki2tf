@@ -51,6 +51,7 @@ def test_drift_detected_payload_contract() -> None:
         "workspace": "generated",
         "apply_aborted": False,
         "regenerated_addresses": [],
+        "deferred_addresses": [],
         "unsupported_count": 0,
         "unsupported": [],
     }
@@ -109,6 +110,7 @@ def test_run_success_payload_contract() -> None:
         "deletions_pending_confirmation": ["meraki_devices.q2ab"],
         "unmanaged_secret_attribute_count": 1,
         "unmanaged_secret_attributes": {"meraki_wireless_ssid.s_0": ["psk"]},
+        "deferred_addresses": [],
     }
     assert "1 resource(s) added to state" in run_success(
         imports_written=4,

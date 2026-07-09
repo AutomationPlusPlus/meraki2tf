@@ -1312,6 +1312,30 @@ DUPLICATE_SET_STDERR = (
 )
 
 
+def test_defer_resources_removes_config_and_import_blocks(
+    runner: TerraformRunner,
+) -> None:
+    """Deferral is pure kit surgery: the racy resource leaves both the
+    baseline and imports.tf; nothing else is touched."""
+    runner.prepare_workspace()
+    (runner.workdir / AGGREGATED_CONFIG_FILENAME).write_text(
+        SNMP_BLOCK + FIRMWARE_BLOCK, encoding="utf-8"
+    )
+    (runner.workdir / "imports.tf").write_text(
+        FIRMWARE_IMPORT
+        + "import {\n  to = meraki_network_snmp.l_1\n"
+        '  id = "L_1"\n}\n',
+        encoding="utf-8",
+    )
+    runner.defer_resources(frozenset({"meraki_network_snmp.l_1"}))
+    baseline = (runner.workdir / AGGREGATED_CONFIG_FILENAME).read_text(
+        encoding="utf-8"
+    )
+    imports = (runner.workdir / "imports.tf").read_text(encoding="utf-8")
+    assert "snmp" not in baseline and "snmp" not in imports
+    assert "firmware_upgrades" in baseline and "firmware_upgrades" in imports
+
+
 def test_plan_drops_duplicate_set_resources_via_payload_locator(
     runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -120,6 +120,8 @@ class StubRunner:
         self.actions: dict[str, tuple[str, ...]] = {}
         #: Per-call plan_resource_actions queue (falls back to .actions).
         self.actions_queue: list[dict[str, tuple[str, ...]]] = []
+        #: Addresses handed to defer_resources, per call.
+        self.deferred_kit: list[tuple[str, ...]] = []
         self.apply_added: tuple[str, ...] = ()
         self.apply_guard_error: ImportGuardViolation | None = None
         self.initialized = False
@@ -190,6 +192,9 @@ class StubRunner:
         removed = tuple(sorted(addresses))
         self.removed.append(removed)
         self.state_addresses.difference_update(removed)
+
+    def defer_resources(self, addresses: frozenset[str]) -> None:
+        self.deferred_kit.append(tuple(sorted(addresses)))
 
     def rebuild_apply(self) -> TerraformCommandResult:
         self.rebuild_applied = True
@@ -560,6 +565,89 @@ def test_sync_heals_successive_drift_rounds_then_applies(
     )
 
 
+def test_sync_defers_racy_pending_imports_and_applies_the_rest(
+    tmp_path: Path, api_key: None
+) -> None:
+    """An untracked resource that keeps drifting through every heal
+    window is pulled from this run's kit so the other imports apply —
+    monotone state growth instead of an unwinnable race."""
+    orchestrator, recorder, _, runner = _orchestrator(tmp_path, sync=True)
+    runner.plans = [
+        (2, PLAN_WITH_CHANGES),   # initial plan: n_1 drifting
+        (2, PLAN_WITH_CHANGES),   # after heal round 1: still drifting
+        (2, PLAN_IMPORT_ONLY),    # after deferral: pure imports
+    ]
+    runner.actions_queue = [
+        {"meraki_networks.n_1": ("update",)},  # heal round 1
+        {"meraki_networks.n_1": ("update",)},  # heal round 2 → no progress
+        {"meraki_networks.n_1": ("update",)},  # deferral round
+    ]
+    runner.apply_added = ("meraki_devices.q2ab",)
+    summary = orchestrator.run("org-123")
+
+    assert runner.applied
+    assert runner.deferred_kit == [("meraki_networks.n_1",)]
+    assert summary.apply_aborted is False
+    assert summary.deferred_addresses == ("meraki_networks.n_1",)
+    assert summary.regenerated_addresses == ("meraki_networks.n_1",)
+    assert [e.event_type for e in recorder.events] == [
+        EventType.DRIFT_DETECTED,   # heal round 1 regeneration
+        EventType.DRIFT_DETECTED,   # deferral announcement
+        EventType.RUN_SUCCESS,
+    ]
+    assert recorder.events[1].details["deferred_addresses"] == [
+        "meraki_networks.n_1"
+    ]
+    assert recorder.events[2].details["deferred_addresses"] == [
+        "meraki_networks.n_1"
+    ]
+
+
+def test_sync_never_defers_blocking_mutations(
+    tmp_path: Path, api_key: None
+) -> None:
+    """Deferral only applies to update drift on pending imports; a
+    non-update mutation surfacing at deferral time aborts for review."""
+    orchestrator, recorder, _, runner = _orchestrator(tmp_path, sync=True)
+    runner.plans = [(2, PLAN_WITH_CHANGES)] * 3
+    runner.actions_queue = [
+        {"meraki_networks.n_1": ("update",)},  # heal round 1
+        {"meraki_networks.n_1": ("update",)},  # heal round 2 → no progress
+        {"meraki_networks.gone": ("delete",)},  # deferral: blocking → abort
+    ]
+    summary = orchestrator.run("org-123")
+
+    assert not runner.applied
+    assert runner.deferred_kit == []
+    assert summary.apply_aborted is True
+    assert summary.deferred_addresses == ()
+
+
+def test_sync_defer_round_cap_aborts_for_human_review(
+    tmp_path: Path, api_key: None
+) -> None:
+    """Fresh racy addresses on every deferral round exhaust the defer
+    budget and abort — the org is too hot for unattended progress."""
+    orchestrator, recorder, _, runner = _orchestrator(tmp_path, sync=True)
+    runner.plans = [(2, PLAN_WITH_CHANGES)] * 4
+    runner.actions_queue = [
+        {"meraki_networks.n_1": ("update",)},   # heal round 1
+        {"meraki_networks.n_1": ("update",)},   # heal round 2 → no progress
+        {"meraki_networks.n_1": ("update",)},   # defer round 1
+        {"meraki_devices.q2ab": ("update",)},   # defer round 2 (fresh)
+    ]
+    summary = orchestrator.run("org-123")
+
+    assert not runner.applied
+    assert summary.apply_aborted is True
+    assert runner.deferred_kit == [
+        ("meraki_networks.n_1",), ("meraki_devices.q2ab",)
+    ]
+    assert summary.deferred_addresses == (
+        "meraki_networks.n_1", "meraki_devices.q2ab",
+    )
+
+
 def test_sync_heal_round_cap_aborts_for_human_review(
     tmp_path: Path, api_key: None
 ) -> None:
@@ -591,9 +679,11 @@ def test_sync_heal_round_cap_aborts_for_human_review(
     assert recorder.events[3].details["apply_aborted"] is True
 
 
-def test_sync_aborts_when_drift_survives_regeneration(
+def test_sync_aborts_when_drift_survives_regeneration_and_deferral(
     tmp_path: Path, api_key: None
 ) -> None:
+    """A resource that keeps planning as an update after both the regen
+    and the kit surgery is beyond automatic repair — human review."""
     orchestrator, recorder, _, runner = _orchestrator(tmp_path, sync=True)
     runner.state_addresses = {"meraki_networks.n_1"}
     runner.plans = [(2, PLAN_WITH_CHANGES), (2, PLAN_WITH_CHANGES)]
@@ -602,12 +692,16 @@ def test_sync_aborts_when_drift_survives_regeneration(
 
     assert not runner.applied
     assert summary.apply_aborted is True
+    # Regenerated, then deferred, then still drifting → abort.
+    assert runner.deferred_kit == [("meraki_networks.n_1",)]
+    assert summary.deferred_addresses == ("meraki_networks.n_1",)
     assert [e.event_type for e in recorder.events] == [
         EventType.DRIFT_DETECTED,  # regeneration announcement
+        EventType.DRIFT_DETECTED,  # deferral announcement
         EventType.DRIFT_DETECTED,  # persistent drift → abort
         EventType.RUN_SUCCESS,
     ]
-    assert recorder.events[1].details["apply_aborted"] is True
+    assert recorder.events[2].details["apply_aborted"] is True
 
 
 def test_runner_guard_violation_aborts_with_alert_not_fault(
