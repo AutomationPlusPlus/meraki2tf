@@ -309,6 +309,20 @@ def test_existing_addresses_tolerates_non_object_state(tmp_path: Path) -> None:
     assert runner.existing_addresses() == frozenset()
 
 
+def test_empty_state_file_is_treated_as_no_state(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An interrupted terraform run leaves a 0-byte state placeholder;
+    the next unattended run must proceed (nothing in it to lose), not
+    die at state inspection."""
+    state = tmp_path / "terraform.tfstate"
+    state.write_text("", encoding="utf-8")
+    runner = TerraformRunner(tmp_path / "ws", state_path=state)
+    with caplog.at_level("WARNING", logger="meraki2tf.terraform_runner"):
+        assert runner.existing_addresses() == frozenset()
+    assert any("empty" in r.message for r in caplog.records)
+
+
 def test_unreadable_state_is_a_hard_error(tmp_path: Path) -> None:
     state = tmp_path / "terraform.tfstate"
     state.write_text("{corrupt", encoding="utf-8")
