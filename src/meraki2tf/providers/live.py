@@ -21,8 +21,11 @@ Security and contract notes:
 from __future__ import annotations
 
 import inspect
+import itertools
 import logging
-import time
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from meraki2tf.config import read_api_key
@@ -41,6 +44,7 @@ from meraki2tf.providers.discovery import (
     nested_collection_operations,
     parent_item_path,
 )
+from meraki2tf.providers.ratelimit import AdaptiveTokenBucket
 from meraki2tf.spec.engine import OperationSpec
 
 logger = logging.getLogger(__name__)
@@ -86,13 +90,17 @@ def _scope_label(params: dict[str, str]) -> str:
     return ", ".join(f"{name} {value}" for name, value in params.items())
 
 
-#: Outer waits applied when the SDK's whole retry budget is consumed by
-#: a throttle. Meraki answers 429 with ``Retry-After: 1``, so the SDK's
-#: retries all burn within seconds — useless against another integration
-#: saturating the shared per-organization budget for minutes. These
-#: pauses let the competing consumer's burst pass; only after all of
-#: them fail does discovery abort. Completeness over speed.
-_THROTTLE_BACKOFF_WAITS = (30.0, 60.0, 120.0)
+#: Per-call throttle budget: every attempt is paced by the shared AIMD
+#: bucket (whose global pauses and rate cuts grow under sustained
+#: saturation), so this many failed attempts means minutes of a
+#: saturated organization budget — abort rather than ship a snapshot
+#: that looks complete. Completeness over speed.
+_MAX_THROTTLE_ATTEMPTS = 40
+
+#: Worker-pool width for feature discovery; the AIMD bucket paces all
+#: workers together, so width buys concurrency, never request rate.
+DISCOVERY_WORKERS_ENV_VAR = "MERAKI2TF_DISCOVERY_WORKERS"
+_DEFAULT_DISCOVERY_WORKERS = 8
 
 
 class LiveApiDataProvider(MerakiDataProvider):
@@ -103,21 +111,50 @@ class LiveApiDataProvider(MerakiDataProvider):
     def __init__(self, parser: OpenApiParser | None = None) -> None:
         self._parser = parser
         self._client: Any = None
+        #: True when _dashboard() built the client itself (vs a test
+        #: injecting one) — decides whether workers may share it.
+        self._constructed = False
+        self._local = threading.local()
+        self._workers = max(
+            1,
+            int(os.environ.get(DISCOVERY_WORKERS_ENV_VAR, "").strip()
+                or _DEFAULT_DISCOVERY_WORKERS),
+        )
+
+    def _build_client(self, wait_on_rate_limit: bool) -> Any:
+        import meraki
+
+        return meraki.DashboardAPI(
+            api_key=read_api_key(),
+            suppress_logging=True,
+            print_console=False,
+            output_log=False,
+            wait_on_rate_limit=wait_on_rate_limit,
+            maximum_retries=_SDK_MAXIMUM_RETRIES,
+        )
 
     def _dashboard(self) -> Any:
         if self._client is None:
-            import meraki
-
-            self._client = meraki.DashboardAPI(
-                api_key=read_api_key(),
-                suppress_logging=True,
-                print_console=False,
-                output_log=False,
-                wait_on_rate_limit=True,
-                maximum_retries=_SDK_MAXIMUM_RETRIES,
-            )
+            self._client = self._build_client(wait_on_rate_limit=True)
+            self._constructed = True
             logger.debug("Meraki dashboard client initialized (logging suppressed).")
         return self._client
+
+    def _worker_dashboard(self) -> Any:
+        """One SDK client per worker thread.
+
+        ``requests.Session`` is not documented thread-safe, so real
+        clients are never shared across the pool. 429 waiting is turned
+        off — the shared AIMD bucket owns all pacing decisions. An
+        externally injected client (tests) is shared as-is.
+        """
+        if self._client is not None and not self._constructed:
+            return self._client
+        client = getattr(self._local, "client", None)
+        if client is None:
+            client = self._build_client(wait_on_rate_limit=False)
+            self._local.client = client
+        return client
 
     def fetch_network_graph(self, organization_id: str | None = None) -> NetworkGraph:
         if not organization_id:
@@ -163,40 +200,30 @@ class LiveApiDataProvider(MerakiDataProvider):
         run per network, and device-scoped endpoints (switch ports,
         management interfaces, …) run per device serial — mirroring the
         scopes the dump provider resolves so both modalities discover
-        the same surfaces.
+        the same surfaces. Nested (multi-parameter) surfaces run in
+        parameter-count levels, scoping off elements the previous level
+        discovered.
+
+        Work items inside a level are independent, so they run on a
+        worker pool paced by one shared AIMD bucket: width buys back the
+        idle time a sequential sweep wastes waiting on round trips, and
+        the bucket guarantees the pool never outruns the shared
+        per-organization budget. Results are gathered in submission
+        order, so discovery output stays deterministic; any fatal
+        failure (throttle exhaustion) cancels the remaining work and
+        aborts the run — a snapshot is complete or it is nothing.
         """
         if self._parser is None:
             logger.debug("No OpenAPI parser supplied; skipping feature discovery.")
             return []
         parser = self._parser
         undispatchable: set[str] = set()
+        undispatchable_lock = threading.Lock()
+        bucket = AdaptiveTokenBucket()
+        abort = threading.Event()
         features: list[FeatureConfiguration] = []
         mappings = parser.resource_mappings()
         lookup = parser.endpoint_lookup()
-
-        def _collect(op: OperationSpec, scope_values: tuple[str, ...]) -> None:
-            params = dict(zip(op.path_params, scope_values))
-            try:
-                payload = self._try_call(dashboard, op, params, undispatchable)
-            except _EndpointUnreadable as exc:
-                logger.warning(
-                    "Feature endpoint %s for %s could not be read (%s); "
-                    "recorded as a coverage gap — its objects are missing "
-                    "from this snapshot.",
-                    op.path, _scope_label(params), exc,
-                )
-                features.append(
-                    FeatureConfiguration(
-                        api_path=op.path,
-                        path_values=scope_values,
-                        payload={UNREADABLE_MARKER: str(exc)},
-                    )
-                )
-                return
-            if payload is not None:
-                features.extend(
-                    expand_endpoint_payload(parser, op, scope_values, payload)
-                )
 
         def _folds_elsewhere(op: OperationSpec) -> bool:
             # Collections that fold into another entity list first-class
@@ -208,53 +235,115 @@ class LiveApiDataProvider(MerakiDataProvider):
                 op.path
             )
 
-        for op in config_collection_operations(parser, "organizationId"):
-            if _folds_elsewhere(op):
-                continue
-            _collect(op, (organization_id,))
+        def _fetch(
+            op: OperationSpec, scope_values: tuple[str, ...]
+        ) -> list[FeatureConfiguration]:
+            params = dict(zip(op.path_params, scope_values))
+            try:
+                payload = self._try_call(
+                    op, params, undispatchable, undispatchable_lock, bucket, abort
+                )
+            except _EndpointUnreadable as exc:
+                logger.warning(
+                    "Feature endpoint %s for %s could not be read (%s); "
+                    "recorded as a coverage gap — its objects are missing "
+                    "from this snapshot.",
+                    op.path, _scope_label(params), exc,
+                )
+                return [
+                    FeatureConfiguration(
+                        api_path=op.path,
+                        path_values=scope_values,
+                        payload={UNREADABLE_MARKER: str(exc)},
+                    )
+                ]
+            if payload is None:
+                return []
+            return expand_endpoint_payload(parser, op, scope_values, payload)
+
+        def _run_level(
+            items: list[tuple[OperationSpec, tuple[str, ...]]]
+        ) -> None:
+            if not items:
+                return
+            with ThreadPoolExecutor(max_workers=self._workers) as pool:
+                futures = [
+                    pool.submit(_fetch, op, scope_values)
+                    for op, scope_values in items
+                ]
+                try:
+                    # Submission order, not completion order — discovery
+                    # output stays deterministic under any pool width.
+                    for future in futures:
+                        features.extend(future.result())
+                except BaseException:
+                    # Fail fast and loud: cancel the level, let workers
+                    # drain, and re-raise so the orchestrator alerts. A
+                    # partially discovered snapshot must never look done.
+                    abort.set()
+                    for future in futures:
+                        future.cancel()
+                    raise
+
+        level: list[tuple[OperationSpec, tuple[str, ...]]] = [
+            (op, (organization_id,))
+            for op in config_collection_operations(parser, "organizationId")
+            if not _folds_elsewhere(op)
+        ]
         network_ops = tuple(
             op
             for op in config_collection_operations(parser)
             if not _folds_elsewhere(op)
         )
-        for network in networks:
-            for op in network_ops:
-                _collect(op, (network.network_id,))
+        level.extend(
+            (op, (network.network_id,))
+            for network in networks
+            for op in network_ops
+        )
         serial_ops = tuple(
             op
             for op in config_collection_operations(parser, "serial")
             if not _folds_elsewhere(op)
         )
-        for device in devices:
-            for op in serial_ops:
-                _collect(op, (device.serial,))
+        level.extend(
+            (op, (device.serial,)) for device in devices for op in serial_ops
+        )
+        _run_level(level)
+
         # Nested (multi-parameter) configuration surfaces: per-SSID
         # sub-configs, switch-stack routing, config-template switch
-        # profiles, per-interface DHCP, ... Their scopes are elements
-        # the passes above (and shallower nested passes — the list is
-        # ordered by parameter count) already discovered at the
-        # enclosing item path.
-        for op in nested_collection_operations(parser):
-            # Same folding guard as the single-scope loops above; no
-            # nested surface in today's spec folds, hence uncoverable.
-            if _folds_elsewhere(op):  # pragma: no cover
-                continue  # pragma: no cover
-            parent = parent_item_path(op.path)
-            for scope_values in [
-                feature.path_values
-                for feature in features
-                if feature.api_path == parent
-                and len(feature.path_values) == len(op.path_params)
-            ]:
-                _collect(op, scope_values)
+        # profiles, per-interface DHCP, ... Grouped by parameter count:
+        # each level scopes off elements the previous levels discovered.
+        nested_ops = [
+            op
+            for op in nested_collection_operations(parser)
+            # Same folding guard as the single-scope pass; no nested
+            # surface in today's spec folds, hence uncoverable.
+            if not _folds_elsewhere(op)  # pragma: no branch
+        ]
+        for _, level_ops in itertools.groupby(
+            nested_ops, key=lambda op: len(op.path_params)
+        ):
+            nested_level: list[tuple[OperationSpec, tuple[str, ...]]] = []
+            for op in level_ops:
+                parent = parent_item_path(op.path)
+                nested_level.extend(
+                    (op, feature.path_values)
+                    for feature in features
+                    if feature.api_path == parent
+                    and len(feature.path_values) == len(op.path_params)
+                )
+            _run_level(nested_level)
         return features
 
     def _try_call(
         self,
-        dashboard: Any,
         op: OperationSpec,
         params: dict[str, str],
         undispatchable: set[str],
+        undispatchable_lock: threading.Lock,
+        bucket: AdaptiveTokenBucket,
+        abort: threading.Event,
     ) -> Any:
         """One endpoint call; refusals are data, API failures never are.
 
@@ -262,50 +351,53 @@ class LiveApiDataProvider(MerakiDataProvider):
         logged at DEBUG. An operation the installed SDK cannot dispatch at
         all would silently drop that endpoint's assets from every scope —
         that is missing DR coverage, so it warns once and is skipped for
-        the rest of the run. A throttle that survived the SDK's retries
-        aborts discovery (LiveRetryExhaustedError) rather than emit an
-        incomplete snapshot that looks complete. A persistent server
-        error raises _EndpointUnreadable so the caller records that one
-        endpoint as a coverage gap without losing the rest of the run.
+        the rest of the run. Throttles are retried under the shared AIMD
+        bucket's pacing (its rate cuts and global pauses grow while the
+        organization budget stays saturated); a call that exhausts the
+        attempt budget aborts discovery (LiveRetryExhaustedError) rather
+        than emit an incomplete snapshot that looks complete. A
+        persistent server error raises _EndpointUnreadable so the caller
+        records that one endpoint as a coverage gap without losing the
+        rest of the run.
         """
-        if op.operation_id in undispatchable:
-            return None
-        waits = iter(_THROTTLE_BACKOFF_WAITS)
-        while True:
+        with undispatchable_lock:
+            if op.operation_id in undispatchable:
+                return None
+        dashboard = self._worker_dashboard()
+        throttled_attempts = 0
+        while not abort.is_set():
+            bucket.acquire()
             try:
-                return self._call(dashboard, op, **params)
+                result = self._call(dashboard, op, **params)
             except LiveDispatchError as exc:
-                undispatchable.add(op.operation_id)
-                logger.warning(
-                    "Endpoint %s cannot be dispatched onto the installed meraki "
-                    "SDK (%s); its assets will be missing from this snapshot. "
-                    "Upgrade the SDK or pin a matching --spec release.",
-                    op.path, exc,
-                )
+                with undispatchable_lock:
+                    fresh = op.operation_id not in undispatchable
+                    undispatchable.add(op.operation_id)
+                if fresh:
+                    logger.warning(
+                        "Endpoint %s cannot be dispatched onto the installed "
+                        "meraki SDK (%s); its assets will be missing from "
+                        "this snapshot. Upgrade the SDK or pin a matching "
+                        "--spec release.",
+                        op.path, exc,
+                    )
                 return None
             except Exception as exc:
                 status = getattr(exc, "status", None)
                 if status in _THROTTLE_HTTP_STATUSES:
-                    wait = next(waits, None)
-                    if wait is not None:
-                        logger.warning(
-                            "Feature endpoint %s for %s is still throttled "
-                            "after the SDK's own retries; pausing %.0f s for "
-                            "the competing API consumer to back off, then "
-                            "retrying.",
-                            op.path, _scope_label(params), wait,
-                        )
-                        time.sleep(wait)
-                        continue
-                    raise LiveRetryExhaustedError(
-                        f"Feature endpoint {op.path} for "
-                        f"{_scope_label(params)} failed with HTTP {status} after the "
-                        "SDK's retries and every extended backoff; aborting "
-                        "discovery because the snapshot would be silently "
-                        "incomplete. Rerun once the API is responsive (the "
-                        "per-organization rate budget is shared with other "
-                        "API consumers)."
-                    ) from exc
+                    bucket.on_throttle()
+                    throttled_attempts += 1
+                    if throttled_attempts >= _MAX_THROTTLE_ATTEMPTS:
+                        raise LiveRetryExhaustedError(
+                            f"Feature endpoint {op.path} for "
+                            f"{_scope_label(params)} was still throttled "
+                            f"after {_MAX_THROTTLE_ATTEMPTS} paced attempts; "
+                            "aborting discovery because the snapshot would "
+                            "be silently incomplete. Rerun once the API is "
+                            "responsive (the per-organization rate budget "
+                            "is shared with other API consumers)."
+                        ) from exc
+                    continue
                 if status in _SERVER_ERROR_HTTP_STATUSES:
                     raise _EndpointUnreadable(
                         f"HTTP {status} from the Meraki API after every retry"
@@ -315,6 +407,9 @@ class LiveApiDataProvider(MerakiDataProvider):
                     op.path, _scope_label(params), exc,
                 )
                 return None
+            bucket.on_success()
+            return result
+        return None
 
     def _call(self, dashboard: Any, op: OperationSpec, **params: str) -> Any:
         """Resolve ``dashboard.<first tag>.<operationId>`` dynamically."""
