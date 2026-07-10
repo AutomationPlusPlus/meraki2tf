@@ -1610,3 +1610,235 @@ def test_restore_drill_preview_notes_skip_claims(
     console = capsys.readouterr().err
     assert exit_code == 0
     assert "Drill mode" in console
+
+
+# ------------------------------------------------------------- --wipe-org
+
+
+def _install_wipe_dashboard(
+    monkeypatch: pytest.MonkeyPatch, devices: int = 0, name: str = "Drill Org"
+) -> dict:
+    import sys as _sys
+    import types as _types
+
+    deleted: dict = {"networks": [], "orgs": []}
+
+    class Organizations:
+        def getOrganization(self, organizationId: str) -> dict:
+            return {"id": organizationId, "name": name}
+
+        def getOrganizationDevices(
+            self, organizationId: str, total_pages: str = "all"
+        ) -> list:
+            return [{"serial": f"Q{i}"} for i in range(devices)]
+
+        def getOrganizationNetworks(
+            self, organizationId: str, total_pages: str = "all"
+        ) -> list:
+            return [{"id": "L_1"}]
+
+        def deleteOrganization(self, organizationId: str) -> dict:
+            deleted["orgs"].append(organizationId)
+            return {}
+
+    class Networks:
+        def deleteNetwork(self, networkId: str) -> dict:
+            deleted["networks"].append(networkId)
+            return {}
+
+    dashboard = SimpleNamespace(organizations=Organizations(), networks=Networks())
+    stub = _types.ModuleType("meraki")
+    stub.DashboardAPI = lambda **kwargs: dashboard  # type: ignore[attr-defined]
+    monkeypatch.setitem(_sys.modules, "meraki", stub)
+    return deleted
+
+
+def test_wipe_requires_name_second_factor(spec_file: Path) -> None:
+    with pytest.raises(SystemExit):
+        main(["--spec", str(spec_file), "--wipe-org", "org-drill"])
+
+
+def test_wipe_rejects_other_modes_and_org_id_match(spec_file: Path) -> None:
+    with pytest.raises(SystemExit):
+        main(
+            ["--spec", str(spec_file), "--wipe-org", "org-x",
+             "--wipe-org-name", "X", "--sync"]
+        )
+    with pytest.raises(SystemExit):
+        main(
+            ["--spec", str(spec_file), "--org-id", "org-x",
+             "--wipe-org", "org-x", "--wipe-org-name", "X"]
+        )
+
+
+def test_wipe_refuses_production_shaped_orgs(
+    spec_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    deleted = _install_wipe_dashboard(monkeypatch, devices=5)
+    exit_code = main(
+        ["--spec", str(spec_file), "--wipe-org", "org-prod",
+         "--wipe-org-name", "Drill Org", "--confirm"]
+    )
+    assert exit_code == 2
+    assert deleted["networks"] == [] and deleted["orgs"] == []
+
+
+def test_wipe_preview_deletes_nothing(
+    spec_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    deleted = _install_wipe_dashboard(monkeypatch)
+    exit_code = main(
+        ["--spec", str(spec_file), "--wipe-org", "org-drill",
+         "--wipe-org-name", "Drill Org"]
+    )
+    console = capsys.readouterr().err
+    assert exit_code == 0
+    assert "Preview only" in console
+    assert "data-deletion request" in console  # retention honesty
+    assert deleted["networks"] == [] and deleted["orgs"] == []
+
+
+def test_wipe_confirm_executes_and_alerts(
+    spec_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    deleted = _install_wipe_dashboard(monkeypatch)
+    delivered: list[dict[str, Any]] = []
+
+    def fake_urlopen(request: Any, timeout: float) -> FakeResponse:
+        delivered.append(json.loads(request.data.decode("utf-8")))
+        return FakeResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    exit_code = main(
+        ["--spec", str(spec_file), "--wipe-org", "org-drill",
+         "--wipe-org-name", "Drill Org", "--confirm",
+         "--webhook-url", "https://hooks.example/dr"]
+    )
+    assert exit_code == 0
+    assert deleted["networks"] == ["L_1"]
+    assert deleted["orgs"] == ["org-drill"]
+    (event,) = delivered
+    assert event["event_type"] == "ORG_WIPE_EXECUTED"
+    assert event["details"]["organization_deleted"] is True
+
+
+def test_wipe_confirm_requires_api_key(
+    spec_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    exit_code = main(
+        ["--spec", str(spec_file), "--wipe-org", "org-drill",
+         "--wipe-org-name", "Drill Org"]
+    )
+    assert exit_code == 1
+
+
+def test_wipe_inspection_failure_exits_1(
+    spec_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys as _sys
+    import types as _types
+
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+
+    class Exploding:
+        def getOrganization(self, organizationId: str) -> dict:
+            raise RuntimeError("api unreachable")
+
+    dashboard = SimpleNamespace(organizations=Exploding())
+    stub = _types.ModuleType("meraki")
+    stub.DashboardAPI = lambda **kwargs: dashboard  # type: ignore[attr-defined]
+    monkeypatch.setitem(_sys.modules, "meraki", stub)
+    exit_code = main(
+        ["--spec", str(spec_file), "--wipe-org", "org-x",
+         "--wipe-org-name", "X"]
+    )
+    assert exit_code == 1
+
+
+def test_wipe_execution_recheck_refusal_exits_2(
+    spec_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A device claimed between preview and --confirm still stops the
+    wipe: the interlocks are re-verified at execution time."""
+    import sys as _sys
+    import types as _types
+
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    device_state = {"count": 0}
+
+    class Organizations:
+        def getOrganization(self, organizationId: str) -> dict:
+            return {"id": organizationId, "name": "Drill Org"}
+
+        def getOrganizationDevices(
+            self, organizationId: str, total_pages: str = "all"
+        ) -> list:
+            count = device_state["count"]
+            device_state["count"] += 1  # second call sees a claim
+            return [] if count == 0 else [{"serial": "Q1"}]
+
+        def getOrganizationNetworks(
+            self, organizationId: str, total_pages: str = "all"
+        ) -> list:
+            return []
+
+    dashboard = SimpleNamespace(organizations=Organizations())
+    stub = _types.ModuleType("meraki")
+    stub.DashboardAPI = lambda **kwargs: dashboard  # type: ignore[attr-defined]
+    monkeypatch.setitem(_sys.modules, "meraki", stub)
+    exit_code = main(
+        ["--spec", str(spec_file), "--wipe-org", "org-drill",
+         "--wipe-org-name", "Drill Org", "--confirm"]
+    )
+    assert exit_code == 2
+
+
+def test_wipe_confirm_reports_failures_nonzero(
+    spec_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys as _sys
+    import types as _types
+
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+
+    class Organizations:
+        def getOrganization(self, organizationId: str) -> dict:
+            return {"id": organizationId, "name": "Drill Org"}
+
+        def getOrganizationDevices(
+            self, organizationId: str, total_pages: str = "all"
+        ) -> list:
+            return []
+
+        def getOrganizationNetworks(
+            self, organizationId: str, total_pages: str = "all"
+        ) -> list:
+            return [{"id": "L_1"}]
+
+    class Networks:
+        def deleteNetwork(self, networkId: str) -> dict:
+            raise RuntimeError("bound to template")
+
+    dashboard = SimpleNamespace(
+        organizations=Organizations(), networks=Networks()
+    )
+    stub = _types.ModuleType("meraki")
+    stub.DashboardAPI = lambda **kwargs: dashboard  # type: ignore[attr-defined]
+    monkeypatch.setitem(_sys.modules, "meraki", stub)
+    exit_code = main(
+        ["--spec", str(spec_file), "--wipe-org", "org-drill",
+         "--wipe-org-name", "Drill Org", "--confirm"]
+    )
+    assert exit_code == 1

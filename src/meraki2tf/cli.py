@@ -30,6 +30,7 @@ from pathlib import Path
 
 from meraki2tf.alerts import (
     drift_detected,
+    org_wipe_executed,
     restore_executed,
     AlertDispatcher,
     EmailNotifier,
@@ -197,6 +198,28 @@ def build_parser() -> argparse.ArgumentParser:
             "device-scoped features (the hardware is attached to the "
             "production organization, so a drill cannot claim it). They "
             "are reported as drill-skipped, never as failures."
+        ),
+    )
+    parser.add_argument(
+        "--wipe-org",
+        metavar="ORG_ID",
+        default=None,
+        help=(
+            "Disaster-recovery drill teardown: preview (or, with "
+            "--confirm, execute) deleting every network and then the "
+            "organization itself. Refused outright for any organization "
+            "holding claimed devices — production always has hardware, a "
+            "drill org never does. Requires --wipe-org-name as a second "
+            "factor."
+        ),
+    )
+    parser.add_argument(
+        "--wipe-org-name",
+        metavar="NAME",
+        default=None,
+        help=(
+            "The exact name of the organization --wipe-org targets; a "
+            "mismatch refuses the wipe."
         ),
     )
     parser.add_argument(
@@ -474,6 +497,73 @@ def _rebuild(config: RuntimeConfig) -> int:
     return 0
 
 
+def _wipe_org(config: RuntimeConfig) -> int:
+    """Guarded teardown of a hardware-free drill organization.
+
+    The fourth guarded write path. Interlocks live in
+    :class:`~meraki2tf.restorer.OrgWiper` (no-claimed-devices, exact
+    name match) and are re-verified immediately before destruction.
+    """
+    assert config.wipe_org is not None  # guarded by the caller
+    assert config.wipe_org_name is not None  # guarded by the caller
+    from meraki2tf.restorer import OrgWiper, WipeRefusedError
+
+    if not api_key_present():
+        logger.critical(
+            "--wipe-org requires %s to inspect and (with --confirm) "
+            "delete the drill organization.", API_KEY_ENV_VAR,
+        )
+        return 1
+    wiper = OrgWiper()
+    try:
+        preview = wiper.preview(config.wipe_org, config.wipe_org_name)
+    except WipeRefusedError as exc:
+        logger.critical("Wipe refused: %s", exc)
+        return 2
+    except Exception as exc:
+        logger.critical("Wipe target could not be inspected: %s", exc)
+        return 1
+    logger.warning(
+        "Wipe target verified: organization %s (%r), %d network(s), "
+        "0 claimed devices.",
+        preview.organization_id, preview.organization_name,
+        preview.network_count,
+    )
+    if not config.confirm:
+        logger.warning(
+            "Preview only — nothing was deleted. Re-run with "
+            "'--wipe-org %s --wipe-org-name %r --confirm' to delete "
+            "every network and the organization itself. Note: dashboard "
+            "deletion is immediate; Cisco's backend retention of deleted "
+            "data is their policy — for hard-erasure guarantees after an "
+            "unsanitized drill, file a data-deletion request with Meraki "
+            "support (or drill from the sanitized snapshot).",
+            preview.organization_id, preview.organization_name,
+        )
+        return 0
+    try:
+        result = wiper.execute(config.wipe_org, config.wipe_org_name)
+    except WipeRefusedError as exc:
+        logger.critical("Wipe refused at execution recheck: %s", exc)
+        return 2
+    for target, reason in result.failed:
+        logger.error("Wipe FAILED for %s: %s", target, reason)
+    logger.warning(
+        "Wipe complete: %d network(s) deleted, organization %s.",
+        len(result.deleted_networks),
+        "deleted" if result.organization_deleted else "NOT deleted",
+    )
+    build_dispatcher(config).dispatch(
+        org_wipe_executed(
+            organization_id=config.wipe_org,
+            deleted_networks=len(result.deleted_networks),
+            organization_deleted=result.organization_deleted,
+            failed=result.failed,
+        )
+    )
+    return 0 if result.organization_deleted else 1
+
+
 def _restore(config: RuntimeConfig) -> int:
     """Explicit DR action: preview or execute a full-organization restore.
 
@@ -692,11 +782,37 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if config.confirm and not (
         config.rebuild or config.replay_gaps or config.restore
+        or config.wipe_org
     ):
         arg_parser.error(
             "--confirm is only valid together with --rebuild, --replay-gaps, "
-            "or --restore."
+            "--restore, or --wipe-org."
         )
+    if config.wipe_org:
+        if not config.wipe_org_name:
+            arg_parser.error(
+                "--wipe-org requires --wipe-org-name: the organization's "
+                "exact name is the second factor for the teardown."
+            )
+        if (
+            config.rebuild or config.replay_gaps or config.restore
+            or config.sync or config.confirm_deletions or config.fail_on_gaps
+            or config.rebaseline or config.dump_to is not None
+            or config.sanitize or config.dump_path is not None
+        ):
+            arg_parser.error(
+                "--wipe-org is a standalone drill-teardown action; do not "
+                "combine it with any other mode."
+            )
+        if config.org_id and config.org_id == config.wipe_org:
+            arg_parser.error(
+                "--wipe-org matches --org-id; the wipe is for drill "
+                "organizations only, never a production target."
+            )
+        logger.info(
+            "meraki2tf starting in drill-wipe (disaster recovery) mode."
+        )
+        return _wipe_org(config)
     if config.skip_claims and not config.restore:
         arg_parser.error("--skip-claims is only valid together with --restore.")
     if config.restore:

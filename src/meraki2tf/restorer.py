@@ -651,3 +651,129 @@ class OrgRestorer:
             if new_id is not None:
                 return str(new_id)
         return None
+
+
+@dataclass(frozen=True)
+class WipePreview:
+    """What a wipe would destroy — shown before any --confirm."""
+
+    organization_id: str
+    organization_name: str
+    network_count: int
+    claimed_device_count: int
+
+
+@dataclass(frozen=True)
+class WipeResult:
+    """Outcome of one executed wipe."""
+
+    deleted_networks: tuple[str, ...] = ()
+    organization_deleted: bool = False
+    failed: tuple[tuple[str, str], ...] = ()
+
+
+class WipeRefusedError(RuntimeError):
+    """A safety interlock refused the wipe target."""
+
+
+class OrgWiper:
+    """Tears down a drill organization after a restore rehearsal.
+
+    The most dangerous verb in the tool, so the interlocks are stacked
+    and non-negotiable:
+
+    * an organization holding **any claimed device** is refused — a
+      production org always has hardware, a drill org structurally
+      never does, so the destructive path is physically incapable of
+      targeting production;
+    * the caller must present the organization's exact **name** as a
+      second factor alongside its ID;
+    * preview first, ``--confirm`` to execute, like every write path.
+
+    The wipe deletes every network (which deletes their configuration)
+    and then the organization itself. Dashboard-side deletion is
+    immediate; backend retention of deleted-organization data is
+    governed by Cisco's data-handling policy — for hard erasure
+    guarantees after an unsanitized drill, file a data-deletion request
+    with Meraki support (or drill from the sanitized snapshot so no
+    real secrets or identifiers ever enter the org).
+    """
+
+    def __init__(self, bucket: AdaptiveTokenBucket | None = None) -> None:
+        self._bucket = bucket or AdaptiveTokenBucket()
+        self._client: Any = None
+
+    def _dashboard(self) -> Any:
+        if self._client is None:
+            import meraki
+
+            self._client = meraki.DashboardAPI(
+                api_key=read_api_key(),
+                suppress_logging=True,
+                print_console=False,
+                output_log=False,
+            )
+        return self._client
+
+    def preview(self, organization_id: str, expected_name: str) -> WipePreview:
+        """Validate every interlock and report the blast radius."""
+        dashboard = self._dashboard()
+        organization = dashboard.organizations.getOrganization(organization_id)
+        name = str(organization.get("name", ""))
+        if name != expected_name:
+            raise WipeRefusedError(
+                f"--wipe-org-name {expected_name!r} does not match the "
+                f"organization's actual name {name!r}; refusing."
+            )
+        devices = dashboard.organizations.getOrganizationDevices(
+            organization_id, total_pages="all"
+        )
+        if devices:
+            raise WipeRefusedError(
+                f"Organization {organization_id} has {len(devices)} claimed "
+                "device(s); wiping is only permitted for hardware-free "
+                "drill organizations. Unclaim the devices first if this "
+                "really is a drill org."
+            )
+        networks = dashboard.organizations.getOrganizationNetworks(
+            organization_id, total_pages="all"
+        )
+        return WipePreview(
+            organization_id=organization_id,
+            organization_name=name,
+            network_count=len(networks),
+            claimed_device_count=0,
+        )
+
+    def execute(self, organization_id: str, expected_name: str) -> WipeResult:
+        """Re-verify the interlocks immediately before destroying."""
+        self.preview(organization_id, expected_name)
+        dashboard = self._dashboard()
+        networks = dashboard.organizations.getOrganizationNetworks(
+            organization_id, total_pages="all"
+        )
+        deleted: list[str] = []
+        failed: list[tuple[str, str]] = []
+        for network in networks:
+            network_id = str(network.get("id", ""))
+            try:
+                self._bucket.acquire()
+                dashboard.networks.deleteNetwork(network_id)
+                self._bucket.on_success()
+                deleted.append(network_id)
+            except Exception as exc:  # noqa: BLE001 - per-object isolation
+                failed.append((network_id, str(exc)))
+        org_deleted = False
+        if not failed:
+            try:
+                self._bucket.acquire()
+                dashboard.organizations.deleteOrganization(organization_id)
+                self._bucket.on_success()
+                org_deleted = True
+            except Exception as exc:  # noqa: BLE001
+                failed.append((organization_id, str(exc)))
+        return WipeResult(
+            deleted_networks=tuple(deleted),
+            organization_deleted=org_deleted,
+            failed=tuple(failed),
+        )

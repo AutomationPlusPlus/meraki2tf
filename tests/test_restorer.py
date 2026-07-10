@@ -522,3 +522,111 @@ def test_drill_mode_skips_claims_and_device_features(tmp_path: Path) -> None:
     assert "updateNetworkSnmp" in ops  # network config still restored
     drill_skips = [e for e in result.skipped if "drill" in e["reason"]]
     assert len(drill_skips) == 2  # the claim + the switch port
+
+
+# ------------------------------------------------------------------- wipe
+
+
+def _wipe_dashboard(devices: int = 0, networks: int = 2, name: str = "Drill Org"):
+    from types import SimpleNamespace
+
+    deleted: dict[str, list] = {"networks": [], "orgs": []}
+
+    class Organizations:
+        def getOrganization(self, organizationId: str) -> dict:
+            return {"id": organizationId, "name": name}
+
+        def getOrganizationDevices(
+            self, organizationId: str, total_pages: str = "all"
+        ) -> list:
+            return [{"serial": f"Q{i}"} for i in range(devices)]
+
+        def getOrganizationNetworks(
+            self, organizationId: str, total_pages: str = "all"
+        ) -> list:
+            return [{"id": f"L_{i}"} for i in range(networks)]
+
+        def deleteOrganization(self, organizationId: str) -> dict:
+            deleted["orgs"].append(organizationId)
+            return {}
+
+    class Networks:
+        def deleteNetwork(self, networkId: str) -> dict:
+            deleted["networks"].append(networkId)
+            return {}
+
+    return (
+        SimpleNamespace(organizations=Organizations(), networks=Networks()),
+        deleted,
+    )
+
+
+def test_wipe_refuses_orgs_with_claimed_devices() -> None:
+    import pytest as _pytest
+
+    from meraki2tf.restorer import OrgWiper, WipeRefusedError
+
+    wiper = OrgWiper()
+    wiper._client, _ = _wipe_dashboard(devices=3)
+    with _pytest.raises(WipeRefusedError, match="claimed device"):
+        wiper.preview("org-drill", "Drill Org")
+
+
+def test_wipe_refuses_name_mismatch() -> None:
+    import pytest as _pytest
+
+    from meraki2tf.restorer import OrgWiper, WipeRefusedError
+
+    wiper = OrgWiper()
+    wiper._client, _ = _wipe_dashboard()
+    with _pytest.raises(WipeRefusedError, match="does not match"):
+        wiper.preview("org-drill", "Production Org")
+
+
+def test_wipe_executes_networks_then_organization() -> None:
+    from meraki2tf.restorer import OrgWiper
+
+    wiper = OrgWiper()
+    wiper._client, deleted = _wipe_dashboard(networks=3)
+    result = wiper.execute("org-drill", "Drill Org")
+    assert result.deleted_networks == ("L_0", "L_1", "L_2")
+    assert result.organization_deleted is True
+    assert deleted["orgs"] == ["org-drill"]
+    assert result.failed == ()
+
+
+def test_wipe_keeps_the_org_when_a_network_fails() -> None:
+    """A partial wipe never deletes the organization out from under
+    whatever refused to delete — the operator investigates first."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgWiper
+
+    wiper = OrgWiper()
+    dashboard, deleted = _wipe_dashboard(networks=2)
+
+    def explode(networkId: str) -> dict:
+        raise RuntimeError("network is bound to a template")
+
+    dashboard.networks = SimpleNamespace(deleteNetwork=explode)
+    wiper._client = dashboard
+    result = wiper.execute("org-drill", "Drill Org")
+    assert result.organization_deleted is False
+    assert len(result.failed) == 2
+    assert deleted["orgs"] == []
+
+
+def test_wipe_reports_organization_delete_failure() -> None:
+    from meraki2tf.restorer import OrgWiper
+
+    wiper = OrgWiper()
+    dashboard, deleted = _wipe_dashboard(networks=0)
+
+    def explode(organizationId: str) -> dict:
+        raise RuntimeError("org has pending licenses")
+
+    dashboard.organizations.deleteOrganization = explode
+    wiper._client = dashboard
+    result = wiper.execute("org-drill", "Drill Org")
+    assert result.organization_deleted is False
+    assert result.failed == (("org-drill", "org has pending licenses"),)

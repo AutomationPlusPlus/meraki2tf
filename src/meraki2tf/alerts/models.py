@@ -34,6 +34,9 @@ class EventType(enum.Enum):
     #: A human-invoked --restore --confirm rebuilt a target organization
     #: from a snapshot (never the source organization).
     RESTORE_EXECUTED = "RESTORE_EXECUTED"
+    #: A human-invoked --wipe-org --confirm tore down a hardware-free
+    #: drill organization after a restore rehearsal.
+    ORG_WIPE_EXECUTED = "ORG_WIPE_EXECUTED"
 
 
 class EventSeverity(enum.Enum):
@@ -232,6 +235,32 @@ def restore_executed(
             "executed": list(executed),
             "failed": [list(item) for item in failed],
             "skipped": [dict(item) for item in skipped],
+        },
+    )
+
+
+def org_wipe_executed(
+    organization_id: str,
+    deleted_networks: int,
+    organization_deleted: bool,
+    failed: Sequence[Sequence[str]],
+) -> AlertEvent:
+    """Contract payload for a human-invoked drill-organization wipe."""
+    severity = EventSeverity.WARNING if failed else EventSeverity.INFO
+    return AlertEvent(
+        event_type=EventType.ORG_WIPE_EXECUTED,
+        severity=severity,
+        summary=(
+            f"Drill organization {organization_id} wiped: "
+            f"{deleted_networks} network(s) deleted, organization "
+            f"{'deleted' if organization_deleted else 'NOT deleted'}, "
+            f"{len(failed)} failure(s)."
+        ),
+        details={
+            "organization_id": organization_id,
+            "deleted_networks": deleted_networks,
+            "organization_deleted": organization_deleted,
+            "failed": [list(item) for item in failed],
         },
     )
 
