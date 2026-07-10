@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import json
 import logging
 import sys
 import tempfile
@@ -29,6 +30,7 @@ from pathlib import Path
 
 from meraki2tf.alerts import (
     drift_detected,
+    restore_executed,
     AlertDispatcher,
     EmailNotifier,
     WebhookNotifier,
@@ -163,6 +165,38 @@ def build_parser() -> argparse.ArgumentParser:
             "'--rebuild --confirm' has restored the Terraform-covered "
             "resources; network IDs are remapped to the rebuilt tenant "
             "by name."
+        ),
+    )
+    parser.add_argument(
+        "--restore",
+        action="store_true",
+        help=(
+            "Disaster recovery: preview rebuilding an ENTIRE organization "
+            "from a --from-dump snapshot into --target-org, directly via "
+            "the API (networks created, devices claimed, every restorable "
+            "feature written in dependency order with ID remapping). Add "
+            "--confirm to execute. Refuses to target the snapshot's own "
+            "source organization."
+        ),
+    )
+    parser.add_argument(
+        "--target-org",
+        metavar="ORG_ID",
+        default=None,
+        help=(
+            "Organization the --restore writes into (a fresh or scratch "
+            "org). Required with --restore; must differ from the "
+            "snapshot's source organization."
+        ),
+    )
+    parser.add_argument(
+        "--serial-map",
+        metavar="PATH",
+        default=None,
+        help=(
+            "JSON object mapping snapshot device serials to replacement "
+            "hardware serials for --restore (hardware-loss DR). Unmapped "
+            "serials are claimed as-is."
         ),
     )
     parser.add_argument(
@@ -430,6 +464,98 @@ def _rebuild(config: RuntimeConfig) -> int:
     return 0
 
 
+def _restore(config: RuntimeConfig) -> int:
+    """Explicit DR action: preview or execute a full-organization restore.
+
+    The third guarded write path (with ``_rebuild`` and
+    ``_replay_gaps``): preview by default, ``--confirm`` executes — and
+    only ever into ``--target-org``, never the snapshot's source
+    organization.
+    """
+    assert config.dump_path is not None  # guarded by the caller
+    assert config.target_org is not None  # guarded by the caller
+    from meraki2tf.restorer import (
+        OrgRestorer,
+        RestoreJournal,
+        plan_restore,
+        render_restore_plan,
+    )
+
+    try:
+        spec_parser = OpenApiParser(resolve_spec(config.spec_path))
+        provider = StaticJsonDataProvider(config.dump_path, parser=spec_parser)
+        with provider as source:
+            graph = source.fetch_network_graph(config.org_id)
+    except Exception as exc:
+        logger.critical("Restore could not load the snapshot: %s", exc)
+        return 1
+    if config.target_org == graph.organization_id:
+        logger.critical(
+            "--target-org matches the snapshot's source organization; "
+            "a restore never writes to the org it was captured from. "
+            "Create a fresh organization and target that."
+        )
+        return 2
+    serial_map: dict[str, str] = {}
+    if config.serial_map is not None:
+        try:
+            loaded = json.loads(config.serial_map.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.critical("Cannot read --serial-map: %s", exc)
+            return 2
+        if not isinstance(loaded, dict):
+            logger.critical("--serial-map must be a JSON object of old→new serials.")
+            return 2
+        serial_map = {str(k): str(v) for k, v in loaded.items()}
+    plan = plan_restore(graph, spec_parser)
+    logger.info(
+        "Restore plan for target organization %s from snapshot %s:\n%s",
+        config.target_org, config.dump_path, render_restore_plan(plan),
+    )
+    for item in plan.unrestorable:
+        logger.warning(
+            "Cannot restore %s (ids=%s): %s",
+            item.api_path, ",".join(item.path_values) or "<none>", item.reason,
+        )
+    if not config.confirm:
+        logger.warning(
+            "Preview only — nothing was written to Meraki. Re-run with "
+            "'--restore --confirm' to rebuild organization %s from the "
+            "snapshot.", config.target_org,
+        )
+        return 0
+    if not api_key_present():
+        logger.critical(
+            "--restore --confirm requires %s: rebuilding writes to the "
+            "Meraki dashboard API.", API_KEY_ENV_VAR,
+        )
+        return 1
+    journal = RestoreJournal(config.workdir / "restore-journal.jsonl")
+    restorer = OrgRestorer(
+        config.target_org, journal, serial_map=serial_map
+    )
+    result = restorer.execute(graph, plan)
+    for key, reason in result.failed:
+        logger.error("Restore FAILED for %s: %s", key, reason)
+    for entry in result.skipped:
+        logger.warning("Restore skipped %s: %s", entry["target"], entry["reason"])
+    logger.info(
+        "Restore into %s complete: %d executed, %d failed, %d skipped "
+        "(journal: %s).",
+        config.target_org, len(result.executed), len(result.failed),
+        len(result.skipped), config.workdir / "restore-journal.jsonl",
+    )
+    build_dispatcher(config).dispatch(
+        restore_executed(
+            target_organization_id=config.target_org,
+            executed=result.executed,
+            failed=result.failed,
+            skipped=result.skipped,
+        )
+    )
+    return 0 if not result.failed else 1
+
+
 def _replay_gaps(config: RuntimeConfig) -> int:
     """Explicit DR action: preview or execute a snapshot gap replay.
 
@@ -547,10 +673,45 @@ def main(argv: Sequence[str] | None = None) -> int:
             "(e.g. the azurerm 'key' setting)."
         )
 
-    if config.confirm and not (config.rebuild or config.replay_gaps):
+    if config.confirm and not (
+        config.rebuild or config.replay_gaps or config.restore
+    ):
         arg_parser.error(
-            "--confirm is only valid together with --rebuild or --replay-gaps."
+            "--confirm is only valid together with --rebuild, --replay-gaps, "
+            "or --restore."
         )
+    if config.restore:
+        if config.dump_path is None:
+            arg_parser.error(
+                "--restore rebuilds from an offline snapshot; pass the "
+                "unsanitized export via --from-dump."
+            )
+        if not config.target_org:
+            arg_parser.error(
+                "--restore requires --target-org: the (fresh or scratch) "
+                "organization to rebuild into. It never writes to the "
+                "snapshot's source organization."
+            )
+        if config.rebuild or config.replay_gaps:
+            arg_parser.error(
+                "--restore is a standalone DR action; do not combine it "
+                "with --rebuild or --replay-gaps."
+            )
+        if (
+            config.sync
+            or config.confirm_deletions
+            or config.fail_on_gaps
+            or config.rebaseline
+            or config.dump_to is not None
+            or config.sanitize
+        ):
+            arg_parser.error(
+                "--restore cannot be combined with pipeline or export flags."
+            )
+        logger.info(
+            "meraki2tf starting in restore (disaster recovery) mode."
+        )
+        return _restore(config)
     if config.rebuild and config.replay_gaps:
         arg_parser.error(
             "--rebuild and --replay-gaps are separate DR steps; run "

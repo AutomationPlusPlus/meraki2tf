@@ -31,6 +31,9 @@ class EventType(enum.Enum):
     #: A human-invoked --replay-gaps --confirm wrote unsupported
     #: objects/secret attributes back to Meraki from a snapshot.
     GAP_REPLAY_EXECUTED = "GAP_REPLAY_EXECUTED"
+    #: A human-invoked --restore --confirm rebuilt a target organization
+    #: from a snapshot (never the source organization).
+    RESTORE_EXECUTED = "RESTORE_EXECUTED"
 
 
 class EventSeverity(enum.Enum):
@@ -202,6 +205,33 @@ def unsupported_feature_flagged(
             "api_path": api_path,
             "reason": reason,
             "identifiers": list(identifiers),
+        },
+    )
+
+
+def restore_executed(
+    target_organization_id: str,
+    executed: Sequence[str],
+    failed: Sequence[Sequence[str]],
+    skipped: Sequence[Mapping[str, Any]],
+) -> AlertEvent:
+    """Contract payload for a human-invoked full restore into a target
+    organization. Entries are value-free action labels — restored
+    payloads and secret values never leave the process."""
+    severity = EventSeverity.WARNING if failed else EventSeverity.INFO
+    return AlertEvent(
+        event_type=EventType.RESTORE_EXECUTED,
+        severity=severity,
+        summary=(
+            f"Restore into organization {target_organization_id}: "
+            f"{len(executed)} restored, {len(failed)} failed, "
+            f"{len(skipped)} skipped."
+        ),
+        details={
+            "target_organization_id": target_organization_id,
+            "executed": list(executed),
+            "failed": [list(item) for item in failed],
+            "skipped": [dict(item) for item in skipped],
         },
     )
 

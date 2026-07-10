@@ -1311,3 +1311,280 @@ def test_export_with_identical_drift_baseline_is_quiet(
             "--webhook-url", "https://hooks.example/dr",
         ]
     ) == 0
+
+
+# ------------------------------------------------------------- --restore
+
+
+def _restore_dump(tmp_path: Path) -> Path:
+    dump = tmp_path / "restore-snapshot.json"
+    dump.write_text(
+        json.dumps(
+            {
+                "organizationId": "org-123",
+                "networks": [
+                    {"id": "N_1", "organizationId": "org-123", "name": "HQ",
+                     "productTypes": ["wireless"], "timeZone": "UTC"}
+                ],
+                "devices": [],
+                "features": [
+                    {
+                        "apiPath": "/networks/{networkId}/wireless/ssids/{number}",
+                        "pathValues": ["N_1", "0"],
+                        "payload": {"number": 0, "name": "Corp"},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return dump
+
+
+def test_restore_requires_snapshot_and_target(spec_file: Path) -> None:
+    with pytest.raises(SystemExit):
+        main(["--spec", str(spec_file), "--restore"])
+    with pytest.raises(SystemExit):
+        main(
+            ["--spec", str(spec_file), "--restore",
+             "--from-dump", "whatever.json"]
+        )
+
+
+def test_restore_rejects_pipeline_flags(spec_file: Path, tmp_path: Path) -> None:
+    dump = _restore_dump(tmp_path)
+    with pytest.raises(SystemExit):
+        main(
+            ["--spec", str(spec_file), "--restore", "--from-dump", str(dump),
+             "--target-org", "org-999", "--sync"]
+        )
+
+
+def test_restore_refuses_the_source_organization(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The restore engine must never write to the org the snapshot was
+    captured from."""
+    _no_network(monkeypatch)
+    dump = _restore_dump(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--restore", "--from-dump", str(dump),
+         "--target-org", "org-123"]
+    )
+    assert exit_code == 2
+
+
+def test_restore_preview_writes_nothing(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import sys as _sys
+    import types as _types
+
+    _no_network(monkeypatch)
+
+    def forbidden(**kwargs: Any) -> None:
+        raise AssertionError("preview must not construct an SDK client")
+
+    stub = _types.ModuleType("meraki")
+    stub.DashboardAPI = forbidden  # type: ignore[attr-defined]
+    monkeypatch.setitem(_sys.modules, "meraki", stub)
+    dump = _restore_dump(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--restore", "--from-dump", str(dump),
+         "--target-org", "org-999", "--workdir", str(tmp_path / "ws")]
+    )
+    console = capsys.readouterr().err
+    assert exit_code == 0
+    assert "Preview only" in console
+    assert "configure" in console or "create" in console
+
+
+def test_restore_confirm_requires_api_key(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _no_network(monkeypatch)
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    dump = _restore_dump(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--restore", "--from-dump", str(dump),
+         "--target-org", "org-999", "--workdir", str(tmp_path / "ws")]
+        + ["--confirm"]
+    )
+    assert exit_code == 1
+
+
+def test_restore_rejects_bad_serial_map(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _no_network(monkeypatch)
+    bad = tmp_path / "serials.json"
+    bad.write_text("[]", encoding="utf-8")
+    dump = _restore_dump(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--restore", "--from-dump", str(dump),
+         "--target-org", "org-999", "--serial-map", str(bad)]
+    )
+    assert exit_code == 2
+
+
+def test_restore_confirm_executes_and_alerts(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys as _sys
+    import types as _types
+
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    calls: list[tuple[str, tuple, dict]] = []
+
+    class Section:
+        def __getattr__(self, operation_id: str):  # noqa: ANN204
+            def _dispatch(*args: Any, **kwargs: Any) -> dict:
+                calls.append((operation_id, args, kwargs))
+                if operation_id == "createOrganizationNetwork":
+                    return {"id": "L_NEW"}
+                return {}
+
+            return _dispatch
+
+    section = Section()
+    dashboard = SimpleNamespace(
+        organizations=section, networks=section, wireless=section
+    )
+    stub = _types.ModuleType("meraki")
+    stub.DashboardAPI = lambda **kwargs: dashboard  # type: ignore[attr-defined]
+    monkeypatch.setitem(_sys.modules, "meraki", stub)
+
+    delivered: list[dict[str, Any]] = []
+
+    def fake_urlopen(request: Any, timeout: float) -> FakeResponse:
+        delivered.append(json.loads(request.data.decode("utf-8")))
+        return FakeResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    dump = _restore_dump(tmp_path)
+    workdir = tmp_path / "ws"
+    exit_code = main(
+        ["--spec", str(spec_file), "--restore", "--from-dump", str(dump),
+         "--target-org", "org-999", "--workdir", str(workdir), "--confirm",
+         "--webhook-url", "https://hooks.example/dr"]
+    )
+    assert exit_code == 0
+    ops = [c[0] for c in calls]
+    assert ops.index("createOrganizationNetwork") < ops.index(
+        "updateNetworkWirelessSsid"
+    )
+    ssid = next(c for c in calls if c[0] == "updateNetworkWirelessSsid")
+    assert ssid[1] == ("L_NEW", "0")  # remapped to the rebuilt network
+    (event,) = delivered
+    assert event["event_type"] == "RESTORE_EXECUTED"
+    assert event["details"]["target_organization_id"] == "org-999"
+    assert (workdir / "restore-journal.jsonl").exists()
+
+
+def test_restore_fails_cleanly_on_unreadable_snapshot(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _no_network(monkeypatch)
+    exit_code = main(
+        ["--spec", str(spec_file), "--restore",
+         "--from-dump", str(tmp_path / "missing.json"),
+         "--target-org", "org-999"]
+    )
+    assert exit_code == 1
+
+
+def test_restore_rejects_combination_with_rebuild(
+    spec_file: Path, tmp_path: Path
+) -> None:
+    with pytest.raises(SystemExit):
+        main(
+            ["--spec", str(spec_file), "--restore", "--rebuild",
+             "--from-dump", str(tmp_path / "x.json"), "--target-org", "o"]
+        )
+
+
+def test_restore_preview_reports_unrestorables_and_serial_map(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _no_network(monkeypatch)
+    dump = tmp_path / "gapd.json"
+    dump.write_text(
+        json.dumps(
+            {
+                "organizationId": "org-123",
+                "networks": [],
+                "devices": [],
+                "features": [
+                    {
+                        "apiPath": "/networks/{networkId}/clients",
+                        "pathValues": ["N_1"],
+                        "payload": {"usage": 1},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    serial_map = tmp_path / "serials.json"
+    serial_map.write_text('{"Q2AB-CDEF-GHIJ": "Q9ZZ-NEWW-HWSN"}', encoding="utf-8")
+    exit_code = main(
+        ["--spec", str(spec_file), "--restore", "--from-dump", str(dump),
+         "--target-org", "org-999", "--serial-map", str(serial_map)]
+    )
+    console = capsys.readouterr().err
+    assert exit_code == 0
+    assert "Cannot restore /networks/{networkId}/clients" in console
+
+
+def test_restore_unreadable_serial_map_exits_2(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _no_network(monkeypatch)
+    dump = _restore_dump(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--restore", "--from-dump", str(dump),
+         "--target-org", "org-999",
+         "--serial-map", str(tmp_path / "no-such-map.json")]
+    )
+    assert exit_code == 2
+
+
+def test_restore_confirm_reports_failures_nonzero(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys as _sys
+    import types as _types
+
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+
+    class FailingSection:
+        def __getattr__(self, operation_id: str):  # noqa: ANN204
+            def _dispatch(*args: Any, **kwargs: Any) -> dict:
+                raise RuntimeError("simulated failure")
+
+            return _dispatch
+
+    section = FailingSection()
+    dashboard = SimpleNamespace(
+        organizations=section, networks=section, wireless=section
+    )
+    stub = _types.ModuleType("meraki")
+    stub.DashboardAPI = lambda **kwargs: dashboard  # type: ignore[attr-defined]
+    monkeypatch.setitem(_sys.modules, "meraki", stub)
+    dump = _restore_dump(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--restore", "--from-dump", str(dump),
+         "--target-org", "org-999", "--workdir", str(tmp_path / "ws"),
+         "--confirm"]
+    )
+    assert exit_code == 1
