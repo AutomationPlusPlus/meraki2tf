@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -97,3 +98,86 @@ def test_snapshot_carries_full_network_and_device_payloads(tmp_path: Path) -> No
     loaded = StaticJsonDataProvider(path).fetch_network_graph()
     assert loaded.networks[0].payload["timeZone"] == "Europe/Berlin"
     assert loaded.devices[0].payload["address"] == "1 Main St"
+
+
+def _payload_graph() -> Any:
+    from meraki2tf.models import (
+        FeatureConfiguration,
+        MerakiDevice,
+        MerakiNetwork,
+        NetworkGraph,
+    )
+
+    return NetworkGraph(
+        organization_id="org-123",
+        networks=(
+            MerakiNetwork.from_payload(
+                {
+                    "id": "N_1",
+                    "organizationId": "org-123",
+                    "name": "HQ",
+                    "productTypes": ["appliance"],
+                    "timeZone": "Europe/Berlin",
+                }
+            ),
+        ),
+        devices=(
+            MerakiDevice.from_payload(
+                {"serial": "Q2AB-CDEF-GHIJ", "networkId": "N_1", "model": "MX68",
+                 "name": "edge", "address": "1 Main St"}
+            ),
+        ),
+        features=(
+            FeatureConfiguration(
+                "/networks/{networkId}/appliance/vlans/{vlanId}",
+                ("N_1", "10"),
+                {"id": 10, "name": "Data"},
+            ),
+        ),
+    )
+
+
+@pytest.mark.parametrize("name", ["snap.jsonl.gz", "snap.jsonl"])
+def test_snapshot_v2_stream_round_trips(tmp_path: Path, name: str) -> None:
+    """The v2 stream format (JSONL, optionally gzipped) round-trips the
+    full graph and is detected by content, not filename."""
+    graph = _payload_graph()
+    path = write_snapshot(graph, tmp_path / name)
+    assert oct(path.stat().st_mode & 0o777) == "0o600"
+    if name.endswith(".gz"):
+        assert path.read_bytes()[:2] == b"\x1f\x8b"
+
+    # Rename away the meaningful suffix: detection must be content-based.
+    renamed = path.rename(tmp_path / "renamed.dat")
+    loaded = StaticJsonDataProvider(renamed).fetch_network_graph()
+    assert loaded.organization_id == "org-123"
+    assert loaded.networks[0].payload["timeZone"] == "Europe/Berlin"
+    assert loaded.devices[0].payload["address"] == "1 Main St"
+    assert [(f.api_path, f.path_values) for f in loaded.features] == [
+        ("/networks/{networkId}/appliance/vlans/{vlanId}", ("N_1", "10")),
+    ]
+
+
+def test_snapshot_v2_is_dramatically_smaller_than_v1(tmp_path: Path) -> None:
+    graph = _payload_graph()
+    v1 = write_snapshot(graph, tmp_path / "snap.json")
+    v2 = write_snapshot(graph, tmp_path / "snap.jsonl.gz")
+    assert v2.stat().st_size < v1.stat().st_size
+
+
+def test_snapshot_v2_loader_tolerates_stray_lines(tmp_path: Path) -> None:
+    """Blank lines, non-object records, and unknown kinds are skipped —
+    a hand-edited or partially-corrupt stream degrades loudly at the
+    model layer, not with a parser crash here."""
+    path = tmp_path / "stray.jsonl"
+    path.write_text(
+        '{"meraki2tfSnapshot": 2, "organizationId": "org-123"}\n'
+        "\n"
+        '"just-a-string"\n'
+        '{"kind": "mystery", "x": 1}\n'
+        '{"kind": "network", "id": "N_1", "organizationId": "org-123"}\n',
+        encoding="utf-8",
+    )
+    loaded = StaticJsonDataProvider(path).fetch_network_graph()
+    assert [n.network_id for n in loaded.networks] == ["N_1"]
+    assert loaded.devices == () and loaded.features == ()

@@ -9,6 +9,7 @@ air-gapped runtimes, scheduled offline parsing, and regression tests.
 
 from __future__ import annotations
 
+import gzip
 import json
 import logging
 from pathlib import Path
@@ -57,21 +58,98 @@ def graph_to_snapshot(graph: NetworkGraph) -> dict[str, Any]:
     }
 
 
+#: First line of a v2 snapshot: a header object carrying this marker.
+SNAPSHOT_V2_MARKER = "meraki2tfSnapshot"
+SNAPSHOT_V2_VERSION = 2
+
+#: Suffixes selecting the v2 stream format from --dump-to paths.
+_V2_SUFFIXES = (".jsonl.gz", ".jsonl")
+
+
+def _wants_v2(path: Path) -> bool:
+    name = path.name.lower()
+    return any(name.endswith(suffix) for suffix in _V2_SUFFIXES)
+
+
 def write_snapshot(graph: NetworkGraph, path: Path) -> Path:
-    """Write the canonical snapshot document for later ``--from-dump`` runs.
+    """Write the canonical snapshot for later ``--from-dump`` runs.
 
     Written owner-only (0600): an unsanitized snapshot carries every
     credential Meraki returns on GET (SSID PSKs, SNMP community
     strings, …) — it is the DR kit's secret-bearing artifact.
+
+    Paths ending in ``.jsonl`` / ``.jsonl.gz`` select the v2 stream
+    format: a header line followed by one object per line, gzip-
+    compressed when the name says so. At 200k-object scale the v1
+    pretty-printed document costs gigabytes and three in-memory copies;
+    v2 streams one small line at a time and compresses ~10-20×.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.touch(mode=0o600, exist_ok=True)
     restrict_to_owner(path)
-    path.write_text(
-        json.dumps(graph_to_snapshot(graph), indent=2) + "\n", encoding="utf-8"
-    )
+    if _wants_v2(path):
+        _write_snapshot_v2(graph, path)
+    else:
+        path.write_text(
+            json.dumps(graph_to_snapshot(graph), indent=2) + "\n",
+            encoding="utf-8",
+        )
     logger.info(
         "Snapshot written to %s: %d network(s), %d device(s), %d feature(s).",
         path, len(graph.networks), len(graph.devices), len(graph.features),
     )
     return path
+
+
+def _write_snapshot_v2(graph: NetworkGraph, path: Path) -> None:
+    opener = gzip.open if path.name.lower().endswith(".gz") else open
+    with opener(path, "wt", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    SNAPSHOT_V2_MARKER: SNAPSHOT_V2_VERSION,
+                    "organizationId": graph.organization_id,
+                }
+            )
+            + "\n"
+        )
+        for network in graph.networks:
+            handle.write(
+                json.dumps(
+                    {
+                        "kind": "network",
+                        **dict(network.payload),
+                        "id": network.network_id,
+                        "organizationId": network.organization_id,
+                        "name": network.name,
+                        "productTypes": list(network.product_types),
+                    }
+                )
+                + "\n"
+            )
+        for device in graph.devices:
+            handle.write(
+                json.dumps(
+                    {
+                        "kind": "device",
+                        **dict(device.payload),
+                        "serial": device.serial,
+                        "networkId": device.network_id,
+                        "model": device.model,
+                        "name": device.name,
+                    }
+                )
+                + "\n"
+            )
+        for feature in graph.features:
+            handle.write(
+                json.dumps(
+                    {
+                        "kind": "feature",
+                        "apiPath": feature.api_path,
+                        "pathValues": list(feature.path_values),
+                        "payload": feature.payload,
+                    }
+                )
+                + "\n"
+            )

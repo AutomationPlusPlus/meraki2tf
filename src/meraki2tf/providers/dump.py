@@ -54,6 +54,7 @@ names the spec cannot disambiguate) are reported and skipped.
 
 from __future__ import annotations
 
+import gzip
 import json
 import logging
 from collections import Counter
@@ -78,6 +79,53 @@ from meraki2tf.spec.engine import OperationSpec
 
 logger = logging.getLogger(__name__)
 
+_GZIP_MAGIC = b"\x1f\x8b"
+
+
+def _load_snapshot_document(path: "Path") -> Any:
+    """Read a snapshot in either format into the canonical document.
+
+    v1 is one pretty-printed JSON object. v2 (written for paths ending
+    in ``.jsonl``/``.jsonl.gz``) is a header line carrying the
+    ``meraki2tfSnapshot`` marker followed by one object per line —
+    detected by content (gzip magic / header marker), not by filename,
+    so renamed files keep working.
+    """
+    from meraki2tf.snapshot import SNAPSHOT_V2_MARKER
+
+    raw = path.open("rb").read(2)
+    opener = gzip.open if raw == _GZIP_MAGIC else open
+    with opener(path, "rt", encoding="utf-8") as handle:
+        first = handle.readline()
+        try:
+            head = json.loads(first) if first.strip() else None
+        except json.JSONDecodeError:
+            head = None
+        if isinstance(head, dict) and SNAPSHOT_V2_MARKER in head:
+            networks: list[Any] = []
+            devices: list[Any] = []
+            features: list[Any] = []
+            buckets = {"network": networks, "device": devices, "feature": features}
+            for line in handle:
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                if not isinstance(record, dict):
+                    continue
+                kind = record.pop("kind", None)
+                bucket = buckets.get(str(kind))
+                if bucket is not None:
+                    bucket.append(record)
+            return {
+                "organizationId": head.get("organizationId"),
+                "networks": networks,
+                "devices": devices,
+                "features": features,
+            }
+        rest = handle.read()
+    return json.loads(first + rest)
+
+
 _NESTED_MARKER = "organizations"
 #: Keys of a nested entry that are structural, not feature sections.
 _ORG_STRUCTURAL_KEYS = frozenset({"info", "networks"})
@@ -100,7 +148,7 @@ class StaticJsonDataProvider(MerakiDataProvider):
         self._matchers: dict[str, FeatureSectionMatcher] = {}
         self._get_ops: dict[str, OperationSpec] | None = None
         try:
-            document = json.loads(dump_path.read_text(encoding="utf-8"))
+            document = _load_snapshot_document(dump_path)
         except (OSError, json.JSONDecodeError) as exc:
             raise MalformedDumpError(f"Cannot read snapshot {dump_path}: {exc}") from exc
         if not isinstance(document, dict):
