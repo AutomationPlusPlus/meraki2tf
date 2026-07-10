@@ -696,6 +696,68 @@ def test_persistent_server_error_becomes_coverage_gap(
     assert len(graph.features) > 1
 
 
+@pytest.mark.parametrize("status", [401, 403])
+def test_auth_refusals_become_coverage_gaps(
+    live_provider: LiveApiDataProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+) -> None:
+    """A rotated key or scope-limited admin is 'the API refused this
+    attempt', never 'this feature does not apply' — swallowing it at
+    DEBUG would vanish whole endpoints from the snapshot behind a
+    success notification."""
+
+    def _refuse(self: Any, organizationId: str) -> list[dict[str, Any]]:
+        raise _FakeApiError(status)
+
+    monkeypatch.setattr(FakeOrganizations, "getOrganizationAdmins", _refuse)
+    graph = live_provider.fetch_network_graph("org-123")
+
+    gaps = [f for f in graph.features if UNREADABLE_MARKER in f.payload]
+    assert len(gaps) == 1
+    assert gaps[0].api_path.endswith("/admins")
+    assert f"HTTP {status}" in gaps[0].payload[UNREADABLE_MARKER]
+
+
+def test_undiscoverable_nested_parents_become_coverage_gaps(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A nested surface whose parent collection can never be discovered
+    (read-only telemetry parent, filtered-out collection) must land in
+    the coverage manifest — 'no query, no warning, no record' would be
+    a silent DR blind spot."""
+    import json as _json
+
+    from conftest import _op
+
+    spec = {
+        "openapi": "3.0.0",
+        "info": {"title": "blind", "version": "1"},
+        "paths": {
+            # Read-only parent: no write op anywhere at its entity key,
+            # so the mutable-entity filter excludes the collection.
+            "/networks/{networkId}/clients": {
+                "get": _op("getNetworkClients", "networks"),
+            },
+            "/networks/{networkId}/clients/{clientId}/policy": {
+                "get": _op("getNetworkClientPolicy", "networks"),
+                "put": _op("updateNetworkClientPolicy", "networks"),
+            },
+        },
+    }
+    spec_path = tmp_path / "blind-spec.json"
+    spec_path.write_text(_json.dumps(spec), encoding="utf-8")
+
+    provider = LiveApiDataProvider(parser=OpenApiParser(spec_path))
+    provider._client = types.SimpleNamespace(organizations=FakeOrganizations())
+    graph = provider.fetch_network_graph("org-123")
+
+    (gap,) = [f for f in graph.features if UNREADABLE_MARKER in f.payload]
+    assert gap.api_path == "/networks/{networkId}/clients/{clientId}/policy"
+    assert gap.path_values == ()
+    assert "not discoverable" in gap.payload[UNREADABLE_MARKER]
+
+
 def test_try_call_still_skips_scope_refusals_with_status(
     live_provider: LiveApiDataProvider, spec_parser: OpenApiParser
 ) -> None:
