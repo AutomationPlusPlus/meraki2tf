@@ -131,3 +131,44 @@ def test_summary_omits_empty_sections(tmp_path: Path) -> None:
     text = summary_path.read_text(encoding="utf-8")
     assert "cannot rebuild" not in text
     assert "Deletions" not in text
+
+
+def test_manifest_carries_restore_verdicts() -> None:
+    from meraki2tf.coverage import build_manifest
+    from meraki2tf.hcl_generator import CapturedAsset, UnsupportedAsset
+
+    captured = (
+        CapturedAsset(
+            address="meraki_appliance_vlan.n_1_10",
+            api_path="/networks/{networkId}/appliance/vlans/{vlanId}",
+            import_id="N_1,10",
+            already_in_state=False,
+            identifiers=("N_1", "10"),
+        ),
+    )
+    unsupported = (
+        UnsupportedAsset(
+            api_path="/networks/{networkId}/clients",
+            reason="no mapping",
+            identifiers=("N_1",),
+        ),
+    )
+    manifest = build_manifest(
+        organization_id="org-123",
+        captured=captured,
+        unsupported=unsupported,
+        state_addresses=frozenset(),
+        restore_via={
+            ("/networks/{networkId}/appliance/vlans/{vlanId}", ("N_1", "10")):
+                "configure",
+            ("/networks/{networkId}/clients", ("N_1",)):
+                "unrestorable: dashboard-only",
+        },
+    )
+    by_path = {obj["api_path"]: obj for obj in manifest["objects"]}
+    assert by_path[
+        "/networks/{networkId}/appliance/vlans/{vlanId}"
+    ]["restore_via"] == "configure"
+    assert by_path["/networks/{networkId}/clients"]["restore_via"] == (
+        "unrestorable: dashboard-only"
+    )

@@ -378,6 +378,15 @@ class PipelineOrchestrator:
                 report.captured, unmanaged_secrets, payload_index(graph)
             )
             final_state = self._runner.existing_addresses()
+            # The direct-API restore verdict for every asset — computed
+            # offline from spec + snapshot, so the weekly manifest
+            # answers "will the API rebuild it?" alongside "will
+            # Terraform import it?".
+            from meraki2tf.restorer import plan_restore, restore_verdicts
+
+            restore_via = restore_verdicts(
+                plan_restore(graph, self._generator.parser)
+            )
             manifest = build_manifest(
                 organization_id=graph.organization_id,
                 captured=report.captured,
@@ -385,6 +394,7 @@ class PipelineOrchestrator:
                 state_addresses=final_state,
                 deletions_pending=deletions_pending,
                 unmanaged_secret_attributes=unmanaged_secrets,
+                restore_via=restore_via,
             )
             write_manifest(manifest, self._runner.workdir)
             coverage_percent = float(manifest["coverage_percent"])

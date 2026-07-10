@@ -26,13 +26,16 @@ alerts to your configured webhook/email channels.
 never mutates your Meraki organization. Its job is to continuously
 convert your org into runnable Terraform artifacts; in the event of a
 major incident you use those artifacts to rebuild — see
-[Disaster Recovery](#disaster-recovery). Only two explicit,
+[Disaster Recovery](#disaster-recovery). Only three explicit,
 human-invoked disaster-recovery actions ever write anything, and each is
 a read-only preview until you add `--confirm`:
 [`--rebuild --confirm`](#restoring-an-existing-organization-primary-dr-path)
 (a `terraform apply` of the kit) and
 [`--replay-gaps --confirm`](#restoring-what-terraform-cant-rebuild---replay-gaps)
-(restores objects and secrets Terraform cannot carry, via the SDK).
+(restores objects and secrets Terraform cannot carry, via the SDK), and
+[`--restore --confirm`](#rebuilding-an-entire-organization---restore)
+(rebuilds an entire organization from a snapshot — only ever into a
+separate `--target-org`, never the source).
 Every scheduled/automated run stays strictly read-only toward Meraki.
 
 **Why dynamic OpenAPI spec parsing?** The Meraki API surface changes
@@ -460,6 +463,58 @@ resources. Notes:
 - Success dispatches a `GAP_REPLAY_EXECUTED` notification summarizing
   what was restored, skipped, and (if any) failed.
 
+### Rebuilding an entire organization (`--restore`)
+
+`--rebuild` applies the Terraform kit and is the right tool when the
+organization still exists (the statistically likely disaster: a subset
+of objects was deleted or mangled). For **total organization loss** the
+kit is not enough — its generated configuration carries the old org's
+literal IDs. `--restore` rebuilds directly through the API from an
+unsanitized snapshot:
+
+```bash
+# Preview (default): the full restore plan — what will be created,
+# configured, claimed, and what cannot be restored (with reasons).
+meraki2tf --restore --from-dump vault/latest.jsonl.gz --target-org 999999
+
+# Execute. Only ever into --target-org; the snapshot's own source
+# organization is refused outright.
+meraki2tf --restore --from-dump vault/latest.jsonl.gz --target-org 999999 \
+  --confirm --workdir ./restore-run
+
+# Hardware was lost too? Map old device serials to replacement units.
+meraki2tf --restore --from-dump vault/latest.jsonl.gz --target-org 999999 \
+  --serial-map replacements.json --confirm
+```
+
+The restore runs in dependency waves — organization-level objects,
+config templates, network creation, device claiming, then features
+(shallow before nested) — capturing every server-assigned ID into a
+crash-resumable journal (`<workdir>/restore-journal.jsonl`) and
+rewriting payload-embedded references (`*Id`/`*Ids` fields, firewall
+`GRP()`/`OBJ()` grammar) to the rebuilt IDs. A reference that cannot be
+rewritten fails that one object loudly; children of failed parents are
+skipped with reasons. Re-running with the same journal resumes instead
+of duplicating creates. The run ends with a `RESTORE_EXECUTED` alert
+listing executed/failed/skipped (identifiers only, never values).
+
+Every weekly coverage manifest also carries each asset's `restore_via`
+verdict (`create` / `configure` / `claim` / `unrestorable: <reason>`),
+so "will the API rebuild it?" is answered **before** any disaster.
+
+### Recommended operating cadence
+
+| Cadence | Job | Cost |
+| --- | --- | --- |
+| Weekly | `--dump-to <new> --drift-baseline <previous>` + rotate snapshots | one discovery sweep |
+| Monthly | Terraform kit export + `--rebuild` preview (`--sync` run or plain pipeline) | one kit/plan cycle |
+| Quarterly | Restore drill: `--restore --confirm` into a scratch org, verify by discovering the rebuilt org and diffing vs the source snapshot | one restore + one sweep |
+
+> The terraform kit remains in the rotation deliberately: it is the
+> proven tool for *same-org subset* restores, and the monthly plan
+> preview catches provider regressions before a disaster does. Retiring
+> it from the schedule is gated on a passed full-org restore drill.
+
 ## Configuration Options
 
 Quick reference (each flag is described in detail below):
@@ -474,7 +529,10 @@ Quick reference (each flag is described in detail below):
 | `--drift-baseline PATH` | — | Prior snapshot to diff the fresh discovery against — attribute-level drift in seconds, no terraform read pass |
 | `--rebuild` | off | Disaster recovery: preview a rebuild apply of the workdir artifacts |
 | `--replay-gaps` | off | Disaster recovery: preview restoring objects/secrets Terraform can't rebuild, from an unsanitized snapshot |
-| `--confirm` | off | Escalate `--rebuild` or `--replay-gaps` from preview to a real write against Meraki |
+| `--restore` | off | Disaster recovery: preview a full-organization rebuild from a snapshot into `--target-org` |
+| `--target-org ORG_ID` | — | The (fresh/scratch) organization `--restore` writes into; never the snapshot's source org |
+| `--serial-map PATH` | — | JSON old→new device-serial map for hardware-loss restores |
+| `--confirm` | off | Escalate `--rebuild`, `--replay-gaps`, or `--restore` from preview to a real write against Meraki |
 | `--rebaseline` | off | Accept current reality: discard `resources.tf` so this run regenerates the baseline |
 | `--sync` | off | DR automation: guarded import-only auto-apply + modified-object baseline regeneration |
 | `--confirm-deletions` | off | Human confirmation to remove Meraki-deleted resources from the kit and state |
@@ -756,6 +814,7 @@ environment itself.
 | `RUN_SUCCESS` | Snapshot generation (and comparison, when an API key was available) completed flawlessly. Payload carries the coverage picture: `discovered_assets`, `imports_written`, `imports_already_tracked`, `unsupported_count` plus the full `unsupported` list, `pending_imports` (imports the plan reports as not yet in state; `null` when unknown), `comparison_performed`, `resources_added_to_state` (sync mode), `coverage_percent`, `deletions_pending_confirmation`, and `unmanaged_secret_attributes` (secrets the kit cannot carry — restore manually after a rebuild) |
 | `UNSUPPORTED_FEATURE_FLAGGED` | A discovered asset cannot be mapped to a Terraform resource |
 | `DELETION_PENDING_CONFIRMATION` | Resources tracked in the DR kit were not found in Meraki (deleted?); they stay in the kit until a human confirms with `--confirm-deletions` |
+| `RESTORE_EXECUTED` | A human-invoked `--restore --confirm` rebuilt a target organization from a snapshot. Payload carries executed/failed/skipped action labels (identifiers and endpoints only — never values) |
 | `GAP_REPLAY_EXECUTED` | A human-invoked `--replay-gaps --confirm` wrote unsupported objects and/or secret attributes back to Meraki from a snapshot. Payload carries the executed, skipped, and failed operations (identifiers/endpoints only — never secret values) |
 | `PROCESSING_FAULT` | A critical pipeline failure (payload carries the failing stage) |
 

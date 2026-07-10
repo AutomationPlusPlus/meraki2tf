@@ -54,28 +54,40 @@ def build_manifest(
     state_addresses: frozenset[str],
     deletions_pending: tuple[str, ...] = (),
     unmanaged_secret_attributes: dict[str, tuple[str, ...]] | None = None,
+    restore_via: dict[tuple[str, tuple[str, ...]], str] | None = None,
 ) -> dict[str, Any]:
     """Assemble the coverage manifest for one completed run.
 
     ``state_addresses`` must reflect the state file *after* any
     sync-mode apply, so freshly materialized imports count as
-    ``imported`` rather than ``pending-import``.
+    ``imported`` rather than ``pending-import``. ``restore_via`` maps
+    ``(api_path, identifiers)`` to the direct-API restore verdict
+    (``create``/``configure``/``claim`` or an ``unrestorable: reason``)
+    so the manifest answers both questions: will Terraform import it,
+    and will the API rebuild it.
     """
+    restore_lookup = restore_via or {}
     objects: list[dict[str, Any]] = []
     imported = 0
     for asset in captured:
         in_state = asset.address in state_addresses
         imported += in_state
-        objects.append(
-            {
-                "address": asset.address,
-                "api_path": asset.api_path,
-                "import_id": asset.import_id,
-                "status": STATUS_IMPORTED if in_state else STATUS_PENDING_IMPORT,
-            }
-        )
-    for entry in unsupported_payload(unsupported):
-        objects.append({"status": STATUS_UNSUPPORTED, **entry})
+        entry = {
+            "address": asset.address,
+            "api_path": asset.api_path,
+            "import_id": asset.import_id,
+            "status": STATUS_IMPORTED if in_state else STATUS_PENDING_IMPORT,
+        }
+        verdict = restore_lookup.get((asset.api_path, asset.identifiers))
+        if verdict is not None:
+            entry["restore_via"] = verdict
+        objects.append(entry)
+    for raw, entry in zip(unsupported, unsupported_payload(unsupported)):
+        record = {"status": STATUS_UNSUPPORTED, **entry}
+        verdict = restore_lookup.get((raw.api_path, raw.identifiers))
+        if verdict is not None:
+            record["restore_via"] = verdict
+        objects.append(record)
     total = len(objects)
     covered = len(captured)
     return {
