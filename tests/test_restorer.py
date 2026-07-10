@@ -458,6 +458,8 @@ def test_rewrite_reference_edges() -> None:
 
     # Non-string reference values (fixed-slot numbers) pass through.
     assert rewrite_references({"vlanId": 5}, {}, frozenset()) == {"vlanId": 5}
+    # Non-string, non-reference scalars pass through untouched.
+    assert rewrite_references({"count": 5}, {}, frozenset()) == {"count": 5}
     # Unknown GRP ids are data, not references.
     assert rewrite_references(
         {"rule": "allow GRP(999)"}, {}, frozenset({"1"})
@@ -824,6 +826,25 @@ def test_drill_mode_skips_objects_referencing_production_serials(
     assert any(
         "production hardware serial" in e["reason"] for e in result.skipped
     )
+
+
+def test_references_serials_checks_path_values_and_empty_sets() -> None:
+    from meraki2tf.restorer import RestoreAction, _references_serials
+    from meraki2tf.spec.engine import OperationSpec
+
+    op = OperationSpec(
+        operation_id="updateNetworkSnmp",
+        method="put",
+        path=SNMP_PATH,
+        path_params=("networkId",),
+        tags=("networks",),
+    )
+    action = RestoreAction(
+        kind="configure", wave=4, api_path=SNMP_PATH,
+        path_values=("Q2AB-CDEF-GHIJ",), operation=op,
+    )
+    assert _references_serials(action, frozenset()) is False
+    assert _references_serials(action, frozenset({"Q2AB-CDEF-GHIJ"})) is True
 
 
 # ------------------------------------------------------------- journal

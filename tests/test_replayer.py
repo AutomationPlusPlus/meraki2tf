@@ -279,6 +279,29 @@ def test_plan_replay_reports_masked_nested_secrets(
     assert "--sanitize" in item.reason
 
 
+def test_plan_replay_skips_fully_redacted_objects(
+    spec_parser: OpenApiParser,
+) -> None:
+    graph = _graph(
+        FeatureConfiguration(VLAN_PATH, ("N_1", "10"), {"psk": REDACTED})
+    )
+    report = _report(
+        unsupported=(UnsupportedAsset(VLAN_PATH, "no match", ("N_1", "10")),)
+    )
+    actions, skipped = plan_replay(graph, report, spec_parser)
+    assert actions == ()
+    (item,) = skipped
+    assert "unsanitized snapshot" in item.reason
+
+
+def test_split_redacted_strips_redacted_list_items() -> None:
+    from meraki2tf.replayer import split_redacted
+
+    clean, redacted = split_redacted({"chain": [REDACTED, "cert-a"]})
+    assert clean == {"chain": ["cert-a"]}
+    assert redacted == ("chain[]",)
+
+
 def test_plan_replay_object_strips_redacted_values(
     spec_parser: OpenApiParser,
 ) -> None:

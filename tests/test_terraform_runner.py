@@ -981,10 +981,19 @@ def test_remove_resources_prunes_baseline_and_state(
         BASELINE, encoding="utf-8"
     )
     _write_state(runner.state_path, "meraki_networks.n_1", "meraki_devices.q2ab")
-    fake = FakeSubprocess(returncode=0)
+    backup = runner.state_path.with_name(runner.state_path.name + ".backup")
+
+    def write_backup() -> None:
+        backup.write_text("{}", encoding="utf-8")
+        backup.chmod(0o644)  # terraform writes with umask defaults
+
+    fake = FakeSubprocess(returncode=0, on_run=write_backup)
     monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
 
     runner.remove_resources({"meraki_networks.n_1", "meraki_networks.oneliner"})
+
+    # The full-state backup is secret material like the state itself.
+    assert (backup.stat().st_mode & 0o777) == 0o600
 
     content = (runner.workdir / AGGREGATED_CONFIG_FILENAME).read_text(encoding="utf-8")
     assert 'resource "meraki_networks" "n_1"' not in content
