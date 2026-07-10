@@ -181,3 +181,25 @@ def test_snapshot_v2_loader_tolerates_stray_lines(tmp_path: Path) -> None:
     loaded = StaticJsonDataProvider(path).fetch_network_graph()
     assert [n.network_id for n in loaded.networks] == ["N_1"]
     assert loaded.devices == () and loaded.features == ()
+
+
+def test_snapshot_v2_survives_payload_key_named_kind(tmp_path: Path) -> None:
+    """A payload field named "kind" must not overwrite the record
+    discriminator — the reader would silently drop the whole object
+    from the DR snapshot."""
+    from meraki2tf.models import MerakiNetwork, NetworkGraph
+
+    graph = NetworkGraph(
+        organization_id="org-123",
+        networks=(
+            MerakiNetwork.from_payload(
+                {"id": "N_1", "organizationId": "org-123", "name": "HQ",
+                 "productTypes": ["wireless"], "kind": "template-child"}
+            ),
+        ),
+        devices=(),
+        features=(),
+    )
+    path = write_snapshot(graph, tmp_path / "kindful.jsonl")
+    loaded = StaticJsonDataProvider(path).fetch_network_graph()
+    assert [n.network_id for n in loaded.networks] == ["N_1"]

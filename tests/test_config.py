@@ -106,7 +106,11 @@ def test_backend_config_file_leads_init_args_and_skips_required_check() -> None:
     assert backend.init_args()[0] == "-backend-config=azure.tfbackend"
 
 
-@pytest.mark.parametrize("secret_key", ["access_key", "sas_token", "client_secret"])
+@pytest.mark.parametrize(
+    "secret_key",
+    ["access_key", "sas_token", "client_secret", "oidc_token",
+     "oidc_request_token"],
+)
 def test_backend_config_rejects_credential_keys(secret_key: str) -> None:
     with pytest.raises(BackendConfigError, match="credential"):
         _config([*_AZURERM_MIN, "--backend-config", f"{secret_key}=super-secret"])

@@ -117,8 +117,11 @@ def _write_snapshot_v2(graph: NetworkGraph, path: Path) -> None:
             handle.write(
                 json.dumps(
                     {
-                        "kind": "network",
+                        # Spread first: a payload key named "kind" must
+                        # never overwrite the record discriminator (the
+                        # reader silently drops unknown kinds).
                         **dict(network.payload),
+                        "kind": "network",
                         "id": network.network_id,
                         "organizationId": network.organization_id,
                         "name": network.name,
@@ -131,8 +134,8 @@ def _write_snapshot_v2(graph: NetworkGraph, path: Path) -> None:
             handle.write(
                 json.dumps(
                     {
-                        "kind": "device",
                         **dict(device.payload),
+                        "kind": "device",
                         "serial": device.serial,
                         "networkId": device.network_id,
                         "model": device.model,

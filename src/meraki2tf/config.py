@@ -46,6 +46,8 @@ SECRET_BACKEND_KEYS = frozenset(
         "client_certificate_password",
         "secret_key",
         "password",
+        "oidc_token",
+        "oidc_request_token",
     }
 )
 

@@ -53,6 +53,19 @@ def test_redact_payload_leaves_non_string_and_empty_secret_values() -> None:
     assert clean == {"tokenCount": 4, "psk": ""}
 
 
+def test_redact_payload_masks_pem_blocks_under_any_key() -> None:
+    """The sanitizer treats PEM private-key blocks as secrets regardless
+    of the key name (RADSEC/custom certs live under `certificate`); the
+    world-readable runbook must apply the same rule."""
+    pem = "-----BEGIN PRIVATE KEY-----\nMIIB...\n-----END PRIVATE KEY-----"
+    clean = redact_payload(
+        {"certificate": pem, "chain": [{"contents": pem}], "name": "radsec"}
+    )
+    assert clean["certificate"] == REDACTED
+    assert clean["chain"][0]["contents"] == REDACTED
+    assert clean["name"] == "radsec"
+
+
 def test_secret_payload_keys_detects_only_valued_string_secrets() -> None:
     keys = secret_payload_keys(
         {"psk": "s", "communityString": "c", "password": "", "name": "x", "port": 1}
