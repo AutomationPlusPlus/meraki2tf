@@ -83,6 +83,10 @@ _SDK_MAXIMUM_RETRIES = 10
 #: does not apply to that scope".
 _THROTTLE_HTTP_STATUSES = frozenset({429})
 _SERVER_ERROR_HTTP_STATUSES = frozenset({500, 502, 503, 504})
+#: Auth refusals are in the "refused" class too: a key rotated mid-sweep
+#: or an admin scope that 403s an endpoint every week must surface as a
+#: coverage gap, never read as "this feature does not apply".
+_AUTH_HTTP_STATUSES = frozenset({401, 403})
 
 
 def _scope_label(params: dict[str, str]) -> str:
@@ -321,18 +325,57 @@ class LiveApiDataProvider(MerakiDataProvider):
             # surface in today's spec folds, hence uncoverable.
             if not _folds_elsewhere(op)  # pragma: no branch
         ]
+        # Collection paths this run actually queried (or captures
+        # first-class via folding): a nested op whose parent collection
+        # is in this set and simply yielded zero elements is genuine
+        # emptiness; one whose parent collection was never queryable at
+        # all is a structural blind spot that must be reported, not
+        # silently skipped (Cardinal Rule 2).
+        queried_paths = {op.path for op, _ in level}
+        queried_paths.update(
+            op.path
+            for op in parser.endpoints()
+            if op.method == "get" and _folds_elsewhere(op)
+        )
         for _, level_ops in itertools.groupby(
             nested_ops, key=lambda op: len(op.path_params)
         ):
             nested_level: list[tuple[OperationSpec, tuple[str, ...]]] = []
             for op in level_ops:
                 parent = parent_item_path(op.path)
-                nested_level.extend(
-                    (op, feature.path_values)
+                scopes = [
+                    feature.path_values
                     for feature in features
                     if feature.api_path == parent
                     and len(feature.path_values) == len(op.path_params)
-                )
+                ]
+                if scopes:
+                    nested_level.extend((op, values) for values in scopes)
+                    continue
+                parent_collection = parent.rsplit("/", 1)[0]
+                if parent_collection not in queried_paths:
+                    logger.warning(
+                        "Nested surface %s cannot be swept: its parent "
+                        "collection %s is not discoverable (read-only or "
+                        "filtered out); recorded as a coverage gap — any "
+                        "configuration there must be verified manually.",
+                        op.path, parent_collection,
+                    )
+                    features.append(
+                        FeatureConfiguration(
+                            api_path=op.path,
+                            path_values=(),
+                            payload={
+                                UNREADABLE_MARKER: (
+                                    "parent collection "
+                                    f"{parent_collection} is not "
+                                    "discoverable, so this surface was "
+                                    "never queried"
+                                )
+                            },
+                        )
+                    )
+            queried_paths.update(op.path for op, _ in nested_level)
             _run_level(nested_level)
         return features
 
@@ -401,6 +444,15 @@ class LiveApiDataProvider(MerakiDataProvider):
                 if status in _SERVER_ERROR_HTTP_STATUSES:
                     raise _EndpointUnreadable(
                         f"HTTP {status} from the Meraki API after every retry"
+                    ) from exc
+                if status in _AUTH_HTTP_STATUSES:
+                    # Not "feature does not apply": a rotated key or a
+                    # scope-limited admin would otherwise vanish whole
+                    # endpoints from the snapshot behind a success
+                    # notification.
+                    raise _EndpointUnreadable(
+                        f"HTTP {status}: the API key was refused for this "
+                        "endpoint (rotated key or missing admin scope)"
                     ) from exc
                 logger.debug(
                     "Feature endpoint %s unavailable for %s: %s",

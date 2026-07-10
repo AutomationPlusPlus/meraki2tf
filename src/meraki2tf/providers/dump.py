@@ -93,7 +93,8 @@ def _load_snapshot_document(path: "Path") -> Any:
     """
     from meraki2tf.snapshot import SNAPSHOT_V2_MARKER
 
-    raw = path.open("rb").read(2)
+    with path.open("rb") as sniff:
+        raw = sniff.read(2)
     opener = gzip.open if raw == _GZIP_MAGIC else open
     with opener(path, "rt", encoding="utf-8") as handle:
         first = handle.readline()
@@ -106,6 +107,7 @@ def _load_snapshot_document(path: "Path") -> Any:
             devices: list[Any] = []
             features: list[Any] = []
             buckets = {"network": networks, "device": devices, "feature": features}
+            dropped = 0
             for line in handle:
                 if not line.strip():
                     continue
@@ -116,6 +118,18 @@ def _load_snapshot_document(path: "Path") -> Any:
                 bucket = buckets.get(str(kind))
                 if bucket is not None:
                     bucket.append(record)
+                else:
+                    dropped += 1
+            if dropped:
+                # Silent record loss from the DR snapshot is the worst
+                # failure mode — an unknown kind means a newer writer or
+                # a corrupted stream, and the operator must know.
+                logger.warning(
+                    "Snapshot %s carries %d record(s) of unknown kind; "
+                    "they were ignored. The snapshot may come from a "
+                    "newer meraki2tf version.",
+                    path, dropped,
+                )
             return {
                 "organizationId": head.get("organizationId"),
                 "networks": networks,

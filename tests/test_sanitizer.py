@@ -456,3 +456,45 @@ def test_network_and_device_payloads_are_sanitized() -> None:
     assert dev_payload["communitySecret"] == REDACTED
     # Raw identifiers never survive in the payloads.
     assert "N_1" not in str(net_payload) and "QAAA-0001" not in str(dev_payload)
+
+
+def test_known_ids_are_mapped_inside_comma_lists_and_free_text() -> None:
+    """Structural IDs must not leak just because they sit inside a
+    comma-separated list element or a free-text sentence — a real
+    network ID anywhere in a shared snapshot identifies the tenant."""
+    graph = NetworkGraph(
+        "org-123", (MerakiNetwork("N_123456789012345", "org-123", "HQ", ()),), (),
+        (
+            FeatureConfiguration(
+                "/networks/{networkId}/appliance/firewall/l3FirewallRules",
+                ("N_123456789012345",),
+                {
+                    "objects": "N_123456789012345, other",
+                    "comment": "temp rule for N_123456789012345 cutover",
+                },
+            ),
+        ),
+    )
+    payload = sanitize_graph(graph).features[0].payload
+    raw = str(payload)
+    assert "N_123456789012345" not in raw
+    assert payload["objects"].startswith("net-0001, ")
+    assert "net-0001" in payload["comment"]
+
+
+def test_fqdns_embedded_in_free_text_are_pseudonymized() -> None:
+    """The docstring promises FQDN scrubbing wherever hostnames appear;
+    rule comments are a common home for internal DC names."""
+    graph = NetworkGraph(
+        "org-123", (), (),
+        (
+            FeatureConfiguration(
+                "/networks/{networkId}/appliance/firewall/l3FirewallRules",
+                ("N_1",),
+                {"comment": "allow AD to dc01.corp.example from HQ"},
+            ),
+        ),
+    )
+    payload = sanitize_graph(graph).features[0].payload
+    assert "dc01.corp.example" not in payload["comment"]
+    assert "allow AD to host-" in payload["comment"]

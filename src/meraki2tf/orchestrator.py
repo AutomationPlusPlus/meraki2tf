@@ -478,7 +478,13 @@ class PipelineOrchestrator:
                     "Provider cannot express this configuration: "
                     f"{plan.dropped[asset.address]}"
                 )
-                identifiers = tuple(asset.import_id.split(","))
+                # Raw path values, not the import ID: the import ID may
+                # carry injected org-prefix/force_delete components, and
+                # the coverage manifest's restore_via join is keyed on
+                # the discovered path values.
+                identifiers = asset.identifiers or tuple(
+                    asset.import_id.split(",")
+                )
                 flagged.append(
                     UnsupportedAsset(
                         api_path=asset.api_path,
@@ -542,8 +548,28 @@ class PipelineOrchestrator:
         Alert-only by default: an accidental clickops deletion must not
         quietly poison the rebuild baseline, so nothing is removed until
         a human passes ``--confirm-deletions``.
+
+        Resources whose endpoint could not be *read* this run are
+        indistinguishable from deletions by absence alone — a transient
+        5xx during discovery must not flag (or, worse, remove via
+        ``--confirm-deletions``) hundreds of live objects. Tracked
+        resources of unreadable types are therefore exempt until a run
+        that reads their endpoint cleanly.
         """
-        deleted = existing - report.captured_addresses
+        missing = existing - report.captured_addresses
+        deleted = frozenset(
+            address
+            for address in missing
+            if address.split(".", 1)[0] not in report.unreadable_types
+        )
+        exempt = missing - deleted
+        if exempt:
+            logger.warning(
+                "%d state-tracked resource(s) were not discovered, but "
+                "their endpoint(s) were unreadable this run — deletion "
+                "review is deferred until the endpoint reads cleanly: %s",
+                len(exempt), ", ".join(sorted(exempt)),
+            )
         if not deleted:
             return (), ()
         if self._confirm_deletions:

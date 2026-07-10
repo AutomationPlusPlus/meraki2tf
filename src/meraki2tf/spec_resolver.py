@@ -66,6 +66,12 @@ def _version_of(document: dict[str, Any]) -> str | None:
     return str(version) if version else None
 
 
+def _has_paths(document: dict[str, Any]) -> bool:
+    """Structural sanity: a JSON object without a ``paths`` object (an
+    API error body, a wrong file) parses fine but kills ingestion."""
+    return isinstance(document.get("paths"), dict)
+
+
 def _local_version(path: Path) -> str | None:
     try:
         return _version_of(_parse_spec(path.read_text(encoding="utf-8"), str(path)))
@@ -87,7 +93,8 @@ def resolve_spec(spec_path: Path | None, remote_url: str = SPEC_REMOTE_URL) -> P
         local_version = _local_version(path)
         try:
             remote_text = _download(remote_url)
-            remote_version = _version_of(_parse_spec(remote_text, remote_url))
+            remote_document = _parse_spec(remote_text, remote_url)
+            remote_version = _version_of(remote_document)
         except SpecResolutionError as exc:
             logger.warning(
                 "Could not check GitHub for a newer spec (%s); using local %s.",
@@ -96,6 +103,16 @@ def resolve_spec(spec_path: Path | None, remote_url: str = SPEC_REMOTE_URL) -> P
             return path
         if local_version is not None and local_version == remote_version:
             logger.info("Spec %s is already the latest release (%s).", path, local_version)
+            return path
+        if not _has_paths(remote_document):
+            # Never clobber a known-good local spec with a document
+            # that would fail ingestion — the good copy would be gone
+            # and every scheduled run after would re-download the same
+            # broken one.
+            logger.warning(
+                "Remote spec from %s parses but carries no 'paths' "
+                "object; keeping the local %s.", remote_url, path,
+            )
             return path
         path.write_text(remote_text, encoding="utf-8")
         logger.info(
@@ -106,7 +123,12 @@ def resolve_spec(spec_path: Path | None, remote_url: str = SPEC_REMOTE_URL) -> P
 
     logger.info("Spec %s not found; downloading the latest release from GitHub.", path)
     remote_text = _download(remote_url)
-    _parse_spec(remote_text, remote_url)  # never write an unparseable document
+    # Never write an unparseable or structurally empty document.
+    if not _has_paths(_parse_spec(remote_text, remote_url)):
+        raise SpecResolutionError(
+            f"Spec from {remote_url} carries no 'paths' object; refusing "
+            "to write it."
+        )
     path.write_text(remote_text, encoding="utf-8")
     logger.info("Downloaded latest spec release to %s.", path)
     return path

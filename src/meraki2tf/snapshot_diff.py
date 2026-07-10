@@ -38,6 +38,7 @@ from meraki2tf.models import (
 )
 from meraki2tf.openapi_parser import OpenApiParser
 from meraki2tf.plan_reconciler import deep_json_equal
+from meraki2tf.replayer import _collection_items
 from meraki2tf.runbook import write_operations
 
 logger = logging.getLogger(__name__)
@@ -115,9 +116,15 @@ def diff_graphs(
             # An unreadable endpoint has no comparable content; its gap
             # is already reported through the coverage manifest.
             continue
-        changed = _payload_changes(
-            old.payload, feature.payload, writable.get(feature.api_path)
-        )
+        allowed = writable.get(feature.api_path)
+        if allowed is not None and feature.api_path == DEVICE_PSEUDO_PATH:
+            # A device re-homed to another network is restore-relevant
+            # drift (the claim wave depends on membership), but the
+            # device PUT schema doesn't carry networkId — claims are a
+            # separate endpoint — so the writable filter would silence
+            # every clickops device move.
+            allowed = allowed | {"networkId"}
+        changed = _payload_changes(old.payload, feature.payload, allowed)
         if changed:
             modified.append(
                 AssetDiff(
@@ -208,6 +215,16 @@ def _payload_changes(
             if _values_equal(before, after)
             else {"<payload>": (before, after)}
         )
+    before_items = _collection_items(before)
+    after_items = _collection_items(after)
+    if before_items is not None and after_items is not None:
+        # Whole-collection assets are stored under the invented `items`
+        # envelope, which never appears in a write schema (the write
+        # body names its sole array property, e.g. `_json`) — filtering
+        # by writable fields would silence ALL drift on this class.
+        if _values_equal(before_items, after_items):
+            return {}
+        return {"items": (before_items, after_items)}
     changed: dict[str, tuple[Any, Any]] = {}
     for key in sorted(set(before) | set(after)):
         if writable is not None and key not in writable:

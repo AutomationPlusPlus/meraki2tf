@@ -98,6 +98,11 @@ _STRUCTURAL_KEYS = {
     "serials": "dev",
 }
 _PATH_PARAM = re.compile(r"\{([^}]+)\}")
+#: Token shape for the known-ID scan over free text: Meraki structural
+#: IDs (org/network IDs, serials, opaque item IDs) are word-and-dash
+#: strings, so token-wise dict lookup replaces them without the cost of
+#: an alternation regex over the whole ID map.
+_ID_TOKEN = re.compile(r"[\w-]+")
 #: Payload keys that reference other objects by opaque ID (``id``,
 #: ``interfaceId``, ``policyIds`` — but not words merely ending in "id"
 #: like ``ssid``). Their values are identifying and must map like any
@@ -284,8 +289,15 @@ class _GraphSanitizer:
             return _pseudonym("url", value)
         if _FQDN_VALUE.fullmatch(value):
             return _pseudonym("host", value)
-        # IPs and MACs are rewritten even when embedded in free text
-        # (e.g. DHCP option strings like `MCIPADD=10.0.0.1,MCPORT=…`).
+        # Known structural IDs, FQDNs, IPs, and MACs are rewritten even
+        # when embedded in free text (rule comments name networks and
+        # hosts; DHCP option strings carry `MCIPADD=10.0.0.1,MCPORT=…`).
+        value = _ID_TOKEN.sub(
+            lambda m: self._id_map.get(m.group(0), m.group(0)), value
+        )
+        value = _FQDN_VALUE.sub(
+            lambda m: _pseudonym("host", m.group(0)), value
+        )
         value = _IPV4_VALUE.sub(
             lambda m: _fake_ip(m.group(0), m.group("prefix") or ""), value
         )

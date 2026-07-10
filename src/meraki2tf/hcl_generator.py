@@ -103,6 +103,11 @@ class GenerationReport:
     #: Every capturable asset with its resolved address — the coverage
     #: manifest's raw material and the deletion detector's reference set.
     captured: tuple[CapturedAsset, ...] = ()
+    #: Terraform resource types whose endpoint(s) could not be read
+    #: during discovery. Their objects are absent from ``captured``
+    #: without being absent from Meraki, so the deletion detector must
+    #: not treat state-tracked resources of these types as deleted.
+    unreadable_types: frozenset[str] = frozenset()
 
     @property
     def captured_addresses(self) -> frozenset[str]:
@@ -173,8 +178,12 @@ class HclImportGenerator:
         unsupported: list[UnsupportedAsset] = []
         skipped_existing = 0
 
+        unreadable_types: set[str] = set()
         for candidate in self._candidates(graph):
             if candidate.unreadable is not None:
+                unreadable_match = matches.get(candidate.api_path)
+                if unreadable_match is not None:
+                    unreadable_types.add(unreadable_match.terraform_name)
                 unsupported.append(
                     self._flag(
                         candidate,
@@ -285,6 +294,7 @@ class HclImportGenerator:
             unsupported=tuple(unsupported),
             skipped_existing=skipped_existing,
             captured=tuple(captured),
+            unreadable_types=frozenset(unreadable_types),
         )
 
     @staticmethod

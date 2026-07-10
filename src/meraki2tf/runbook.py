@@ -49,8 +49,11 @@ _WRITE_METHOD_PRECEDENCE = ("put", "post")
 def redact_payload(value: Any) -> Any:
     """Deep-copy ``value`` with every secret-keyed field redacted.
 
-    Key-name detection matches the sanitizer's, so the runbook and
-    shared snapshots agree on what counts as a credential.
+    Detection matches the sanitizer's, so the runbook and shared
+    snapshots agree on what counts as a credential: secret-shaped key
+    names, plus PEM private-key blocks by *value* — those hide under
+    non-secret-shaped keys like ``certificate``, and the runbook is a
+    world-readable artifact.
     """
     if isinstance(value, Mapping):
         return {
@@ -63,6 +66,8 @@ def redact_payload(value: Any) -> Any:
         }
     if isinstance(value, (list, tuple)):
         return [redact_payload(item) for item in value]
+    if isinstance(value, str) and "PRIVATE KEY-----" in value:
+        return REDACTED
     return value
 
 

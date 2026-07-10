@@ -170,6 +170,35 @@ def test_dump_to_exports_snapshot_without_running_terraform(
     )
 
 
+def test_dump_to_failure_dispatches_processing_fault(
+    spec_file: Path,
+    dump_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The weekly DR job is a --dump-to invocation; a failed export must
+    reach the notification channels, not just the local log."""
+    delivered: list[dict[str, Any]] = []
+
+    def fake_urlopen(request: urllib.request.Request, timeout: float) -> FakeResponse:
+        delivered.append(json.loads(request.data.decode("utf-8")))
+        return FakeResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    _no_network(monkeypatch)
+    out = tmp_path / "already-a-directory"
+    out.mkdir()  # write_snapshot cannot write text over a directory
+
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(dump_file),
+         "--dump-to", str(out), "--webhook-url", "https://hooks.example/dr"]
+    )
+
+    assert exit_code == 1
+    assert [event["event_type"] for event in delivered] == ["PROCESSING_FAULT"]
+    assert "--dump-to" in delivered[0]["details"]["stage"]
+
+
 def test_dump_to_with_sanitize_strips_identity(
     spec_file: Path,
     dump_file: Path,
@@ -1374,6 +1403,20 @@ def test_restore_refuses_the_source_organization(
     assert exit_code == 2
 
 
+def test_restore_rejects_org_id_override(
+    spec_file: Path, tmp_path: Path
+) -> None:
+    """--org-id would replace the snapshot's recorded source org — the
+    value the never-restore-into-the-source-org interlock compares
+    against — so the combination is refused outright."""
+    dump = _restore_dump(tmp_path)
+    with pytest.raises(SystemExit):
+        main(
+            ["--spec", str(spec_file), "--restore", "--from-dump", str(dump),
+             "--target-org", "org-123", "--org-id", "org-999"]
+        )
+
+
 def test_restore_preview_writes_nothing(
     spec_file: Path,
     tmp_path: Path,
@@ -1632,6 +1675,11 @@ def _install_wipe_dashboard(
         ) -> list:
             return [{"serial": f"Q{i}"} for i in range(devices)]
 
+        def getOrganizationInventoryDevices(
+            self, organizationId: str, total_pages: str = "all"
+        ) -> list:
+            return [{"serial": f"Q{i}"} for i in range(devices)]
+
         def getOrganizationNetworks(
             self, organizationId: str, total_pages: str = "all"
         ) -> list:
@@ -1818,6 +1866,11 @@ def test_wipe_confirm_reports_failures_nonzero(
             return {"id": organizationId, "name": "Drill Org"}
 
         def getOrganizationDevices(
+            self, organizationId: str, total_pages: str = "all"
+        ) -> list:
+            return []
+
+        def getOrganizationInventoryDevices(
             self, organizationId: str, total_pages: str = "all"
         ) -> list:
             return []

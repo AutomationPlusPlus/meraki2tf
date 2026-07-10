@@ -31,6 +31,7 @@ from pathlib import Path
 from meraki2tf.alerts import (
     drift_detected,
     org_wipe_executed,
+    processing_fault,
     restore_executed,
     AlertDispatcher,
     EmailNotifier,
@@ -585,7 +586,10 @@ def _restore(config: RuntimeConfig) -> int:
         spec_parser = OpenApiParser(resolve_spec(config.spec_path))
         provider = StaticJsonDataProvider(config.dump_path, parser=spec_parser)
         with provider as source:
-            graph = source.fetch_network_graph(config.org_id)
+            # No org-ID override (the CLI refuses --org-id here): the
+            # graph's organization ID is the snapshot's recorded source
+            # org, which the target guard below depends on.
+            graph = source.fetch_network_graph(None)
     except Exception as exc:
         logger.critical("Restore could not load the snapshot: %s", exc)
         return 1
@@ -636,12 +640,22 @@ def _restore(config: RuntimeConfig) -> int:
             "Meraki dashboard API.", API_KEY_ENV_VAR,
         )
         return 1
-    journal = RestoreJournal(config.workdir / "restore-journal.jsonl")
+    from meraki2tf.restorer import RestoreJournalMismatchError
+
+    try:
+        journal = RestoreJournal(config.workdir / "restore-journal.jsonl")
+    except ValueError as exc:
+        logger.critical("Restore journal is unreadable: %s", exc)
+        return 2
     restorer = OrgRestorer(
         config.target_org, journal, serial_map=serial_map,
         skip_claims=config.skip_claims,
     )
-    result = restorer.execute(graph, plan)
+    try:
+        result = restorer.execute(graph, plan)
+    except RestoreJournalMismatchError as exc:
+        logger.critical("%s", exc)
+        return 2
     for key, reason in result.failed:
         logger.error("Restore FAILED for %s: %s", key, reason)
     for entry in result.skipped:
@@ -832,6 +846,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "--restore is a standalone DR action; do not combine it "
                 "with --rebuild or --replay-gaps."
             )
+        if config.org_id:
+            # The never-write-to-source interlock compares --target-org
+            # against the snapshot's *recorded* source organization; an
+            # --org-id override would replace that recorded value and
+            # let a restore target the very org the snapshot came from.
+            arg_parser.error(
+                "--org-id cannot be combined with --restore: the source "
+                "organization is read from the snapshot itself (the "
+                "never-restore-into-the-source-org check depends on it)."
+            )
         if (
             config.sync
             or config.confirm_deletions
@@ -919,7 +943,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         spec_parser = OpenApiParser(resolve_spec(config.spec_path))
         provider = build_provider(config, spec_parser)
         if config.dump_to is not None:
-            return _export_snapshot(provider, config, spec_parser)
+            # The weekly DR job is exactly this invocation; a
+            # mid-discovery failure must reach the notification
+            # channels, not just the local log (the contract's
+            # "critical script processing faults" trigger).
+            try:
+                return _export_snapshot(provider, config, spec_parser)
+            except Exception as exc:
+                logger.critical("Snapshot export failed: %s", exc)
+                build_dispatcher(config).dispatch(
+                    processing_fault(
+                        stage="snapshot export (--dump-to)", error=str(exc)
+                    )
+                )
+                return 1
         dispatcher = build_dispatcher(config)
         runner = TerraformRunner(
             config.workdir,

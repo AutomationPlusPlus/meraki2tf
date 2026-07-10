@@ -93,6 +93,10 @@ def test_unreadable_endpoint_is_audited_never_imported(
         event.event_type is EventType.UNSUPPORTED_FEATURE_FLAGGED
         for event in recorder.events
     )
+    # The mapped resource type is exempt from deletion detection this
+    # run: its objects are absent because the read failed, not because
+    # they left Meraki.
+    assert report.unreadable_types == frozenset({"meraki_appliance_vlan"})
 
 
 def test_suppressed_addresses_keep_capture_but_lose_import_blocks(

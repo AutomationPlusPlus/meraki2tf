@@ -144,6 +144,101 @@ def test_writable_field_filter_ignores_read_only_noise(tmp_path: Path) -> None:
     assert set(mod.changed) == {"name"}
 
 
+def test_envelope_collections_diff_despite_the_writable_filter(
+    tmp_path: Path,
+) -> None:
+    """Whole-collection assets live under the invented `items` key,
+    which never appears in a write schema (the write body names its
+    sole array property, e.g. `_json`); the writable filter must not
+    silence drift on this entire endpoint class."""
+    import json
+
+    from conftest import _op
+    from meraki2tf.openapi_parser import OpenApiParser
+
+    stages = "/networks/{networkId}/firmwareUpgrades/staged/stages"
+    put = _op("updateNetworkFirmwareUpgradesStagedStages", "networks")
+    put["requestBody"] = {
+        "content": {
+            "application/json": {
+                "schema": {"properties": {"_json": {"type": "array"}}}
+            }
+        }
+    }
+    spec = {
+        "openapi": "3.0.0",
+        "info": {"title": "t", "version": "1"},
+        "paths": {
+            stages: {
+                "get": _op("getNetworkFirmwareUpgradesStagedStages", "networks"),
+                "put": put,
+            },
+        },
+    }
+    path = tmp_path / "stages-spec.json"
+    path.write_text(json.dumps(spec), encoding="utf-8")
+    parser = OpenApiParser(path)
+
+    previous = _graph(
+        FeatureConfiguration(stages, ("N_1",), {"items": [{"group": "a"}]})
+    )
+    current = _graph(
+        FeatureConfiguration(
+            stages, ("N_1",), {"items": [{"group": "a"}, {"group": "b"}]}
+        )
+    )
+    (mod,) = diff_graphs(previous, current, parser).modified
+    assert "items" in mod.changed
+
+    assert diff_graphs(previous, previous, parser).is_empty
+
+
+def test_device_network_moves_are_drift(tmp_path: Path) -> None:
+    """networkId is not in the device PUT schema (claims are separate
+    endpoints), but a device re-homed between networks is exactly the
+    drift the restore's claim wave depends on."""
+    import json
+
+    from conftest import _op
+    from meraki2tf.openapi_parser import OpenApiParser
+
+    put = _op("updateDevice", "devices")
+    put["requestBody"] = {
+        "content": {
+            "application/json": {
+                "schema": {"properties": {"name": {"type": "string"}}}
+            }
+        }
+    }
+    spec = {
+        "openapi": "3.0.0",
+        "info": {"title": "t", "version": "1"},
+        "paths": {
+            "/devices/{serial}": {"get": _op("getDevice", "devices"),
+                                  "put": put},
+        },
+    }
+    path = tmp_path / "device-spec.json"
+    path.write_text(json.dumps(spec), encoding="utf-8")
+    parser = OpenApiParser(path)
+
+    previous = _graph()
+    current = NetworkGraph(
+        organization_id="org-123",
+        networks=previous.networks,
+        devices=(
+            MerakiDevice.from_payload(
+                {"serial": "Q2AB-CDEF-GHIJ", "networkId": "N_2",
+                 "model": "MX68", "name": "edge"}
+            ),
+        ),
+        features=(),
+    )
+    (mod,) = diff_graphs(previous, current, parser).modified
+    assert mod.api_path == "/devices/{serial}"
+    assert mod.changed["networkId"] == ("N_1", "N_2")
+
+
 def test_population_wide_key_additions_are_suppressed() -> None:
     """A new attribute appearing on EVERY modified asset of one path is
     a Meraki rollout, not operator drift."""

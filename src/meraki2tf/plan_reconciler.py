@@ -71,11 +71,15 @@ def hcl_quote(value: str) -> str:
 
 
 #: ``terraform plan -no-color`` diagnostic blocks:
-#: ``Error: <title>`` followed by ``  with <address>,``.
+#: ``Error: <title>`` followed by ``  with <address>,``. The gap
+#: between title and address must not run past the next ``Error:``
+#: line, or an address-less block (Duplicate Set Element, auth
+#: failures) steals the following block's address and garbles the
+#: operator-facing reason.
 _VALIDATION_ERROR_RE = re.compile(
     r"^Error: (?P<title>.+?)\n"
     r"\n"
-    r"(?:.*?\n)*?"
+    r"(?:(?!Error: ).*\n)*?"
     r"\s+with (?P<address>[A-Za-z0-9_.\[\]\"-]+),\n"
     r"(?P<rest>(?:.*\n?)*?)(?=^Error: |\Z)",
     re.MULTILINE,
@@ -90,8 +94,6 @@ _LIFECYCLE_IGNORE_RE = re.compile(
     r"^\s*lifecycle\s*\{\s*\n\s*ignore_changes\s*=\s*\[(?P<attrs>[^\]]*)\]\s*\n\s*\}\s*\n",
     re.MULTILINE,
 )
-
-_SCALAR_TYPES = (str, int, float, bool)
 
 
 @dataclass(frozen=True)
@@ -415,6 +417,7 @@ def classify_plan(document: Any) -> ReconciliationPlan:
             continue
         before_mask = body.get("before_sensitive")
         after_mask = body.get("after_sensitive")
+        after_unknown = body.get("after_unknown")
         secret_attrs: list[str] = []
         normalize_attrs: dict[str, Any] = {}
         inject_attrs: dict[str, Any] = {}
@@ -423,6 +426,13 @@ def classify_plan(document: Any) -> ReconciliationPlan:
             b_value, a_value = before.get(attr), after.get(attr)
             if b_value == a_value:
                 continue
+            if _mask_marks_within(_mask_subtree(after_unknown, attr)):
+                # "(known after apply)" — the plan omits the value from
+                # `after`, which would otherwise read as a generator
+                # omission; an unknown value is never a provable
+                # phantom, so the resource is real drift.
+                explainable = False
+                break
             sensitive = _attr_sensitive(before_mask, attr) or _attr_sensitive(
                 after_mask, attr
             )
@@ -436,11 +446,13 @@ def classify_plan(document: Any) -> ReconciliationPlan:
                 secret_attrs.append(attr)
             elif not sensitive_within and deep_json_equal(b_value, a_value):
                 normalize_attrs[attr] = b_value
-            elif (
-                a_value is None
-                and isinstance(b_value, _SCALAR_TYPES)
-                and not sensitive
-            ):
+            elif a_value is None and b_value == "" and not sensitive:
+                # Exactly the empty-string class: terraform's generator
+                # omits ""-valued attributes, so the provider reads ""
+                # while the config says null — a phantom. A NON-empty
+                # before with a null after means the value changed in
+                # Meraki after generation: genuine clickops drift that
+                # must alert, never be silently written into the config.
                 inject_attrs[attr] = b_value
             else:
                 explainable = False
