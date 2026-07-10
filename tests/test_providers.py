@@ -88,9 +88,9 @@ def live_provider(
         constructed.append(kwargs)
         assert kwargs["suppress_logging"] is True
         assert kwargs["print_console"] is False
-        # The org-wide rate budget is shared with other API consumers;
-        # the SDK must wait out 429s far past its 2-retry default.
-        assert kwargs["wait_on_rate_limit"] is True
+        # The primary client waits out 429s; worker clients turn SDK
+        # waiting OFF because the shared AIMD bucket owns all pacing.
+        assert kwargs["wait_on_rate_limit"] in (True, False)
         assert kwargs["maximum_retries"] == 10
         return FakeDashboard()
 
@@ -538,10 +538,42 @@ def test_try_call_skips_operations_already_known_undispatchable(
         if o.operation_id == "getOrganizationAdmins"
     )
     undispatchable = {op.operation_id}
+    lock, bucket, abort = _try_call_args()
     result = live_provider._try_call(
-        object(), op, {"organizationId": "org-123"}, undispatchable
+        op, {"organizationId": "org-123"}, undispatchable, lock, bucket, abort
     )
     assert result is None  # short-circuited, no dispatch attempted
+
+
+@pytest.fixture(autouse=True)
+def _instant_pacing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Discovery tests must not sleep on real AIMD pacing; the bucket's
+    own behavior is unit-tested in test_ratelimit.py."""
+    monkeypatch.setattr(
+        "meraki2tf.providers.live.AdaptiveTokenBucket", _NullBucket
+    )
+
+
+class _NullBucket:
+    """Pacing stub: tests must not sleep; throttle notifications counted."""
+
+    def __init__(self) -> None:
+        self.throttles = 0
+
+    def acquire(self) -> None:
+        pass
+
+    def on_success(self) -> None:
+        pass
+
+    def on_throttle(self) -> None:
+        self.throttles += 1
+
+
+def _try_call_args() -> tuple[Any, Any, Any]:
+    import threading
+
+    return threading.Lock(), _NullBucket(), threading.Event()
 
 
 class _FakeApiError(Exception):
@@ -552,19 +584,13 @@ class _FakeApiError(Exception):
         self.status = status
 
 
-def test_try_call_aborts_when_throttle_survives_every_backoff(
+def test_try_call_aborts_when_throttle_survives_paced_attempts(
     live_provider: LiveApiDataProvider,
     spec_parser: OpenApiParser,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A 429 that outlasts the SDK's waits AND the extended outer
-    backoffs is missing data, not an inapplicable feature — swallowing
-    it would ship a snapshot that is silently incomplete but looks
-    complete."""
-    sleeps: list[float] = []
-    monkeypatch.setattr(
-        "meraki2tf.providers.live.time.sleep", sleeps.append
-    )
+    """A 429 that outlasts the whole paced attempt budget is missing
+    data, not an inapplicable feature — swallowing it would ship a
+    snapshot that is silently incomplete but looks complete."""
     op = next(
         o for o in spec_parser.endpoints()
         if o.operation_id == "getOrganizationAdmins"
@@ -574,29 +600,23 @@ def test_try_call_aborts_when_throttle_survives_every_backoff(
         def getOrganizationAdmins(self, organizationId: str) -> list[dict[str, Any]]:
             raise _FakeApiError(429)
 
-    dashboard = types.SimpleNamespace(organizations=Throttled())
-    with pytest.raises(LiveRetryExhaustedError, match="HTTP 429"):
+    live_provider._client = types.SimpleNamespace(organizations=Throttled())
+    lock, bucket, abort = _try_call_args()
+    with pytest.raises(LiveRetryExhaustedError, match="paced attempts"):
         live_provider._try_call(
-            dashboard, op, {"organizationId": "org-123"}, set()
+            op, {"organizationId": "org-123"}, set(), lock, bucket, abort
         )
-    # Every extended pause was honored before giving up.
-    assert sleeps == [30.0, 60.0, 120.0]
+    from meraki2tf.providers.live import _MAX_THROTTLE_ATTEMPTS
+
+    assert bucket.throttles == _MAX_THROTTLE_ATTEMPTS
 
 
-def test_try_call_rides_out_throttle_bursts_with_outer_backoff(
+def test_try_call_rides_out_throttle_bursts_under_bucket_pacing(
     live_provider: LiveApiDataProvider,
     spec_parser: OpenApiParser,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Meraki answers 429 with Retry-After: 1, so the SDK's whole retry
-    budget burns in seconds — useless while another integration
-    saturates the shared org budget for minutes. The outer backoff must
-    wait out the burst and then succeed."""
-    sleeps: list[float] = []
-    monkeypatch.setattr(
-        "meraki2tf.providers.live.time.sleep", sleeps.append
-    )
+    """Throttles back the shared bucket off and retry under its pacing;
+    the burst passes and the call succeeds."""
     op = next(
         o for o in spec_parser.endpoints()
         if o.operation_id == "getOrganizationAdmins"
@@ -610,14 +630,39 @@ def test_try_call_rides_out_throttle_bursts_with_outer_backoff(
                 raise _FakeApiError(429)
             return [{"id": "A_1"}]
 
-    dashboard = types.SimpleNamespace(organizations=BurstThrottled())
-    with caplog.at_level("WARNING", logger="meraki2tf.providers.live"):
-        result = live_provider._try_call(
-            dashboard, op, {"organizationId": "org-123"}, set()
-        )
+    live_provider._client = types.SimpleNamespace(organizations=BurstThrottled())
+    lock, bucket, abort = _try_call_args()
+    result = live_provider._try_call(
+        op, {"organizationId": "org-123"}, set(), lock, bucket, abort
+    )
     assert result == [{"id": "A_1"}]
-    assert sleeps == [30.0, 60.0]
-    assert sum("still throttled" in r.message for r in caplog.records) == 2
+    assert bucket.throttles == 2
+
+
+def test_try_call_returns_nothing_once_aborted(
+    live_provider: LiveApiDataProvider,
+    spec_parser: OpenApiParser,
+) -> None:
+    """After a fatal failure elsewhere in the pool, workers stand down
+    immediately — the run is aborting, partial results are discarded."""
+    op = next(
+        o for o in spec_parser.endpoints()
+        if o.operation_id == "getOrganizationAdmins"
+    )
+    calls = {"n": 0}
+
+    class Counting:
+        def getOrganizationAdmins(self, organizationId: str) -> list[dict[str, Any]]:
+            calls["n"] += 1
+            return []
+
+    live_provider._client = types.SimpleNamespace(organizations=Counting())
+    lock, bucket, abort = _try_call_args()
+    abort.set()
+    assert live_provider._try_call(
+        op, {"organizationId": "org-123"}, set(), lock, bucket, abort
+    ) is None
+    assert calls["n"] == 0
 
 
 @pytest.mark.parametrize("status", [500, 502, 503, 504])
@@ -665,9 +710,10 @@ def test_try_call_still_skips_scope_refusals_with_status(
         def getOrganizationAdmins(self, organizationId: str) -> list[dict[str, Any]]:
             raise _FakeApiError(400)
 
-    dashboard = types.SimpleNamespace(organizations=Refusing())
+    live_provider._client = types.SimpleNamespace(organizations=Refusing())
+    lock, bucket, abort = _try_call_args()
     result = live_provider._try_call(
-        dashboard, op, {"organizationId": "org-123"}, set()
+        op, {"organizationId": "org-123"}, set(), lock, bucket, abort
     )
     assert result is None
 
@@ -855,3 +901,60 @@ def test_parent_item_path_and_nested_ordering(tmp_path: Path) -> None:
     assert [op.path for op in nested] == [
         "/networks/{networkId}/wireless/ssids/{number}/identityPsks"
     ]
+
+
+def test_pool_aborts_run_when_a_worker_exhausts_throttle_budget(
+    tmp_path: Path,
+) -> None:
+    """Fail fast and loud: one exhausted worker cancels the level and
+    the whole discovery aborts — a partial snapshot must never look
+    complete."""
+
+    class AlwaysThrottled:
+        def getNetworkWirelessSsids(self, networkId: str) -> list[dict[str, Any]]:
+            raise _FakeApiError(429)
+
+    class Organizations:
+        def getOrganizationNetworks(
+            self, organizationId: str, total_pages: str = "all"
+        ) -> list[dict[str, Any]]:
+            return [{"id": "N_1", "organizationId": organizationId}]
+
+        def getOrganizationDevices(
+            self, organizationId: str, total_pages: str = "all"
+        ) -> list[dict[str, Any]]:
+            return []
+
+    provider = LiveApiDataProvider(parser=OpenApiParser(_nested_spec(tmp_path)))
+    provider._client = types.SimpleNamespace(
+        organizations=Organizations(), wireless=AlwaysThrottled()
+    )
+    with pytest.raises(LiveRetryExhaustedError):
+        provider.fetch_network_graph("org-123")
+
+
+def test_empty_nested_level_is_a_noop(tmp_path: Path) -> None:
+    """A nested surface whose parent produced no elements dispatches
+    nothing (and manufactures no phantom coverage)."""
+
+    class Wireless:
+        def getNetworkWirelessSsids(self, networkId: str) -> list[dict[str, Any]]:
+            return []
+
+    class Organizations:
+        def getOrganizationNetworks(
+            self, organizationId: str, total_pages: str = "all"
+        ) -> list[dict[str, Any]]:
+            return [{"id": "N_1", "organizationId": organizationId}]
+
+        def getOrganizationDevices(
+            self, organizationId: str, total_pages: str = "all"
+        ) -> list[dict[str, Any]]:
+            return []
+
+    provider = LiveApiDataProvider(parser=OpenApiParser(_nested_spec(tmp_path)))
+    provider._client = types.SimpleNamespace(
+        organizations=Organizations(), wireless=Wireless()
+    )
+    graph = provider.fetch_network_graph("org-123")
+    assert graph.features == ()
