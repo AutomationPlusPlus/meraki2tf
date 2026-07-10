@@ -1368,6 +1368,22 @@ DUPLICATE_SET_STDERR = (
 )
 
 
+def test_plan_with_generation_supports_targeted_replans(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Heal/deferral replans narrow to the affected addresses — minutes
+    instead of re-reading the whole kit."""
+    runner.prepare_workspace()
+    scripted = ScriptedSubprocess((0, "No changes.", None))
+    monkeypatch.setattr(terraform_runner.subprocess, "run", scripted.run)
+    runner.plan_with_generation(
+        save_plan=True, targets=["meraki_networks.n_1"]
+    )
+    command = scripted.calls[0]
+    assert "-target=meraki_networks.n_1" in command
+    assert any(arg.startswith("-generate-config-out=") for arg in command)
+
+
 def test_plan_targeted_passes_target_flags_and_saves_the_plan(
     runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:

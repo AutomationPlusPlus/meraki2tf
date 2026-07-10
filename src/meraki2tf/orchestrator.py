@@ -650,13 +650,14 @@ class PipelineOrchestrator:
                 suppress_addresses=frozenset(plan.dropped),
             )
             plan = self._runner.plan_with_generation(
-                save_plan=True
+                save_plan=True,
+                targets=self._pending_targets(report, plan),
             ).merged_with_earlier(plan)
             regenerated.extend(modified)
             if not plan.has_drift:
                 return plan, report, tuple(regenerated), (), False
         plan, deferred, defer_aborted = self._defer_racy_pending(
-            plan, unsupported_details, tuple(regenerated), workspace
+            plan, report, unsupported_details, tuple(regenerated), workspace
         )
         if not defer_aborted:
             return plan, report, tuple(regenerated), deferred, False
@@ -677,9 +678,30 @@ class PipelineOrchestrator:
         )
         return plan, report, tuple(regenerated), deferred, True
 
+    def _pending_targets(
+        self,
+        report: GenerationReport,
+        plan: ReconciledPlanResult,
+        extra_excluded: tuple[str, ...] = (),
+    ) -> tuple[str, ...]:
+        """Addresses still pending import — the only resources a heal or
+        deferral replan needs to verify (the run's first, untargeted
+        plan already took the full-kit drift picture)."""
+        tracked = self._runner.existing_addresses()
+        excluded = set(plan.dropped) | set(extra_excluded)
+        return tuple(
+            sorted(
+                asset.address
+                for asset in report.captured
+                if asset.address not in tracked
+                and asset.address not in excluded
+            )
+        )
+
     def _defer_racy_pending(
         self,
         plan: ReconciledPlanResult,
+        report: GenerationReport,
         unsupported_details: list[dict[str, Any]],
         regenerated: tuple[str, ...],
         workspace: str,
@@ -739,7 +761,10 @@ class PipelineOrchestrator:
             self._runner.defer_resources(frozenset(racy))
             deferred.extend(racy)
             plan = self._runner.plan_with_generation(
-                save_plan=True
+                save_plan=True,
+                targets=self._pending_targets(
+                    report, plan, tuple(deferred)
+                ),
             ).merged_with_earlier(plan)
             if not plan.has_drift:
                 return plan, tuple(deferred), False

@@ -595,7 +595,10 @@ class TerraformRunner:
     _MAX_PLAN_ATTEMPTS = 10
 
     def plan_with_generation(
-        self, save_plan: bool = False, reconcile: bool = True
+        self,
+        save_plan: bool = False,
+        reconcile: bool = True,
+        targets: Iterable[str] | None = None,
     ) -> ReconciledPlanResult:
         """Speculative check: plan imports, generate missing config, and
         reconcile provider round-trip artifacts (see plan_reconciler).
@@ -603,10 +606,16 @@ class TerraformRunner:
         Returns with ``has_changes`` reflecting the ``-detailed-exitcode``
         contract (0 = state in sync, 2 = delta present). The plan is
         always saved to the sync plan file (reconciliation classifies it
-        via ``show -json``; sync mode re-verifies its own fresh plan
-        before applying regardless). Bounded loop: at most
-        ``_MAX_PLAN_ATTEMPTS`` plan invocations — remaining changes after
-        that are reported as drift, never looped on.
+        via ``show -json``; the guarded apply verifies the saved plan
+        document). Bounded loop: at most ``_MAX_PLAN_ATTEMPTS`` plan
+        invocations — remaining changes after that are reported as
+        drift, never looped on.
+
+        ``targets`` narrows the plan to the given resource addresses
+        (``-target``): after a heal or deferral touches a handful of
+        resources, re-verifying them takes minutes instead of re-reading
+        the entire kit for hours — the full-kit drift picture was
+        already taken by the run's first, untargeted plan.
         """
         dropped: dict[str, str] = {}
         ignored: dict[str, tuple[str, ...]] = {}
@@ -619,6 +628,7 @@ class TerraformRunner:
             "-detailed-exitcode",
             f"-generate-config-out={GENERATED_CONFIG_FILENAME}",
             f"-out={SYNC_PLAN_FILENAME}",
+            *(f"-target={address}" for address in targets or ()),
         )
         allowed = (
             (_PLAN_NO_CHANGES, _PLAN_ERROR, _PLAN_CHANGES_PRESENT)
