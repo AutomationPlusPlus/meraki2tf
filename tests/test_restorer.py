@@ -269,36 +269,113 @@ def test_render_restore_plan_lists_and_bounds_unrestorable(
 
 
 def test_rewrite_references_maps_ids_and_grammar() -> None:
-    from meraki2tf.restorer import rewrite_references
+    from meraki2tf.restorer import ReferenceResolver, rewrite_references
 
-    id_map = {"N_old": "N_new", "100": "200"}
-    known = frozenset({"N_old", "100", "GP_dangling"})
+    graph = _graph(
+        FeatureConfiguration(GP_ITEM, ("N_1", "100"), {"name": "kiosk"}),
+    )
+    resolver = ReferenceResolver(graph)
+    resolver.record("network", "N_1", "N_new")
+    resolver.record("grouppolicy", "100", "200", ("N_1",))
     payload = {
         "groupPolicyId": "100",
-        "hubIds": ["N_old"],
+        "hubIds": ["N_1"],
         "rule": "allow GRP(100) to any",
-        "comment": "mentions N_old only as data",
+        "comment": "mentions N_1 only as data",
         "nested": {"rfProfileId": "unrelated-string"},
     }
-    rewritten = rewrite_references(payload, id_map, known)
+    rewritten = rewrite_references(payload, resolver, ("N_1", "0"))
     assert rewritten["groupPolicyId"] == "200"
-    assert rewritten["hubIds"] == ["N_new"]
+    assert rewritten["hubIds"] == ["N_new"]  # network ref via flat-unique
     assert rewritten["rule"] == "allow GRP(200) to any"
     # Non-reference keys pass through even when they contain known IDs.
-    assert rewritten["comment"] == "mentions N_old only as data"
+    assert rewritten["comment"] == "mentions N_1 only as data"
     assert rewritten["nested"]["rfProfileId"] == "unrelated-string"
 
 
 def test_rewrite_references_fails_loudly_on_dangling_ids() -> None:
     import pytest as _pytest
 
-    from meraki2tf.restorer import UnmappedReferenceError, rewrite_references
+    from meraki2tf.restorer import (
+        ReferenceResolver,
+        UnmappedReferenceError,
+        rewrite_references,
+    )
 
-    known = frozenset({"GP_dangling", "42"})
+    graph = _graph(
+        FeatureConfiguration(GP_ITEM, ("N_1", "GP_dangling"), {"name": "x"}),
+        FeatureConfiguration(
+            "/organizations/{organizationId}/policyObjects/{policyObjectId}",
+            ("org-123", "42"),
+            {"name": "obj"},
+        ),
+    )
+    resolver = ReferenceResolver(graph)  # no rebuilt counterparts yet
     with _pytest.raises(UnmappedReferenceError):
-        rewrite_references({"groupPolicyId": "GP_dangling"}, {}, known)
+        rewrite_references(
+            {"groupPolicyId": "GP_dangling"}, resolver, ("N_1", "0")
+        )
     with _pytest.raises(UnmappedReferenceError):
-        rewrite_references({"rule": "deny OBJ(42)"}, {}, known)
+        rewrite_references({"rule": "deny OBJ(42)"}, resolver, ("N_1",))
+
+
+def test_resolver_scopes_colliding_ids_by_type() -> None:
+    """Group-policy IDs start at 100 and VLAN 100 is ubiquitous; the
+    old flat map remapped whichever was journaled last. Type stems keep
+    them apart, and an unscopable collision refuses to guess."""
+    import pytest as _pytest
+
+    from meraki2tf.restorer import (
+        ReferenceResolver,
+        UnmappedReferenceError,
+        rewrite_references,
+    )
+
+    graph = _graph(
+        FeatureConfiguration(GP_ITEM, ("N_1", "100"), {"name": "kiosk"}),
+        FeatureConfiguration(VLAN_ITEM, ("N_1", "100"), {"id": "100"}),
+    )
+    resolver = ReferenceResolver(graph)
+    resolver.record("grouppolicy", "100", "900", ("N_1",))
+    resolver.record("vlan", "100", "100", ("N_1",))
+
+    rewritten = rewrite_references(
+        {"groupPolicyId": "100", "vlanId": "100"}, resolver, ("N_1", "0")
+    )
+    assert rewritten == {"groupPolicyId": "900", "vlanId": "100"}
+    # A reference key naming no snapshot type cannot pick between the
+    # two colliding mappings — never guess.
+    with _pytest.raises(UnmappedReferenceError, match="ambiguous"):
+        rewrite_references({"policyIds": ["100"]}, resolver, ("N_1", "0"))
+
+
+def test_resolver_scopes_same_type_ids_by_parent_context() -> None:
+    """Two networks both hold group policy 100; a referrer resolves the
+    one under its own network, and a cross-parent reference refuses."""
+    import pytest as _pytest
+
+    from meraki2tf.restorer import (
+        ReferenceResolver,
+        UnmappedReferenceError,
+        rewrite_references,
+    )
+
+    graph = _graph(
+        FeatureConfiguration(GP_ITEM, ("N_1", "100"), {"name": "a"}),
+        FeatureConfiguration(GP_ITEM, ("N_2", "100"), {"name": "b"}),
+    )
+    resolver = ReferenceResolver(graph)
+    resolver.record("grouppolicy", "100", "900", ("N_1",))
+    resolver.record("grouppolicy", "100", "901", ("N_2",))
+
+    assert rewrite_references(
+        {"groupPolicyId": "100"}, resolver, ("N_1", "0")
+    ) == {"groupPolicyId": "900"}
+    assert rewrite_references(
+        {"groupPolicyId": "100"}, resolver, ("N_2", "0")
+    ) == {"groupPolicyId": "901"}
+    with _pytest.raises(UnmappedReferenceError):
+        rewrite_references({"groupPolicyId": "100"}, resolver, ("N_3",))
 
 
 def test_restore_journal_round_trips_and_resumes(tmp_path: Path) -> None:
@@ -453,16 +530,87 @@ def test_executor_reports_unmapped_references_per_object(
     assert any("no rebuilt counterpart" in reason for _, reason in result.failed)
 
 
-def test_rewrite_reference_edges() -> None:
-    from meraki2tf.restorer import rewrite_references
+def test_resolver_edge_cases() -> None:
+    import pytest as _pytest
 
+    from meraki2tf.models import (
+        MerakiDevice as _Device,
+        MerakiNetwork as _Network,
+        NetworkGraph as _NetworkGraph,
+    )
+    from meraki2tf.restorer import (
+        ReferenceResolver,
+        UnmappedReferenceError,
+    )
+
+    graph = _NetworkGraph(
+        "org-123",
+        (_Network("N_1", "org-123", "HQ", ()),),
+        # Empty identifiers are ignored, not registered.
+        (_Device("", "N_1", "MX68", "ghost"),),
+        (FeatureConfiguration(VLAN_ITEM, ("N_1", "100"), {"id": "100"}),),
+    )
+    resolver = ReferenceResolver(graph)
+
+    # Same stem, same old, two in-context targets: never guess.
+    resolver.record("grouppolicy", "9", "900", ("N_1",))
+    resolver.record("grouppolicy", "9", "901", ("N_1",))
+    with _pytest.raises(UnmappedReferenceError, match="ambiguous"):
+        resolver.resolve_reference("groupPolicyId", "9", ("N_1", "0"))
+
+    # A create's own identity is never a dangling reference — scoped
+    # (schema-kept VLAN id) and generic keys alike.
+    assert resolver.resolve_reference(
+        "vlanId", "100", ("N_1", "100"), exclude="100"
+    ) == "100"
+    assert resolver.resolve_reference(
+        "id", "N_1", ("N_1",), exclude="N_1"
+    ) == "N_1"
+
+    # Known-but-unmapped IDs raise even under type-less reference keys.
+    with _pytest.raises(UnmappedReferenceError, match="no rebuilt"):
+        resolver.resolve_reference("someIds", "N_1", ())
+
+    # Lenient path-parameter resolution: flat-unique wins (a config
+    # template ID used as a {networkId} scope), unknowns pass through.
+    resolver.record("configtemplate", "T_1", "T_NEW", ())
+    assert resolver.resolve_scope("networkId", "T_1", ("T_1",)) == "T_NEW"
+    assert resolver.resolve_scope("networkId", "N_x", ("N_x",)) == "N_x"
+
+
+def test_own_identity_covers_all_action_kinds(tmp_path: Path) -> None:
+    from meraki2tf.restorer import _own_identity
+
+    parser = _restore_spec(tmp_path)
+    plan = plan_restore(
+        _graph(FeatureConfiguration(GP_ITEM, ("N_1", "100"), {"name": "x"})),
+        parser,
+    )
+    by_kind = {action.kind: action for action in plan.actions}
+    assert _own_identity(by_kind["create"]) == (
+        ("network", "N_1")
+        if by_kind["create"].wave == WAVE_NETWORKS
+        else ("grouppolicy", "100")
+    )
+    assert _own_identity(by_kind["claim"]) == ("serial", "Q2AB-CDEF-GHIJ")
+    gp = next(a for a in plan.actions if a.api_path == GP_ITEM)
+    assert _own_identity(gp) == ("grouppolicy", "100")
+
+
+def test_rewrite_reference_edges() -> None:
+    from meraki2tf.models import NetworkGraph as _NetworkGraph
+    from meraki2tf.restorer import ReferenceResolver, rewrite_references
+
+    resolver = ReferenceResolver(
+        _NetworkGraph("org-123", (), (), ())
+    )
     # Non-string reference values (fixed-slot numbers) pass through.
-    assert rewrite_references({"vlanId": 5}, {}, frozenset()) == {"vlanId": 5}
+    assert rewrite_references({"vlanId": 5}, resolver, ()) == {"vlanId": 5}
     # Non-string, non-reference scalars pass through untouched.
-    assert rewrite_references({"count": 5}, {}, frozenset()) == {"count": 5}
+    assert rewrite_references({"count": 5}, resolver, ()) == {"count": 5}
     # Unknown GRP ids are data, not references.
     assert rewrite_references(
-        {"rule": "allow GRP(999)"}, {}, frozenset({"1"})
+        {"rule": "allow GRP(999)"}, resolver, ()
     ) == {"rule": "allow GRP(999)"}
 
 
@@ -845,6 +993,181 @@ def test_references_serials_checks_path_values_and_empty_sets() -> None:
     )
     assert _references_serials(action, frozenset()) is False
     assert _references_serials(action, frozenset({"Q2AB-CDEF-GHIJ"})) is True
+
+
+def test_attempted_creates_reconcile_by_name_instead_of_duplicating(
+    tmp_path: Path,
+) -> None:
+    """A crash between the API create and the journal append leaves an
+    attempted-but-not-done key; the resume must adopt the existing
+    object by name, not re-POST it (a duplicate network name 400 would
+    skip every child of the network)."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    parser = _restore_spec(tmp_path)
+    graph = _graph(FeatureConfiguration(SNMP_PATH, ("N_1",), {"access": "none"}))
+    plan = plan_restore(graph, parser)
+    network_key = "/organizations/{organizationId}/networks::N_1"
+
+    journal = RestoreJournal(tmp_path / "crashed.jsonl")
+    journal.bind(target="org-TARGET", source="org-123")
+    journal.record_attempt(network_key)  # the crashed run got this far
+
+    calls: list = []
+
+    class AdoptingSection(_RecordingSection):
+        def getOrganizationNetworks(
+            self, organizationId: str, total_pages: str = "all"
+        ) -> list[dict]:
+            self._calls.append(("getOrganizationNetworks", (organizationId,), {}))
+            return [
+                {"id": "L_EXIST", "name": "HQ"},
+                {"id": "L_OTHER", "name": "Branch"},
+            ]
+
+    section = AdoptingSection(calls)
+    restorer = OrgRestorer("org-TARGET", RestoreJournal(tmp_path / "crashed.jsonl"))
+    restorer._client = SimpleNamespace(organizations=section, networks=section)
+    result = restorer.execute(graph, plan)
+
+    assert result.failed == ()
+    ops = [c[0] for c in calls]
+    assert "createOrganizationNetwork" not in ops  # adopted, not re-created
+    assert "getOrganizationNetworks" in ops
+    # Children run against the adopted network's real ID.
+    claim = next(c for c in calls if c[0] == "claimNetworkDevices")
+    assert claim[1] == ("L_EXIST",)
+    snmp = next(c for c in calls if c[0] == "updateNetworkSnmp")
+    assert snmp[1] == ("L_EXIST",)
+    assert network_key in result.executed
+
+
+def test_unattempted_creates_never_pay_the_recovery_lookup(
+    tmp_path: Path,
+) -> None:
+    """A clean run must not read collections back before every create —
+    the write-ahead attempt record is what marks the crash window."""
+    parser = _restore_spec(tmp_path)
+    graph = _graph()
+    plan = plan_restore(graph, parser)
+    restorer, calls = _executor(tmp_path)
+    restorer.execute(graph, plan)
+
+    ops = [c[0] for c in calls]
+    assert "getOrganizationNetworks" not in ops
+    assert "createOrganizationNetwork" in ops
+    # The journal write-ahead is on disk: attempt precedes done.
+    lines = [
+        json.loads(line)
+        for line in (tmp_path / "journal.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        if line.strip()
+    ]
+    kinds = [record["kind"] for record in lines]
+    assert kinds.index("attempt") < kinds.index("done")
+
+
+def test_recovery_lookup_edge_branches(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    from meraki2tf.models import NetworkGraph as _NetworkGraph
+    from meraki2tf.restorer import (
+        OrgRestorer,
+        ReferenceResolver,
+        RestoreAction,
+        RestoreJournal,
+    )
+    from meraki2tf.spec.engine import OperationSpec
+
+    resolver = ReferenceResolver(_NetworkGraph("org-123", (), (), ()))
+    restorer = OrgRestorer("org-TARGET", RestoreJournal(tmp_path / "e.jsonl"))
+    lookup = OperationSpec(
+        operation_id="getNetworkGroupPolicies",
+        method="get",
+        path=GP_COLLECTION,
+        path_params=("networkId",),
+        tags=("networks",),
+    )
+
+    def action(**overrides: object) -> RestoreAction:
+        values = dict(
+            kind="create", wave=4, api_path=GP_ITEM,
+            path_values=("N_1", "100"), operation=lookup,
+            payload={"name": "kiosk"}, lookup=lookup,
+        )
+        values.update(overrides)
+        return RestoreAction(**values)  # type: ignore[arg-type]
+
+    dashboard = SimpleNamespace()
+
+    # No lookup op / no usable name → straight to the POST.
+    assert restorer._reconcile_existing(
+        dashboard, action(lookup=None), resolver, "org-123"
+    ) is None
+    assert restorer._reconcile_existing(
+        dashboard, action(payload={}), resolver, "org-123"
+    ) is None
+    # SDK without the lookup method → straight to the POST.
+    assert restorer._reconcile_existing(
+        dashboard, action(), resolver, "org-123"
+    ) is None
+
+    class Sections:
+        def getNetworkGroupPolicies(self, networkId: str) -> object:
+            raise RuntimeError("boom")
+
+    # Unreadable collection → straight to the POST.
+    assert restorer._reconcile_existing(
+        SimpleNamespace(networks=Sections()), action(), resolver, "org-123"
+    ) is None
+
+    class EnvelopeSections:
+        def getNetworkGroupPolicies(self, networkId: str) -> dict:
+            return {"items": [{"name": "kiosk", "groupPolicyId": "900",
+                               "id": "900"}]}
+
+    # Envelope listings unwrap; a unique name match adopts.
+    assert restorer._reconcile_existing(
+        SimpleNamespace(networks=EnvelopeSections()), action(),
+        resolver, "org-123",
+    ) == "900"
+
+
+def test_recovery_lookup_falls_back_to_the_create(tmp_path: Path) -> None:
+    """No unique name match (or an unreadable collection) proceeds with
+    the POST — worst case the API rejects one duplicate, as before."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    parser = _restore_spec(tmp_path)
+    graph = _graph()
+    plan = plan_restore(graph, parser)
+    network_key = "/organizations/{organizationId}/networks::N_1"
+
+    journal = RestoreJournal(tmp_path / "nomatch.jsonl")
+    journal.record_attempt(network_key)
+
+    calls: list = []
+
+    class NoMatchSection(_RecordingSection):
+        def getOrganizationNetworks(
+            self, organizationId: str, total_pages: str = "all"
+        ) -> list[dict]:
+            return []  # the crashed create never landed
+
+    section = NoMatchSection(calls)
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "nomatch.jsonl")
+    )
+    restorer._client = SimpleNamespace(organizations=section, networks=section)
+    result = restorer.execute(graph, plan)
+
+    assert result.failed == ()
+    assert "createOrganizationNetwork" in [c[0] for c in calls]
 
 
 # ------------------------------------------------------------- journal

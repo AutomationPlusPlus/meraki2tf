@@ -430,7 +430,7 @@ def _export_snapshot(
             "written owner-only (0600) — store it like a password file, and "
             "use --sanitize for any copy that leaves the DR vault."
         )
-    write_snapshot(graph, config.dump_to)
+    write_snapshot(graph, config.dump_to, sanitized=config.sanitize)
     return 0
 
 
@@ -600,6 +600,15 @@ def _restore(config: RuntimeConfig) -> int:
             "Create a fresh organization and target that."
         )
         return 2
+    if provider.snapshot_sanitized:
+        logger.warning(
+            "This snapshot is SANITIZED: its organization ID is a "
+            "pseudonym, so the never-restore-into-the-source-org check "
+            "cannot verify the target — make certain %s is a scratch "
+            "organization. Secret values were redacted at export and "
+            "will be reported for manual re-entry, not restored.",
+            config.target_org,
+        )
     serial_map: dict[str, str] = {}
     if config.serial_map is not None:
         try:
@@ -693,6 +702,14 @@ def _replay_gaps(config: RuntimeConfig) -> int:
     except Exception as exc:
         logger.critical("Gap replay could not load the snapshot: %s", exc)
         return 1
+    if provider.snapshot_sanitized:
+        logger.warning(
+            "This snapshot is SANITIZED: secret values are redaction "
+            "markers and identifiers are pseudonyms. Gap replay against "
+            "a live tenant needs the unsanitized DR snapshot; redacted "
+            "attributes will be skipped and reported for manual "
+            "re-entry."
+        )
     dispatcher = build_dispatcher(config)
     runner = TerraformRunner(
         config.workdir,

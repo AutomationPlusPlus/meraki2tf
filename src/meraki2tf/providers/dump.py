@@ -132,6 +132,7 @@ def _load_snapshot_document(path: "Path") -> Any:
                 )
             return {
                 "organizationId": head.get("organizationId"),
+                "sanitized": bool(head.get("sanitized")),
                 "networks": networks,
                 "devices": devices,
                 "features": features,
@@ -169,6 +170,16 @@ class StaticJsonDataProvider(MerakiDataProvider):
             raise MalformedDumpError(f"Snapshot {dump_path} must be a JSON object.")
         self._document: dict[str, Any] = document
         logger.debug("Loaded offline snapshot from %s", dump_path)
+
+    @property
+    def snapshot_sanitized(self) -> bool:
+        """Whether the snapshot declares itself sanitized (--sanitize).
+
+        A sanitized snapshot's identifiers are pseudonyms, so equality
+        checks against real org IDs (the restore source-org interlock)
+        are vacuous and its secret values are redaction markers.
+        """
+        return bool(self._document.get("sanitized"))
 
     def fetch_network_graph(self, organization_id: str | None = None) -> NetworkGraph:
         if _NESTED_MARKER in self._document:
