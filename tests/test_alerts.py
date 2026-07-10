@@ -49,6 +49,7 @@ def test_drift_detected_payload_contract() -> None:
     assert payload["details"] == {
         "diff": "~ plan delta",
         "workspace": "generated",
+        "origin": "terraform-plan",
         "apply_aborted": False,
         "regenerated_addresses": [],
         "deferred_addresses": [],

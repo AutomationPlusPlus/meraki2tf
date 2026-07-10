@@ -130,6 +130,20 @@ def diff_graphs(
     return SnapshotDiff(added=added, removed=removed, modified=tuple(modified))
 
 
+def baseline_drift(
+    graph: NetworkGraph,
+    baseline_path: Any,
+    parser: OpenApiParser | None,
+) -> SnapshotDiff:
+    """Diff a freshly discovered graph against a stored baseline snapshot."""
+    from meraki2tf.providers.dump import StaticJsonDataProvider
+
+    baseline = StaticJsonDataProvider(
+        baseline_path, parser=parser
+    ).fetch_network_graph(graph.organization_id)
+    return diff_graphs(baseline, graph, parser)
+
+
 def _assets_by_key(
     graph: NetworkGraph,
 ) -> dict[tuple[str, tuple[str, ...]], FeatureConfiguration]:

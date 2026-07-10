@@ -120,6 +120,9 @@ class RunSummary:
     #: Resources whose generated values were normalized to round-trip
     #: (state formatting/omissions or provider enum casing).
     normalized_addresses: tuple[str, ...] = ()
+    #: Human summary of snapshot-vs-baseline drift (--drift-baseline),
+    #: None when no baseline was supplied or nothing changed.
+    snapshot_drift: str | None = None
 
 
 class PipelineOrchestrator:
@@ -150,6 +153,7 @@ class PipelineOrchestrator:
         rebaseline: bool = False,
         sync: bool = False,
         confirm_deletions: bool = False,
+        drift_baseline: Any = None,
     ) -> None:
         self._provider = provider
         self._generator = generator
@@ -158,6 +162,9 @@ class PipelineOrchestrator:
         self._rebaseline = rebaseline
         self._sync = sync
         self._confirm_deletions = confirm_deletions
+        #: Optional prior snapshot: API-to-API drift detection right
+        #: after discovery, independent of the terraform comparison.
+        self._drift_baseline = drift_baseline
         #: Addresses already alerted as unsupported by reconciliation
         #: this run — regeneration re-plans must not duplicate alerts.
         self._reconciliation_alerted: set[str] = set()
@@ -172,6 +179,11 @@ class PipelineOrchestrator:
                 "Discovered %d asset(s) for organization %s via %s mode.",
                 graph.asset_count(), graph.organization_id, self._provider.mode,
             )
+
+            snapshot_drift: str | None = None
+            if self._drift_baseline is not None:
+                stage = "snapshot drift comparison"
+                snapshot_drift = self._compare_snapshot_baseline(graph)
 
             stage = "workspace preparation"
             self._runner.prepare_workspace()
@@ -429,6 +441,7 @@ class PipelineOrchestrator:
                 reconciliation_dropped=recon_dropped,
                 unmanaged_secret_attributes=unmanaged_secrets,
                 normalized_addresses=normalized_addresses,
+                snapshot_drift=snapshot_drift,
             )
         except Exception as exc:
             logger.exception("Pipeline fault during %s.", stage)
@@ -923,6 +936,36 @@ class PipelineOrchestrator:
             )
             return None
         return None  # pragma: no cover - every loop arm returns/continues
+
+    def _compare_snapshot_baseline(self, graph: NetworkGraph) -> str | None:
+        """API-to-API drift: fresh discovery vs the baseline snapshot.
+
+        Sees drift classes the terraform comparison cannot (provider-
+        inexpressible objects, secret values) in seconds, offline. Real
+        differences dispatch the mandated DRIFT_DETECTED alert with an
+        attribute-naming digest — never values.
+        """
+        from meraki2tf.snapshot_diff import baseline_drift, render_diff
+
+        drift = baseline_drift(
+            graph, self._drift_baseline, self._generator.parser
+        )
+        if drift.is_empty:
+            logger.info("Snapshot drift vs baseline: none.")
+            return None
+        summary = drift.summary()
+        logger.warning(
+            "Snapshot drift vs baseline (%s); dispatching DRIFT_DETECTED "
+            "alert.", summary,
+        )
+        self._dispatcher.dispatch(
+            drift_detected(
+                diff=render_diff(drift),
+                workspace=str(self._runner.workdir),
+                origin="snapshot-diff",
+            )
+        )
+        return summary
 
     def _materialize_state(
         self, unsupported_details: list[dict[str, Any]]

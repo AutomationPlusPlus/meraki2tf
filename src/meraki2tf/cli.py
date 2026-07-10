@@ -28,6 +28,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from meraki2tf.alerts import (
+    drift_detected,
     AlertDispatcher,
     EmailNotifier,
     WebhookNotifier,
@@ -107,6 +108,19 @@ def build_parser() -> argparse.ArgumentParser:
             "(the --from-dump format) instead of running the Terraform pipeline. "
             "Combine with --org-id for a live export, or with --from-dump to "
             "normalize an existing nested export into the canonical format."
+        ),
+    )
+    parser.add_argument(
+        "--drift-baseline",
+        metavar="PATH",
+        default=None,
+        help=(
+            "A previous snapshot (any --dump-to format) to compare the fresh "
+            "discovery against: attribute-level, spec-normalized drift "
+            "detection in seconds, without a terraform read pass. Real "
+            "differences dispatch a DRIFT_DETECTED alert. Typical scheduled "
+            "use: --dump-to snapshots/this-week.jsonl.gz --drift-baseline "
+            "snapshots/last-week.jsonl.gz."
         ),
     )
     parser.add_argument(
@@ -311,11 +325,33 @@ def build_provider(config: RuntimeConfig, parser: OpenApiParser) -> MerakiDataPr
     return LiveApiDataProvider(parser=parser)
 
 
-def _export_snapshot(provider: MerakiDataProvider, config: RuntimeConfig) -> int:
+def _export_snapshot(
+    provider: MerakiDataProvider,
+    config: RuntimeConfig,
+    parser: OpenApiParser,
+) -> int:
     """Discover the graph and write it as an offline snapshot (--dump-to)."""
     assert config.dump_to is not None  # guarded by the caller
     with provider as source:
         graph = source.fetch_network_graph(config.org_id)
+    if config.drift_baseline is not None:
+        from meraki2tf.snapshot_diff import baseline_drift, render_diff
+
+        drift = baseline_drift(graph, config.drift_baseline, parser)
+        if drift.is_empty:
+            logger.info("Snapshot drift vs baseline: none.")
+        else:
+            logger.warning(
+                "Snapshot drift vs baseline (%s); dispatching "
+                "DRIFT_DETECTED alert.", drift.summary(),
+            )
+            build_dispatcher(config).dispatch(
+                drift_detected(
+                    diff=render_diff(drift),
+                    workspace=str(config.dump_to),
+                    origin="snapshot-diff",
+                )
+            )
     if config.sanitize:
         graph = sanitize_graph(graph)
         logger.info("Snapshot sanitized: secrets redacted, identity pseudonymized.")
@@ -587,7 +623,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         spec_parser = OpenApiParser(resolve_spec(config.spec_path))
         provider = build_provider(config, spec_parser)
         if config.dump_to is not None:
-            return _export_snapshot(provider, config)
+            return _export_snapshot(provider, config, spec_parser)
         dispatcher = build_dispatcher(config)
         runner = TerraformRunner(
             config.workdir,
@@ -613,6 +649,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             rebaseline=config.rebaseline,
             sync=config.sync,
             confirm_deletions=config.confirm_deletions,
+            drift_baseline=config.drift_baseline,
         )
         summary = orchestrator.run(config.org_id)
     except PipelineError as exc:
@@ -696,6 +733,11 @@ def _report(summary: RunSummary) -> None:
         logger.info(
             "HCL baseline regenerated to mirror Meraki for: %s",
             ", ".join(summary.regenerated_addresses),
+        )
+    if summary.snapshot_drift:
+        logger.warning(
+            "Snapshot drift vs baseline: %s (see DRIFT_DETECTED alert).",
+            summary.snapshot_drift,
         )
     if summary.deferred_addresses:
         logger.warning(

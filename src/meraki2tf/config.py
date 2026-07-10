@@ -161,6 +161,9 @@ class RuntimeConfig:
     #: When set, discovery output is written here as a canonical
     #: snapshot instead of running the Terraform pipeline.
     dump_to: Path | None
+    #: A previous snapshot to diff the fresh discovery against —
+    #: API-to-API drift detection in seconds, no terraform read pass.
+    drift_baseline: Path | None
     #: Redact secrets/identity from the exported snapshot (--dump-to).
     sanitize: bool
     #: Disaster-recovery action: preview (or, with confirm, execute) a
@@ -213,6 +216,9 @@ class RuntimeConfig:
             org_id=args.org_id,
             spec_path=Path(args.spec) if args.spec else None,
             dump_path=dump_path,
+            drift_baseline=(
+                Path(args.drift_baseline) if args.drift_baseline else None
+            ),
             dump_to=Path(args.dump_to) if args.dump_to else None,
             sanitize=args.sanitize,
             rebuild=args.rebuild,

@@ -63,6 +63,7 @@ def drift_detected(
     apply_aborted: bool = False,
     regenerated_addresses: Sequence[str] = (),
     deferred_addresses: Sequence[str] = (),
+    origin: str = "terraform-plan",
 ) -> AlertEvent:
     """Contract payload for drift discovered during state comparison.
 
@@ -88,6 +89,7 @@ def drift_detected(
         details={
             "diff": diff,
             "workspace": workspace,
+            "origin": origin,
             "apply_aborted": apply_aborted,
             "regenerated_addresses": list(regenerated_addresses),
             "deferred_addresses": list(deferred_addresses),
