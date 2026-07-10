@@ -129,6 +129,8 @@ class StubRunner:
         self.targeted_calls: list[tuple[str, ...]] = []
         #: Per-call apply_import_plan results (falls back to apply_added).
         self.apply_added_queue: list[tuple[str, ...]] = []
+        #: targets passed to plan_with_generation, per call (None = full).
+        self.plan_targets: list[tuple[str, ...] | None] = []
         self.apply_added: tuple[str, ...] = ()
         self.apply_guard_error: ImportGuardViolation | None = None
         self.initialized = False
@@ -170,9 +172,13 @@ class StubRunner:
         )
 
     def plan_with_generation(
-        self, save_plan: bool = False, reconcile: bool = True
+        self,
+        save_plan: bool = False,
+        reconcile: bool = True,
+        targets: Any = None,
     ) -> ReconciledPlanResult:
         self.plan_calls.append(save_plan)
+        self.plan_targets.append(tuple(targets) if targets else None)
         code, stdout = self.plans[0] if len(self.plans) == 1 else self.plans.pop(0)
         return ReconciledPlanResult(
             result=TerraformCommandResult(
@@ -528,6 +534,11 @@ def test_sync_regenerates_modified_objects_then_applies(
     assert generator.calls[0] == (frozenset({"meraki_networks.n_1"}), True)
     assert generator.calls[1] == (frozenset(), False)
     assert runner.plan_calls == [True, True]
+    # The heal replan is targeted at pending resources only — never a
+    # second multi-hour full-kit read pass.
+    assert runner.plan_targets == [
+        None, ("meraki_devices.q2ab", "meraki_networks.n_1"),
+    ]
     assert runner.applied
     assert summary.regenerated_addresses == ("meraki_networks.n_1",)
     assert summary.apply_aborted is False
