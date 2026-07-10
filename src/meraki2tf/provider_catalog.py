@@ -98,7 +98,7 @@ class ProviderCatalog:
                 "meraki2tf requires CiscoDevNet/meraki >= 1.12.0."
             )
         resources = {
-            str(name): frozenset(schema.get("attributes", {}))
+            str(name): _attribute_names(schema)
             for name, schema in identity.items()
             if isinstance(schema, Mapping)
         }
@@ -132,10 +132,17 @@ class ProviderCatalog:
         raw = document.get("resources")
         if not isinstance(raw, Mapping) or not raw:
             raise CatalogError(f"Catalog payload from {source} has no resources.")
-        resources = {
-            str(name): frozenset(str(attr) for attr in attrs)
-            for name, attrs in raw.items()
-        }
+        resources: dict[str, frozenset[str]] = {}
+        for name, attrs in raw.items():
+            if not isinstance(attrs, (list, tuple)):
+                # A corrupted cache must degrade (CatalogError → bundled
+                # fallback), never crash the DR run — and a string here
+                # would silently explode into single characters.
+                raise CatalogError(
+                    f"Catalog payload from {source} has malformed "
+                    f"attributes for {name!r}."
+                )
+            resources[str(name)] = frozenset(str(attr) for attr in attrs)
         return cls(resources=resources, source=source)
 
     def to_cache_payload(self) -> dict[str, Any]:
@@ -146,6 +153,15 @@ class ProviderCatalog:
                 name: sorted(attrs) for name, attrs in sorted(self.resources.items())
             },
         }
+
+
+def _attribute_names(schema: Mapping[str, Any]) -> frozenset[str]:
+    """Identity attribute names, tolerating null/malformed `attributes`
+    (a provider schema quirk must degrade, never crash the DR run)."""
+    attrs = schema.get("attributes")
+    if isinstance(attrs, Mapping):
+        return frozenset(str(attr) for attr in attrs)
+    return frozenset()
 
 
 def resolve_catalog(runner: "TerraformRunner", keyed: bool) -> ProviderCatalog:

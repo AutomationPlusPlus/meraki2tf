@@ -86,6 +86,25 @@ def test_rejects_document_without_paths() -> None:
         SpecIngestionEngine({"openapi": "3.0.1"})
 
 
+def test_null_or_string_tags_do_not_crash_ingestion() -> None:
+    """Hand-trimmed specs carry `tags: null` (TypeError before) or a
+    bare string (which would decompose into single-character tags)."""
+    spec = {
+        "openapi": "3.0.1",
+        "paths": {
+            "/organizations": {
+                "get": {"operationId": "getOrganizations", "tags": None},
+            },
+            "/networks/{networkId}/snmp": {
+                "get": {"operationId": "getNetworkSnmp", "tags": "networks"},
+            },
+        },
+    }
+    ops = {op.operation_id: op for op in SpecIngestionEngine(spec).operations()}
+    assert ops["getOrganizations"].tags == ()
+    assert ops["getNetworkSnmp"].tags == ()
+
+
 def test_unimplemented_stages_are_explicit() -> None:
     engine = SpecIngestionEngine(MOCK_SPEC)
     with pytest.raises(NotImplementedError):

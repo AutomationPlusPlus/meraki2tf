@@ -156,6 +156,32 @@ def test_non_object_remote_document_is_rejected(
         fetch_latest_spec()
 
 
+def test_structurally_empty_remote_never_clobbers_a_good_local_spec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Any JSON object (an error body, wrong file) parses fine; writing
+    it over the working local spec would kill this run at ingestion and
+    leave every scheduled rerun re-downloading the same broken document
+    with no good copy left."""
+    path = tmp_path / "spec3.json"
+    _write_spec(path, "1.40.0")
+    original = path.read_text(encoding="utf-8")
+    _patch_remote(monkeypatch, json.dumps({"message": "rate limited"}))
+
+    assert resolve_spec(path) == path
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_structurally_empty_remote_is_never_written_fresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "spec3.json"
+    _patch_remote(monkeypatch, json.dumps({"message": "rate limited"}))
+    with pytest.raises(SpecResolutionError, match="paths"):
+        resolve_spec(path)
+    assert not path.exists()
+
+
 def test_remote_without_version_still_refreshes_local(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

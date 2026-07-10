@@ -75,7 +75,19 @@ def test_cache_payload_round_trips(tmp_path: Path) -> None:
     assert loaded.source == str(cache)
 
 
-@pytest.mark.parametrize("content", ["{not json", "[]", '{"resources": {}}'])
+@pytest.mark.parametrize(
+    "content",
+    [
+        "{not json",
+        "[]",
+        '{"resources": {}}',
+        # Malformed attribute values must be CatalogError (degrades to
+        # the bundled fallback), never TypeError (crashes the DR run) —
+        # and a string here would silently explode into characters.
+        '{"resources": {"meraki_network": null}}',
+        '{"resources": {"meraki_network": "id,organization_id"}}',
+    ],
+)
 def test_cache_file_rejects_malformed_payloads(
     tmp_path: Path, content: str
 ) -> None:
@@ -83,6 +95,22 @@ def test_cache_file_rejects_malformed_payloads(
     cache.write_text(content, encoding="utf-8")
     with pytest.raises(CatalogError):
         ProviderCatalog.from_cache_file(cache)
+
+
+def test_from_schema_document_tolerates_null_attributes() -> None:
+    """A provider schema quirk (attributes: null) degrades to an
+    attributeless identity instead of crashing catalog resolution."""
+    document = {
+        "provider_schemas": {
+            "registry.terraform.io/ciscodevnet/meraki": {
+                "resource_identity_schemas": {
+                    "meraki_network": {"attributes": None},
+                }
+            }
+        }
+    }
+    catalog = ProviderCatalog.from_schema_document(document)
+    assert catalog.resources["meraki_network"] == frozenset()
 
 
 def test_cache_file_missing_is_a_catalog_error(tmp_path: Path) -> None:

@@ -103,14 +103,18 @@ class SpecIngestionEngine:
                 if not isinstance(operation_id, str):
                     logger.warning("Skipping %s %s: missing operationId", method, path)
                     continue
+                # `tags` may be null or a bare string in hand-trimmed
+                # specs; only a real sequence yields tags (a string
+                # would decompose into single characters).
+                raw_tags = operation.get("tags")
+                if not isinstance(raw_tags, (list, tuple)):
+                    raw_tags = ()
                 yield OperationSpec(
                     operation_id=operation_id,
                     method=method,
                     path=path,
                     path_params=tuple(_PATH_PARAM_PATTERN.findall(path)),
-                    tags=tuple(
-                        tag for tag in operation.get("tags", ()) if isinstance(tag, str)
-                    ),
+                    tags=tuple(tag for tag in raw_tags if isinstance(tag, str)),
                     raw=operation,
                 )
 
