@@ -56,9 +56,9 @@ from meraki2tf.replayer import (
     _collection_items,
     _single_array_body_field,
     _strip_nulls,
+    split_redacted as _split_redacted,
 )
 from meraki2tf.runbook import write_operations
-from meraki2tf.sanitizer import REDACTED
 from meraki2tf.spec.engine import OperationSpec
 
 logger = logging.getLogger(__name__)
@@ -252,50 +252,6 @@ def _feature_wave(api_path: str) -> int:
     if "{serial}" in api_path:
         return WAVE_DEVICE_FEATURES
     return WAVE_ORG_FEATURES
-
-
-def _split_redacted(
-    payload: Mapping[str, Any],
-) -> tuple[dict[str, Any], tuple[str, ...]]:
-    """Separate restorable attributes from sanitized-away secrets.
-
-    ``**REDACTED**`` values cannot be written back — sending the marker
-    string as live configuration (a nested RADIUS secret, a PEM
-    certificate under a non-secret key) is worse than omitting the
-    field — so they are stripped at **any** depth and become the
-    operator's secret re-entry list (dotted key paths). Secret-*named*
-    attributes with real values (unsanitized snapshot) stay in the
-    payload — restoring them is the whole point of the unsanitized DR
-    snapshot.
-    """
-    redacted: set[str] = set()
-
-    def clean_mapping(
-        mapping: Mapping[str, Any], prefix: str
-    ) -> dict[str, Any]:
-        out: dict[str, Any] = {}
-        for key, value in mapping.items():
-            path = f"{prefix}.{key}" if prefix else str(key)
-            if value == REDACTED:
-                redacted.add(path)
-                continue
-            out[key] = clean_value(value, path)
-        return out
-
-    def clean_value(value: Any, prefix: str) -> Any:
-        if isinstance(value, Mapping):
-            return clean_mapping(value, prefix)
-        if isinstance(value, list):
-            kept = []
-            for item in value:
-                if item == REDACTED:
-                    redacted.add(f"{prefix}[]")
-                    continue
-                kept.append(clean_value(item, f"{prefix}[]"))
-            return kept
-        return value
-
-    return clean_mapping(payload, ""), tuple(sorted(redacted))
 
 
 def _network_create_operation(parser: OpenApiParser) -> OperationSpec:

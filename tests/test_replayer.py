@@ -232,6 +232,74 @@ def test_plan_replay_skips_sanitized_and_updateless_secrets(
     assert "no update operation" in reasons[CLIENTS_PATH]
 
 
+def test_plan_replay_restores_nested_secrets(
+    spec_parser: OpenApiParser,
+) -> None:
+    """radiusServers[].secret is the most common Meraki secret; a
+    top-level-only scan would neither replay it nor report it."""
+    graph = _graph(
+        FeatureConfiguration(
+            SSID_PATH, ("N_1", "0"),
+            {"number": 0, "name": "Corp",
+             "radiusServers": [{"host": "10.0.0.1", "secret": "radius-secret"}]},
+        )
+    )
+    report = _report(
+        captured=(_captured(SSID_PATH, ("N_1", "0"), "meraki_wireless_ssid.n_1_0"),)
+    )
+    actions, skipped = plan_replay(graph, report, spec_parser)
+    assert skipped == ()
+    (action,) = actions
+    assert action.kind == "secrets"
+    # The whole top-level field rides along: the PUT needs the complete
+    # sub-structure around the nested secret.
+    assert action.payload == {
+        "radiusServers": [{"host": "10.0.0.1", "secret": "radius-secret"}]
+    }
+
+
+def test_plan_replay_reports_masked_nested_secrets(
+    spec_parser: OpenApiParser,
+) -> None:
+    """A sanitized snapshot's nested secrets must surface as a skip —
+    silence here loses them from the manual re-entry list."""
+    graph = _graph(
+        FeatureConfiguration(
+            SSID_PATH, ("N_1", "0"),
+            {"number": 0,
+             "radiusServers": [{"host": "10.0.0.1", "secret": REDACTED}]},
+        )
+    )
+    report = _report(
+        captured=(_captured(SSID_PATH, ("N_1", "0"), "meraki_wireless_ssid.n_1_0"),)
+    )
+    actions, skipped = plan_replay(graph, report, spec_parser)
+    assert actions == ()
+    (item,) = skipped
+    assert "--sanitize" in item.reason
+
+
+def test_plan_replay_object_strips_redacted_values(
+    spec_parser: OpenApiParser,
+) -> None:
+    """Gap-object replay from a sanitized snapshot must never write the
+    literal redaction marker into the live tenant."""
+    graph = _graph(
+        FeatureConfiguration(
+            VLAN_PATH, ("N_1", "10"),
+            {"id": 10, "name": "Data", "certificate": REDACTED},
+        )
+    )
+    report = _report(
+        unsupported=(UnsupportedAsset(VLAN_PATH, "no match", ("N_1", "10")),)
+    )
+    actions, skipped = plan_replay(graph, report, spec_parser)
+    (action,) = actions
+    assert action.payload == {"id": 10, "name": "Data"}
+    (item,) = skipped
+    assert "re-enter manually" in item.reason and "certificate" in item.reason
+
+
 # ------------------------------------------------------------- id mapping
 
 

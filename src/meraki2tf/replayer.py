@@ -37,8 +37,8 @@ from meraki2tf.config import read_api_key
 from meraki2tf.hcl_generator import GenerationReport
 from meraki2tf.models import UNREADABLE_MARKER, NetworkGraph
 from meraki2tf.openapi_parser import OpenApiParser
-from meraki2tf.runbook import payload_index, secret_payload_keys, write_operations
-from meraki2tf.sanitizer import REDACTED
+from meraki2tf.runbook import payload_index, write_operations
+from meraki2tf.sanitizer import REDACTED, SECRET_KEY_PATTERN
 from meraki2tf.spec.engine import OperationSpec
 
 logger = logging.getLogger(__name__)
@@ -140,12 +140,35 @@ def plan_replay(
                 )
             )
             continue
+        clean, redacted = split_redacted(payload)
+        if redacted and not clean:
+            skipped.append(
+                SkippedReplay(
+                    asset.api_path,
+                    asset.identifiers,
+                    "Every captured attribute is redacted — the snapshot "
+                    "was written with --sanitize; replay needs the "
+                    "unsanitized snapshot.",
+                )
+            )
+            continue
+        if redacted:
+            # Never write the redaction marker as live configuration;
+            # the stripped attributes go on the manual re-entry list.
+            skipped.append(
+                SkippedReplay(
+                    asset.api_path,
+                    asset.identifiers,
+                    "Redacted attribute(s) not replayed (sanitized "
+                    "snapshot); re-enter manually: " + ", ".join(redacted),
+                )
+            )
         actions.append(
             ReplayAction(
                 kind="object",
                 api_path=asset.api_path,
                 path_values=asset.identifiers,
-                payload=payload,
+                payload=clean,
                 operation=writes[0],
             )
         )
@@ -154,10 +177,14 @@ def plan_replay(
         payload = payloads.get((captured.api_path, captured.identifiers))
         if not payload:
             continue
-        secret_keys = secret_payload_keys(payload)
-        if not secret_keys:
+        # Secrets hide at any depth (radiusServers[].secret is the most
+        # common Meraki secret); a top-level-only scan would neither
+        # replay them nor report them as skipped.
+        if not _secret_paths(payload):
             continue
-        if all(payload[key] == REDACTED for key in secret_keys):
+        clean, _ = split_redacted(payload)
+        live_paths = _secret_paths(clean)
+        if not live_paths:
             skipped.append(
                 SkippedReplay(
                     captured.api_path,
@@ -179,16 +206,17 @@ def plan_replay(
                 )
             )
             continue
+        # A nested secret restores through its whole top-level field
+        # (the PUT needs the complete sub-structure around it).
+        top_level = sorted(
+            {path.split(".", 1)[0].split("[", 1)[0] for path in live_paths}
+        )
         actions.append(
             ReplayAction(
                 kind="secrets",
                 api_path=captured.api_path,
                 path_values=captured.identifiers,
-                payload={
-                    key: payload[key]
-                    for key in secret_keys
-                    if payload[key] != REDACTED
-                },
+                payload={key: clean[key] for key in top_level},
                 operation=updates[0],
                 address=captured.address,
             )
@@ -345,6 +373,69 @@ class GapReplayer:
         ):
             body = {key: value for key, value in body.items() if key in accepted}
         return method(**params, **body)
+
+
+def split_redacted(
+    payload: Mapping[str, Any],
+) -> tuple[dict[str, Any], tuple[str, ...]]:
+    """Separate restorable attributes from sanitized-away secrets.
+
+    ``**REDACTED**`` values cannot be written back — sending the marker
+    string as live configuration (a nested RADIUS secret, a PEM
+    certificate under a non-secret key) is worse than omitting the
+    field — so they are stripped at **any** depth and returned as
+    dotted re-entry paths. Secret-*named* attributes with real values
+    (unsanitized snapshot) stay in the payload — restoring them is the
+    whole point of the unsanitized DR snapshot.
+    """
+    redacted: set[str] = set()
+
+    def clean_mapping(
+        mapping: Mapping[str, Any], prefix: str
+    ) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for key, value in mapping.items():
+            path = f"{prefix}.{key}" if prefix else str(key)
+            if value == REDACTED:
+                redacted.add(path)
+                continue
+            out[key] = clean_value(value, path)
+        return out
+
+    def clean_value(value: Any, prefix: str) -> Any:
+        if isinstance(value, Mapping):
+            return clean_mapping(value, prefix)
+        if isinstance(value, list):
+            kept = []
+            for item in value:
+                if item == REDACTED:
+                    redacted.add(f"{prefix}[]")
+                    continue
+                kept.append(clean_value(item, f"{prefix}[]"))
+            return kept
+        return value
+
+    return clean_mapping(payload, ""), tuple(sorted(redacted))
+
+
+def _secret_paths(value: Any, prefix: str = "") -> tuple[str, ...]:
+    """Dotted paths of non-empty secret-keyed string values, any depth."""
+    paths: list[str] = []
+    if isinstance(value, Mapping):
+        for key, inner in value.items():
+            path = f"{prefix}.{key}" if prefix else str(key)
+            if (
+                SECRET_KEY_PATTERN.search(str(key))
+                and isinstance(inner, str)
+                and inner
+            ):
+                paths.append(path)
+            else:
+                paths.extend(_secret_paths(inner, path))
+    elif isinstance(value, list):
+        for item in value:
+            paths.extend(_secret_paths(item, f"{prefix}[]"))
+    return tuple(paths)
 
 
 def _collection_items(payload: Mapping[str, Any]) -> list[Any] | None:
