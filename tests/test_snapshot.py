@@ -53,3 +53,47 @@ def test_snapshot_routes_through_owner_only_helper(
     write_snapshot(graph, out)
 
     assert restricted == [out]
+
+
+def test_snapshot_carries_full_network_and_device_payloads(tmp_path: Path) -> None:
+    """Restore-grade contract: fields beyond the identity surface
+    (timezone, tags, device placement) survive the snapshot round trip."""
+    from meraki2tf.models import MerakiDevice, MerakiNetwork, NetworkGraph
+    from meraki2tf.providers import StaticJsonDataProvider
+
+    graph = NetworkGraph(
+        organization_id="org-123",
+        networks=(
+            MerakiNetwork.from_payload(
+                {
+                    "id": "N_1",
+                    "organizationId": "org-123",
+                    "name": "HQ",
+                    "productTypes": ["appliance"],
+                    "timeZone": "Europe/Berlin",
+                    "tags": ["core"],
+                }
+            ),
+        ),
+        devices=(
+            MerakiDevice.from_payload(
+                {
+                    "serial": "Q2AB-CDEF-GHIJ",
+                    "networkId": "N_1",
+                    "model": "MX68",
+                    "name": "edge",
+                    "address": "1 Main St",
+                    "floorPlanId": "fp-9",
+                }
+            ),
+        ),
+        features=(),
+    )
+    document = graph_to_snapshot(graph)
+    assert document["networks"][0]["timeZone"] == "Europe/Berlin"
+    assert document["devices"][0]["floorPlanId"] == "fp-9"
+
+    path = write_snapshot(graph, tmp_path / "snap.json")
+    loaded = StaticJsonDataProvider(path).fetch_network_graph()
+    assert loaded.networks[0].payload["timeZone"] == "Europe/Berlin"
+    assert loaded.devices[0].payload["address"] == "1 Main St"

@@ -189,6 +189,7 @@ class _GraphSanitizer:
                     organization_id=self._mapped(network.organization_id),
                     name=_pseudonym("network", network.name) if network.name else "",
                     product_types=network.product_types,
+                    payload=self._clean(dict(network.payload), None),
                 )
                 for network in graph.networks
             ),
@@ -198,6 +199,7 @@ class _GraphSanitizer:
                     network_id=self._mapped(device.network_id),
                     model=device.model,
                     name=_pseudonym("device", device.name) if device.name else "",
+                    payload=self._clean(dict(device.payload), None),
                 )
                 for device in graph.devices
             ),
