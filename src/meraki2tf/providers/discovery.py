@@ -71,6 +71,45 @@ def config_collection_operations(
     )
 
 
+def nested_collection_operations(
+    parser: OpenApiParser,
+) -> tuple[OperationSpec, ...]:
+    """Configuration GETs scoped by two or more path parameters.
+
+    Their parent scopes are elements the single-parameter pass already
+    discovers (SSID numbers, switch-stack IDs, config-template IDs, per-
+    device interface IDs, …). Ordered by parameter count so a deeper
+    surface can scope off elements a shallower one just produced.
+    """
+    mutable = mutable_entity_keys(parser)
+    ops = [
+        op
+        for op in parser.endpoints()
+        if op.method == "get"
+        and len(op.path_params) >= 2
+        and not is_item_path(op.path)
+        and entity_key(op.path) in mutable
+    ]
+    return tuple(sorted(ops, key=lambda op: (len(op.path_params), op.path)))
+
+
+def parent_item_path(path: str) -> str:
+    """The enclosing item path a nested collection hangs off.
+
+    ``/networks/{networkId}/wireless/ssids/{number}/identityPsks`` →
+    ``/networks/{networkId}/wireless/ssids/{number}`` — the prefix up to
+    the last path parameter, which is exactly the item path whose
+    discovered elements provide the nested collection's scope values.
+    """
+    segments = path.split("/")
+    last_param = max(
+        index
+        for index, segment in enumerate(segments)
+        if segment.startswith("{")
+    )
+    return "/".join(segments[: last_param + 1])
+
+
 def item_operation_for(
     parser: OpenApiParser, op: OperationSpec
 ) -> OperationSpec | None:
@@ -85,7 +124,7 @@ def item_operation_for(
         if (
             is_item_path(candidate.path)
             and candidate.path.startswith(op.path + "/{")
-            and len(candidate.path_params) == 2
+            and len(candidate.path_params) == len(op.path_params) + 1
         ):
             if candidate.method == "get":
                 return candidate
@@ -136,7 +175,10 @@ def element_id(item_op: OperationSpec, element: Any) -> str | None:
 
 
 def expand_endpoint_payload(
-    parser: OpenApiParser, op: OperationSpec, scope_value: str, payload: Any
+    parser: OpenApiParser,
+    op: OperationSpec,
+    scope_value: str | tuple[str, ...],
+    payload: Any,
 ) -> list[FeatureConfiguration]:
     """Normalize one endpoint payload into importable feature assets.
 
@@ -150,12 +192,15 @@ def expand_endpoint_payload(
     their raw data through this one function, which is what guarantees
     structural parity between them.
     """
+    scopes = (
+        (scope_value,) if isinstance(scope_value, str) else tuple(scope_value)
+    )
     if isinstance(payload, Mapping):
         elements = _envelope_elements(op, payload)
         if elements is None:
             return [
                 FeatureConfiguration(
-                    api_path=op.path, path_values=(scope_value,), payload=payload
+                    api_path=op.path, path_values=scopes, payload=payload
                 )
             ]
         payload = elements
@@ -167,7 +212,7 @@ def expand_endpoint_payload(
             return [
                 FeatureConfiguration(
                     api_path=op.path,
-                    path_values=(scope_value,),
+                    path_values=scopes,
                     payload={"items": []},
                 )
             ]
@@ -181,7 +226,7 @@ def expand_endpoint_payload(
         return [
             FeatureConfiguration(
                 api_path=op.path,
-                path_values=(scope_value,),
+                path_values=scopes,
                 payload={"items": payload},
             )
         ]
@@ -201,7 +246,7 @@ def expand_endpoint_payload(
             expanded.append(
                 FeatureConfiguration(
                     api_path=op.path,
-                    path_values=(scope_value,),
+                    path_values=scopes,
                     payload=(
                         element
                         if isinstance(element, Mapping)
@@ -213,7 +258,7 @@ def expand_endpoint_payload(
         expanded.append(
             FeatureConfiguration(
                 api_path=item_op.path,
-                path_values=(scope_value, item_id),
+                path_values=(*scopes, item_id),
                 payload=element,
             )
         )

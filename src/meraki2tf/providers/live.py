@@ -38,6 +38,8 @@ from meraki2tf.providers.base import MerakiDataProvider
 from meraki2tf.providers.discovery import (
     config_collection_operations,
     expand_endpoint_payload,
+    nested_collection_operations,
+    parent_item_path,
 )
 from meraki2tf.spec.engine import OperationSpec
 
@@ -77,6 +79,12 @@ _SDK_MAXIMUM_RETRIES = 10
 #: does not apply to that scope".
 _THROTTLE_HTTP_STATUSES = frozenset({429})
 _SERVER_ERROR_HTTP_STATUSES = frozenset({500, 502, 503, 504})
+
+
+def _scope_label(params: dict[str, str]) -> str:
+    """Human-readable scope for log/error messages, any parameter depth."""
+    return ", ".join(f"{name} {value}" for name, value in params.items())
+
 
 #: Outer waits applied when the SDK's whole retry budget is consumed by
 #: a throttle. Meraki answers 429 with ``Retry-After: 1``, so the SDK's
@@ -166,29 +174,28 @@ class LiveApiDataProvider(MerakiDataProvider):
         mappings = parser.resource_mappings()
         lookup = parser.endpoint_lookup()
 
-        def _collect(op: OperationSpec, scope_param: str, scope_value: str) -> None:
+        def _collect(op: OperationSpec, scope_values: tuple[str, ...]) -> None:
+            params = dict(zip(op.path_params, scope_values))
             try:
-                payload = self._try_call(
-                    dashboard, op, scope_param, scope_value, undispatchable
-                )
+                payload = self._try_call(dashboard, op, params, undispatchable)
             except _EndpointUnreadable as exc:
                 logger.warning(
-                    "Feature endpoint %s for %s %s could not be read (%s); "
+                    "Feature endpoint %s for %s could not be read (%s); "
                     "recorded as a coverage gap — its objects are missing "
                     "from this snapshot.",
-                    op.path, scope_param, scope_value, exc,
+                    op.path, _scope_label(params), exc,
                 )
                 features.append(
                     FeatureConfiguration(
                         api_path=op.path,
-                        path_values=(scope_value,),
+                        path_values=scope_values,
                         payload={UNREADABLE_MARKER: str(exc)},
                     )
                 )
                 return
             if payload is not None:
                 features.extend(
-                    expand_endpoint_payload(parser, op, scope_value, payload)
+                    expand_endpoint_payload(parser, op, scope_values, payload)
                 )
 
         def _folds_elsewhere(op: OperationSpec) -> bool:
@@ -204,7 +211,7 @@ class LiveApiDataProvider(MerakiDataProvider):
         for op in config_collection_operations(parser, "organizationId"):
             if _folds_elsewhere(op):
                 continue
-            _collect(op, "organizationId", organization_id)
+            _collect(op, (organization_id,))
         network_ops = tuple(
             op
             for op in config_collection_operations(parser)
@@ -212,7 +219,7 @@ class LiveApiDataProvider(MerakiDataProvider):
         )
         for network in networks:
             for op in network_ops:
-                _collect(op, "networkId", network.network_id)
+                _collect(op, (network.network_id,))
         serial_ops = tuple(
             op
             for op in config_collection_operations(parser, "serial")
@@ -220,15 +227,33 @@ class LiveApiDataProvider(MerakiDataProvider):
         )
         for device in devices:
             for op in serial_ops:
-                _collect(op, "serial", device.serial)
+                _collect(op, (device.serial,))
+        # Nested (multi-parameter) configuration surfaces: per-SSID
+        # sub-configs, switch-stack routing, config-template switch
+        # profiles, per-interface DHCP, ... Their scopes are elements
+        # the passes above (and shallower nested passes — the list is
+        # ordered by parameter count) already discovered at the
+        # enclosing item path.
+        for op in nested_collection_operations(parser):
+            # Same folding guard as the single-scope loops above; no
+            # nested surface in today's spec folds, hence uncoverable.
+            if _folds_elsewhere(op):  # pragma: no cover
+                continue  # pragma: no cover
+            parent = parent_item_path(op.path)
+            for scope_values in [
+                feature.path_values
+                for feature in features
+                if feature.api_path == parent
+                and len(feature.path_values) == len(op.path_params)
+            ]:
+                _collect(op, scope_values)
         return features
 
     def _try_call(
         self,
         dashboard: Any,
         op: OperationSpec,
-        scope_param: str,
-        scope_value: str,
+        params: dict[str, str],
         undispatchable: set[str],
     ) -> Any:
         """One endpoint call; refusals are data, API failures never are.
@@ -248,7 +273,7 @@ class LiveApiDataProvider(MerakiDataProvider):
         waits = iter(_THROTTLE_BACKOFF_WAITS)
         while True:
             try:
-                return self._call(dashboard, op, **{scope_param: scope_value})
+                return self._call(dashboard, op, **params)
             except LiveDispatchError as exc:
                 undispatchable.add(op.operation_id)
                 logger.warning(
@@ -264,17 +289,17 @@ class LiveApiDataProvider(MerakiDataProvider):
                     wait = next(waits, None)
                     if wait is not None:
                         logger.warning(
-                            "Feature endpoint %s for %s %s is still throttled "
+                            "Feature endpoint %s for %s is still throttled "
                             "after the SDK's own retries; pausing %.0f s for "
                             "the competing API consumer to back off, then "
                             "retrying.",
-                            op.path, scope_param, scope_value, wait,
+                            op.path, _scope_label(params), wait,
                         )
                         time.sleep(wait)
                         continue
                     raise LiveRetryExhaustedError(
-                        f"Feature endpoint {op.path} for {scope_param} "
-                        f"{scope_value} failed with HTTP {status} after the "
+                        f"Feature endpoint {op.path} for "
+                        f"{_scope_label(params)} failed with HTTP {status} after the "
                         "SDK's retries and every extended backoff; aborting "
                         "discovery because the snapshot would be silently "
                         "incomplete. Rerun once the API is responsive (the "
@@ -286,8 +311,8 @@ class LiveApiDataProvider(MerakiDataProvider):
                         f"HTTP {status} from the Meraki API after every retry"
                     ) from exc
                 logger.debug(
-                    "Feature endpoint %s unavailable for %s %s: %s",
-                    op.path, scope_param, scope_value, exc,
+                    "Feature endpoint %s unavailable for %s: %s",
+                    op.path, _scope_label(params), exc,
                 )
                 return None
 

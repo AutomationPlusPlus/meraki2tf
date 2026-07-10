@@ -539,7 +539,7 @@ def test_try_call_skips_operations_already_known_undispatchable(
     )
     undispatchable = {op.operation_id}
     result = live_provider._try_call(
-        object(), op, "organizationId", "org-123", undispatchable
+        object(), op, {"organizationId": "org-123"}, undispatchable
     )
     assert result is None  # short-circuited, no dispatch attempted
 
@@ -577,7 +577,7 @@ def test_try_call_aborts_when_throttle_survives_every_backoff(
     dashboard = types.SimpleNamespace(organizations=Throttled())
     with pytest.raises(LiveRetryExhaustedError, match="HTTP 429"):
         live_provider._try_call(
-            dashboard, op, "organizationId", "org-123", set()
+            dashboard, op, {"organizationId": "org-123"}, set()
         )
     # Every extended pause was honored before giving up.
     assert sleeps == [30.0, 60.0, 120.0]
@@ -613,7 +613,7 @@ def test_try_call_rides_out_throttle_bursts_with_outer_backoff(
     dashboard = types.SimpleNamespace(organizations=BurstThrottled())
     with caplog.at_level("WARNING", logger="meraki2tf.providers.live"):
         result = live_provider._try_call(
-            dashboard, op, "organizationId", "org-123", set()
+            dashboard, op, {"organizationId": "org-123"}, set()
         )
     assert result == [{"id": "A_1"}]
     assert sleeps == [30.0, 60.0]
@@ -667,7 +667,7 @@ def test_try_call_still_skips_scope_refusals_with_status(
 
     dashboard = types.SimpleNamespace(organizations=Refusing())
     result = live_provider._try_call(
-        dashboard, op, "organizationId", "org-123", set()
+        dashboard, op, {"organizationId": "org-123"}, set()
     )
     assert result is None
 
@@ -761,4 +761,97 @@ def test_provider_parity_between_live_and_dump(
         (f.api_path, f.path_values, dict(f.payload)) for f in dump_graph.features
     ] == [
         (f.api_path, f.path_values, dict(f.payload)) for f in live_graph.features
+    ]
+
+
+def _nested_spec(tmp_path: Path) -> Path:
+    """Minimal spec with a two-parameter configuration surface."""
+    from conftest import _op
+
+    spec = {
+        "openapi": "3.0.0",
+        "info": {"title": "nested", "version": "1"},
+        "paths": {
+            "/networks/{networkId}/wireless/ssids": {
+                "get": _op("getNetworkWirelessSsids", "wireless"),
+            },
+            "/networks/{networkId}/wireless/ssids/{number}": {
+                "get": _op("getNetworkWirelessSsid", "wireless"),
+                "put": _op("updateNetworkWirelessSsid", "wireless"),
+            },
+            "/networks/{networkId}/wireless/ssids/{number}/identityPsks": {
+                "get": _op("getNetworkWirelessSsidIdentityPsks", "wireless"),
+            },
+            "/networks/{networkId}/wireless/ssids/{number}/identityPsks/{identityPskId}": {
+                "get": _op("getNetworkWirelessSsidIdentityPsk", "wireless"),
+                "put": _op("updateNetworkWirelessSsidIdentityPsk", "wireless"),
+            },
+        },
+    }
+    path = tmp_path / "nested-spec.json"
+    path.write_text(json.dumps(spec), encoding="utf-8")
+    return path
+
+
+def test_nested_collections_discovered_from_parent_elements(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Multi-parameter configuration surfaces (per-SSID identity PSKs,
+    switch-stack routing, template switch profiles, ...) scope off
+    elements discovered at the enclosing item path. They were previously
+    skipped entirely — a Cardinal Rule 2 violation."""
+    calls: list[tuple[str, ...]] = []
+
+    class Wireless:
+        def getNetworkWirelessSsids(self, networkId: str) -> list[dict[str, Any]]:
+            return [{"number": 0, "name": "Corp"}]
+
+        def getNetworkWirelessSsidIdentityPsks(
+            self, networkId: str, number: str
+        ) -> list[dict[str, Any]]:
+            calls.append((networkId, number))
+            return [{"id": "psk-1", "name": "kiosk"}]
+
+    class Organizations:
+        def getOrganizationNetworks(
+            self, organizationId: str, total_pages: str = "all"
+        ) -> list[dict[str, Any]]:
+            return [{"id": "N_1", "organizationId": organizationId}]
+
+        def getOrganizationDevices(
+            self, organizationId: str, total_pages: str = "all"
+        ) -> list[dict[str, Any]]:
+            return []
+
+    provider = LiveApiDataProvider(parser=OpenApiParser(_nested_spec(tmp_path)))
+    provider._client = types.SimpleNamespace(
+        organizations=Organizations(), wireless=Wireless()
+    )
+    graph = provider.fetch_network_graph("org-123")
+
+    assert calls == [("N_1", "0")]  # scoped off the discovered SSID element
+    addressed = {(f.api_path, f.path_values) for f in graph.features}
+    assert (
+        "/networks/{networkId}/wireless/ssids/{number}",
+        ("N_1", "0"),
+    ) in addressed
+    assert (
+        "/networks/{networkId}/wireless/ssids/{number}/identityPsks/{identityPskId}",
+        ("N_1", "0", "psk-1"),
+    ) in addressed
+
+
+def test_parent_item_path_and_nested_ordering(tmp_path: Path) -> None:
+    from meraki2tf.providers.discovery import (
+        nested_collection_operations,
+        parent_item_path,
+    )
+
+    assert parent_item_path(
+        "/networks/{networkId}/wireless/ssids/{number}/identityPsks"
+    ) == "/networks/{networkId}/wireless/ssids/{number}"
+    parser = OpenApiParser(_nested_spec(tmp_path))
+    nested = nested_collection_operations(parser)
+    assert [op.path for op in nested] == [
+        "/networks/{networkId}/wireless/ssids/{number}/identityPsks"
     ]
