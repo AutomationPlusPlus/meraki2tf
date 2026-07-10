@@ -19,12 +19,19 @@ class MalformedPayloadError(ValueError):
 
 @dataclass(frozen=True)
 class MerakiNetwork:
-    """One dashboard network."""
+    """One dashboard network.
+
+    ``payload`` carries the complete API object (timezone, tags, notes,
+    template binding, …) — a disaster-recovery snapshot must be able to
+    recreate the network, not merely address it. The typed fields stay
+    as the identity/convenience surface.
+    """
 
     network_id: str
     organization_id: str
     name: str
     product_types: tuple[str, ...]
+    payload: Mapping[str, Any] = field(default_factory=dict, hash=False)
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "MerakiNetwork":
@@ -36,6 +43,7 @@ class MerakiNetwork:
             organization_id=str(payload.get("organizationId", "")),
             name=str(payload.get("name", "")),
             product_types=tuple(str(p) for p in payload.get("productTypes") or ()),
+            payload=dict(payload),
         )
 
 
@@ -47,6 +55,9 @@ class MerakiDevice:
     network_id: str
     model: str
     name: str
+    #: Complete API object (address, lat/lng, tags, floorPlanId, …) —
+    #: required to restore the device's placement after a disaster.
+    payload: Mapping[str, Any] = field(default_factory=dict, hash=False)
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "MerakiDevice":
@@ -58,6 +69,7 @@ class MerakiDevice:
             network_id=str(payload.get("networkId", "")),
             model=str(payload.get("model", "")),
             name=str(payload.get("name", "")),
+            payload=dict(payload),
         )
 
 

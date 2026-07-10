@@ -413,3 +413,46 @@ def test_keyless_scalars_pass_through_unchanged() -> None:
     sanitizer = _GraphSanitizer(_graph())
     assert sanitizer._clean("free-floating", None) == "free-floating"
     assert sanitizer._clean("N_1", None) == "net-0001"  # IDs still map
+
+
+def test_network_and_device_payloads_are_sanitized() -> None:
+    """The widened model payloads (restore-grade full API objects) must
+    go through the same scrubbing as feature payloads."""
+    graph = NetworkGraph(
+        organization_id="org-123",
+        networks=(
+            MerakiNetwork.from_payload(
+                {
+                    "id": "N_1",
+                    "organizationId": "org-123",
+                    "name": "HQ",
+                    "productTypes": ["appliance"],
+                    "timeZone": "Europe/Berlin",
+                    "notes": "contact jdoe",
+                }
+            ),
+        ),
+        devices=(
+            MerakiDevice.from_payload(
+                {
+                    "serial": "QAAA-0001",
+                    "networkId": "N_1",
+                    "model": "MX64",
+                    "name": "edge-fw",
+                    "communitySecret": "sn4ck",
+                }
+            ),
+        ),
+        features=(),
+    )
+    clean = sanitize_graph(graph)
+    net_payload = dict(clean.networks[0].payload)
+    dev_payload = dict(clean.devices[0].payload)
+    # Structural IDs map consistently with the typed fields.
+    assert net_payload["id"] == clean.networks[0].network_id
+    assert dev_payload["serial"] == clean.devices[0].serial
+    # Non-identifying config survives; secrets are redacted.
+    assert net_payload["timeZone"] == "Europe/Berlin"
+    assert dev_payload["communitySecret"] == REDACTED
+    # Raw identifiers never survive in the payloads.
+    assert "N_1" not in str(net_payload) and "QAAA-0001" not in str(dev_payload)

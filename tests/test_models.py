@@ -69,3 +69,36 @@ def test_coerce_sequence_accepts_lists_and_none() -> None:
 def test_coerce_sequence_rejects_non_arrays(bad: object) -> None:
     with pytest.raises(MalformedPayloadError):
         coerce_sequence(bad, "'networks'")
+
+
+def test_models_retain_complete_payloads_for_restore() -> None:
+    """DR snapshots must be able to recreate networks/devices, not just
+    address them — the full API object rides on the model."""
+    network = MerakiNetwork.from_payload(
+        {
+            "id": "N_9",
+            "organizationId": "org-1",
+            "name": "Branch",
+            "productTypes": ["appliance"],
+            "timeZone": "America/New_York",
+            "tags": ["dr-critical"],
+            "isBoundToConfigTemplate": False,
+        }
+    )
+    assert network.payload["timeZone"] == "America/New_York"
+    assert network.payload["tags"] == ["dr-critical"]
+
+    device = MerakiDevice.from_payload(
+        {
+            "serial": "Q2XX-XXXX-XXXX",
+            "networkId": "N_9",
+            "model": "MX68",
+            "name": "edge",
+            "address": "1 Main St",
+            "lat": 42.1,
+            "lng": -71.2,
+            "floorPlanId": "fp-1",
+        }
+    )
+    assert device.payload["address"] == "1 Main St"
+    assert device.payload["floorPlanId"] == "fp-1"

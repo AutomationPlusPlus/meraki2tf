@@ -24,8 +24,11 @@ def graph_to_snapshot(graph: NetworkGraph) -> dict[str, Any]:
     """Serialize a domain graph into the canonical snapshot document."""
     return {
         "organizationId": graph.organization_id,
+        # Full API payloads (restore-grade), with the canonical identity
+        # fields normalized on top so legacy consumers keep working.
         "networks": [
             {
+                **dict(network.payload),
                 "id": network.network_id,
                 "organizationId": network.organization_id,
                 "name": network.name,
@@ -35,6 +38,7 @@ def graph_to_snapshot(graph: NetworkGraph) -> dict[str, Any]:
         ],
         "devices": [
             {
+                **dict(device.payload),
                 "serial": device.serial,
                 "networkId": device.network_id,
                 "model": device.model,
