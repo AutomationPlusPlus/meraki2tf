@@ -332,77 +332,242 @@ class UnmappedReferenceError(RuntimeError):
     so the action fails loudly instead of guessing."""
 
 
-#: Policy-object grammar embedded in firewall rule strings.
+#: Policy-object grammar embedded in firewall rule strings, and the
+#: reference-key stems its two verbs resolve through.
 _OBJ_GRP_RE = re.compile(r"\b(GRP|OBJ)\((\d+)\)")
+_GRAMMAR_KEYS = {"GRP": "policyObjectGroupId", "OBJ": "policyObjectId"}
 
 #: Payload keys whose values are cross-references to other objects.
 _REFERENCE_KEY_RE = re.compile(r"Ids?$")
 
+_PATH_PARAM_RE = re.compile(r"\{([^}]+)\}")
+
+
+def _scope_stem(name: str) -> str:
+    """Normalize a path-parameter or reference-key name to a type stem.
+
+    ``groupPolicyId``/``groupPolicyIds`` → ``grouppolicy``; bare
+    ``id``/``ids`` → ``""`` (generic — resolvable only when globally
+    unambiguous).
+    """
+    lowered = name.lower()
+    for suffix in ("ids", "id"):
+        if lowered.endswith(suffix):
+            lowered = lowered[: -len(suffix)]
+            break
+    return lowered
+
+
+class ReferenceResolver:
+    """Old→new identifier resolution scoped by type and parent context.
+
+    Meraki IDs are only unique per object type and per parent —
+    group-policy IDs restart at 100 in every network and VLAN 100 is
+    ubiquitous — so a flat old→new map mis-remaps colliding IDs.
+    Mappings are recorded under a *type stem* (the created object's own
+    path-parameter name) plus its old-space parent path values, and
+    lookups resolve in order:
+
+    1. **scoped**: entries under the reference key's stem whose context
+       is contained in the referring action's own path values;
+    2. **flat-unique**: when the snapshot holds no object of that stem
+       with this ID (e.g. ``hubIds`` values are network IDs), a single
+       matching mapping of any scope wins;
+    3. otherwise **loud failure** — a known-but-unmapped ID has no
+       rebuilt counterpart *yet* (the executor defers and retries), and
+       an ambiguous ID is never guessed.
+    """
+
+    def __init__(self, graph: NetworkGraph) -> None:
+        #: (stem, old) → [(context, new), ...]
+        self._entries: dict[
+            tuple[str, str], list[tuple[frozenset[str], str]]
+        ] = {}
+        #: old → [(context, new), ...] across every stem, for fallback.
+        self._by_old: dict[str, list[tuple[frozenset[str], str]]] = {}
+        #: Identities the snapshot's own objects carry, per stem and flat.
+        self._known_scoped: set[tuple[str, str]] = set()
+        self._known_flat: set[str] = set()
+        self._register_known("organization", graph.organization_id)
+        for network in graph.networks:
+            self._register_known("network", network.network_id)
+        for device in graph.devices:
+            self._register_known("serial", device.serial)
+        for feature in graph.features:
+            placeholders = _PATH_PARAM_RE.findall(feature.api_path)
+            if placeholders and feature.path_values:
+                # Only the feature's own identity (its last path value)
+                # is registered under a stem; parent values are known
+                # through the parent objects themselves.
+                self._register_known(
+                    _scope_stem(placeholders[-1]), feature.path_values[-1]
+                )
+            self._known_flat.update(v for v in feature.path_values if v)
+
+    def _register_known(self, stem: str, value: str) -> None:
+        if not value:
+            return
+        self._known_flat.add(value)
+        if stem:
+            self._known_scoped.add((stem, value))
+
+    def record(
+        self, stem: str, old: str, new: str, context: tuple[str, ...] = ()
+    ) -> None:
+        entry = (frozenset(context), new)
+        self._entries.setdefault((stem, old), []).append(entry)
+        self._by_old.setdefault(old, []).append(entry)
+
+    def resolve_reference(
+        self,
+        key: str,
+        old: str,
+        context: tuple[str, ...],
+        exclude: str | None = None,
+    ) -> str:
+        """Strict resolution for payload references (fails loudly).
+
+        ``exclude`` is the referring object's own old identity on a
+        create: a self-referential field is identity, not a dangling
+        reference, so it passes through when nothing scoped matches.
+        """
+        referrer = frozenset(context)
+        stem = _scope_stem(key)
+        if stem:
+            scoped = self._entries.get((stem, old), [])
+            matches = {new for ctx, new in scoped if ctx <= referrer}
+            if len(matches) == 1:
+                return next(iter(matches))
+            if len(matches) > 1:
+                raise UnmappedReferenceError(
+                    f"reference {key}={old!r} is ambiguous across "
+                    "rebuilt objects; refusing to guess"
+                )
+            if old == exclude:
+                return old
+            if scoped or (stem, old) in self._known_scoped:
+                # An object of this type with this ID exists in the
+                # snapshot (or was rebuilt under another parent) — its
+                # in-context counterpart just does not exist yet.
+                raise UnmappedReferenceError(
+                    f"reference to snapshot object {old!r} has no "
+                    "rebuilt counterpart yet"
+                )
+        if old == exclude:
+            return old
+        candidates = {
+            new
+            for ctx, new in self._by_old.get(old, [])
+            if ctx <= referrer
+        }
+        if len(candidates) == 1:
+            return next(iter(candidates))
+        if len(candidates) > 1:
+            raise UnmappedReferenceError(
+                f"reference {old!r} is ambiguous across rebuilt objects; "
+                "refusing to guess"
+            )
+        if old in self._known_flat:
+            raise UnmappedReferenceError(
+                f"reference to snapshot object {old!r} has no rebuilt "
+                "counterpart yet"
+            )
+        return old
+
+    def resolve_scope(
+        self, key: str, old: str, context: tuple[str, ...]
+    ) -> str:
+        """Lenient resolution for path parameters (never raises).
+
+        A parameter with no mapping addresses a fixed-slot object that
+        kept its identity (SSID numbers, per-scope singletons); wave
+        ordering guarantees created parents are mapped before their
+        children dispatch, and a failed parent skips them instead.
+        """
+        referrer = frozenset(context)
+        stem = _scope_stem(key)
+        if stem:
+            matches = {
+                new
+                for ctx, new in self._entries.get((stem, old), [])
+                if ctx <= referrer
+            }
+            if len(matches) == 1:
+                return next(iter(matches))
+        candidates = {
+            new
+            for ctx, new in self._by_old.get(old, [])
+            if ctx <= referrer
+        }
+        if len(candidates) == 1:
+            return next(iter(candidates))
+        return old
+
 
 def rewrite_references(
     value: Any,
-    id_map: Mapping[str, str],
-    known_old_ids: frozenset[str],
+    resolver: ReferenceResolver,
+    context: tuple[str, ...],
+    exclude: str | None = None,
 ) -> Any:
     """Rewrite snapshot-tenant identifiers to their rebuilt counterparts.
 
     Reference-shaped keys (``*Id``/``*Ids``) and the ``GRP()``/``OBJ()``
-    grammar inside rule strings are remapped through ``id_map``. A
-    reference to a *known* old identifier with no mapping raises
-    :class:`UnmappedReferenceError`; unknown strings pass through
-    untouched (they are data, not references).
+    grammar inside rule strings are remapped through the resolver. A
+    reference to a *known* old identifier with no rebuilt counterpart
+    raises :class:`UnmappedReferenceError`; unknown strings pass
+    through untouched (they are data, not references).
     """
     if isinstance(value, Mapping):
         return {
             key: (
-                _rewrite_reference_value(inner, id_map, known_old_ids)
+                _rewrite_reference_value(
+                    key, inner, resolver, context, exclude
+                )
                 if isinstance(key, str) and _REFERENCE_KEY_RE.search(key)
-                else rewrite_references(inner, id_map, known_old_ids)
+                else rewrite_references(inner, resolver, context, exclude)
             )
             for key, inner in value.items()
         }
     if isinstance(value, list):
         return [
-            rewrite_references(item, id_map, known_old_ids) for item in value
+            rewrite_references(item, resolver, context, exclude)
+            for item in value
         ]
     if isinstance(value, str):
-        return _rewrite_grammar(value, id_map, known_old_ids)
+        return _rewrite_grammar(value, resolver, context, exclude)
     return value
 
 
 def _rewrite_reference_value(
-    value: Any, id_map: Mapping[str, str], known_old_ids: frozenset[str]
+    key: str,
+    value: Any,
+    resolver: ReferenceResolver,
+    context: tuple[str, ...],
+    exclude: str | None,
 ) -> Any:
     if isinstance(value, str):
-        if value in id_map:
-            return id_map[value]
-        if value in known_old_ids:
-            raise UnmappedReferenceError(
-                f"reference to snapshot object {value!r} has no rebuilt "
-                "counterpart yet"
-            )
-        return value
+        return resolver.resolve_reference(key, value, context, exclude)
     if isinstance(value, list):
         return [
-            _rewrite_reference_value(item, id_map, known_old_ids)
+            _rewrite_reference_value(key, item, resolver, context, exclude)
             for item in value
         ]
     return value
 
 
 def _rewrite_grammar(
-    value: str, id_map: Mapping[str, str], known_old_ids: frozenset[str]
+    value: str,
+    resolver: ReferenceResolver,
+    context: tuple[str, ...],
+    exclude: str | None,
 ) -> str:
     def _sub(match: "re.Match[str]") -> str:
-        old = match.group(2)
-        if old in id_map:
-            return f"{match.group(1)}({id_map[old]})"
-        if old in known_old_ids:
-            raise UnmappedReferenceError(
-                f"{match.group(1)}({old}) references a snapshot object "
-                "with no rebuilt counterpart yet"
-            )
-        return match.group(0)
+        verb, old = match.group(1), match.group(2)
+        new = resolver.resolve_reference(
+            _GRAMMAR_KEYS[verb], old, context, exclude
+        )
+        return f"{verb}({new})"
 
     return _OBJ_GRP_RE.sub(_sub, value)
 
@@ -467,21 +632,15 @@ def _remap_serial_fields(
     return value
 
 
-def known_snapshot_ids(graph: NetworkGraph) -> frozenset[str]:
-    """Every identifier the snapshot's own objects carry.
-
-    The registry that separates "this string is a reference to one of
-    our objects" from "this string is just data": path values, network
-    IDs, and device serials.
-    """
-    ids: set[str] = {graph.organization_id}
-    for network in graph.networks:
-        ids.add(network.network_id)
-    for device in graph.devices:
-        ids.add(device.serial)
-    for feature in graph.features:
-        ids.update(feature.path_values)
-    return frozenset(ids)
+def _own_identity(action: RestoreAction) -> tuple[str, str]:
+    """(type stem, old ID) of the object an action creates or claims."""
+    if action.wave == WAVE_NETWORKS:
+        return ("network", action.path_values[0])
+    if action.kind == "claim":
+        return ("serial", action.path_values[-1])
+    placeholders = _PATH_PARAM_RE.findall(action.api_path)
+    stem = _scope_stem(placeholders[-1]) if placeholders else ""
+    return (stem, action.path_values[-1])
 
 
 class RestoreJournalMismatchError(RuntimeError):
@@ -504,6 +663,10 @@ class RestoreJournal:
         self._path = path
         self.completed: set[str] = set()
         self.id_map: dict[str, str] = {}
+        #: (scope stem, old, new, context) per mapping — the resolver's
+        #: raw material. Legacy records load with scope "" / context ()
+        #: and resolve through the flat-unique fallback.
+        self.mappings: list[tuple[str, str, str, tuple[str, ...]]] = []
         self.meta: dict[str, str] = {}
         if path.exists():
             lines = path.read_text(encoding="utf-8").splitlines()
@@ -527,7 +690,19 @@ class RestoreJournal:
                 if record.get("kind") == "done":
                     self.completed.add(str(record["key"]))
                 elif record.get("kind") == "map":
-                    self.id_map[str(record["old"])] = str(record["new"])
+                    old, new = str(record["old"]), str(record["new"])
+                    self.id_map[old] = new
+                    self.mappings.append(
+                        (
+                            str(record.get("scope", "")),
+                            old,
+                            new,
+                            tuple(
+                                str(v)
+                                for v in record.get("context") or ()
+                            ),
+                        )
+                    )
                 elif record.get("kind") == "meta":
                     self.meta = {
                         str(key): str(value)
@@ -570,9 +745,24 @@ class RestoreJournal:
         self.completed.add(key)
         self._append({"kind": "done", "key": key})
 
-    def record_mapping(self, old: str, new: str) -> None:
+    def record_mapping(
+        self,
+        old: str,
+        new: str,
+        scope: str = "",
+        context: tuple[str, ...] = (),
+    ) -> None:
         self.id_map[old] = new
-        self._append({"kind": "map", "old": old, "new": new})
+        self.mappings.append((scope, old, new, tuple(context)))
+        self._append(
+            {
+                "kind": "map",
+                "old": old,
+                "new": new,
+                "scope": scope,
+                "context": list(context),
+            }
+        )
 
 
 @dataclass(frozen=True)
@@ -632,20 +822,23 @@ class OrgRestorer:
         self._journal.bind(
             target=self._target, source=graph.organization_id
         )
-        known = known_snapshot_ids(graph)
         #: Serials a drill cannot touch: production hardware without a
         #: replacement mapping. Payloads referencing them (switch
         #: stacks, …) are drill-skipped, not failed.
         drill_serials = frozenset(
             device.serial for device in graph.devices
         ) - frozenset(self._serial_map)
-        id_map = dict(self._journal.id_map)
-        id_map.setdefault(graph.organization_id, self._target)
-        id_map.update(self._serial_map)
+        resolver = ReferenceResolver(graph)
+        for scope, old, new, mapping_context in self._journal.mappings:
+            resolver.record(scope, old, new, mapping_context)
+        resolver.record("organization", graph.organization_id, self._target)
+        for old_serial, new_serial in self._serial_map.items():
+            resolver.record("serial", old_serial, new_serial)
         executed: list[str] = []
         failed: list[tuple[str, str]] = []
         skipped: list[dict[str, str]] = []
-        failed_parents: set[str] = set()
+        #: (type stem, old value) of creates that failed this run.
+        failed_parents: set[tuple[str, str]] = set()
 
         # Alphabetical wave order can place a referrer before its
         # referent (an appliance VLAN carrying groupPolicyId before the
@@ -682,7 +875,17 @@ class OrgRestorer:
                          "(journal); resume skips completed actions"}
                     )
                     continue
-                dead = [v for v in action.path_values if v in failed_parents]
+                # Parents are matched by (type stem, value): a bare
+                # value match would let e.g. a failed group policy
+                # "100" poison the unrelated VLAN 100.
+                dead = [
+                    value
+                    for name, value in zip(
+                        _PATH_PARAM_RE.findall(action.api_path),
+                        action.path_values,
+                    )
+                    if (_scope_stem(name), value) in failed_parents
+                ]
                 if dead:
                     skipped.append(
                         {"target": action.key, "reason": "parent object "
@@ -691,7 +894,7 @@ class OrgRestorer:
                     continue
                 try:
                     new_id = self._dispatch(
-                        dashboard, action, id_map, known, graph.organization_id
+                        dashboard, action, resolver, graph.organization_id
                     )
                 except UnmappedReferenceError as exc:
                     deferred.append((action, str(exc)))
@@ -699,18 +902,20 @@ class OrgRestorer:
                 except Exception as exc:  # noqa: BLE001 - per-object isolation
                     failed.append((action.key, str(exc)))
                     if action.kind == "create":
-                        failed_parents.add(action.path_values[0]
-                                           if action.wave == WAVE_NETWORKS
-                                           else action.path_values[-1])
+                        failed_parents.add(_own_identity(action))
                     continue
                 if new_id is not None:
-                    old = (
-                        action.path_values[0]
+                    own_stem, own_old = _own_identity(action)
+                    mapping_context = (
+                        ()
                         if action.wave == WAVE_NETWORKS
-                        else action.path_values[-1]
+                        else tuple(action.path_values[:-1])
                     )
-                    id_map[old] = new_id
-                    self._journal.record_mapping(old, new_id)
+                    resolver.record(own_stem, own_old, new_id, mapping_context)
+                    self._journal.record_mapping(
+                        own_old, new_id,
+                        scope=own_stem, context=mapping_context,
+                    )
                 self._journal.record_done(action.key)
                 executed.append(action.key)
             if not deferred:
@@ -732,8 +937,7 @@ class OrgRestorer:
         self,
         dashboard: Any,
         action: RestoreAction,
-        id_map: Mapping[str, str],
-        known: frozenset[str],
+        resolver: ReferenceResolver,
         source_org: str,
     ) -> str | None:
         """One write; returns the server-assigned ID for creates."""
@@ -747,7 +951,9 @@ class OrgRestorer:
         elif action.kind == "claim":
             scope_values = (action.path_values[0],)
         for name, value in zip(op.path_params, scope_values):
-            params[name] = id_map.get(value, value)
+            params[name] = resolver.resolve_scope(
+                name, value, action.path_values
+            )
         # Path parameters win over any payload field of the same name —
         # the payload echoes the snapshot tenant's identifiers
         # (organizationId in network payloads, number in SSIDs, portId
@@ -758,6 +964,7 @@ class OrgRestorer:
             for key, value in action.payload.items()
             if key not in params
         }
+        exclude: str | None = None
         if action.kind == "create":
             # The object's own identity is server-assigned on create:
             # strip self-referential fields the write schema does not
@@ -766,17 +973,15 @@ class OrgRestorer:
             # keep their value even when it equals the old ID — an
             # appliance VLAN's client-assigned `id` is required by its
             # create operation.
-            own_old = (
-                action.path_values[0]
-                if action.wave == WAVE_NETWORKS
-                else action.path_values[-1]
-            )
+            _, own_old = _own_identity(action)
             accepted = _body_property_names(op)
             body = {
                 k: v for k, v in body.items() if v != own_old or k in accepted
             }
-            known = frozenset(known - {own_old})
-        body = rewrite_references(body, id_map, known)
+            exclude = own_old
+        body = rewrite_references(
+            body, resolver, action.path_values, exclude
+        )
         if self._serial_map:
             body = _remap_serial_fields(body, self._serial_map)
         if action.kind == "claim":
