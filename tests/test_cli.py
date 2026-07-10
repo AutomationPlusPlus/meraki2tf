@@ -1588,3 +1588,25 @@ def test_restore_confirm_reports_failures_nonzero(
          "--confirm"]
     )
     assert exit_code == 1
+
+
+def test_skip_claims_requires_restore(spec_file: Path) -> None:
+    with pytest.raises(SystemExit):
+        main(["--spec", str(spec_file), "--org-id", "org-123", "--skip-claims"])
+
+
+def test_restore_drill_preview_notes_skip_claims(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _no_network(monkeypatch)
+    dump = _restore_dump(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--restore", "--from-dump", str(dump),
+         "--target-org", "org-999", "--skip-claims"]
+    )
+    console = capsys.readouterr().err
+    assert exit_code == 0
+    assert "Drill mode" in console

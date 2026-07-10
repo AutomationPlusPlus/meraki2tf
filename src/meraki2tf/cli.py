@@ -190,6 +190,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--skip-claims",
+        action="store_true",
+        help=(
+            "Drill mode for --restore: skip device claiming and "
+            "device-scoped features (the hardware is attached to the "
+            "production organization, so a drill cannot claim it). They "
+            "are reported as drill-skipped, never as failures."
+        ),
+    )
+    parser.add_argument(
         "--serial-map",
         metavar="PATH",
         default=None,
@@ -517,6 +527,12 @@ def _restore(config: RuntimeConfig) -> int:
             "Cannot restore %s (ids=%s): %s",
             item.api_path, ",".join(item.path_values) or "<none>", item.reason,
         )
+    if config.skip_claims:
+        logger.info(
+            "Drill mode: device claiming and device-scoped features "
+            "will be skipped (hardware belongs to the production "
+            "organization)."
+        )
     if not config.confirm:
         logger.warning(
             "Preview only — nothing was written to Meraki. Re-run with "
@@ -532,7 +548,8 @@ def _restore(config: RuntimeConfig) -> int:
         return 1
     journal = RestoreJournal(config.workdir / "restore-journal.jsonl")
     restorer = OrgRestorer(
-        config.target_org, journal, serial_map=serial_map
+        config.target_org, journal, serial_map=serial_map,
+        skip_claims=config.skip_claims,
     )
     result = restorer.execute(graph, plan)
     for key, reason in result.failed:
@@ -680,6 +697,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "--confirm is only valid together with --rebuild, --replay-gaps, "
             "or --restore."
         )
+    if config.skip_claims and not config.restore:
+        arg_parser.error("--skip-claims is only valid together with --restore.")
     if config.restore:
         if config.dump_path is None:
             arg_parser.error(
