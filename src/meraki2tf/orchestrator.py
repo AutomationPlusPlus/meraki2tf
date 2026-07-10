@@ -484,8 +484,20 @@ class PipelineOrchestrator:
                     if asset.address not in plan.dropped
                 ),
                 unsupported=report.unsupported + tuple(flagged),
-                imports_written=report.imports_written
-                - sum(1 for asset in dropped_assets if not asset.already_in_state),
+                # Drops accumulate across the whole plan loop while a
+                # heal regeneration rewrites a much smaller kit, so the
+                # subtraction can undershoot; a negative "imports
+                # written" is meaningless to report — floor at zero (the
+                # coverage manifest carries the exact per-asset truth).
+                imports_written=max(
+                    0,
+                    report.imports_written
+                    - sum(
+                        1
+                        for asset in dropped_assets
+                        if not asset.already_in_state
+                    ),
+                ),
             )
         if plan.ignored_secrets:
             logger.warning(

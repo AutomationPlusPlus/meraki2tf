@@ -1089,6 +1089,28 @@ def test_reconciliation_drops_become_unsupported_with_alert(
     assert success.details["unsupported_count"] == 1
 
 
+def test_imports_written_never_reports_negative(
+    tmp_path: Path, api_key: None
+) -> None:
+    """Drops accumulate across the plan loop while heal regenerations
+    rewrite a much smaller kit; the fold must floor at zero instead of
+    reporting a negative import count to monitoring consumers."""
+    generator = StubGenerator(addresses=("meraki_networks.n_1",))
+    orchestrator, _, _, runner = _orchestrator(
+        tmp_path,
+        plan_exit=2,
+        plan_stdout="Plan: 1 to import, 0 to add, 0 to change, 0 to destroy.",
+        generator=generator,
+    )
+    runner.reconciliation_dropped = {
+        "meraki_networks.n_1": "unexpressible",
+        "meraki_devices.q2ab": "unexpressible",
+        "meraki_widget.w_1": "unexpressible",
+    }
+    summary = orchestrator.run("org-123")
+    assert summary.imports_written == 0
+
+
 def test_unmanaged_secrets_reach_summary_manifest_and_notification(
     tmp_path: Path, api_key: None
 ) -> None:
