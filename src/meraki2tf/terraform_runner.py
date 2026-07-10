@@ -605,9 +605,14 @@ class TerraformRunner:
 
         Returns with ``has_changes`` reflecting the ``-detailed-exitcode``
         contract (0 = state in sync, 2 = delta present). The plan is
-        always saved to the sync plan file (reconciliation classifies it
-        via ``show -json``; the guarded apply verifies the saved plan
-        document). Bounded loop: at most ``_MAX_PLAN_ATTEMPTS`` plan
+        always saved to the sync plan file *during* planning
+        (reconciliation classifies it via ``show -json``; the guarded
+        apply verifies the saved plan document), but a saved plan embeds
+        the refreshed values of every resource — the same secret
+        material that forces the state file to 0600 — so when
+        ``save_plan`` is false (no apply will consume it) the file is
+        deleted before returning, and it is kept owner-only while it
+        exists. Bounded loop: at most ``_MAX_PLAN_ATTEMPTS`` plan
         invocations — remaining changes after that are reported as
         drift, never looped on.
 
@@ -617,6 +622,19 @@ class TerraformRunner:
         the entire kit for hours — the full-kit drift picture was
         already taken by the run's first, untargeted plan.
         """
+        try:
+            return self._plan_with_generation(
+                reconcile=reconcile, targets=targets
+            )
+        finally:
+            if not save_plan:
+                (self._workdir / SYNC_PLAN_FILENAME).unlink(missing_ok=True)
+
+    def _plan_with_generation(
+        self,
+        reconcile: bool = True,
+        targets: Iterable[str] | None = None,
+    ) -> ReconciledPlanResult:
         dropped: dict[str, str] = {}
         ignored: dict[str, tuple[str, ...]] = {}
         normalized: dict[str, tuple[str, ...]] = {}
@@ -643,6 +661,7 @@ class TerraformRunner:
             # absorbed first so surgery always edits resources.tf.
             self._absorb_generated_config()
             result = self._run(*args, allowed=allowed)
+            self._restrict_plan_file_permissions()
             self._absorb_generated_config()
             final_attempt = attempt >= self._MAX_PLAN_ATTEMPTS
             if result.returncode == _PLAN_ERROR:
@@ -815,6 +834,7 @@ class TerraformRunner:
             *args,
             allowed=(_PLAN_NO_CHANGES, _PLAN_ERROR, _PLAN_CHANGES_PRESENT),
         )
+        self._restrict_plan_file_permissions()
         self._absorb_generated_config()
         return result
 
@@ -950,6 +970,17 @@ class TerraformRunner:
                     f"verified: {exc}",
                     plan_output="",
                 ) from exc
+            malformed = _document_malformed_entry_count(document)
+            if malformed:
+                # The lenient parse below skips entries it cannot read;
+                # inside the guard an unreadable entry must refuse, not
+                # pass as "no mutation".
+                raise ImportGuardViolation(
+                    "Refusing to apply: the saved plan document carries "
+                    f"{malformed} resource change entry(ies) whose shape "
+                    "cannot be verified.",
+                    plan_output="",
+                )
             actions = _document_resource_actions(document)
             mutations = {
                 address: acts
@@ -1002,9 +1033,17 @@ class TerraformRunner:
         if not targets:
             return
         self._prune_baseline(targets)
-        tracked = [address for address in targets if address in self.existing_addresses()]
+        existing = self.existing_addresses()
+        tracked = [address for address in targets if address in existing]
         if tracked:
-            self._run("state", "rm", "-no-color", *tracked)
+            # `state rm` writes a full pre-removal state backup (secret
+            # material included); route it to a fixed path instead of
+            # terraform's timestamped default so it can be kept 0600.
+            backup = self._state_path.with_name(self._state_path.name + ".backup")
+            self._run("state", "rm", "-no-color", f"-backup={backup}", *tracked)
+            if backup.exists():
+                restrict_to_owner(backup)
+            self._restrict_state_permissions()
             logger.info("Removed %d resource(s) from the Terraform state.", len(tracked))
 
     def _prune_baseline(self, addresses: Iterable[str]) -> None:
@@ -1124,6 +1163,18 @@ class TerraformRunner:
         self._restrict_state_permissions()
         return result
 
+    def _restrict_plan_file_permissions(self) -> None:
+        """Owner-only (0600) permissions on the saved plan file.
+
+        A saved plan document embeds the refreshed values of every
+        planned resource (SSID PSKs, SNMP community strings, …) exactly
+        like the state file; terraform writes it with default
+        permissions.
+        """
+        plan_file = self._workdir / SYNC_PLAN_FILENAME
+        if plan_file.exists():
+            restrict_to_owner(plan_file)
+
     def _restrict_state_permissions(self) -> None:
         """Owner-only (0600) permissions on the state file and its backup.
 
@@ -1212,6 +1263,20 @@ class TerraformRunner:
             stdout=completed.stdout,
             stderr=completed.stderr,
         )
+
+
+def _document_malformed_entry_count(document: Any) -> int:
+    """Resource-change entries a shown plan document carries that the
+    lenient parser would skip — the guard refuses when any exist."""
+    changes = document.get("resource_changes") if isinstance(document, dict) else None
+    return sum(
+        1
+        for change in changes or ()
+        if not isinstance(change, dict)
+        or not change.get("address")
+        or not isinstance(change.get("change"), dict)
+        or not isinstance(change["change"].get("actions"), list)
+    )
 
 
 def _document_resource_actions(document: Any) -> dict[str, tuple[str, ...]]:

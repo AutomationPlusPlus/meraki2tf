@@ -874,6 +874,47 @@ def test_plan_with_generation_always_saves_the_plan(
     assert f"-out={SYNC_PLAN_FILENAME}" in fake.calls[1]["command"]
 
 
+def test_plan_deletes_saved_plan_unless_an_apply_will_consume_it(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The saved plan embeds refreshed secret values; runs that never
+    apply (save_plan=False) must not leave it in the workdir, and while
+    it exists it is owner-only like the state file."""
+    runner.prepare_workspace()
+    plan_file = runner.workdir / SYNC_PLAN_FILENAME
+
+    def write_plan() -> None:
+        plan_file.write_bytes(b"opaque-plan")
+        plan_file.chmod(0o644)  # terraform writes with umask defaults
+
+    fake = FakeSubprocess(returncode=0, on_run=write_plan)
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+
+    runner.plan_with_generation()  # default: nothing will apply it
+    assert not plan_file.exists()
+
+    runner.plan_with_generation(save_plan=True)  # sync: the guard needs it
+    assert plan_file.exists()
+    assert (plan_file.stat().st_mode & 0o777) == 0o600
+
+
+def test_guard_refuses_malformed_plan_document_entries(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An entry the lenient parser would skip (no address) must read as
+    "unverifiable" inside the guard, never as "no mutation"."""
+    runner.prepare_workspace()
+    (runner.workdir / SYNC_PLAN_FILENAME).write_bytes(b"opaque-plan")
+    show_json = json.dumps(
+        {"resource_changes": [{"change": {"actions": ["delete"]}}]}
+    )
+    scripted = ScriptedSubprocess((0, show_json, None))
+    monkeypatch.setattr(terraform_runner.subprocess, "run", scripted.run)
+    with pytest.raises(ImportGuardViolation, match="shape cannot be verified"):
+        runner.apply_import_plan()
+    assert len(scripted.calls) == 1  # refused before any apply
+
+
 def test_plan_resource_actions_parses_show_json(
     runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -950,9 +991,13 @@ def test_remove_resources_prunes_baseline_and_state(
     assert 'site = "hq"' not in content  # nested braces stay inside the block
     assert 'resource "meraki_networks" "oneliner"' not in content
     assert 'resource "meraki_devices" "q2ab"' in content  # untouched neighbor
-    # Only the state-tracked address reaches `state rm`.
+    # Only the state-tracked address reaches `state rm`, and the
+    # secret-bearing pre-removal backup lands on the fixed 0600-managed
+    # path instead of terraform's timestamped default.
     assert fake.calls[0]["command"] == (
-        "terraform", "state", "rm", "-no-color", "meraki_networks.n_1",
+        "terraform", "state", "rm", "-no-color",
+        f"-backup={runner.state_path.with_name(runner.state_path.name + '.backup')}",
+        "meraki_networks.n_1",
     )
 
 
