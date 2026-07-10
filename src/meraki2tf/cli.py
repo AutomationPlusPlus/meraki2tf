@@ -640,12 +640,22 @@ def _restore(config: RuntimeConfig) -> int:
             "Meraki dashboard API.", API_KEY_ENV_VAR,
         )
         return 1
-    journal = RestoreJournal(config.workdir / "restore-journal.jsonl")
+    from meraki2tf.restorer import RestoreJournalMismatchError
+
+    try:
+        journal = RestoreJournal(config.workdir / "restore-journal.jsonl")
+    except ValueError as exc:
+        logger.critical("Restore journal is unreadable: %s", exc)
+        return 2
     restorer = OrgRestorer(
         config.target_org, journal, serial_map=serial_map,
         skip_claims=config.skip_claims,
     )
-    result = restorer.execute(graph, plan)
+    try:
+        result = restorer.execute(graph, plan)
+    except RestoreJournalMismatchError as exc:
+        logger.critical("%s", exc)
+        return 2
     for key, reason in result.failed:
         logger.error("Restore FAILED for %s: %s", key, reason)
     for entry in result.skipped:

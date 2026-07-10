@@ -348,7 +348,7 @@ def _executor(tmp_path: Path, fail_ops: set[str] | None = None):
     section = _RecordingSection(calls, fail_ops)
     restorer._client = __import__("types").SimpleNamespace(
         organizations=section, networks=section, wireless=section,
-        switch=section,
+        switch=section, appliance=section,
     )
     return restorer, calls
 
@@ -524,10 +524,359 @@ def test_drill_mode_skips_claims_and_device_features(tmp_path: Path) -> None:
     assert len(drill_skips) == 2  # the claim + the switch port
 
 
+# ----------------------------------------------------- dispatch hardening
+
+
+VLAN_COLLECTION = "/networks/{networkId}/appliance/vlans"
+VLAN_ITEM = "/networks/{networkId}/appliance/vlans/{vlanId}"
+STAGES_PATH = "/networks/{networkId}/firmwareUpgrades/staged/stages"
+
+
+def _vlan_spec(tmp_path: Path) -> OpenApiParser:
+    """Spec slice where a referrer sorts before its referent in-wave and
+    the create schema declares the client-assigned ``id``."""
+    spec = {
+        "openapi": "3.0.0",
+        "info": {"title": "vlan", "version": "1"},
+        "paths": {
+            "/organizations/{organizationId}/networks": {
+                "get": _op("getOrganizationNetworks", "organizations"),
+                "post": _op("createOrganizationNetwork", "organizations"),
+            },
+            "/networks/{networkId}/devices/claim": {
+                "post": _op("claimNetworkDevices", "networks"),
+            },
+            VLAN_COLLECTION: {
+                "get": _op("getNetworkApplianceVlans", "appliance"),
+                "post": {
+                    **_op("createNetworkApplianceVlan", "appliance"),
+                    "requestBody": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "properties": {
+                                        "id": {"type": "string"},
+                                        "name": {"type": "string"},
+                                        "groupPolicyId": {"type": "string"},
+                                    }
+                                }
+                            }
+                        }
+                    },
+                },
+            },
+            VLAN_ITEM: {
+                "get": _op("getNetworkApplianceVlan", "appliance"),
+                "put": _op("updateNetworkApplianceVlan", "appliance"),
+            },
+            GP_COLLECTION: {
+                "get": _op("getNetworkGroupPolicies", "networks"),
+                "post": _op("createNetworkGroupPolicy", "networks"),
+            },
+            GP_ITEM: {
+                "get": _op("getNetworkGroupPolicy", "networks"),
+                "put": _op("updateNetworkGroupPolicy", "networks"),
+            },
+        },
+    }
+    path = tmp_path / "vlan-spec.json"
+    path.write_text(json.dumps(spec), encoding="utf-8")
+    return OpenApiParser(path)
+
+
+def test_executor_defers_references_created_later_in_the_wave(
+    tmp_path: Path,
+) -> None:
+    """Alphabetical wave order puts appliance VLANs before group
+    policies; a VLAN carrying groupPolicyId must retry after the policy
+    exists, not fail as an unmapped reference — and its client-assigned
+    ``id`` (declared by the create schema) must survive the stale-ID
+    strip."""
+    parser = _vlan_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(
+            VLAN_ITEM, ("N_1", "100"),
+            {"id": "100", "name": "Data", "groupPolicyId": "101"},
+        ),
+        FeatureConfiguration(
+            GP_ITEM, ("N_1", "101"),
+            {"groupPolicyId": "101", "name": "kiosk"},
+        ),
+    )
+    plan = plan_restore(graph, parser)
+    ordered = [a.api_path for a in plan.actions if a.wave == WAVE_NETWORK_FEATURES]
+    assert ordered.index(VLAN_ITEM) < ordered.index(GP_ITEM)  # the trap
+
+    restorer, calls = _executor(tmp_path)
+    result = restorer.execute(graph, plan)
+
+    assert result.failed == ()
+    ops = [c[0] for c in calls]
+    assert ops.index("createNetworkGroupPolicy") < ops.index(
+        "createNetworkApplianceVlan"
+    )
+    vlan = next(c for c in calls if c[0] == "createNetworkApplianceVlan")
+    assert vlan[2]["id"] == "100"  # schema-declared, required, kept
+    assert vlan[2]["groupPolicyId"] == "900"  # remapped to the new GP
+
+
+def test_dispatch_never_passes_path_params_as_body_kwargs(
+    tmp_path: Path,
+) -> None:
+    """Payloads echo the snapshot tenant's identifiers (organizationId
+    in networks, number in SSIDs); the real SDK methods take those as
+    explicit positional parameters, so forwarding them as body kwargs
+    raises 'got multiple values for argument'."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(
+            SSID_ITEM, ("N_1", "0"), {"number": 0, "name": "Corp"}
+        ),
+    )
+    plan = plan_restore(graph, parser)
+    calls: list = []
+
+    class StrictSections:
+        """SDK-faithful signatures: path params are named positionals."""
+
+        def createOrganizationNetwork(
+            self, organizationId: str, **kwargs: object
+        ) -> dict:
+            calls.append(("createOrganizationNetwork", organizationId, kwargs))
+            return {"id": "L_NEW"}
+
+        def claimNetworkDevices(
+            self, networkId: str, **kwargs: object
+        ) -> dict:
+            calls.append(("claimNetworkDevices", networkId, kwargs))
+            return {}
+
+        def updateNetworkWirelessSsid(
+            self, networkId: str, number: str, **kwargs: object
+        ) -> dict:
+            calls.append(("updateNetworkWirelessSsid", networkId, number, kwargs))
+            return {}
+
+    section = StrictSections()
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "strict.jsonl")
+    )
+    restorer._client = SimpleNamespace(
+        organizations=section, networks=section, wireless=section
+    )
+    result = restorer.execute(graph, plan)
+
+    assert result.failed == ()
+    network = next(c for c in calls if c[0] == "createOrganizationNetwork")
+    assert network[1] == "org-TARGET"
+    assert "organizationId" not in network[2] and "id" not in network[2]
+    ssid = next(c for c in calls if c[0] == "updateNetworkWirelessSsid")
+    assert ssid[1:3] == ("L_NEW", "0")
+    assert "number" not in ssid[3]
+
+
+def test_dispatch_unwraps_collection_envelopes(tmp_path: Path) -> None:
+    """Whole-collection {"items": [...]} payloads are discovery
+    artifacts; the write body is the operation's sole array property,
+    exactly like the gap replayer."""
+    spec = {
+        "openapi": "3.0.0",
+        "info": {"title": "stages", "version": "1"},
+        "paths": {
+            STAGES_PATH: {
+                "get": _op("getNetworkFirmwareUpgradesStagedStages", "networks"),
+                "put": {
+                    **_op(
+                        "updateNetworkFirmwareUpgradesStagedStages", "networks"
+                    ),
+                    "requestBody": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "properties": {"_json": {"type": "array"}}
+                                }
+                            }
+                        }
+                    },
+                },
+            },
+        },
+    }
+    path = tmp_path / "stages-spec.json"
+    path.write_text(json.dumps(spec), encoding="utf-8")
+    parser = OpenApiParser(path)
+    graph = _graph(
+        FeatureConfiguration(
+            STAGES_PATH, ("N_1",),
+            {"items": [{"group": {"id": "1"}}], "meta": {"counts": {}}},
+        ),
+    )
+    plan = plan_restore(graph, parser)
+    restorer, calls = _executor(tmp_path)
+    result = restorer.execute(graph, plan)
+
+    assert result.failed == ()
+    stages = next(
+        c for c in calls
+        if c[0] == "updateNetworkFirmwareUpgradesStagedStages"
+    )
+    assert stages[2] == {"_json": [{"group": {"id": "1"}}]}
+
+
+def test_empty_collections_plan_as_nothing_to_restore(tmp_path: Path) -> None:
+    parser = _restore_spec(tmp_path)
+    plan = plan_restore(
+        _graph(FeatureConfiguration(GP_COLLECTION, ("N_1",), {"items": []})),
+        parser,
+    )
+    (item,) = plan.unrestorable
+    assert "empty at capture" in item.reason
+
+
+def test_nested_redacted_secrets_become_reentry_pointers(
+    tmp_path: Path,
+) -> None:
+    """Sanitized snapshots redact recursively (and PEM blocks under any
+    key); the restore must strip those markers at any depth — writing
+    the literal string as a live RADIUS secret would make a drill
+    'pass' with garbage credentials."""
+    parser = _restore_spec(tmp_path)
+    plan = plan_restore(
+        _graph(
+            FeatureConfiguration(
+                SSID_ITEM, ("N_1", "0"),
+                {
+                    "number": 0,
+                    "name": "Corp",
+                    "certificate": REDACTED,
+                    "radiusServers": [{"host": "10.0.0.1", "secret": REDACTED}],
+                },
+            ),
+        ),
+        parser,
+    )
+    ssid = next(a for a in plan.actions if a.api_path == SSID_ITEM)
+    assert ssid.secret_reentry == ("certificate", "radiusServers[].secret")
+    assert "certificate" not in ssid.payload
+    assert ssid.payload["radiusServers"] == [{"host": "10.0.0.1"}]
+
+
+def test_serial_map_rewrites_embedded_serial_references(
+    tmp_path: Path,
+) -> None:
+    """--serial-map must reach serials embedded in payloads (switch
+    stacks and friends), not just the device-claim calls — serial keys
+    never match the *Id reference grammar."""
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(
+            SNMP_PATH, ("N_1",),
+            {"access": "none", "serials": ["Q2AB-CDEF-GHIJ"],
+             "users": [{"serial": "Q2AB-CDEF-GHIJ"}]},
+        ),
+    )
+    plan = plan_restore(graph, parser)
+    restorer, calls = _executor(tmp_path)  # maps Q2AB… → Q9ZZ-NEWW-HWSN
+    result = restorer.execute(graph, plan)
+
+    assert result.failed == ()
+    snmp = next(c for c in calls if c[0] == "updateNetworkSnmp")
+    assert snmp[2]["serials"] == ["Q9ZZ-NEWW-HWSN"]
+    assert snmp[2]["users"] == [{"serial": "Q9ZZ-NEWW-HWSN"}]
+
+
+def test_drill_mode_skips_objects_referencing_production_serials(
+    tmp_path: Path,
+) -> None:
+    """In a --skip-claims drill the hardware belongs to production; a
+    network-wave object whose payload references those serials is a
+    drill-skipped verdict, not a failure."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(
+            SNMP_PATH, ("N_1",),
+            {"access": "none", "serials": ["Q2AB-CDEF-GHIJ"]},
+        ),
+    )
+    plan = plan_restore(graph, parser)
+    calls: list = []
+    section = _RecordingSection(calls)
+    restorer = OrgRestorer(
+        "org-TARGET",
+        RestoreJournal(tmp_path / "drill2.jsonl"),
+        skip_claims=True,
+    )
+    restorer._client = SimpleNamespace(
+        organizations=section, networks=section
+    )
+    result = restorer.execute(graph, plan)
+
+    assert result.failed == ()
+    assert all(c[0] != "updateNetworkSnmp" for c in calls)
+    assert any(
+        "production hardware serial" in e["reason"] for e in result.skipped
+    )
+
+
+# ------------------------------------------------------------- journal
+
+
+def test_journal_binds_to_one_target_and_source(tmp_path: Path) -> None:
+    """Resuming a journal against a different target would skip every
+    create and write the configure actions into the previous target."""
+    import pytest as _pytest
+
+    from meraki2tf.restorer import (
+        RestoreJournal,
+        RestoreJournalMismatchError,
+    )
+
+    path = tmp_path / "bound.jsonl"
+    RestoreJournal(path).bind(target="org-A", source="org-123")
+    RestoreJournal(path).bind(target="org-A", source="org-123")  # resume: ok
+    with _pytest.raises(RestoreJournalMismatchError, match="refusing"):
+        RestoreJournal(path).bind(target="org-B", source="org-123")
+    with _pytest.raises(RestoreJournalMismatchError, match="refusing"):
+        RestoreJournal(path).bind(target="org-A", source="org-456")
+
+
+def test_journal_tolerates_a_torn_final_line_only(tmp_path: Path) -> None:
+    import pytest as _pytest
+
+    torn = tmp_path / "torn.jsonl"
+    torn.write_text(
+        '{"kind": "done", "key": "a"}\n{"kind": "ma', encoding="utf-8"
+    )
+    from meraki2tf.restorer import RestoreJournal
+
+    journal = RestoreJournal(torn)
+    assert journal.completed == {"a"}  # the torn tail is dropped
+
+    corrupt = tmp_path / "corrupt.jsonl"
+    corrupt.write_text(
+        '{"kind": "ma\n{"kind": "done", "key": "a"}\n', encoding="utf-8"
+    )
+    with _pytest.raises(json.JSONDecodeError):
+        RestoreJournal(corrupt)  # mid-file corruption still refuses
+
+
 # ------------------------------------------------------------------- wipe
 
 
-def _wipe_dashboard(devices: int = 0, networks: int = 2, name: str = "Drill Org"):
+def _wipe_dashboard(
+    devices: int = 0,
+    networks: int = 2,
+    name: str = "Drill Org",
+    inventory: int = 0,
+):
     from types import SimpleNamespace
 
     deleted: dict[str, list] = {"networks": [], "orgs": []}
@@ -540,6 +889,11 @@ def _wipe_dashboard(devices: int = 0, networks: int = 2, name: str = "Drill Org"
             self, organizationId: str, total_pages: str = "all"
         ) -> list:
             return [{"serial": f"Q{i}"} for i in range(devices)]
+
+        def getOrganizationInventoryDevices(
+            self, organizationId: str, total_pages: str = "all"
+        ) -> list:
+            return [{"serial": f"QI{i}"} for i in range(inventory)]
 
         def getOrganizationNetworks(
             self, organizationId: str, total_pages: str = "all"
@@ -569,6 +923,36 @@ def test_wipe_refuses_orgs_with_claimed_devices() -> None:
     wiper = OrgWiper()
     wiper._client, _ = _wipe_dashboard(devices=3)
     with _pytest.raises(WipeRefusedError, match="claimed device"):
+        wiper.preview("org-drill", "Drill Org")
+
+
+def test_wipe_refuses_orgs_with_inventory_only_claims() -> None:
+    """Hardware claimed into the inventory but not yet assigned to a
+    network is invisible to /organizations/{id}/devices — the interlock
+    must consult the inventory too, or a production org whose devices
+    are staged-but-unassigned would pass the hardware check."""
+    import pytest as _pytest
+
+    from meraki2tf.restorer import OrgWiper, WipeRefusedError
+
+    wiper = OrgWiper()
+    wiper._client, _ = _wipe_dashboard(devices=0, inventory=2)
+    with _pytest.raises(WipeRefusedError, match="claimed device"):
+        wiper.preview("org-drill", "Drill Org")
+
+
+def test_wipe_fails_closed_without_the_inventory_endpoint() -> None:
+    """An SDK that cannot answer the inventory question refuses the
+    wipe instead of proceeding on partial evidence."""
+    import pytest as _pytest
+
+    from meraki2tf.restorer import OrgWiper, WipeRefusedError
+
+    wiper = OrgWiper()
+    dashboard, _ = _wipe_dashboard()
+    del dashboard.organizations.__class__.getOrganizationInventoryDevices
+    wiper._client = dashboard
+    with _pytest.raises(WipeRefusedError, match="inventory"):
         wiper.preview("org-drill", "Drill Org")
 
 

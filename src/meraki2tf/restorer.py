@@ -52,9 +52,13 @@ from meraki2tf.openapi_parser import OpenApiParser
 from meraki2tf.config import read_api_key
 from meraki2tf.fsperms import restrict_to_owner
 from meraki2tf.providers.ratelimit import AdaptiveTokenBucket
-from meraki2tf.replayer import _strip_nulls
+from meraki2tf.replayer import (
+    _collection_items,
+    _single_array_body_field,
+    _strip_nulls,
+)
 from meraki2tf.runbook import write_operations
-from meraki2tf.sanitizer import REDACTED, SECRET_KEY_PATTERN
+from meraki2tf.sanitizer import REDACTED
 from meraki2tf.spec.engine import OperationSpec
 
 logger = logging.getLogger(__name__)
@@ -183,6 +187,12 @@ def _classify_feature(
             feature.path_values,
             "No payload captured in the snapshot for this asset.",
         )
+    if _collection_items(feature.payload) == []:
+        return Unrestorable(
+            feature.api_path,
+            feature.path_values,
+            "Collection was empty at capture — nothing to restore.",
+        )
     payload, redacted = _split_redacted(feature.payload)
     if redacted and not payload:
         return Unrestorable(
@@ -249,19 +259,43 @@ def _split_redacted(
 ) -> tuple[dict[str, Any], tuple[str, ...]]:
     """Separate restorable attributes from sanitized-away secrets.
 
-    ``**REDACTED**`` values cannot be written back; they become the
-    operator's secret re-entry list. Secret-*named* attributes with
-    real values (unsanitized snapshot) stay in the payload — restoring
-    them is the whole point of the unsanitized DR snapshot.
+    ``**REDACTED**`` values cannot be written back — sending the marker
+    string as live configuration (a nested RADIUS secret, a PEM
+    certificate under a non-secret key) is worse than omitting the
+    field — so they are stripped at **any** depth and become the
+    operator's secret re-entry list (dotted key paths). Secret-*named*
+    attributes with real values (unsanitized snapshot) stay in the
+    payload — restoring them is the whole point of the unsanitized DR
+    snapshot.
     """
-    clean: dict[str, Any] = {}
-    redacted: list[str] = []
-    for key, value in payload.items():
-        if value == REDACTED and SECRET_KEY_PATTERN.search(key):
-            redacted.append(key)
-            continue
-        clean[key] = value
-    return clean, tuple(sorted(redacted))
+    redacted: set[str] = set()
+
+    def clean_mapping(
+        mapping: Mapping[str, Any], prefix: str
+    ) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for key, value in mapping.items():
+            path = f"{prefix}.{key}" if prefix else str(key)
+            if value == REDACTED:
+                redacted.add(path)
+                continue
+            out[key] = clean_value(value, path)
+        return out
+
+    def clean_value(value: Any, prefix: str) -> Any:
+        if isinstance(value, Mapping):
+            return clean_mapping(value, prefix)
+        if isinstance(value, list):
+            kept = []
+            for item in value:
+                if item == REDACTED:
+                    redacted.add(f"{prefix}[]")
+                    continue
+                kept.append(clean_value(item, f"{prefix}[]"))
+            return kept
+        return value
+
+    return clean_mapping(payload, ""), tuple(sorted(redacted))
 
 
 def _network_create_operation(parser: OpenApiParser) -> OperationSpec:
@@ -417,6 +451,66 @@ def _rewrite_grammar(
     return _OBJ_GRP_RE.sub(_sub, value)
 
 
+def _references_serials(
+    action: RestoreAction, serials: frozenset[str]
+) -> bool:
+    """Does the action's address or payload reference any of ``serials``?"""
+    if not serials:
+        return False
+    if any(value in serials for value in action.path_values):
+        return True
+
+    def scan(value: Any) -> bool:
+        if isinstance(value, Mapping):
+            return any(scan(inner) for inner in value.values())
+        if isinstance(value, list):
+            return any(scan(item) for item in value)
+        return isinstance(value, str) and value in serials
+
+    return scan(action.payload)
+
+
+def _body_property_names(op: OperationSpec) -> frozenset[str]:
+    """Property names the operation's JSON request body declares."""
+    node: Any = op.raw.get("requestBody") if op.raw else None
+    for key in ("content", "application/json", "schema", "properties"):
+        node = node.get(key) if isinstance(node, Mapping) else None
+    if isinstance(node, Mapping):
+        return frozenset(str(name) for name in node)
+    return frozenset()
+
+
+def _remap_serial_fields(
+    value: Any, serial_map: Mapping[str, str]
+) -> Any:
+    """Rewrite ``serial``/``serials`` fields through the hardware map.
+
+    ``--serial-map`` exists for hardware-loss recovery: payloads that
+    embed dead serials (switch stacks, per-port references) must point
+    at the replacement hardware, not just the device-claim calls —
+    serial keys don't match the ``*Id`` reference grammar, so the ID
+    rewriter never sees them.
+    """
+    if isinstance(value, Mapping):
+        out: dict[str, Any] = {}
+        for key, inner in value.items():
+            if key == "serial" and isinstance(inner, str):
+                out[key] = serial_map.get(inner, inner)
+            elif key == "serials" and isinstance(inner, list):
+                out[key] = [
+                    serial_map.get(item, item)
+                    if isinstance(item, str)
+                    else item
+                    for item in inner
+                ]
+            else:
+                out[key] = _remap_serial_fields(inner, serial_map)
+        return out
+    if isinstance(value, list):
+        return [_remap_serial_fields(item, serial_map) for item in value]
+    return value
+
+
 def known_snapshot_ids(graph: NetworkGraph) -> frozenset[str]:
     """Every identifier the snapshot's own objects carry.
 
@@ -434,11 +528,16 @@ def known_snapshot_ids(graph: NetworkGraph) -> frozenset[str]:
     return frozenset(ids)
 
 
+class RestoreJournalMismatchError(RuntimeError):
+    """The journal belongs to a different restore (target or source)."""
+
+
 class RestoreJournal:
     """Crash-resumable restore progress: the terraform-state stand-in.
 
     One JSONL line per event, appended and flushed after every
-    successful write, owner-only on disk: ``done`` lines carry
+    successful write, owner-only on disk: a ``meta`` line binds the
+    journal to its target/source organizations, ``done`` lines carry
     completed action keys, ``map`` lines carry old → new identifier
     pairs. Re-running a restore with the same journal skips completed
     actions and reuses the mappings, so an interrupted restore resumes
@@ -449,19 +548,63 @@ class RestoreJournal:
         self._path = path
         self.completed: set[str] = set()
         self.id_map: dict[str, str] = {}
+        self.meta: dict[str, str] = {}
         if path.exists():
-            for line in path.read_text(encoding="utf-8").splitlines():
+            lines = path.read_text(encoding="utf-8").splitlines()
+            for index, line in enumerate(lines):
                 if not line.strip():
                     continue
-                record = json.loads(line)
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    if index == len(lines) - 1:
+                        # Torn final line: the process died mid-append.
+                        # Its event replays on resume (worst case one
+                        # duplicate-create failure); refusing to load
+                        # would strand the whole restore.
+                        logger.warning(
+                            "Restore journal %s ends in a torn line; "
+                            "ignoring it and resuming.", path,
+                        )
+                        continue
+                    raise
                 if record.get("kind") == "done":
                     self.completed.add(str(record["key"]))
                 elif record.get("kind") == "map":
                     self.id_map[str(record["old"])] = str(record["new"])
+                elif record.get("kind") == "meta":
+                    self.meta = {
+                        str(key): str(value)
+                        for key, value in record.items()
+                        if key != "kind"
+                    }
         else:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.touch(mode=0o600)
         restrict_to_owner(path)
+
+    def bind(self, target: str, source: str) -> None:
+        """Bind the journal to exactly one target org and snapshot source.
+
+        A journal resumes the restore it started: replaying completed-
+        action skips and ID mappings against a *different* target would
+        skip every create and then write the configure actions into the
+        previous target's networks.
+        """
+        claim = {"target": target, "source": source}
+        if self.meta:
+            if self.meta != claim:
+                raise RestoreJournalMismatchError(
+                    f"Restore journal {self._path} belongs to a restore "
+                    f"of org {self.meta.get('source')!r} into "
+                    f"{self.meta.get('target')!r}; refusing to reuse it "
+                    f"for a restore of {source!r} into {target!r}. Use a "
+                    "fresh --workdir (or remove the journal) to start a "
+                    "new restore."
+                )
+            return
+        self.meta = dict(claim)
+        self._append({"kind": "meta", **claim})
 
     def _append(self, record: Mapping[str, Any]) -> None:
         with self._path.open("a", encoding="utf-8") as handle:
@@ -530,7 +673,16 @@ class OrgRestorer:
         self, graph: NetworkGraph, plan: RestorePlan
     ) -> RestoreResult:
         dashboard = self._dashboard()
+        self._journal.bind(
+            target=self._target, source=graph.organization_id
+        )
         known = known_snapshot_ids(graph)
+        #: Serials a drill cannot touch: production hardware without a
+        #: replacement mapping. Payloads referencing them (switch
+        #: stacks, …) are drill-skipped, not failed.
+        drill_serials = frozenset(
+            device.serial for device in graph.devices
+        ) - frozenset(self._serial_map)
         id_map = dict(self._journal.id_map)
         id_map.setdefault(graph.organization_id, self._target)
         id_map.update(self._serial_map)
@@ -539,54 +691,81 @@ class OrgRestorer:
         skipped: list[dict[str, str]] = []
         failed_parents: set[str] = set()
 
-        for action in plan.actions:
-            if self._skip_claims and action.wave in (
-                WAVE_DEVICE_CLAIM, WAVE_DEVICE_FEATURES
-            ):
-                skipped.append(
-                    {"target": action.key, "reason": "drill: hardware is "
-                     "attached to another organization; device claiming "
-                     "and device-scoped features only execute in a real "
-                     "disaster recovery"}
-                )
-                continue
-            if action.key in self._journal.completed:
-                skipped.append(
-                    {"target": action.key, "reason": "already restored "
-                     "(journal); resume skips completed actions"}
-                )
-                continue
-            dead = [v for v in action.path_values if v in failed_parents]
-            if dead:
-                skipped.append(
-                    {"target": action.key, "reason": "parent object "
-                     f"{dead[0]} failed to restore"}
-                )
-                continue
-            try:
-                new_id = self._dispatch(
-                    dashboard, action, id_map, known, graph.organization_id
-                )
-            except UnmappedReferenceError as exc:
-                failed.append((action.key, str(exc)))
-                continue
-            except Exception as exc:  # noqa: BLE001 - per-object isolation
-                failed.append((action.key, str(exc)))
-                if action.kind == "create":
-                    failed_parents.add(action.path_values[0]
-                                       if action.wave == WAVE_NETWORKS
-                                       else action.path_values[-1])
-                continue
-            if new_id is not None:
-                old = (
-                    action.path_values[0]
-                    if action.wave == WAVE_NETWORKS
-                    else action.path_values[-1]
-                )
-                id_map[old] = new_id
-                self._journal.record_mapping(old, new_id)
-            self._journal.record_done(action.key)
-            executed.append(action.key)
+        # Alphabetical wave order can place a referrer before its
+        # referent (an appliance VLAN carrying groupPolicyId before the
+        # group policy's own create), so unmapped references defer to
+        # the next round instead of failing; a round that maps or
+        # settles nothing means the references are genuinely dead.
+        pending: list[RestoreAction] = list(plan.actions)
+        while pending:
+            deferred: list[tuple[RestoreAction, str]] = []
+            for action in pending:
+                if self._skip_claims and action.wave in (
+                    WAVE_DEVICE_CLAIM, WAVE_DEVICE_FEATURES
+                ):
+                    skipped.append(
+                        {"target": action.key, "reason": "drill: hardware "
+                         "is attached to another organization; device "
+                         "claiming and device-scoped features only execute "
+                         "in a real disaster recovery"}
+                    )
+                    continue
+                if self._skip_claims and _references_serials(
+                    action, drill_serials
+                ):
+                    skipped.append(
+                        {"target": action.key, "reason": "drill: the "
+                         "payload references production hardware serials; "
+                         "this object only restores in a real disaster "
+                         "recovery (or with --serial-map)"}
+                    )
+                    continue
+                if action.key in self._journal.completed:
+                    skipped.append(
+                        {"target": action.key, "reason": "already restored "
+                         "(journal); resume skips completed actions"}
+                    )
+                    continue
+                dead = [v for v in action.path_values if v in failed_parents]
+                if dead:
+                    skipped.append(
+                        {"target": action.key, "reason": "parent object "
+                         f"{dead[0]} failed to restore"}
+                    )
+                    continue
+                try:
+                    new_id = self._dispatch(
+                        dashboard, action, id_map, known, graph.organization_id
+                    )
+                except UnmappedReferenceError as exc:
+                    deferred.append((action, str(exc)))
+                    continue
+                except Exception as exc:  # noqa: BLE001 - per-object isolation
+                    failed.append((action.key, str(exc)))
+                    if action.kind == "create":
+                        failed_parents.add(action.path_values[0]
+                                           if action.wave == WAVE_NETWORKS
+                                           else action.path_values[-1])
+                    continue
+                if new_id is not None:
+                    old = (
+                        action.path_values[0]
+                        if action.wave == WAVE_NETWORKS
+                        else action.path_values[-1]
+                    )
+                    id_map[old] = new_id
+                    self._journal.record_mapping(old, new_id)
+                self._journal.record_done(action.key)
+                executed.append(action.key)
+            if not deferred:
+                break
+            if len(deferred) == len(pending):
+                # Nothing settled this round, so no new mapping can
+                # appear — the remaining references are unresolvable.
+                for action, reason in deferred:
+                    failed.append((action.key, reason))
+                break
+            pending = [action for action, _ in deferred]
         return RestoreResult(
             executed=tuple(executed),
             failed=tuple(failed),
@@ -613,22 +792,48 @@ class OrgRestorer:
             scope_values = (action.path_values[0],)
         for name, value in zip(op.path_params, scope_values):
             params[name] = id_map.get(value, value)
-        body = dict(action.payload)
+        # Path parameters win over any payload field of the same name —
+        # the payload echoes the snapshot tenant's identifiers
+        # (organizationId in network payloads, number in SSIDs, portId
+        # in switch ports), and passing both would collide with the SDK
+        # method's positional parameters.
+        body = {
+            key: value
+            for key, value in action.payload.items()
+            if key not in params
+        }
         if action.kind == "create":
             # The object's own identity is server-assigned on create:
-            # strip self-referential fields so the stale snapshot ID is
-            # neither POSTed nor mistaken for a dangling reference.
+            # strip self-referential fields the write schema does not
+            # declare, so the stale snapshot ID is neither POSTed nor
+            # mistaken for a dangling reference. Schema-declared fields
+            # keep their value even when it equals the old ID — an
+            # appliance VLAN's client-assigned `id` is required by its
+            # create operation.
             own_old = (
                 action.path_values[0]
                 if action.wave == WAVE_NETWORKS
                 else action.path_values[-1]
             )
-            body = {k: v for k, v in body.items() if v != own_old}
+            accepted = _body_property_names(op)
+            body = {
+                k: v for k, v in body.items() if v != own_old or k in accepted
+            }
             known = frozenset(known - {own_old})
         body = rewrite_references(body, id_map, known)
+        if self._serial_map:
+            body = _remap_serial_fields(body, self._serial_map)
         if action.kind == "claim":
             serial = action.path_values[1]
             body = {"serials": [self._serial_map.get(serial, serial)]}
+        items = _collection_items(body)
+        if items is not None:
+            # Collection envelopes ({"items": [...], "meta": …}) are
+            # discovery artifacts; the writable body is the operation's
+            # sole array property (same handling as the gap replayer).
+            field = _single_array_body_field(op)
+            if field is not None:
+                body = {field: items}
         body = _strip_nulls(body)
         section = getattr(dashboard, op.tags[0], None) if op.tags else None
         method = (
@@ -728,12 +933,31 @@ class OrgWiper:
         devices = dashboard.organizations.getOrganizationDevices(
             organization_id, total_pages="all"
         )
-        if devices:
+        # /organizations/{id}/devices lists only network-assigned
+        # devices; hardware claimed into the inventory but not yet
+        # added to a network appears only in the inventory endpoint —
+        # and it is exactly as production-indicating.
+        inventory_reader = getattr(
+            dashboard.organizations, "getOrganizationInventoryDevices", None
+        )
+        if inventory_reader is None:
             raise WipeRefusedError(
-                f"Organization {organization_id} has {len(devices)} claimed "
-                "device(s); wiping is only permitted for hardware-free "
-                "drill organizations. Unclaim the devices first if this "
-                "really is a drill org."
+                "Cannot verify the organization's claimed-device "
+                "inventory (SDK lacks getOrganizationInventoryDevices); "
+                "refusing to wipe without the interlock."
+            )
+        inventory = inventory_reader(organization_id, total_pages="all")
+        claimed = {
+            str(entry.get("serial", ""))
+            for entry in (*devices, *inventory)
+            if isinstance(entry, Mapping)
+        } - {""}
+        if claimed:
+            raise WipeRefusedError(
+                f"Organization {organization_id} has {len(claimed)} claimed "
+                "device(s) (network-assigned or inventory-only); wiping is "
+                "only permitted for hardware-free drill organizations. "
+                "Unclaim the devices first if this really is a drill org."
             )
         networks = dashboard.organizations.getOrganizationNetworks(
             organization_id, total_pages="all"

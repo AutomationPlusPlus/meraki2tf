@@ -1675,6 +1675,11 @@ def _install_wipe_dashboard(
         ) -> list:
             return [{"serial": f"Q{i}"} for i in range(devices)]
 
+        def getOrganizationInventoryDevices(
+            self, organizationId: str, total_pages: str = "all"
+        ) -> list:
+            return [{"serial": f"Q{i}"} for i in range(devices)]
+
         def getOrganizationNetworks(
             self, organizationId: str, total_pages: str = "all"
         ) -> list:
@@ -1861,6 +1866,11 @@ def test_wipe_confirm_reports_failures_nonzero(
             return {"id": organizationId, "name": "Drill Org"}
 
         def getOrganizationDevices(
+            self, organizationId: str, total_pages: str = "all"
+        ) -> list:
+            return []
+
+        def getOrganizationInventoryDevices(
             self, organizationId: str, total_pages: str = "all"
         ) -> list:
             return []
