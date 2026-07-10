@@ -192,6 +192,16 @@ meraki2tf --org-id 123456 --dump-to ./snapshots/org-123456.json
 meraki2tf --from-dump ./snapshots/org-123456.json
 ```
 
+Snapshot paths ending in `.jsonl` or `.jsonl.gz` select the **v2 stream
+format** — one object per line, gzip-compressed when the name says so
+(~10–20× smaller; the right choice for large organizations and for
+weekly snapshot rotation). Reading auto-detects the format by content,
+so both formats work everywhere `--from-dump` does:
+
+```bash
+meraki2tf --org-id 123456 --dump-to ./snapshots/2026-07-10.jsonl.gz
+```
+
 `--dump-to` also accepts `--from-dump` as its *input*, which normalizes
 an existing nested export into the canonical contract:
 
@@ -222,6 +232,36 @@ Sanitization is deterministic and preserves referential integrity:
 > through the Meraki provider, so a sanitized snapshot exercises
 > everything up to and including `imports.tf` generation; the plan
 > comparison additionally needs real IDs and an API key.
+
+### Snapshot-diff drift detection (`--drift-baseline`)
+
+Comparing two snapshots answers "what changed in Meraki?" directly —
+API-to-API, attribute-level, in seconds, with **no terraform read
+pass**. It also sees drift classes the plan comparison never could:
+objects the provider cannot express and secret-valued attributes the
+kit deliberately leaves unmanaged.
+
+```bash
+# The scheduled weekly shape: export this week's snapshot and diff it
+# against last week's. Real differences fire DRIFT_DETECTED
+# (details.origin = "snapshot-diff"); the digest names the changed
+# attributes, never their values.
+meraki2tf --org-id 123456 \
+  --dump-to snapshots/this-week.jsonl.gz \
+  --drift-baseline snapshots/last-week.jsonl.gz \
+  --webhook-url https://alerts.example/dr
+
+# Also works inside the full pipeline (any mode):
+meraki2tf --from-dump snapshots/this-week.jsonl.gz \
+  --drift-baseline snapshots/last-week.jsonl.gz
+```
+
+Noise control is spec-driven: only attributes that appear in a PUT/POST
+request schema are compared ("if you can't write it, it isn't
+configuration"), identity-keyed lists compare order-insensitively while
+bare arrays (firewall rules) stay ordered, and an attribute that
+appears fleet-wide across every modified asset of one endpoint is
+suppressed as a Meraki API rollout rather than operator drift.
 
 ## Disaster Recovery
 
@@ -431,6 +471,7 @@ Quick reference (each flag is described in detail below):
 | `--from-dump PATH` | — | Offline snapshot; switches to dump mode |
 | `--dump-to PATH` | — | Export discovery output as a snapshot instead of running Terraform |
 | `--sanitize` | off | Redact secrets/identity in the `--dump-to` snapshot |
+| `--drift-baseline PATH` | — | Prior snapshot to diff the fresh discovery against — attribute-level drift in seconds, no terraform read pass |
 | `--rebuild` | off | Disaster recovery: preview a rebuild apply of the workdir artifacts |
 | `--replay-gaps` | off | Disaster recovery: preview restoring objects/secrets Terraform can't rebuild, from an unsanitized snapshot |
 | `--confirm` | off | Escalate `--rebuild` or `--replay-gaps` from preview to a real write against Meraki |
@@ -711,7 +752,7 @@ environment itself.
 
 | Event | Trigger |
 | --- | --- |
-| `DRIFT_DETECTED` | The speculative plan found real changes (add/change/destroy) on tracked resources — pending imports alone don't count. Payload carries the diff, the unsupported list, `apply_aborted` (true when a `--sync` auto-apply was refused), and `regenerated_addresses` (modified objects re-baselined in sync mode) |
+| `DRIFT_DETECTED` | Real configuration drift. Two origins, distinguished by `details.origin`: `terraform-plan` (the speculative plan found add/change/destroy on tracked resources — pending imports alone don't count) and `snapshot-diff` (`--drift-baseline` comparison found added/modified/removed assets, including provider-inexpressible and secret-bearing ones). Payload carries the diff/digest, the unsupported list, `apply_aborted` (true when a `--sync` auto-apply was refused), `regenerated_addresses` (modified objects re-baselined in sync mode), and `deferred_addresses` (drift-racy pending imports pushed to the next run) |
 | `RUN_SUCCESS` | Snapshot generation (and comparison, when an API key was available) completed flawlessly. Payload carries the coverage picture: `discovered_assets`, `imports_written`, `imports_already_tracked`, `unsupported_count` plus the full `unsupported` list, `pending_imports` (imports the plan reports as not yet in state; `null` when unknown), `comparison_performed`, `resources_added_to_state` (sync mode), `coverage_percent`, `deletions_pending_confirmation`, and `unmanaged_secret_attributes` (secrets the kit cannot carry — restore manually after a rebuild) |
 | `UNSUPPORTED_FEATURE_FLAGGED` | A discovered asset cannot be mapped to a Terraform resource |
 | `DELETION_PENDING_CONFIRMATION` | Resources tracked in the DR kit were not found in Meraki (deleted?); they stay in the kit until a human confirms with `--confirm-deletions` |
@@ -742,6 +783,32 @@ Vault, and every run's artifacts archived to Blob Storage — lives in
 [`docs/azure-automation.md`](docs/azure-automation.md), with a
 ready-made wrapper runbook in
 [`deploy/azure/runbook.py`](deploy/azure/runbook.py).
+
+## Performance & Scale
+
+Discovery reads every configuration surface of the organization —
+including nested, multi-parameter surfaces (per-SSID identity PSKs and
+firewall rules, switch-stack routing, config-template switch
+profiles, …) that scope off elements discovered at their parent paths.
+Completeness costs reads: budget roughly one GET per (object ×
+surface).
+
+Feature discovery runs on a worker pool (`MERAKI2TF_DISCOVERY_WORKERS`,
+default 8) paced by a single adaptive AIMD rate bucket: the pool speeds
+up while the API accepts calls, backs off multiplicatively and pauses
+globally the moment anything is throttled, and never exceeds 6 req/s —
+the per-organization budget is 10 req/s and it is **shared with every
+other API consumer of your tenant**. Width buys back idle round-trip
+time; it cannot mint budget.
+
+Empirically (a ~22k-object organization with a busy co-tenant
+integration): a full sequential read pass costs ~2.5–3 h; the pool
+reclaims most idle time, and the snapshot-diff drift path removes the
+second (terraform) read pass entirely, so a weekly
+`--dump-to … --drift-baseline …` job is dominated by a single
+discovery sweep. Prefer `.jsonl.gz` snapshots at this scale, and give
+schedulers a generous timeout — completeness matters more than speed
+for a DR safety net.
 
 ## Contributor Architecture
 

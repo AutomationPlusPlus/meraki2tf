@@ -1332,3 +1332,63 @@ def test_payload_duplicate_locator_attributes_duplicates_to_addresses() -> None:
     assert set(found) == {"meraki_network_group_policy.n_1_100"}
     assert "dup.example" in found["meraki_network_group_policy.n_1_100"]
     assert locate(("absent.example",)) == {}
+
+
+def test_snapshot_baseline_drift_dispatches_alert(
+    tmp_path: Path, api_key: None
+) -> None:
+    """--drift-baseline: API-to-API drift right after discovery, on the
+    mandated DRIFT_DETECTED rail, independent of the terraform plan."""
+    from meraki2tf.snapshot import write_snapshot
+
+    baseline_graph = NetworkGraph(
+        organization_id="org-123",
+        networks=(),
+        devices=(),
+        features=(
+            FeatureConfiguration(
+                "/networks/{networkId}/appliance/vlans/{vlanId}",
+                ("N_1", "10"),
+                {"id": "10", "name": "OLD-NAME"},
+            ),
+        ),
+    )
+    baseline = write_snapshot(baseline_graph, tmp_path / "baseline.json")
+
+    recorder = RecordingNotifier()
+    provider = StubProvider()  # discovers zero features → the VLAN "vanished"
+    runner = StubRunner(tmp_path, plan_exit=0, plan_stdout="No changes.")
+    orchestrator = PipelineOrchestrator(
+        provider=provider,
+        generator=StubGenerator(),  # type: ignore[arg-type]
+        runner=runner,  # type: ignore[arg-type]
+        dispatcher=AlertDispatcher([recorder]),
+        drift_baseline=baseline,
+    )
+    summary = orchestrator.run("org-123")
+
+    assert summary.snapshot_drift == "0 added, 0 modified, 1 removed"
+    drift_events = [
+        e for e in recorder.events if e.event_type is EventType.DRIFT_DETECTED
+    ]
+    assert len(drift_events) == 1
+    assert drift_events[0].details["origin"] == "snapshot-diff"
+    assert "OLD-NAME" not in drift_events[0].details["diff"]  # names, not values
+
+
+def test_snapshot_baseline_with_no_drift_is_quiet(
+    tmp_path: Path, api_key: None
+) -> None:
+    from meraki2tf.snapshot import write_snapshot
+
+    baseline_graph = NetworkGraph(
+        organization_id="org-123", networks=(), devices=(), features=()
+    )
+    baseline = write_snapshot(baseline_graph, tmp_path / "baseline.json")
+    orchestrator, recorder, _, _ = _orchestrator(tmp_path)
+    orchestrator._drift_baseline = baseline
+    summary = orchestrator.run("org-123")
+    assert summary.snapshot_drift is None
+    assert all(
+        e.event_type is not EventType.DRIFT_DETECTED for e in recorder.events
+    )

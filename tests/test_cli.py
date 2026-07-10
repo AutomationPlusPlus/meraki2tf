@@ -931,6 +931,7 @@ def test_report_surfaces_every_dr_outcome(
         regenerated_addresses=("meraki_networks.n_1",),
         deferred_addresses=("meraki_wireless_ssid.racy_1",),
         coverage_percent=80.0,
+        snapshot_drift="1 added, 2 modified, 0 removed",
     )
     with caplog.at_level(logging.INFO, logger="meraki2tf.cli"):
         _report(summary)
@@ -940,6 +941,7 @@ def test_report_surfaces_every_dr_outcome(
     assert "regenerated to mirror Meraki" in text
     assert "deferred to the next run" in text
     assert "meraki_wireless_ssid.racy_1" in text
+    assert "Snapshot drift vs baseline" in text
     assert "meraki_devices.confirmed" in text
     assert "--confirm-deletions" in text and "meraki_devices.gone" in text
     assert "80.00% coverage" in text
@@ -1239,3 +1241,73 @@ def test_snapshot_exports_are_owner_only_and_warned(
          "--dump-to", str(sanitized), "--sanitize"]
     ) == 0
     assert "UNSANITIZED" not in capsys.readouterr().err
+
+
+def test_export_with_drift_baseline_reports_snapshot_drift(
+    spec_file: Path,
+    dump_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--dump-to + --drift-baseline: the weekly-job shape — export the
+    fresh snapshot and diff it against last week's, no terraform."""
+    _no_network(monkeypatch)
+    delivered: list[dict[str, Any]] = []
+
+    def fake_urlopen(request: Any, timeout: float) -> FakeResponse:
+        delivered.append(json.loads(request.data.decode("utf-8")))
+        return FakeResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(
+        json.dumps(
+            {"organizationId": "org-123", "networks": [], "devices": [],
+             "features": []}
+        ),
+        encoding="utf-8",
+    )
+    out = tmp_path / "current.jsonl.gz"
+    exit_code = main(
+        [
+            "--spec", str(spec_file),
+            "--from-dump", str(dump_file),
+            "--dump-to", str(out),
+            "--drift-baseline", str(baseline),
+            "--webhook-url", "https://hooks.example/dr",
+        ]
+    )
+    assert exit_code == 0
+    assert out.exists()
+    (event,) = delivered
+    assert event["event_type"] == "DRIFT_DETECTED"
+    assert event["details"]["origin"] == "snapshot-diff"
+    assert "added" in event["details"]["diff"]
+
+
+def test_export_with_identical_drift_baseline_is_quiet(
+    spec_file: Path,
+    dump_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _no_network(monkeypatch)
+
+    def forbidden_urlopen(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("no alert may fire when nothing drifted")
+
+    monkeypatch.setattr(urllib.request, "urlopen", forbidden_urlopen)
+    first = tmp_path / "first.json"
+    assert main(
+        ["--spec", str(spec_file), "--from-dump", str(dump_file),
+         "--dump-to", str(first)]
+    ) == 0
+    out = tmp_path / "second.jsonl.gz"
+    assert main(
+        [
+            "--spec", str(spec_file), "--from-dump", str(dump_file),
+            "--dump-to", str(out),
+            "--drift-baseline", str(first),
+            "--webhook-url", "https://hooks.example/dr",
+        ]
+    ) == 0
