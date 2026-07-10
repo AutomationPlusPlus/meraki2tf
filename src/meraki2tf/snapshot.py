@@ -71,12 +71,19 @@ def _wants_v2(path: Path) -> bool:
     return any(name.endswith(suffix) for suffix in _V2_SUFFIXES)
 
 
-def write_snapshot(graph: NetworkGraph, path: Path) -> Path:
+def write_snapshot(
+    graph: NetworkGraph, path: Path, sanitized: bool = False
+) -> Path:
     """Write the canonical snapshot for later ``--from-dump`` runs.
 
     Written owner-only (0600): an unsanitized snapshot carries every
     credential Meraki returns on GET (SSID PSKs, SNMP community
     strings, …) — it is the DR kit's secret-bearing artifact.
+
+    ``sanitized`` stamps the document so downstream consumers can tell
+    a pseudonymized drill snapshot from the real one: the restore
+    source-org interlock compares against the recorded org ID, and a
+    pseudonym can never match the production org it stands for.
 
     Paths ending in ``.jsonl`` / ``.jsonl.gz`` select the v2 stream
     format: a header line followed by one object per line, gzip-
@@ -88,10 +95,13 @@ def write_snapshot(graph: NetworkGraph, path: Path) -> Path:
     path.touch(mode=0o600, exist_ok=True)
     restrict_to_owner(path)
     if _wants_v2(path):
-        _write_snapshot_v2(graph, path)
+        _write_snapshot_v2(graph, path, sanitized=sanitized)
     else:
+        document = graph_to_snapshot(graph)
+        if sanitized:
+            document["sanitized"] = True
         path.write_text(
-            json.dumps(graph_to_snapshot(graph), indent=2) + "\n",
+            json.dumps(document, indent=2) + "\n",
             encoding="utf-8",
         )
     logger.info(
@@ -101,18 +111,18 @@ def write_snapshot(graph: NetworkGraph, path: Path) -> Path:
     return path
 
 
-def _write_snapshot_v2(graph: NetworkGraph, path: Path) -> None:
+def _write_snapshot_v2(
+    graph: NetworkGraph, path: Path, sanitized: bool = False
+) -> None:
     opener = gzip.open if path.name.lower().endswith(".gz") else open
+    header: dict[str, Any] = {
+        SNAPSHOT_V2_MARKER: SNAPSHOT_V2_VERSION,
+        "organizationId": graph.organization_id,
+    }
+    if sanitized:
+        header["sanitized"] = True
     with opener(path, "wt", encoding="utf-8") as handle:
-        handle.write(
-            json.dumps(
-                {
-                    SNAPSHOT_V2_MARKER: SNAPSHOT_V2_VERSION,
-                    "organizationId": graph.organization_id,
-                }
-            )
-            + "\n"
-        )
+        handle.write(json.dumps(header) + "\n")
         for network in graph.networks:
             handle.write(
                 json.dumps(

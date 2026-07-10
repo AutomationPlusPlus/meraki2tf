@@ -203,3 +203,16 @@ def test_snapshot_v2_survives_payload_key_named_kind(tmp_path: Path) -> None:
     path = write_snapshot(graph, tmp_path / "kindful.jsonl")
     loaded = StaticJsonDataProvider(path).fetch_network_graph()
     assert [n.network_id for n in loaded.networks] == ["N_1"]
+
+
+def test_sanitized_marker_round_trips_in_both_formats(tmp_path: Path) -> None:
+    """A sanitized snapshot must be distinguishable from the real one:
+    its identifiers are pseudonyms, so the restore source-org interlock
+    is vacuous against it and consumers need to know."""
+    graph = _payload_graph()
+    for name in ("marked.json", "marked.jsonl"):
+        path = write_snapshot(graph, tmp_path / name, sanitized=True)
+        assert StaticJsonDataProvider(path).snapshot_sanitized is True
+    for name in ("plain.json", "plain.jsonl"):
+        path = write_snapshot(graph, tmp_path / name)
+        assert StaticJsonDataProvider(path).snapshot_sanitized is False

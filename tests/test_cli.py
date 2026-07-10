@@ -1417,6 +1417,46 @@ def test_restore_rejects_org_id_override(
         )
 
 
+def test_restore_warns_on_sanitized_snapshots(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--sanitize exports carry a marker; a restore from one must warn
+    that the source-org interlock is vacuous (pseudonymized IDs) and
+    that secrets will be re-entry pointers, not values."""
+    _no_network(monkeypatch)
+    dump = _restore_dump(tmp_path)
+    document = json.loads(dump.read_text(encoding="utf-8"))
+    document["sanitized"] = True
+    dump.write_text(json.dumps(document), encoding="utf-8")
+
+    exit_code = main(
+        ["--spec", str(spec_file), "--restore", "--from-dump", str(dump),
+         "--target-org", "org-999", "--workdir", str(tmp_path / "ws")]
+    )
+    console = capsys.readouterr().err
+    assert exit_code == 0
+    assert "SANITIZED" in console
+    assert "scratch organization" in console
+
+
+def test_sanitize_export_stamps_the_snapshot(
+    spec_file: Path,
+    dump_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _no_network(monkeypatch)
+    out = tmp_path / "sanitized.json"
+    assert main(
+        ["--spec", str(spec_file), "--from-dump", str(dump_file),
+         "--dump-to", str(out), "--sanitize"]
+    ) == 0
+    assert json.loads(out.read_text(encoding="utf-8"))["sanitized"] is True
+
+
 def test_restore_preview_writes_nothing(
     spec_file: Path,
     tmp_path: Path,
