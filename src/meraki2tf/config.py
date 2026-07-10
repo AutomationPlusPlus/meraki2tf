@@ -182,6 +182,9 @@ class RuntimeConfig:
     target_org: str | None
     #: Optional old→new device serial map (hardware-loss DR).
     serial_map: Path | None
+    #: Drill mode for --restore: skip device claiming + device-scoped
+    #: features (hardware belongs to the production org).
+    skip_claims: bool
     #: Discard the accumulated resources.tf baseline so this run
     #: regenerates configuration from currently discovered data.
     rebaseline: bool
@@ -233,6 +236,7 @@ class RuntimeConfig:
             restore=args.restore,
             target_org=args.target_org,
             serial_map=Path(args.serial_map) if args.serial_map else None,
+            skip_claims=args.skip_claims,
             rebaseline=args.rebaseline,
             sync=args.sync,
             confirm_deletions=args.confirm_deletions,

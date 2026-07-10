@@ -489,3 +489,36 @@ def test_executor_records_missing_sdk_method_as_failure(
     result = restorer.execute(graph, plan)
     assert result.executed == ()
     assert all("no method" in reason for _, reason in result.failed)
+
+
+def test_drill_mode_skips_claims_and_device_features(tmp_path: Path) -> None:
+    """A drill cannot claim production hardware; those waves are
+    drill-skipped verdicts, never failures."""
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(PORT_ITEM, ("Q2AB-CDEF-GHIJ", "1"),
+                             {"portId": "1", "name": "uplink"}),
+        FeatureConfiguration(SNMP_PATH, ("N_1",), {"access": "none"}),
+    )
+    plan = plan_restore(graph, parser)
+    calls: list = []
+    restorer = OrgRestorer(
+        "org-TARGET",
+        RestoreJournal(tmp_path / "drill-journal.jsonl"),
+        skip_claims=True,
+    )
+    section = _RecordingSection(calls)
+    restorer._client = __import__("types").SimpleNamespace(
+        organizations=section, networks=section, switch=section
+    )
+    result = restorer.execute(graph, plan)
+
+    assert result.failed == ()
+    ops = [c[0] for c in calls]
+    assert "claimNetworkDevices" not in ops
+    assert "updateDeviceSwitchPort" not in ops
+    assert "updateNetworkSnmp" in ops  # network config still restored
+    drill_skips = [e for e in result.skipped if "drill" in e["reason"]]
+    assert len(drill_skips) == 2  # the claim + the switch port

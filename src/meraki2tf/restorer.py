@@ -501,11 +501,17 @@ class OrgRestorer:
         journal: RestoreJournal,
         serial_map: Mapping[str, str] | None = None,
         bucket: AdaptiveTokenBucket | None = None,
+        skip_claims: bool = False,
     ) -> None:
         self._target = target_organization_id
         self._journal = journal
         self._serial_map = dict(serial_map or {})
         self._bucket = bucket or AdaptiveTokenBucket()
+        #: Drill mode: hardware is claimed by another (the production)
+        #: organization, so device claiming and device-scoped features
+        #: are structurally untestable — skipped with explicit drill
+        #: verdicts, never reported as failures.
+        self._skip_claims = skip_claims
         self._client: Any = None
 
     def _dashboard(self) -> Any:
@@ -534,6 +540,16 @@ class OrgRestorer:
         failed_parents: set[str] = set()
 
         for action in plan.actions:
+            if self._skip_claims and action.wave in (
+                WAVE_DEVICE_CLAIM, WAVE_DEVICE_FEATURES
+            ):
+                skipped.append(
+                    {"target": action.key, "reason": "drill: hardware is "
+                     "attached to another organization; device claiming "
+                     "and device-scoped features only execute in a real "
+                     "disaster recovery"}
+                )
+                continue
             if action.key in self._journal.completed:
                 skipped.append(
                     {"target": action.key, "reason": "already restored "
