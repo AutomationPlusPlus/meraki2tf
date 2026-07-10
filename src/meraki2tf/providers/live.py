@@ -106,6 +106,16 @@ _MAX_THROTTLE_ATTEMPTS = 40
 DISCOVERY_WORKERS_ENV_VAR = "MERAKI2TF_DISCOVERY_WORKERS"
 _DEFAULT_DISCOVERY_WORKERS = 8
 
+#: Config templates hold network configuration readable through the
+#: same ``/networks/{networkId}/...`` endpoints, scoped by the template
+#: ID — but ``getOrganizationNetworks`` never lists templates. The
+#: template list itself is spec-discovered like any collection; that a
+#: template ID is a valid ``{networkId}`` scope is Meraki domain
+#: semantics (documented dashboard behavior), not a resource mapping.
+CONFIG_TEMPLATE_ITEM_PATH = (
+    "/organizations/{organizationId}/configTemplates/{configTemplateId}"
+)
+
 
 class LiveApiDataProvider(MerakiDataProvider):
     """Fetches the domain graph from the Meraki cloud."""
@@ -313,6 +323,30 @@ class LiveApiDataProvider(MerakiDataProvider):
             (op, (device.serial,)) for device in devices for op in serial_ops
         )
         _run_level(level)
+
+        # Template-held configuration (SSIDs, VLANs, firewall rules on
+        # a config template) is invisible to the per-network sweep —
+        # without this pass it would vanish from the snapshot and the
+        # rebuilt org would re-inherit nothing (Cardinal Rule 2).
+        template_ids = tuple(
+            feature.path_values[-1]
+            for feature in features
+            if feature.api_path == CONFIG_TEMPLATE_ITEM_PATH
+            and feature.path_values
+            and UNREADABLE_MARKER not in feature.payload
+        )
+        if template_ids:
+            logger.info(
+                "Sweeping %d config template(s) for template-held "
+                "network configuration.", len(template_ids),
+            )
+            _run_level(
+                [
+                    (op, (template_id,))
+                    for template_id in template_ids
+                    for op in network_ops
+                ]
+            )
 
         # Nested (multi-parameter) configuration surfaces: per-SSID
         # sub-configs, switch-stack routing, config-template switch

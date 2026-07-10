@@ -758,6 +758,83 @@ def test_undiscoverable_nested_parents_become_coverage_gaps(
     assert "not discoverable" in gap.payload[UNREADABLE_MARKER]
 
 
+def test_config_template_contents_are_swept_as_network_scopes(
+    tmp_path: Path,
+) -> None:
+    """Template-held configuration reads through the same
+    /networks/{networkId}/... endpoints scoped by the template ID;
+    getOrganizationNetworks never lists templates, so without the
+    template sweep that configuration would vanish from the snapshot."""
+    import json as _json
+
+    from conftest import _op
+
+    spec = {
+        "openapi": "3.0.0",
+        "info": {"title": "templates", "version": "1"},
+        "paths": {
+            "/organizations/{organizationId}/configTemplates": {
+                "get": _op("getOrganizationConfigTemplates", "organizations"),
+                "post": _op("createOrganizationConfigTemplate", "organizations"),
+            },
+            "/organizations/{organizationId}/configTemplates/{configTemplateId}": {
+                "get": _op("getOrganizationConfigTemplate", "organizations"),
+                "put": _op("updateOrganizationConfigTemplate", "organizations"),
+            },
+            "/networks/{networkId}/appliance/vlans": {
+                "get": _op("getNetworkApplianceVlans", "appliance"),
+            },
+            "/networks/{networkId}/appliance/vlans/{vlanId}": {
+                "get": _op("getNetworkApplianceVlan", "appliance"),
+                "put": _op("updateNetworkApplianceVlan", "appliance"),
+            },
+        },
+    }
+    spec_path = tmp_path / "template-spec.json"
+    spec_path.write_text(_json.dumps(spec), encoding="utf-8")
+
+    vlan_scopes: list[str] = []
+
+    class Organizations:
+        def getOrganizationNetworks(
+            self, org_id: str, total_pages: str
+        ) -> list[dict[str, Any]]:
+            return [dict(NETWORK_PAYLOAD)]
+
+        def getOrganizationDevices(
+            self, org_id: str, total_pages: str
+        ) -> list[dict[str, Any]]:
+            return []
+
+        def getOrganizationConfigTemplates(
+            self, organizationId: str
+        ) -> list[dict[str, Any]]:
+            return [{"id": "T_1", "name": "Branch Template"}]
+
+    class Appliance:
+        def getNetworkApplianceVlans(
+            self, networkId: str
+        ) -> list[dict[str, Any]]:
+            vlan_scopes.append(networkId)
+            if networkId == "T_1":
+                return [{"id": 77, "name": "Template-Data"}]
+            return [{"id": 10, "name": "Data"}]
+
+    provider = LiveApiDataProvider(parser=OpenApiParser(spec_path))
+    provider._client = types.SimpleNamespace(
+        organizations=Organizations(), appliance=Appliance()
+    )
+    graph = provider.fetch_network_graph("org-123")
+
+    assert set(vlan_scopes) == {"N_1", "T_1"}
+    template_vlans = [
+        f for f in graph.features
+        if f.api_path == "/networks/{networkId}/appliance/vlans/{vlanId}"
+        and f.path_values[0] == "T_1"
+    ]
+    assert [f.path_values for f in template_vlans] == [("T_1", "77")]
+
+
 def test_try_call_still_skips_scope_refusals_with_status(
     live_provider: LiveApiDataProvider, spec_parser: OpenApiParser
 ) -> None:
