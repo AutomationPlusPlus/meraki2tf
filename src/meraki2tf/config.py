@@ -185,6 +185,9 @@ class RuntimeConfig:
     #: Drill mode for --restore: skip device claiming + device-scoped
     #: features (hardware belongs to the production org).
     skip_claims: bool
+    #: Guarded teardown of a hardware-free drill organization.
+    wipe_org: str | None
+    wipe_org_name: str | None
     #: Discard the accumulated resources.tf baseline so this run
     #: regenerates configuration from currently discovered data.
     rebaseline: bool
@@ -237,6 +240,8 @@ class RuntimeConfig:
             target_org=args.target_org,
             serial_map=Path(args.serial_map) if args.serial_map else None,
             skip_claims=args.skip_claims,
+            wipe_org=args.wipe_org,
+            wipe_org_name=args.wipe_org_name,
             rebaseline=args.rebaseline,
             sync=args.sync,
             confirm_deletions=args.confirm_deletions,

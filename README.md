@@ -502,6 +502,47 @@ Every weekly coverage manifest also carries each asset's `restore_via`
 verdict (`create` / `configure` / `claim` / `unrestorable: <reason>`),
 so "will the API rebuild it?" is answered **before** any disaster.
 
+#### Restore drills (and cleaning up after them)
+
+Rehearse into a scratch organization — Meraki organizations are free to
+create. Two drill realities the tool handles for you:
+
+**Hardware is mono-org.** Your devices are claimed by production, so a
+drill cannot claim them. `--skip-claims` marks device claiming and
+device-scoped features as drill-skipped verdicts (never failures); the
+drill still exercises everything risky — network creation, ID
+remapping, the journal, and every network-scoped feature:
+
+```bash
+meraki2tf --restore --from-dump vault/sanitized.jsonl.gz \
+  --target-org <scratch-org> --skip-claims --confirm
+```
+
+**No sensitive residue.** Prefer drilling from the **sanitized**
+snapshot: it is structurally faithful (same object graph, same
+ordering and remapping exercise) but contains pseudonymized names,
+fake IPs, and no secret values — so the drill org never holds real
+environment data. Run one full-fidelity unsanitized drill before final
+sign-off, then tear the org down:
+
+```bash
+# Preview: verifies the interlocks and shows the blast radius.
+meraki2tf --wipe-org <scratch-org> --wipe-org-name "DR Drill"
+
+# Execute: deletes every network, then the organization itself.
+meraki2tf --wipe-org <scratch-org> --wipe-org-name "DR Drill" --confirm
+```
+
+The wipe is refused outright for **any organization holding claimed
+devices** — production always has hardware, a drill org never does, so
+the destructive path physically cannot target production. The exact
+organization name is a required second factor, and the interlocks are
+re-verified immediately before deletion. Note that dashboard deletion
+is immediate, but backend retention of deleted-organization data is
+governed by Cisco's data-handling policy — for hard-erasure guarantees
+after an unsanitized drill, file a data-deletion request with Meraki
+support.
+
 ### Recommended operating cadence
 
 | Cadence | Job | Cost |
@@ -514,6 +555,18 @@ so "will the API rebuild it?" is answered **before** any disaster.
 > proven tool for *same-org subset* restores, and the monthly plan
 > preview catches provider regressions before a disaster does. Retiring
 > it from the schedule is gated on a passed full-org restore drill.
+
+### Transitioning to Infrastructure-as-Code
+
+The full Terraform pipeline is a permanent, first-class capability —
+not a legacy path. When (or if) your team decides to stop clickops and
+manage Meraki as code, the transition is one `--sync` run away: the
+kit (`imports.tf`, `resources.tf`, `provider.tf`) plus the materialized
+state file are a complete, importable Terraform root module reflecting
+the live organization. From there you own the HCL — commit it, review
+changes as pull requests, and `terraform plan/apply` becomes your
+change-management process, with meraki2tf's weekly snapshot+diff
+continuing to serve as the independent DR safety net underneath.
 
 ## Configuration Options
 
@@ -532,6 +585,9 @@ Quick reference (each flag is described in detail below):
 | `--restore` | off | Disaster recovery: preview a full-organization rebuild from a snapshot into `--target-org` |
 | `--target-org ORG_ID` | — | The (fresh/scratch) organization `--restore` writes into; never the snapshot's source org |
 | `--serial-map PATH` | — | JSON old→new device-serial map for hardware-loss restores |
+| `--skip-claims` | off | Drill mode for `--restore`: device claiming + device-scoped features become drill-skipped verdicts |
+| `--wipe-org ORG_ID` | — | Drill teardown: delete every network then the org; refused for any org with claimed devices |
+| `--wipe-org-name NAME` | — | Second factor for `--wipe-org`: must match the organization's exact name |
 | `--confirm` | off | Escalate `--rebuild`, `--replay-gaps`, or `--restore` from preview to a real write against Meraki |
 | `--rebaseline` | off | Accept current reality: discard `resources.tf` so this run regenerates the baseline |
 | `--sync` | off | DR automation: guarded import-only auto-apply + modified-object baseline regeneration |
@@ -815,6 +871,7 @@ environment itself.
 | `UNSUPPORTED_FEATURE_FLAGGED` | A discovered asset cannot be mapped to a Terraform resource |
 | `DELETION_PENDING_CONFIRMATION` | Resources tracked in the DR kit were not found in Meraki (deleted?); they stay in the kit until a human confirms with `--confirm-deletions` |
 | `RESTORE_EXECUTED` | A human-invoked `--restore --confirm` rebuilt a target organization from a snapshot. Payload carries executed/failed/skipped action labels (identifiers and endpoints only — never values) |
+| `ORG_WIPE_EXECUTED` | A human-invoked `--wipe-org --confirm` tore down a hardware-free drill organization (networks deleted + org deleted, with any failures) |
 | `GAP_REPLAY_EXECUTED` | A human-invoked `--replay-gaps --confirm` wrote unsupported objects and/or secret attributes back to Meraki from a snapshot. Payload carries the executed, skipped, and failed operations (identifiers/endpoints only — never secret values) |
 | `PROCESSING_FAULT` | A critical pipeline failure (payload carries the failing stage) |
 
