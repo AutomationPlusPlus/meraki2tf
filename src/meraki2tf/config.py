@@ -176,6 +176,12 @@ class RuntimeConfig:
     #: replaying Terraform-unsupported objects and uncaptured secret
     #: attributes from a snapshot back into the Meraki organization.
     replay_gaps: bool
+    #: Full-organization restore from a snapshot into a TARGET org
+    #: (never the source). Preview by default; --confirm executes.
+    restore: bool
+    target_org: str | None
+    #: Optional old→new device serial map (hardware-loss DR).
+    serial_map: Path | None
     #: Discard the accumulated resources.tf baseline so this run
     #: regenerates configuration from currently discovered data.
     rebaseline: bool
@@ -224,6 +230,9 @@ class RuntimeConfig:
             rebuild=args.rebuild,
             confirm=args.confirm,
             replay_gaps=args.replay_gaps,
+            restore=args.restore,
+            target_org=args.target_org,
+            serial_map=Path(args.serial_map) if args.serial_map else None,
             rebaseline=args.rebaseline,
             sync=args.sync,
             confirm_deletions=args.confirm_deletions,

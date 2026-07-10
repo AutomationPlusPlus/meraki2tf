@@ -263,3 +263,229 @@ def test_render_restore_plan_lists_and_bounds_unrestorable(
     text = render_restore_plan(plan, limit=3)
     assert "UNRESTORABLE" in text
     assert "more unrestorable" in text
+
+
+# ---------------------------------------------------------------- executor
+
+
+def test_rewrite_references_maps_ids_and_grammar() -> None:
+    from meraki2tf.restorer import rewrite_references
+
+    id_map = {"N_old": "N_new", "100": "200"}
+    known = frozenset({"N_old", "100", "GP_dangling"})
+    payload = {
+        "groupPolicyId": "100",
+        "hubIds": ["N_old"],
+        "rule": "allow GRP(100) to any",
+        "comment": "mentions N_old only as data",
+        "nested": {"rfProfileId": "unrelated-string"},
+    }
+    rewritten = rewrite_references(payload, id_map, known)
+    assert rewritten["groupPolicyId"] == "200"
+    assert rewritten["hubIds"] == ["N_new"]
+    assert rewritten["rule"] == "allow GRP(200) to any"
+    # Non-reference keys pass through even when they contain known IDs.
+    assert rewritten["comment"] == "mentions N_old only as data"
+    assert rewritten["nested"]["rfProfileId"] == "unrelated-string"
+
+
+def test_rewrite_references_fails_loudly_on_dangling_ids() -> None:
+    import pytest as _pytest
+
+    from meraki2tf.restorer import UnmappedReferenceError, rewrite_references
+
+    known = frozenset({"GP_dangling", "42"})
+    with _pytest.raises(UnmappedReferenceError):
+        rewrite_references({"groupPolicyId": "GP_dangling"}, {}, known)
+    with _pytest.raises(UnmappedReferenceError):
+        rewrite_references({"rule": "deny OBJ(42)"}, {}, known)
+
+
+def test_restore_journal_round_trips_and_resumes(tmp_path: Path) -> None:
+    from meraki2tf.restorer import RestoreJournal
+
+    path = tmp_path / "restore-journal.jsonl"
+    journal = RestoreJournal(path)
+    journal.record_done("a::1")
+    journal.record_mapping("old-1", "new-1")
+    assert oct(path.stat().st_mode & 0o777) == "0o600"
+
+    resumed = RestoreJournal(path)
+    assert resumed.completed == {"a::1"}
+    assert resumed.id_map == {"old-1": "new-1"}
+
+
+class _RecordingSection:
+    """SDK-section stand-in recording every dispatched write."""
+
+    def __init__(self, calls: list, fail_ops: set[str] | None = None) -> None:
+        self._calls = calls
+        self._fail = fail_ops or set()
+
+    def __getattr__(self, operation_id: str):  # noqa: ANN204
+        def _dispatch(*args: object, **kwargs: object) -> dict:
+            self._calls.append((operation_id, args, kwargs))
+            if operation_id in self._fail:
+                raise RuntimeError("simulated API failure")
+            if operation_id == "createOrganizationNetwork":
+                return {"id": "L_NEW"}
+            if operation_id == "createNetworkGroupPolicy":
+                return {"id": "900"}
+            return {}
+
+        return _dispatch
+
+
+def _executor(tmp_path: Path, fail_ops: set[str] | None = None):
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    calls: list = []
+    restorer = OrgRestorer(
+        "org-TARGET",
+        RestoreJournal(tmp_path / "journal.jsonl"),
+        serial_map={"Q2AB-CDEF-GHIJ": "Q9ZZ-NEWW-HWSN"},
+    )
+    section = _RecordingSection(calls, fail_ops)
+    restorer._client = __import__("types").SimpleNamespace(
+        organizations=section, networks=section, wireless=section,
+        switch=section,
+    )
+    return restorer, calls
+
+
+def test_executor_creates_claims_and_remaps_in_order(tmp_path: Path) -> None:
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(
+            GP_ITEM, ("N_1", "100"), {"groupPolicyId": "100", "name": "kiosk"}
+        ),
+        FeatureConfiguration(
+            SSID_ITEM, ("N_1", "0"),
+            {"number": 0, "name": "Corp", "groupPolicyId": "100"},
+        ),
+    )
+    plan = plan_restore(graph, parser)
+    restorer, calls = _executor(tmp_path)
+    result = restorer.execute(graph, plan)
+
+    assert result.failed == ()
+    ops = [c[0] for c in calls]
+    # Network created before claim, before its features.
+    assert ops.index("createOrganizationNetwork") < ops.index("claimNetworkDevices")
+    assert ops.index("claimNetworkDevices") < ops.index("createNetworkGroupPolicy")
+    # Network create targets the TARGET org.
+    create = next(c for c in calls if c[0] == "createOrganizationNetwork")
+    assert create[1] == ("org-TARGET",)
+    # Claim uses the mapped network ID and the replacement serial.
+    claim = next(c for c in calls if c[0] == "claimNetworkDevices")
+    assert claim[1] == ("L_NEW",)
+    assert claim[2] == {"serials": ["Q9ZZ-NEWW-HWSN"]}
+    # The SSID references the group policy's NEW server-assigned ID.
+    ssid = next(c for c in calls if c[0] == "updateNetworkWirelessSsid")
+    assert ssid[1] == ("L_NEW", "0")
+    assert ssid[2]["groupPolicyId"] == "900"
+
+
+def test_executor_skips_children_of_failed_parents(tmp_path: Path) -> None:
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(SNMP_PATH, ("N_1",), {"access": "none"}),
+    )
+    plan = plan_restore(graph, parser)
+    restorer, calls = _executor(
+        tmp_path, fail_ops={"createOrganizationNetwork"}
+    )
+    result = restorer.execute(graph, plan)
+
+    assert [key for key, _ in result.failed] == [
+        "/organizations/{organizationId}/networks::N_1"
+    ]
+    skipped_reasons = " ".join(e["reason"] for e in result.skipped)
+    assert "parent object N_1 failed" in skipped_reasons
+    assert all(c[0] != "updateNetworkSnmp" for c in calls)
+
+
+def test_executor_resumes_from_the_journal(tmp_path: Path) -> None:
+    from meraki2tf.restorer import RestoreJournal
+
+    parser = _restore_spec(tmp_path)
+    graph = _graph()
+    plan = plan_restore(graph, parser)
+    restorer, calls = _executor(tmp_path)
+    first = restorer.execute(graph, plan)
+    assert len(first.executed) == 2  # network + device claim
+
+    # Fresh executor, same journal: everything already restored.
+    from meraki2tf.restorer import OrgRestorer
+
+    calls2: list = []
+    section = _RecordingSection(calls2)
+    again = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "journal.jsonl")
+    )
+    again._client = __import__("types").SimpleNamespace(
+        organizations=section, networks=section
+    )
+    second = again.execute(graph, plan)
+    assert second.executed == ()
+    assert calls2 == []
+    assert all("already restored" in e["reason"] for e in second.skipped)
+
+
+def test_executor_reports_unmapped_references_per_object(
+    tmp_path: Path,
+) -> None:
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(
+            SSID_ITEM, ("N_1", "0"),
+            # references a group policy that exists in the snapshot but
+            # is never restored (no feature for it) → dangling.
+            {"number": 0, "groupPolicyId": "GP_ghost"},
+        ),
+        FeatureConfiguration(
+            GP_ITEM, ("N_1", "GP_ghost"), {UNREADABLE_MARKER: "HTTP 500"}
+        ),
+    )
+    plan = plan_restore(graph, parser)
+    restorer, _calls = _executor(tmp_path)
+    result = restorer.execute(graph, plan)
+    assert any("no rebuilt counterpart" in reason for _, reason in result.failed)
+
+
+def test_rewrite_reference_edges() -> None:
+    from meraki2tf.restorer import rewrite_references
+
+    # Non-string reference values (fixed-slot numbers) pass through.
+    assert rewrite_references({"vlanId": 5}, {}, frozenset()) == {"vlanId": 5}
+    # Unknown GRP ids are data, not references.
+    assert rewrite_references(
+        {"rule": "allow GRP(999)"}, {}, frozenset({"1"})
+    ) == {"rule": "allow GRP(999)"}
+
+
+def test_journal_ignores_blank_lines(tmp_path: Path) -> None:
+    from meraki2tf.restorer import RestoreJournal
+
+    path = tmp_path / "j.jsonl"
+    path.write_text('{"kind": "done", "key": "a"}\n\n', encoding="utf-8")
+    assert RestoreJournal(path).completed == {"a"}
+
+
+def test_executor_records_missing_sdk_method_as_failure(
+    tmp_path: Path,
+) -> None:
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    parser = _restore_spec(tmp_path)
+    graph = _graph()
+    plan = plan_restore(graph, parser)
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "j2.jsonl")
+    )
+    restorer._client = SimpleNamespace()  # no sections at all
+    result = restorer.execute(graph, plan)
+    assert result.executed == ()
+    assert all("no method" in reason for _, reason in result.failed)
