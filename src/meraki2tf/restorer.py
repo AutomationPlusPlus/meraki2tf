@@ -35,6 +35,7 @@ Ordering is by dependency waves:
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import re
@@ -84,6 +85,12 @@ class RestoreAction:
     #: Attribute names whose values were redacted in the snapshot and
     #: must be re-entered by an operator after the restore.
     secret_reentry: tuple[str, ...] = ()
+    #: The GET on the create's collection, when the spec has one: the
+    #: executor reads it back to adopt (by name) an object a crashed
+    #: run created but never journaled, instead of duplicating it.
+    lookup: OperationSpec | None = field(
+        hash=False, compare=False, default=None
+    )
 
     @property
     def key(self) -> str:
@@ -123,6 +130,9 @@ def plan_restore(graph: NetworkGraph, parser: OpenApiParser) -> RestorePlan:
     coverage manifest always carries the current restore verdict.
     """
     writes = write_operations(parser)
+    lookups = {
+        op.path: op for op in parser.endpoints() if op.method == "get"
+    }
     actions: list[RestoreAction] = []
     unrestorable: list[Unrestorable] = []
 
@@ -135,6 +145,7 @@ def plan_restore(graph: NetworkGraph, parser: OpenApiParser) -> RestorePlan:
                 path_values=(network.network_id,),
                 operation=_network_create_operation(parser),
                 payload=dict(network.payload),
+                lookup=lookups.get("/organizations/{organizationId}/networks"),
             )
         )
     for device in graph.devices:
@@ -150,7 +161,7 @@ def plan_restore(graph: NetworkGraph, parser: OpenApiParser) -> RestorePlan:
         )
 
     for feature in graph.features:
-        classified = _classify_feature(feature, parser, writes)
+        classified = _classify_feature(feature, parser, writes, lookups)
         if isinstance(classified, Unrestorable):
             unrestorable.append(classified)
         else:
@@ -165,6 +176,7 @@ def _classify_feature(
     feature: FeatureConfiguration,
     parser: OpenApiParser,
     writes: Mapping[str, tuple[OperationSpec, ...]],
+    lookups: Mapping[str, OperationSpec],
 ) -> RestoreAction | Unrestorable:
     if UNREADABLE_MARKER in feature.payload:
         return Unrestorable(
@@ -213,6 +225,9 @@ def _classify_feature(
             operation=creates[0],
             payload=payload,
             secret_reentry=redacted,
+            # The collection GET (same path as the collection POST),
+            # for crash-recovery adoption by name.
+            lookup=lookups.get(creates[0].path),
         )
     operation = updates[0] if updates else creates[0]
     return RestoreAction(
@@ -662,6 +677,10 @@ class RestoreJournal:
     def __init__(self, path: Path) -> None:
         self._path = path
         self.completed: set[str] = set()
+        #: Creates whose API call was about to fire (write-ahead): an
+        #: attempted-but-not-completed key on resume means the process
+        #: died in the create/journal window and the object may exist.
+        self.attempted: set[str] = set()
         self.id_map: dict[str, str] = {}
         #: (scope stem, old, new, context) per mapping — the resolver's
         #: raw material. Legacy records load with scope "" / context ()
@@ -689,6 +708,8 @@ class RestoreJournal:
                     raise
                 if record.get("kind") == "done":
                     self.completed.add(str(record["key"]))
+                elif record.get("kind") == "attempt":
+                    self.attempted.add(str(record["key"]))
                 elif record.get("kind") == "map":
                     old, new = str(record["old"]), str(record["new"])
                     self.id_map[old] = new
@@ -740,6 +761,12 @@ class RestoreJournal:
     def _append(self, record: Mapping[str, Any]) -> None:
         with self._path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(dict(record)) + "\n")
+
+    def record_attempt(self, key: str) -> None:
+        if key in self.attempted:
+            return
+        self.attempted.add(key)
+        self._append({"kind": "attempt", "key": key})
 
     def record_done(self, key: str) -> None:
         self.completed.add(key)
@@ -893,9 +920,33 @@ class OrgRestorer:
                     )
                     continue
                 try:
-                    new_id = self._dispatch(
-                        dashboard, action, resolver, graph.organization_id
-                    )
+                    new_id: str | None
+                    recovered: str | None = None
+                    if (
+                        action.kind == "create"
+                        and action.key in self._journal.attempted
+                    ):
+                        # A previous run recorded the attempt but never
+                        # the completion: it died in the create/journal
+                        # window and the object may already exist.
+                        # Re-POSTing blind duplicates it (or fails on
+                        # the duplicate name and skips every child).
+                        recovered = self._reconcile_existing(
+                            dashboard, action, resolver,
+                            graph.organization_id,
+                        )
+                    if recovered is not None:
+                        logger.warning(
+                            "Adopted %s: an interrupted run created it "
+                            "without journaling; matched by name in the "
+                            "target instead of re-creating.", action.key,
+                        )
+                        new_id = recovered
+                    else:
+                        new_id = self._dispatch(
+                            dashboard, action, resolver,
+                            graph.organization_id,
+                        )
                 except UnmappedReferenceError as exc:
                     deferred.append((action, str(exc)))
                     continue
@@ -1006,6 +1057,12 @@ class OrgRestorer:
             raise RuntimeError(
                 f"Meraki SDK exposes no method for {op.operation_id!r}"
             )
+        if action.kind == "create":
+            # Write-ahead: recorded after reference rewriting (so a
+            # deferral leaves no trace) but before the API call, so a
+            # crash inside the create/journal window is detectable on
+            # resume (see _reconcile_existing).
+            self._journal.record_attempt(action.key)
         self._bucket.acquire()
         if isinstance(body, Mapping):
             response = method(*params.values(), **body)
@@ -1017,6 +1074,67 @@ class OrgRestorer:
             if new_id is not None:
                 return str(new_id)
         return None
+
+    def _reconcile_existing(
+        self,
+        dashboard: Any,
+        action: RestoreAction,
+        resolver: ReferenceResolver,
+        source_org: str,
+    ) -> str | None:
+        """The ID of an already-existing, name-matching counterpart.
+
+        Reads the create's collection back from the target and matches
+        by name; anything short of exactly one match (no name in the
+        payload, no collection GET in the spec, unreadable collection,
+        zero or several matches) returns ``None`` and the normal create
+        proceeds — worst case the API rejects a duplicate per object,
+        exactly as before.
+        """
+        op = action.lookup
+        name = action.payload.get("name")
+        if op is None or not isinstance(name, str) or not name:
+            return None
+        scope_values = action.path_values
+        if action.wave == WAVE_NETWORKS:
+            scope_values = (source_org,)
+        params = {
+            param: resolver.resolve_scope(param, value, action.path_values)
+            for param, value in zip(op.path_params, scope_values)
+        }
+        section = getattr(dashboard, op.tags[0], None) if op.tags else None
+        method = (
+            getattr(section, op.operation_id, None)
+            if section is not None
+            else None
+        )
+        if method is None:
+            return None
+        self._bucket.acquire()
+        try:
+            listing = (
+                method(*params.values(), total_pages="all")
+                if "total_pages" in inspect.signature(method).parameters
+                else method(*params.values())
+            )
+        except Exception as exc:  # noqa: BLE001 - fall back to the POST
+            logger.debug(
+                "Crash-recovery lookup for %s failed (%s); proceeding "
+                "with the create.", action.key, exc,
+            )
+            return None
+        self._bucket.on_success()
+        if isinstance(listing, Mapping):
+            listing = listing.get("items")
+        matches = [
+            item
+            for item in (listing if isinstance(listing, list) else [])
+            if isinstance(item, Mapping) and item.get("name") == name
+        ]
+        if len(matches) != 1:
+            return None
+        found = matches[0].get("id")
+        return str(found) if found is not None else None
 
 
 @dataclass(frozen=True)

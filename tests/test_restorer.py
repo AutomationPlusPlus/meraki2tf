@@ -995,6 +995,181 @@ def test_references_serials_checks_path_values_and_empty_sets() -> None:
     assert _references_serials(action, frozenset({"Q2AB-CDEF-GHIJ"})) is True
 
 
+def test_attempted_creates_reconcile_by_name_instead_of_duplicating(
+    tmp_path: Path,
+) -> None:
+    """A crash between the API create and the journal append leaves an
+    attempted-but-not-done key; the resume must adopt the existing
+    object by name, not re-POST it (a duplicate network name 400 would
+    skip every child of the network)."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    parser = _restore_spec(tmp_path)
+    graph = _graph(FeatureConfiguration(SNMP_PATH, ("N_1",), {"access": "none"}))
+    plan = plan_restore(graph, parser)
+    network_key = "/organizations/{organizationId}/networks::N_1"
+
+    journal = RestoreJournal(tmp_path / "crashed.jsonl")
+    journal.bind(target="org-TARGET", source="org-123")
+    journal.record_attempt(network_key)  # the crashed run got this far
+
+    calls: list = []
+
+    class AdoptingSection(_RecordingSection):
+        def getOrganizationNetworks(
+            self, organizationId: str, total_pages: str = "all"
+        ) -> list[dict]:
+            self._calls.append(("getOrganizationNetworks", (organizationId,), {}))
+            return [
+                {"id": "L_EXIST", "name": "HQ"},
+                {"id": "L_OTHER", "name": "Branch"},
+            ]
+
+    section = AdoptingSection(calls)
+    restorer = OrgRestorer("org-TARGET", RestoreJournal(tmp_path / "crashed.jsonl"))
+    restorer._client = SimpleNamespace(organizations=section, networks=section)
+    result = restorer.execute(graph, plan)
+
+    assert result.failed == ()
+    ops = [c[0] for c in calls]
+    assert "createOrganizationNetwork" not in ops  # adopted, not re-created
+    assert "getOrganizationNetworks" in ops
+    # Children run against the adopted network's real ID.
+    claim = next(c for c in calls if c[0] == "claimNetworkDevices")
+    assert claim[1] == ("L_EXIST",)
+    snmp = next(c for c in calls if c[0] == "updateNetworkSnmp")
+    assert snmp[1] == ("L_EXIST",)
+    assert network_key in result.executed
+
+
+def test_unattempted_creates_never_pay_the_recovery_lookup(
+    tmp_path: Path,
+) -> None:
+    """A clean run must not read collections back before every create —
+    the write-ahead attempt record is what marks the crash window."""
+    parser = _restore_spec(tmp_path)
+    graph = _graph()
+    plan = plan_restore(graph, parser)
+    restorer, calls = _executor(tmp_path)
+    restorer.execute(graph, plan)
+
+    ops = [c[0] for c in calls]
+    assert "getOrganizationNetworks" not in ops
+    assert "createOrganizationNetwork" in ops
+    # The journal write-ahead is on disk: attempt precedes done.
+    lines = [
+        json.loads(line)
+        for line in (tmp_path / "journal.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        if line.strip()
+    ]
+    kinds = [record["kind"] for record in lines]
+    assert kinds.index("attempt") < kinds.index("done")
+
+
+def test_recovery_lookup_edge_branches(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    from meraki2tf.models import NetworkGraph as _NetworkGraph
+    from meraki2tf.restorer import (
+        OrgRestorer,
+        ReferenceResolver,
+        RestoreAction,
+        RestoreJournal,
+    )
+    from meraki2tf.spec.engine import OperationSpec
+
+    resolver = ReferenceResolver(_NetworkGraph("org-123", (), (), ()))
+    restorer = OrgRestorer("org-TARGET", RestoreJournal(tmp_path / "e.jsonl"))
+    lookup = OperationSpec(
+        operation_id="getNetworkGroupPolicies",
+        method="get",
+        path=GP_COLLECTION,
+        path_params=("networkId",),
+        tags=("networks",),
+    )
+
+    def action(**overrides: object) -> RestoreAction:
+        values = dict(
+            kind="create", wave=4, api_path=GP_ITEM,
+            path_values=("N_1", "100"), operation=lookup,
+            payload={"name": "kiosk"}, lookup=lookup,
+        )
+        values.update(overrides)
+        return RestoreAction(**values)  # type: ignore[arg-type]
+
+    dashboard = SimpleNamespace()
+
+    # No lookup op / no usable name → straight to the POST.
+    assert restorer._reconcile_existing(
+        dashboard, action(lookup=None), resolver, "org-123"
+    ) is None
+    assert restorer._reconcile_existing(
+        dashboard, action(payload={}), resolver, "org-123"
+    ) is None
+    # SDK without the lookup method → straight to the POST.
+    assert restorer._reconcile_existing(
+        dashboard, action(), resolver, "org-123"
+    ) is None
+
+    class Sections:
+        def getNetworkGroupPolicies(self, networkId: str) -> object:
+            raise RuntimeError("boom")
+
+    # Unreadable collection → straight to the POST.
+    assert restorer._reconcile_existing(
+        SimpleNamespace(networks=Sections()), action(), resolver, "org-123"
+    ) is None
+
+    class EnvelopeSections:
+        def getNetworkGroupPolicies(self, networkId: str) -> dict:
+            return {"items": [{"name": "kiosk", "groupPolicyId": "900",
+                               "id": "900"}]}
+
+    # Envelope listings unwrap; a unique name match adopts.
+    assert restorer._reconcile_existing(
+        SimpleNamespace(networks=EnvelopeSections()), action(),
+        resolver, "org-123",
+    ) == "900"
+
+
+def test_recovery_lookup_falls_back_to_the_create(tmp_path: Path) -> None:
+    """No unique name match (or an unreadable collection) proceeds with
+    the POST — worst case the API rejects one duplicate, as before."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    parser = _restore_spec(tmp_path)
+    graph = _graph()
+    plan = plan_restore(graph, parser)
+    network_key = "/organizations/{organizationId}/networks::N_1"
+
+    journal = RestoreJournal(tmp_path / "nomatch.jsonl")
+    journal.record_attempt(network_key)
+
+    calls: list = []
+
+    class NoMatchSection(_RecordingSection):
+        def getOrganizationNetworks(
+            self, organizationId: str, total_pages: str = "all"
+        ) -> list[dict]:
+            return []  # the crashed create never landed
+
+    section = NoMatchSection(calls)
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "nomatch.jsonl")
+    )
+    restorer._client = SimpleNamespace(organizations=section, networks=section)
+    result = restorer.execute(graph, plan)
+
+    assert result.failed == ()
+    assert "createOrganizationNetwork" in [c[0] for c in calls]
+
+
 # ------------------------------------------------------------- journal
 
 
