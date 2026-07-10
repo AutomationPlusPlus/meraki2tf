@@ -371,6 +371,68 @@ def test_classify_empty_null_scalars_become_injections() -> None:
     )
 
 
+def test_classify_nonempty_scalar_to_null_is_real_drift() -> None:
+    """A NON-empty before with a null after means the value changed in
+    Meraki after the config was generated (the generator only omits
+    null/empty reads) — genuine clickops drift that must alert, never
+    be silently injected into the config as if nothing happened."""
+    document = {
+        "resource_changes": [
+            _update(
+                "meraki_networks.n_1",
+                {"notes": "set by clickops after generation"},
+                {"notes": None},
+            )
+        ]
+    }
+    plan = classify_plan(document)
+    assert plan.remediations == ()
+    assert plan.real_changes == ("meraki_networks.n_1",)
+
+
+def test_classify_unknown_after_values_are_real_drift() -> None:
+    """'(known after apply)' attributes are omitted from `after` and
+    would otherwise masquerade as generator omissions; an unknown value
+    is never a provable phantom."""
+    document = {
+        "resource_changes": [
+            _update(
+                "meraki_networks.n_1",
+                {"sp_initiated_idp_id": ""},
+                {"sp_initiated_idp_id": None},
+            )
+        ]
+    }
+    document["resource_changes"][0]["change"]["after_unknown"] = {
+        "sp_initiated_idp_id": True
+    }
+    plan = classify_plan(document)
+    assert plan.remediations == ()
+    assert plan.real_changes == ("meraki_networks.n_1",)
+
+
+def test_validation_failures_do_not_cross_error_block_boundaries() -> None:
+    """An address-less error block must not steal the next block's
+    address — the garbled reason would land in the coverage manifest as
+    that resource's drop cause."""
+    diagnostics = (
+        "Error: Unable to find API key\n"
+        "\n"
+        "boom\n"
+        "\n"
+        "Error: Invalid Attribute Value Match\n"
+        "\n"
+        "  with meraki_network_firmware_upgrades.l_1,\n"
+        "  on resources.tf line 5:\n"
+        "Attribute upgrade_window_day_of_week value must be one of...\n"
+    )
+    failures = validation_failures(diagnostics)
+    assert set(failures) == {"meraki_network_firmware_upgrades.l_1"}
+    assert failures["meraki_network_firmware_upgrades.l_1"].startswith(
+        "Invalid Attribute Value Match"
+    )
+
+
 def test_classify_real_changes_disable_remediation_for_the_resource() -> None:
     """One unexplained diff makes the whole resource real drift — a
     genuine change must never be partially masked."""
