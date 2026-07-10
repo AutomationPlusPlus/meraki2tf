@@ -297,6 +297,21 @@ def _device_claim_operation(parser: OpenApiParser) -> OperationSpec:
     )
 
 
+def restore_verdicts(
+    plan: RestorePlan,
+) -> dict[tuple[str, tuple[str, ...]], str]:
+    """(api_path, identifiers) → restore verdict, for the coverage
+    manifest's ``restore_via`` column."""
+    verdicts: dict[tuple[str, tuple[str, ...]], str] = {}
+    for action in plan.actions:
+        verdicts[(action.api_path, action.path_values)] = action.kind
+    for item in plan.unrestorable:
+        verdicts[(item.api_path, item.path_values)] = (
+            f"unrestorable: {item.reason}"
+        )
+    return verdicts
+
+
 def render_restore_plan(plan: RestorePlan, limit: int = 30) -> str:
     """Operator-facing digest: identifiers and reasons, never values."""
     lines = [plan.summary()]

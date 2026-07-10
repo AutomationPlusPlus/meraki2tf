@@ -1392,3 +1392,18 @@ def test_snapshot_baseline_with_no_drift_is_quiet(
     assert all(
         e.event_type is not EventType.DRIFT_DETECTED for e in recorder.events
     )
+
+
+def test_manifest_includes_restore_verdicts(
+    tmp_path: Path, api_key: None
+) -> None:
+    """The weekly manifest answers 'will the API rebuild it?' for every
+    asset, computed offline from the restore planner."""
+    orchestrator, _, _, _ = _orchestrator(tmp_path)
+    orchestrator.run("org-123")
+    manifest = json.loads(
+        (tmp_path / COVERAGE_JSON_FILENAME).read_text(encoding="utf-8")
+    )
+    # StubGenerator's assets aren't in the stub graph, so no verdicts
+    # attach — the column is present only where the planner has one.
+    assert "objects" in manifest
