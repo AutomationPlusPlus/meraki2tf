@@ -66,9 +66,11 @@ class StubGenerator:
         self,
         addresses: tuple[str, ...] = ("meraki_devices.q2ab", "meraki_networks.n_1"),
         unsupported: tuple[UnsupportedAsset, ...] = (),
+        unreadable_types: frozenset[str] = frozenset(),
     ) -> None:
         self.addresses = addresses
         self.unsupported = unsupported
+        self.unreadable_types = unreadable_types
         self.parser = StubParser()
         #: (existing_addresses, audit) per generate() invocation.
         self.calls: list[tuple[frozenset[str], bool]] = []
@@ -101,6 +103,7 @@ class StubGenerator:
             unsupported=self.unsupported,
             skipped_existing=skipped,
             captured=captured,
+            unreadable_types=self.unreadable_types,
         )
 
 
@@ -980,6 +983,34 @@ def test_confirm_deletions_is_a_noop_without_deletions(
     assert summary.deletions_removed == ()
 
 
+def test_unreadable_endpoints_do_not_read_as_deletions(
+    tmp_path: Path, api_key: None
+) -> None:
+    """A transiently unreadable endpoint leaves its objects out of the
+    captured set without them being gone from Meraki; flagging (or
+    removing, under --confirm-deletions) those live resources as
+    deletions would let one 5xx during discovery gut the DR kit."""
+    generator = StubGenerator(
+        unreadable_types=frozenset({"meraki_wireless_ssids"})
+    )
+    orchestrator, recorder, _, runner = _orchestrator(
+        tmp_path, generator=generator, confirm_deletions=True
+    )
+    runner.state_addresses = {
+        "meraki_networks.n_1",
+        "meraki_wireless_ssids.s_1",  # unreadable this run — exempt
+        "meraki_networks.deleted",  # genuinely missing — still handled
+    }
+    summary = orchestrator.run("org-123")
+
+    assert runner.removed == [("meraki_networks.deleted",)]
+    assert summary.deletions_removed == ("meraki_networks.deleted",)
+    assert summary.deletions_pending == ()
+    assert "meraki_wireless_ssids.s_1" not in {
+        address for removed in runner.removed for address in removed
+    }
+
+
 # ---------------------------------------------------------------------------
 # Coverage manifest: the "what is / isn't in Terraform" guarantee
 # ---------------------------------------------------------------------------
@@ -1087,6 +1118,35 @@ def test_reconciliation_drops_become_unsupported_with_alert(
         e for e in recorder.events if e.event_type is EventType.RUN_SUCCESS
     ][0]
     assert success.details["unsupported_count"] == 1
+
+
+def test_reconciliation_drop_reports_raw_path_identifiers(
+    tmp_path: Path, api_key: None
+) -> None:
+    """Dropped assets must carry their discovered path values — not the
+    import ID's injected org-prefix/force_delete components — or the
+    coverage manifest's restore_via join and the runbook's payload
+    lookup miss exactly the objects that need manual attention."""
+    recorder = RecordingNotifier()
+    runner = StubRunner(
+        tmp_path,
+        plan_exit=2,
+        plan_stdout="Plan: 1 to import, 0 to add, 0 to change, 0 to destroy.",
+    )
+    runner.reconciliation_dropped = {"meraki_networks.n_1": "unexpressible"}
+    orchestrator = PipelineOrchestrator(
+        provider=StubProvider(),
+        generator=IdentifiedStubGenerator(),  # type: ignore[arg-type]
+        runner=runner,  # type: ignore[arg-type]
+        dispatcher=AlertDispatcher([recorder]),
+    )
+    orchestrator.run("org-123")
+    flagged = [
+        e for e in recorder.events
+        if e.event_type is EventType.UNSUPPORTED_FEATURE_FLAGGED
+    ][0]
+    # IdentifiedStubGenerator's identifiers, not import_id.split(",").
+    assert flagged.details["identifiers"] == ["n_1"]
 
 
 def test_imports_written_never_reports_negative(
