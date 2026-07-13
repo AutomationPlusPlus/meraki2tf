@@ -1,6 +1,6 @@
 # meraki2tf
 
-[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Python 3.11–3.14](https://img.shields.io/badge/python-3.11%20%E2%80%93%203.14-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Terraform](https://img.shields.io/badge/terraform-CiscoDevNet%2Fmeraki-844FBA?logo=terraform&logoColor=white)](https://registry.terraform.io/providers/CiscoDevNet/meraki)
 [![Tests](https://img.shields.io/badge/tests-passing-success?logo=pytest&logoColor=white)](#contributor-architecture)
 [![Coverage](https://img.shields.io/badge/coverage-100%25-success)](#contributor-architecture)
@@ -58,7 +58,8 @@ is flagged through the exception auditor instead of silently dropped.
 
 ## Prerequisites & Installation
 
-- Python 3.11+
+- Python 3.11–3.14 (every CPython version still receiving security patches;
+  3.14 recommended — the floor is 3.11 because the `meraki` SDK requires it)
 - The `terraform` CLI on your `PATH` (any version supporting `import` blocks, ≥ 1.5)
 - A Meraki dashboard API key (live mode only)
 - The Meraki OpenAPI spec — fetched from GitHub automatically; only
