@@ -22,7 +22,7 @@ import logging
 from collections.abc import Iterable, Mapping
 from typing import Any
 
-from meraki2tf.models import FeatureConfiguration
+from meraki2tf.models import UNREADABLE_MARKER, FeatureConfiguration
 from meraki2tf.openapi_parser import OpenApiParser, entity_key, is_item_path
 from meraki2tf.spec.engine import OperationSpec
 
@@ -204,6 +204,29 @@ def expand_endpoint_payload(
                 )
             ]
         payload = elements
+    if not isinstance(payload, (list, tuple)):
+        # A scalar body (bare string, number, …) is a malformed endpoint
+        # response: iterating it would expand a string per-character
+        # into garbage records and crash on a number, aborting the whole
+        # discovery run. Record it the way unreadable endpoints are
+        # recorded, so it surfaces as a coverage gap instead.
+        logger.warning(
+            "Endpoint %s returned a non-collection %s payload; it is "
+            "recorded as a coverage gap.",
+            op.path, type(payload).__name__,
+        )
+        return [
+            FeatureConfiguration(
+                api_path=op.path,
+                path_values=scopes,
+                payload={
+                    UNREADABLE_MARKER: (
+                        "malformed endpoint response: expected an object "
+                        f"or list, got {type(payload).__name__}"
+                    )
+                },
+            )
+        ]
     if not payload:
         if _whole_collection_put(parser, op):
             # The collection itself is one config object (its PUT

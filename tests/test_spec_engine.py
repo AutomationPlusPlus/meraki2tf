@@ -1,6 +1,7 @@
 """Dynamic OpenAPI ingestion: discovery driven purely by document content."""
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -39,6 +40,7 @@ def test_operations_are_discovered_dynamically() -> None:
         "getOrganizations",
         "getNetworkApplianceVlan",
         "updateNetworkApplianceVlan",
+        "get_no_op_id",  # synthesized: the spec left it anonymous
     }
     vlan_get = ops["getNetworkApplianceVlan"]
     assert vlan_get.method == "get"
@@ -57,7 +59,7 @@ def test_from_file_round_trip(tmp_path: Path) -> None:
     spec_path = tmp_path / "spec.json"
     spec_path.write_text(json.dumps(MOCK_SPEC), encoding="utf-8")
     engine = SpecIngestionEngine.from_file(spec_path)
-    assert len(engine.resource_groups()) == 2
+    assert len(engine.resource_groups()) == 3
 
 
 def test_from_file_rejects_invalid_json(tmp_path: Path) -> None:
@@ -105,10 +107,90 @@ def test_null_or_string_tags_do_not_crash_ingestion() -> None:
     assert ops["getNetworkSnmp"].tags == ()
 
 
-def test_unimplemented_stages_are_explicit() -> None:
-    engine = SpecIngestionEngine(MOCK_SPEC)
-    with pytest.raises(NotImplementedError):
-        engine.build_registry()
+def test_missing_operation_id_synthesizes_a_deterministic_fallback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """operationId is optional per OpenAPI; skipping such an operation
+    would make its entity invisible to discovery and coverage. The
+    synthesized id keeps the operation flowing (live SDK dispatch then
+    reports it undispatchable, loudly) and warns at ingestion."""
+    with caplog.at_level(logging.WARNING, logger="meraki2tf.spec.engine"):
+        ops = {
+            op.operation_id: op
+            for op in SpecIngestionEngine(MOCK_SPEC).operations()
+        }
+    orphan = ops["get_no_op_id"]
+    assert orphan.method == "get"
+    assert orphan.path == "/no-op-id"
+    assert orphan.tags == ("orphan",)
+    assert any(
+        "no operationId" in record.message and "get_no_op_id" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_ref_path_items_resolve_within_the_document() -> None:
+    """A path item that is a $ref (valid OpenAPI 3.x) must not silently
+    drop every operation under that path."""
+    spec = {
+        "openapi": "3.0.1",
+        "paths": {
+            "/organizations": {"$ref": "#/components/pathItems/orgs"},
+        },
+        "components": {
+            "pathItems": {
+                "orgs": {
+                    "get": {
+                        "operationId": "getOrganizations",
+                        "tags": ["organizations"],
+                    },
+                },
+            },
+        },
+    }
+    ops = list(SpecIngestionEngine(spec).operations())
+    assert [op.operation_id for op in ops] == ["getOrganizations"]
+    assert ops[0].path == "/organizations"
+
+
+def test_ref_path_items_honor_json_pointer_escaping() -> None:
+    """RFC 6901: ``~1`` is ``/`` and ``~0`` is ``~`` inside a token."""
+    spec = {
+        "openapi": "3.0.1",
+        "paths": {
+            "/organizations": {"$ref": "#/x~1y/a~0b"},
+        },
+        "x/y": {
+            "a~b": {
+                "get": {"operationId": "getOrganizations", "tags": []},
+            },
+        },
+    }
+    ops = list(SpecIngestionEngine(spec).operations())
+    assert [op.operation_id for op in ops] == ["getOrganizations"]
+
+
+@pytest.mark.parametrize(
+    "ref",
+    [
+        "https://example.com/shared.json#/pathItems/orgs",  # external
+        "#/components/pathItems/absent",  # dangling
+        123,  # not even a string
+    ],
+)
+def test_unresolvable_ref_path_items_warn_by_path(
+    ref: object, caplog: pytest.LogCaptureFixture
+) -> None:
+    """External or dangling $refs cannot be followed from a local
+    document — a coverage hole that must be loud, naming the path."""
+    spec = {"openapi": "3.0.1", "paths": {"/organizations": {"$ref": ref}}}
+    with caplog.at_level(logging.WARNING, logger="meraki2tf.spec.engine"):
+        ops = list(SpecIngestionEngine(spec).operations())
+    assert ops == []
+    assert any(
+        "/organizations" in record.getMessage() and "$ref" in record.message
+        for record in caplog.records
+    )
 
 
 def test_from_latest_release_builds_from_remote_spec(
@@ -118,4 +200,4 @@ def test_from_latest_release_builds_from_remote_spec(
 
     monkeypatch.setattr(spec_resolver, "fetch_latest_spec", lambda: MOCK_SPEC)
     engine = SpecIngestionEngine.from_latest_release()
-    assert len(engine.resource_groups()) == 2
+    assert len(engine.resource_groups()) == 3

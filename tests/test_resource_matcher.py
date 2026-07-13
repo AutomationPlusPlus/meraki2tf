@@ -8,12 +8,13 @@ import pytest
 
 from conftest import fixture_catalog
 
-from meraki2tf.openapi_parser import OpenApiParser
+from meraki2tf.openapi_parser import OpenApiParser, snake_case
 from meraki2tf.provider_catalog import ProviderCatalog
 from meraki2tf.resource_matcher import (
     MatchedResource,
     _identity_fit,
     _is_subsequence,
+    _path_params,
     _same_word,
     _split_words,
     match_resources,
@@ -78,6 +79,24 @@ def test_variant_equivalence_rejects_unrelated_words() -> None:
 def test_subsequence_requires_order() -> None:
     assert _is_subsequence(["one", "to", "many"], ["one", "to", "many", "nat"])
     assert not _is_subsequence(["one", "to", "one"], ["one", "to", "many"])
+
+
+def test_path_params_use_the_parsers_snake_case_tokenizer() -> None:
+    """The generator's import-ID guard compares the matcher's expected
+    components against provided ones it derives with the parser's
+    ``snake_case``; both sides must share the one tokenizer, or a
+    digit-boundary parameter like ``{hotspot20RuleId}`` would tokenize
+    differently and falsely mark every asset of its entity unsupported."""
+    path = "/networks/{networkId}/wireless/rules/{hotspot20RuleId}"
+    provided = tuple(
+        snake_case(name) for name in ("networkId", "hotspot20RuleId")
+    )
+    assert _path_params(path) == provided
+    # today's spec params are unaffected by the unification
+    assert _path_params(
+        "/networks/{networkId}/appliance/vlans/{vlanId}"
+    ) == ("network_id", "vlan_id")
+    assert _path_params("/devices/{serial}") == ("serial",)
 
 
 # -------------------------------------------------------------- identity fit

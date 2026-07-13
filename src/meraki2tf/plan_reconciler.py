@@ -397,7 +397,11 @@ def classify_plan(document: Any) -> ReconciliationPlan:
     Classification is per top-level attribute; a resource is only
     remediated when *every* diffed attribute falls into a provable
     phantom class — one unexplained attribute makes the whole resource
-    real drift (conservative: never mask a genuine change).
+    real drift (conservative: never mask a genuine change). Only update
+    actions have phantom classes at all: any other mutating verb
+    (create/delete/replace) is genuine drift by definition and is
+    counted in ``real_changes`` so the reconciliation report never
+    understates the mutations left in the plan.
     """
     remediations: list[ResourceRemediation] = []
     real: list[str] = []
@@ -408,7 +412,11 @@ def classify_plan(document: Any) -> ReconciliationPlan:
         body = change.get("change")
         if not isinstance(body, dict):
             continue
-        if "update" not in tuple(body.get("actions") or ()):
+        actions = tuple(body.get("actions") or ())
+        if "update" not in actions:
+            if any(action not in ("no-op", "read") for action in actions):
+                # create/delete/replace: never remediable, always real.
+                real.append(str(change.get("address", "")))
             continue
         address = str(change.get("address", ""))
         before, after = body.get("before"), body.get("after")

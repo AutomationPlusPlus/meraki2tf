@@ -113,6 +113,10 @@ def _load_snapshot_document(path: "Path") -> Any:
                     continue
                 record = json.loads(line)
                 if not isinstance(record, dict):
+                    # Valid JSON but not an object: just as lost as an
+                    # unknown kind — it must count toward the loud
+                    # record-loss warning below.
+                    dropped += 1
                     continue
                 kind = record.pop("kind", None)
                 bucket = buckets.get(str(kind))
@@ -125,9 +129,10 @@ def _load_snapshot_document(path: "Path") -> Any:
                 # failure mode — an unknown kind means a newer writer or
                 # a corrupted stream, and the operator must know.
                 logger.warning(
-                    "Snapshot %s carries %d record(s) of unknown kind; "
-                    "they were ignored. The snapshot may come from a "
-                    "newer meraki2tf version.",
+                    "Snapshot %s carries %d unusable record(s) (unknown "
+                    "kind or not a JSON object); they were ignored. The "
+                    "snapshot may come from a newer meraki2tf version or "
+                    "be corrupted.",
                     path, dropped,
                 )
             return {
@@ -426,18 +431,27 @@ class StaticJsonDataProvider(MerakiDataProvider):
         scope_value: str,
         unmatched: Counter[str],
     ) -> list[FeatureConfiguration]:
-        if payload is None or payload == []:
+        if payload is None:
             return []
         if not isinstance(payload, (dict, list)):
             unmatched[section] += 1
             return []
+        # An empty list still runs through endpoint matching: at an
+        # endpoint whose PUT replaces the whole collection, the live
+        # provider records an empty config as a real {"items": []}
+        # asset, and dump/live parity demands the same here. An empty
+        # section that matches nothing carries no data, so it is
+        # skipped quietly rather than counted as unmatched.
+        empty = payload == []
         if self._parser is None:
-            unmatched[section] += 1
+            if not empty:
+                unmatched[section] += 1
             return []
         sample_keys = self._sample_keys(payload)
         op = self._matcher(scope_param).match(section, sample_keys)
         if op is None:
-            unmatched[section] += 1
+            if not empty:
+                unmatched[section] += 1
             return []
         return expand_endpoint_payload(self._parser, op, scope_value, payload)
 

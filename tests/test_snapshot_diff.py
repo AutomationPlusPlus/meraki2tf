@@ -244,9 +244,11 @@ def test_device_network_moves_are_drift(tmp_path: Path) -> None:
     assert mod.changed["networkId"] == ("N_1", "N_2")
 
 
-def test_population_wide_key_additions_are_suppressed() -> None:
+def test_population_wide_key_additions_are_suppressed_but_recorded() -> None:
     """A new attribute appearing on EVERY modified asset of one path is
-    a Meraki rollout, not operator drift."""
+    probably a Meraki rollout, not operator drift — but a dashboard bulk
+    edit looks identical, so the suppression itself is returned for the
+    alert digest (names and counts, never values)."""
     diffs = [
         AssetDiff(VLAN_PATH, ("N_1", str(i)), {"newField": (None, "x")})
         for i in range(12)
@@ -255,10 +257,14 @@ def test_population_wide_key_additions_are_suppressed() -> None:
         AssetDiff(VLAN_PATH, ("N_1", "real"),
                   {"newField": (None, "x"), "name": ("a", "b")})
     )
-    survivors = _suppress_rollouts(diffs)
+    survivors, suppressed = _suppress_rollouts(diffs)
     (kept,) = survivors
     assert kept.path_values == ("N_1", "real")
     assert set(kept.changed) == {"name"}
+    (rollout,) = suppressed
+    assert rollout.api_path == VLAN_PATH
+    assert rollout.attributes == ("newField",)
+    assert rollout.asset_count == 13
 
 
 def test_small_populations_are_never_treated_as_rollouts() -> None:
@@ -266,7 +272,53 @@ def test_small_populations_are_never_treated_as_rollouts() -> None:
         AssetDiff(VLAN_PATH, ("N_1", str(i)), {"newField": (None, "x")})
         for i in range(3)
     ]
-    assert _suppress_rollouts(diffs) == diffs
+    assert _suppress_rollouts(diffs) == (diffs, ())
+
+
+def test_rollout_only_diffs_still_trigger_the_alert_path() -> None:
+    """Cardinal Rule 2: a diff that is ONLY suppressed rollouts must not
+    vanish — the caller keys the drift alert on is_empty, so it must be
+    non-empty and the digest must carry a clearly labeled verification
+    section with attribute names and counts, never values."""
+    previous = _graph(*[_vlan(str(i), name=f"v{i}") for i in range(12)])
+    current = _graph(
+        *[_vlan(str(i), name=f"v{i}", newField="sekret") for i in range(12)]
+    )
+    diff = diff_graphs(previous, current)
+    assert diff.modified == ()  # all changes were suppressed as rollout
+    assert not diff.is_empty  # ... but the diff still alerts
+    (rollout,) = diff.suppressed_rollouts
+    assert rollout.attributes == ("newField",)
+    assert rollout.asset_count == 12
+    assert "suppressed as probable API rollouts" in diff.summary()
+
+    text = render_diff(diff)
+    assert "suppressed as probable API rollout" in text
+    assert "verify these were NOT an operator bulk change" in text
+    assert f"! {VLAN_PATH} (12 assets): newField" in text
+    assert "sekret" not in text  # names and counts only, never values
+
+
+def test_render_diff_omits_the_rollout_section_when_none_suppressed() -> None:
+    previous = _graph(_vlan("10", name="Data"))
+    current = _graph(_vlan("10", name="Data-renamed"))
+    diff = diff_graphs(previous, current)
+    assert diff.suppressed_rollouts == ()
+    assert "rollout" not in render_diff(diff)
+    assert "rollout" not in diff.summary()
+
+
+def test_duplicate_asset_keys_warn_about_shadowed_drift(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Two assets sharing one identity key shadow each other (last
+    wins); the loss of drift visibility must be loud, never silent."""
+    duplicate = FeatureConfiguration(VLAN_PATH, ("N_1", "10"), {"name": "A"})
+    shadowing = FeatureConfiguration(VLAN_PATH, ("N_1", "10"), {"name": "B"})
+    graph = _graph(duplicate, shadowing)
+    with caplog.at_level("WARNING", logger="meraki2tf.snapshot_diff"):
+        diff_graphs(graph, graph)
+    assert any("Duplicate asset key" in r.message for r in caplog.records)
 
 
 def test_render_diff_is_secret_free_and_bounded() -> None:

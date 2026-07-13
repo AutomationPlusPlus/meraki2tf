@@ -16,9 +16,24 @@ class AlertDispatcher:
 
     def __init__(self, notifiers: Iterable[Notifier] = ()) -> None:
         self._notifiers: list[Notifier] = list(notifiers)
+        self._failed_events = 0
 
     def register(self, notifier: Notifier) -> None:
         self._notifiers.append(notifier)
+
+    @property
+    def channel_count(self) -> int:
+        """Number of registered delivery channels."""
+        return len(self._notifiers)
+
+    @property
+    def failed_event_count(self) -> int:
+        """Events that reached no configured channel (total delivery
+        failure). Zero channels is a deliberate setup, not a failure —
+        the counter only moves when configured channels all refuse an
+        event, so callers can turn a silent notifier outage into a
+        nonzero exit code."""
+        return self._failed_events
 
     def dispatch(self, event: AlertEvent) -> int:
         """Send ``event`` to all channels; returns the count delivered.
@@ -41,6 +56,7 @@ class AlertDispatcher:
                     event.event_type.value,
                 )
         if self._notifiers and not delivered:
+            self._failed_events += 1
             logger.error(
                 "Alert delivery failed on ALL %d configured channel(s) for "
                 "event %s — nobody was notified. Check the notifier "

@@ -155,9 +155,11 @@ def test_dump_to_exports_snapshot_without_running_terraform(
 
     monkeypatch.setattr(terraform_runner.subprocess, "run", forbidden_run)
     out = tmp_path / "exports" / "snapshot.json"
+    workdir = tmp_path / "workspace"
 
     exit_code = main(
-        ["--spec", str(spec_file), "--from-dump", str(dump_file), "--dump-to", str(out)]
+        ["--spec", str(spec_file), "--from-dump", str(dump_file),
+         "--dump-to", str(out), "--workdir", str(workdir)]
     )
 
     assert exit_code == 0
@@ -168,6 +170,12 @@ def test_dump_to_exports_snapshot_without_running_terraform(
         feature["apiPath"] == "/networks/{networkId}/appliance/vlans/{vlanId}"
         for feature in document["features"]
     )
+    # The coverage guarantee holds on export runs too — classified via
+    # the bundled catalog, without ever invoking terraform.
+    manifest = json.loads((workdir / "coverage.json").read_text(encoding="utf-8"))
+    assert manifest["totals"]["discovered"] == 4
+    assert manifest["totals"]["unsupported"] == 0
+    assert (workdir / "coverage.txt").exists()
 
 
 def test_dump_to_failure_dispatches_processing_fault(
@@ -214,6 +222,7 @@ def test_dump_to_with_sanitize_strips_identity(
             "--from-dump", str(dump_file),
             "--dump-to", str(out),
             "--sanitize",
+            "--workdir", str(tmp_path / "workspace"),
         ]
     )
 
@@ -1038,6 +1047,373 @@ def test_report_logs_reconciliation_outcomes(
     assert "meraki_wireless_ssid.s_0: psk" in text
 
 
+# ------------------------------------------ alerting & exit-code contract
+
+
+def _failing_urlopen(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every webhook delivery attempt fails (total notifier outage)."""
+
+    def down(*args: Any, **kwargs: Any) -> None:
+        raise OSError("endpoint unreachable")
+
+    monkeypatch.setattr(urllib.request, "urlopen", down)
+
+
+def _stub_pipeline_summary(
+    monkeypatch: pytest.MonkeyPatch, summary: Any
+) -> None:
+    """Route main() through a stub orchestrator returning ``summary``."""
+    from meraki2tf import cli as cli_module
+
+    class StubOrchestrator:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        def run(self, organization_id: str | None) -> Any:
+            return summary
+
+    monkeypatch.setattr(cli_module, "PipelineOrchestrator", StubOrchestrator)
+
+
+def test_zero_alert_channels_warns_loudly(
+    spec_file: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A scheduled DR job with no channels would drop every alert on the
+    floor; the gap must be unmissable in the run log."""
+    with caplog.at_level(logging.WARNING, logger="meraki2tf.cli"):
+        build_dispatcher(_config(["--spec", str(spec_file)]))
+    assert "No alert channels are configured" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="meraki2tf.cli"):
+        build_dispatcher(
+            _config(
+                ["--spec", str(spec_file),
+                 "--webhook-url", "https://hooks.example/a"]
+            )
+        )
+    assert "No alert channels are configured" not in caplog.text
+
+
+def test_startup_failure_dispatches_processing_fault(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec resolution / provider construction failures happen before the
+    orchestrator's alerting exists; the CLI itself must attempt the
+    mandated PROCESSING_FAULT before exiting 1."""
+    _no_network(monkeypatch)
+    delivered: list[dict[str, Any]] = []
+
+    def fake_urlopen(request: Any, timeout: float) -> FakeResponse:
+        delivered.append(json.loads(request.data.decode("utf-8")))
+        return FakeResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    exit_code = main(
+        [
+            "--spec", str(tmp_path / "missing-spec.json"),
+            "--from-dump", str(tmp_path / "missing-dump.json"),
+            "--webhook-url", "https://hooks.example/alerts",
+        ]
+    )
+    assert exit_code == 1
+    assert [event["event_type"] for event in delivered] == ["PROCESSING_FAULT"]
+    assert delivered[0]["details"]["stage"] == "startup"
+
+
+def test_sync_without_api_key_alerts_the_scheduler(
+    dump_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The weekly job's most likely misconfiguration (a lost key) must
+    reach the notification channels, not just the local log."""
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    delivered: list[dict[str, Any]] = []
+
+    def fake_urlopen(request: Any, timeout: float) -> FakeResponse:
+        delivered.append(json.loads(request.data.decode("utf-8")))
+        return FakeResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    exit_code = main(
+        ["--from-dump", str(dump_file), "--sync",
+         "--webhook-url", "https://hooks.example/alerts"]
+    )
+    assert exit_code == 1
+    assert [event["event_type"] for event in delivered] == ["PROCESSING_FAULT"]
+    assert delivered[0]["details"]["stage"] == "startup"
+    assert "--sync requires" in delivered[0]["details"]["error"]
+
+
+def test_total_alert_delivery_failure_exits_five(
+    spec_file: Path,
+    dump_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A run whose work product is intact but whose alerts reached nobody
+    must not exit 0 — the scheduler is the only observer left."""
+    _no_network(monkeypatch)
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    _failing_urlopen(monkeypatch)
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(dump_file),
+         "--workdir", str(tmp_path / "workspace"),
+         "--webhook-url", "https://hooks.example/alerts"]
+    )
+    assert exit_code == 5
+    # The kit itself was still produced — 5 marks a notifier outage,
+    # not a pipeline failure.
+    assert (tmp_path / "workspace" / "imports.tf").exists()
+
+
+def test_export_alert_outage_exits_five(
+    spec_file: Path,
+    dump_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _no_network(monkeypatch)
+    _failing_urlopen(monkeypatch)
+    out = tmp_path / "export.json"
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(dump_file),
+         "--dump-to", str(out), "--workdir", str(tmp_path / "workspace"),
+         "--webhook-url", "https://hooks.example/alerts"]
+    )
+    assert exit_code == 5
+    assert out.exists()  # the snapshot itself was written
+
+
+def test_fail_on_gaps_outranks_alert_outage(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exit-code priority: known coverage gaps (3) over notifier outage
+    (5) — 5 is the lowest-priority nonzero of the 3/4/5 group."""
+    _no_network(monkeypatch)
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    _failing_urlopen(monkeypatch)
+    from conftest import DUMP_DOCUMENT
+
+    document = json.loads(json.dumps(DUMP_DOCUMENT))
+    document["features"].append(
+        {"apiPath": "/networks/{networkId}/unknownFeature", "pathValues": ["N_1"]}
+    )
+    dump = tmp_path / "gappy.json"
+    dump.write_text(json.dumps(document), encoding="utf-8")
+
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(dump),
+         "--workdir", str(tmp_path / "workspace"), "--fail-on-gaps",
+         "--webhook-url", "https://hooks.example/alerts"]
+    )
+    assert exit_code == 3
+
+
+def test_apply_abort_outranks_fail_on_gaps_and_reports_chunk_growth(
+    spec_file: Path,
+    dump_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Exit-code priority: a stalled full-kit materialization (4) over
+    coverage gaps (3) — and the abort message must reflect that
+    import-only chunks may still have grown state."""
+    from meraki2tf.orchestrator import RunSummary
+
+    _no_network(monkeypatch)
+    _stub_pipeline_summary(
+        monkeypatch,
+        RunSummary(
+            organization_id="org-123",
+            discovered_assets=5,
+            imports_written=2,
+            imports_skipped_existing=0,
+            unsupported_count=1,
+            drift_detected=True,
+            comparison_skipped=False,
+            pending_imports=1,
+            resources_added_to_state=("meraki_networks.a", "meraki_networks.b"),
+            apply_aborted=True,
+        ),
+    )
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(dump_file),
+         "--workdir", str(tmp_path / "workspace"), "--fail-on-gaps"]
+    )
+    console = capsys.readouterr().err
+    assert exit_code == 4
+    assert "mutations blocked the full apply" in console
+    assert (
+        "2 import-only resource(s) were still applied through targeted "
+        "chunks" in console
+    )
+
+
+def test_apply_abort_without_growth_reports_the_stall(
+    spec_file: Path,
+    dump_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from meraki2tf.orchestrator import RunSummary
+
+    _no_network(monkeypatch)
+    _stub_pipeline_summary(
+        monkeypatch,
+        RunSummary(
+            organization_id="org-123",
+            discovered_assets=5,
+            imports_written=2,
+            imports_skipped_existing=0,
+            unsupported_count=0,
+            drift_detected=True,
+            comparison_skipped=False,
+            pending_imports=2,
+            apply_aborted=True,
+        ),
+    )
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(dump_file),
+         "--workdir", str(tmp_path / "workspace")]
+    )
+    assert exit_code == 4
+    assert "no state was materialized this run" in capsys.readouterr().err
+
+
+def test_export_flags_unsupported_and_notifies_success(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The scheduled export run must answer 'what is/isn't covered' like
+    every other run: coverage manifest in the workdir, unsupported list
+    pushed with the success notification."""
+    _no_network(monkeypatch)
+    delivered: list[dict[str, Any]] = []
+
+    def fake_urlopen(request: Any, timeout: float) -> FakeResponse:
+        delivered.append(json.loads(request.data.decode("utf-8")))
+        return FakeResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    from conftest import DUMP_DOCUMENT
+
+    document = json.loads(json.dumps(DUMP_DOCUMENT))
+    document["features"].append(
+        {"apiPath": "/networks/{networkId}/unknownFeature", "pathValues": ["N_1"]}
+    )
+    dump = tmp_path / "gappy.json"
+    dump.write_text(json.dumps(document), encoding="utf-8")
+    out = tmp_path / "export.json"
+    workdir = tmp_path / "workspace"
+
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(dump),
+         "--dump-to", str(out), "--workdir", str(workdir),
+         "--webhook-url", "https://hooks.example/dr"]
+    )
+    assert exit_code == 0
+    assert [event["event_type"] for event in delivered] == [
+        "UNSUPPORTED_FEATURE_FLAGGED", "RUN_SUCCESS",
+    ]
+    success = delivered[1]["details"]
+    assert success["unsupported_count"] == 1
+    assert success["discovered_assets"] == 5
+    assert success["comparison_performed"] is False
+    assert success["pending_imports"] is None
+    manifest = json.loads((workdir / "coverage.json").read_text(encoding="utf-8"))
+    assert manifest["totals"]["unsupported"] == 1
+    assert manifest["totals"]["imported"] == 0  # exports never read state
+    assert success["coverage_percent"] == manifest["coverage_percent"]
+
+
+def test_export_classifies_via_workdir_catalog_cache(
+    spec_file: Path,
+    dump_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A catalog cache left by a keyed pipeline run wins over the bundled
+    fallback — proven by a cache that maps nothing."""
+    _no_network(monkeypatch)
+    workdir = tmp_path / "workspace"
+    workdir.mkdir()
+    (workdir / "provider_catalog.json").write_text(
+        json.dumps({"resources": {"meraki_unrelated": ["id"]}}),
+        encoding="utf-8",
+    )
+    out = tmp_path / "export.json"
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(dump_file),
+         "--dump-to", str(out), "--workdir", str(workdir)]
+    )
+    assert exit_code == 0
+    manifest = json.loads((workdir / "coverage.json").read_text(encoding="utf-8"))
+    assert manifest["totals"]["unsupported"] == manifest["totals"]["discovered"]
+
+
+def test_export_recovers_from_a_corrupt_catalog_cache(
+    spec_file: Path,
+    dump_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _no_network(monkeypatch)
+    workdir = tmp_path / "workspace"
+    workdir.mkdir()
+    (workdir / "provider_catalog.json").write_text("not json", encoding="utf-8")
+    out = tmp_path / "export.json"
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(dump_file),
+         "--dump-to", str(out), "--workdir", str(workdir)]
+    )
+    assert exit_code == 0
+    assert "falling back to the bundled catalog" in capsys.readouterr().err
+    manifest = json.loads((workdir / "coverage.json").read_text(encoding="utf-8"))
+    assert manifest["totals"]["unsupported"] == 0
+
+
+def test_sanitize_with_drift_baseline_is_a_usage_error(
+    spec_file: Path, dump_file: Path, tmp_path: Path
+) -> None:
+    """A sanitized export can never serve as the next run's baseline, so
+    the combination structurally fails from run 2 onward — refuse it up
+    front instead."""
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            ["--spec", str(spec_file), "--from-dump", str(dump_file),
+             "--dump-to", str(tmp_path / "out.json"), "--sanitize",
+             "--drift-baseline", str(tmp_path / "last-week.json")]
+        )
+    assert excinfo.value.code == 2
+
+
+def test_rebuild_preview_log_redacts_secret_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The rebuild plan echoes attribute values into the log; secret-
+    named lines get the same masking the alert payloads do."""
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    workdir = _rebuild_workspace(tmp_path)
+
+    def fake_run(command: tuple[str, ...], **kwargs: Any) -> SimpleNamespace:
+        exit_code = 2 if command[1] == "plan" else 0
+        return SimpleNamespace(
+            returncode=exit_code,
+            stdout='  ~ psk = "hunter2"\nPlan: 1 to add',
+            stderr="",
+        )
+
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake_run)
+    assert main(["--rebuild", "--workdir", str(workdir)]) == 0
+    console = capsys.readouterr().err
+    assert "hunter2" not in console
+    assert "(value redacted)" in console
+
+
 # ----------------------------------------------------------- --replay-gaps
 
 
@@ -1424,7 +1800,7 @@ def test_snapshot_exports_are_owner_only_and_warned(
     out = tmp_path / "export.json"
     assert main(
         ["--spec", str(spec_file), "--from-dump", str(dump_file),
-         "--dump-to", str(out)]
+         "--dump-to", str(out), "--workdir", str(tmp_path / "workspace")]
     ) == 0
     assert out.stat().st_mode & 0o777 == 0o600
     assert "UNSANITIZED" in capsys.readouterr().err
@@ -1432,7 +1808,8 @@ def test_snapshot_exports_are_owner_only_and_warned(
     sanitized = tmp_path / "sanitized.json"
     assert main(
         ["--spec", str(spec_file), "--from-dump", str(dump_file),
-         "--dump-to", str(sanitized), "--sanitize"]
+         "--dump-to", str(sanitized), "--sanitize",
+         "--workdir", str(tmp_path / "workspace")]
     ) == 0
     assert "UNSANITIZED" not in capsys.readouterr().err
 
@@ -1468,15 +1845,19 @@ def test_export_with_drift_baseline_reports_snapshot_drift(
             "--from-dump", str(dump_file),
             "--dump-to", str(out),
             "--drift-baseline", str(baseline),
+            "--workdir", str(tmp_path / "workspace"),
             "--webhook-url", "https://hooks.example/dr",
         ]
     )
     assert exit_code == 0
     assert out.exists()
-    (event,) = delivered
-    assert event["event_type"] == "DRIFT_DETECTED"
+    assert [event["event_type"] for event in delivered] == [
+        "DRIFT_DETECTED", "RUN_SUCCESS",
+    ]
+    event = delivered[0]
     assert event["details"]["origin"] == "snapshot-diff"
     assert "added" in event["details"]["diff"]
+    assert delivered[1]["details"]["drift_was_detected"] is True
 
 
 def test_export_with_identical_drift_baseline_is_quiet(
@@ -1486,15 +1867,17 @@ def test_export_with_identical_drift_baseline_is_quiet(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _no_network(monkeypatch)
+    delivered: list[dict[str, Any]] = []
 
-    def forbidden_urlopen(*args: Any, **kwargs: Any) -> None:
-        raise AssertionError("no alert may fire when nothing drifted")
+    def fake_urlopen(request: Any, timeout: float) -> FakeResponse:
+        delivered.append(json.loads(request.data.decode("utf-8")))
+        return FakeResponse()
 
-    monkeypatch.setattr(urllib.request, "urlopen", forbidden_urlopen)
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     first = tmp_path / "first.json"
     assert main(
         ["--spec", str(spec_file), "--from-dump", str(dump_file),
-         "--dump-to", str(first)]
+         "--dump-to", str(first), "--workdir", str(tmp_path / "workspace")]
     ) == 0
     out = tmp_path / "second.jsonl.gz"
     assert main(
@@ -1502,9 +1885,14 @@ def test_export_with_identical_drift_baseline_is_quiet(
             "--spec", str(spec_file), "--from-dump", str(dump_file),
             "--dump-to", str(out),
             "--drift-baseline", str(first),
+            "--workdir", str(tmp_path / "workspace"),
             "--webhook-url", "https://hooks.example/dr",
         ]
     ) == 0
+    # No drift → no DRIFT_DETECTED; the success notification (with the
+    # coverage picture) still goes out on every clean export.
+    assert [event["event_type"] for event in delivered] == ["RUN_SUCCESS"]
+    assert delivered[0]["details"]["drift_was_detected"] is False
 
 
 # ------------------------------------------------------------- --restore
@@ -1731,7 +2119,8 @@ def test_sanitize_export_stamps_the_snapshot(
     out = tmp_path / "sanitized.json"
     assert main(
         ["--spec", str(spec_file), "--from-dump", str(dump_file),
-         "--dump-to", str(out), "--sanitize"]
+         "--dump-to", str(out), "--sanitize",
+         "--workdir", str(tmp_path / "workspace")]
     ) == 0
     assert json.loads(out.read_text(encoding="utf-8"))["sanitized"] is True
 
@@ -1847,6 +2236,33 @@ def test_restore_confirm_executes_and_alerts(
     assert event["event_type"] == "RESTORE_EXECUTED"
     assert event["details"]["target_organization_id"] == "org-999"
     assert (workdir / "restore-journal.jsonl").exists()
+
+
+def test_restore_refuses_a_bad_webhook_before_any_write(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The dispatcher is built before anything else: a misconfigured
+    channel must stop the restore up front, never leave the target org
+    written with the mandated executed-alert undeliverable."""
+    import sys as _sys
+    import types as _types
+
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+
+    def forbidden(**kwargs: Any) -> None:
+        raise AssertionError("no SDK client may be built with a bad webhook")
+
+    stub = _types.ModuleType("meraki")
+    stub.DashboardAPI = forbidden  # type: ignore[attr-defined]
+    monkeypatch.setitem(_sys.modules, "meraki", stub)
+    dump = _restore_dump(tmp_path)
+    with pytest.raises(SystemExit):
+        main(
+            ["--spec", str(spec_file), "--restore", "--from-dump", str(dump),
+             "--target-org", "org-999", "--workdir", str(tmp_path / "ws"),
+             "--confirm", "--webhook-url", "http://insecure.example/hook"]
+        )
 
 
 def test_restore_fails_cleanly_on_unreadable_snapshot(
@@ -2025,17 +2441,22 @@ def test_wipe_requires_name_second_factor(spec_file: Path) -> None:
         main(["--spec", str(spec_file), "--wipe-org", "org-drill"])
 
 
-def test_wipe_rejects_other_modes_and_org_id_match(spec_file: Path) -> None:
+def test_wipe_rejects_other_modes_and_org_id(spec_file: Path) -> None:
     with pytest.raises(SystemExit):
         main(
             ["--spec", str(spec_file), "--wipe-org", "org-x",
              "--wipe-org-name", "X", "--sync"]
         )
-    with pytest.raises(SystemExit):
-        main(
-            ["--spec", str(spec_file), "--org-id", "org-x",
-             "--wipe-org", "org-x", "--wipe-org-name", "X"]
-        )
+    # --org-id is refused with --wipe-org whether it matches the wipe
+    # target (production-shaped) or differs (it would be silently
+    # ignored, violating the no-silent-orphans policy).
+    for org_id in ("org-x", "org-other"):
+        with pytest.raises(SystemExit) as excinfo:
+            main(
+                ["--spec", str(spec_file), "--org-id", org_id,
+                 "--wipe-org", "org-x", "--wipe-org-name", "X"]
+            )
+        assert excinfo.value.code == 2
 
 
 def test_wipe_refuses_production_shaped_orgs(
@@ -2095,6 +2516,24 @@ def test_wipe_confirm_executes_and_alerts(
     (event,) = delivered
     assert event["event_type"] == "ORG_WIPE_EXECUTED"
     assert event["details"]["organization_deleted"] is True
+
+
+def test_wipe_refuses_a_bad_webhook_before_any_write(
+    spec_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The dispatcher is built before the teardown: a misconfigured
+    channel must stop the wipe up front, never leave the org deleted
+    with the mandated executed-alert undeliverable."""
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    deleted = _install_wipe_dashboard(monkeypatch)
+    with pytest.raises(SystemExit):
+        main(
+            ["--spec", str(spec_file), "--wipe-org", "org-drill",
+             "--wipe-org-name", "Drill Org", "--confirm",
+             "--webhook-url", "http://insecure.example/hook"]
+        )
+    assert deleted["networks"] == [] and deleted["orgs"] == []
 
 
 def test_wipe_confirm_requires_api_key(

@@ -38,6 +38,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -54,10 +55,12 @@ from meraki2tf.config import read_api_key
 from meraki2tf.fsperms import restrict_to_owner
 from meraki2tf.providers.ratelimit import AdaptiveTokenBucket
 from meraki2tf.replayer import (
+    ACTION_LOG_REASON,
     _collection_items,
     _secret_paths,
     _single_array_body_field,
     _strip_nulls,
+    is_action_log,
     split_redacted as _split_redacted,
 )
 from meraki2tf.runbook import write_operations
@@ -193,6 +196,15 @@ def _classify_feature(
             feature.path_values,
             "No write operation in the API spec — dashboard-only; "
             "rebuild manually.",
+        )
+    if is_action_log(feature.api_path, ops):
+        # POST-only action logs (sensor commands, PII requests, …)
+        # record executed operations; re-POSTing a snapshot entry
+        # would re-execute them against the rebuilt organization.
+        return Unrestorable(
+            feature.api_path,
+            feature.path_values,
+            ACTION_LOG_REASON,
         )
     if not feature.payload:
         return Unrestorable(
@@ -762,10 +774,25 @@ class RestoreJournal:
                         # Torn final line: the process died mid-append.
                         # Its event replays on resume (worst case one
                         # duplicate-create failure); refusing to load
-                        # would strand the whole restore.
+                        # would strand the whole restore. The fragment
+                        # is truncated away — the next _append would
+                        # otherwise concatenate onto it, turning a
+                        # tolerated tear into unparseable mid-file
+                        # corruption that strands the run after this.
                         logger.warning(
                             "Restore journal %s ends in a torn line; "
-                            "ignoring it and resuming.", path,
+                            "removing it and resuming.", path,
+                        )
+                        # Records are ASCII JSON, one per "\n"-joined
+                        # line, so the fragment's byte offset is the
+                        # encoded length of the intact prefix.
+                        os.truncate(
+                            path,
+                            len(
+                                "".join(
+                                    f"{kept}\n" for kept in lines[:index]
+                                ).encode("utf-8")
+                            ),
                         )
                         continue
                     raise

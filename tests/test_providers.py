@@ -460,6 +460,88 @@ def test_nested_dump_skips_unmatched_sections_with_warning(
     }
 
 
+def test_nested_dump_preserves_empty_whole_collection_sections(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Live/dump parity: an empty section at an endpoint whose PUT
+    replaces the whole collection is one real — empty — config object,
+    recorded as the same {"items": []} asset the live path produces.
+    Empty sections matching nothing are still skipped, quietly."""
+    from conftest import _op
+    from meraki2tf.providers.discovery import expand_endpoint_payload
+
+    whole_put = _op("updateNetworkVpnSlas", "appliance")
+    whole_put["requestBody"] = {
+        "content": {
+            "application/json": {
+                "schema": {
+                    "type": "object",
+                    "properties": {"items": {"type": "array"}},
+                }
+            }
+        }
+    }
+    spec = {
+        "openapi": "3.0.0",
+        "info": {"title": "slas", "version": "1"},
+        "paths": {
+            "/networks/{networkId}/vpn/slas": {
+                "get": _op("getNetworkVpnSlas", "appliance"),
+                "put": whole_put,
+            },
+        },
+    }
+    spec_path = tmp_path / "slas-spec.json"
+    spec_path.write_text(json.dumps(spec), encoding="utf-8")
+    parser = OpenApiParser(spec_path)
+    dump_path = tmp_path / "empty-slas.json"
+    dump_path.write_text(
+        json.dumps(
+            {
+                "organizations": [
+                    {
+                        "info": {"id": "org-1"},
+                        "networks": [
+                            {
+                                "info": {
+                                    "id": "N_1",
+                                    "organizationId": "org-1",
+                                    "name": "HQ",
+                                    "productTypes": ["appliance"],
+                                },
+                                "slas": [],
+                                "empty_unmatched": [],
+                                "null_section": None,
+                            }
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    with caplog.at_level("WARNING"):
+        graph = StaticJsonDataProvider(
+            dump_path, parser=parser
+        ).fetch_network_graph()
+    (asset,) = graph.features
+    assert asset.api_path == "/networks/{networkId}/vpn/slas"
+    assert asset.path_values == ("N_1",)
+    assert asset.payload == {"items": []}
+    # Byte-identical to what live-path expansion records for the same
+    # (empty) collection.
+    op = next(
+        o for o in parser.endpoints()
+        if o.path == asset.api_path and o.method == "get"
+    )
+    assert expand_endpoint_payload(parser, op, "N_1", []) == [asset]
+    # The empty section matching no endpoint carried no data: skipped
+    # without joining the loud unmatched-section warning.
+    assert not any(
+        "resolves to no spec-derived" in r.message for r in caplog.records
+    )
+
+
 def test_nested_dump_org_override_warns_but_processes_snapshot(
     nested_dump_file: Path,
     spec_parser: OpenApiParser,

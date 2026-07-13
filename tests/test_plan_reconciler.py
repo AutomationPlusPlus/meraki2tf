@@ -459,12 +459,44 @@ def test_classify_tolerates_malformed_documents() -> None:
     assert classify_plan({"resource_changes": ["junk", {"change": None}]}) == (
         ReconciliationPlan()
     )
-    creates = {
+    harmless = {
         "resource_changes": [
-            {"address": "a.b", "change": {"actions": ["create"]}}
+            {"address": "a.b", "change": {"actions": ["no-op"]}},
+            {"address": "a.c", "change": {"actions": ["read"]}},
+            {"address": "a.d", "change": {"actions": []}},
         ]
     }
-    assert classify_plan(creates) == ReconciliationPlan()
+    assert classify_plan(harmless) == ReconciliationPlan()
+
+
+def test_classify_counts_non_update_mutations_as_real() -> None:
+    """create/delete/replace actions have no phantom classes — they are
+    genuine drift and must be counted in real_changes, or the
+    reconciliation report ("N real change(s) left as drift")
+    undercounts the mutations left in the plan."""
+    document = {
+        "resource_changes": [
+            {"address": "meraki_networks.new", "change": {"actions": ["create"]}},
+            {"address": "meraki_devices.gone", "change": {"actions": ["delete"]}},
+            {
+                "address": "meraki_wireless_ssid.reborn",
+                "change": {"actions": ["delete", "create"]},  # replace
+            },
+            _update(  # phantom update: still remediated, never real
+                "meraki_organization_saml.r_1",
+                {"sp_initiated_idp_id": ""},
+                {"sp_initiated_idp_id": None},
+            ),
+        ]
+    }
+    plan = classify_plan(document)
+    (remediation,) = plan.remediations
+    assert remediation.address == "meraki_organization_saml.r_1"
+    assert plan.real_changes == (
+        "meraki_devices.gone",
+        "meraki_networks.new",
+        "meraki_wireless_ssid.reborn",
+    )
 
 
 def test_classify_without_sensitivity_masks() -> None:

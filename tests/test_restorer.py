@@ -164,6 +164,81 @@ def test_unrestorable_reasons_are_spec_derived(tmp_path: Path) -> None:
     assert "unreadable at capture" in reasons[GP_ITEM]
 
 
+SENSOR_COMMANDS = "/devices/{serial}/sensor/commands"
+PII_REQUESTS = "/networks/{networkId}/pii/requests"
+PII_REQUEST_ITEM = PII_REQUESTS + "/{requestId}"
+SPLASH_THEMES = "/organizations/{organizationId}/splash/themes"
+CONTROLLER_MOVES = "/networks/{networkId}/controller/moves"
+
+
+def _action_log_spec(tmp_path: Path) -> OpenApiParser:
+    spec = {
+        "openapi": "3.0.0",
+        "info": {"title": "logs", "version": "1"},
+        "paths": {
+            SENSOR_COMMANDS: {
+                "get": _op("getDeviceSensorCommands", "sensor"),
+                "post": _op("createDeviceSensorCommand", "sensor"),
+            },
+            PII_REQUESTS: {
+                "get": _op("getNetworkPiiRequests", "networks"),
+                "post": _op("createNetworkPiiRequest", "networks"),
+            },
+            PII_REQUEST_ITEM: {
+                "get": _op("getNetworkPiiRequest", "networks"),
+            },
+            SPLASH_THEMES: {
+                "get": _op("getOrganizationSplashThemes", "organizations"),
+                "post": _op("createOrganizationSplashTheme", "organizations"),
+            },
+            CONTROLLER_MOVES: {
+                "get": _op("getNetworkControllerMoves", "networks"),
+                "put": _op("updateNetworkControllerMoves", "networks"),
+            },
+        },
+    }
+    path = tmp_path / "action-log-spec.json"
+    path.write_text(json.dumps(spec), encoding="utf-8")
+    return OpenApiParser(path)
+
+
+def test_action_logs_are_unrestorable_never_planned(tmp_path: Path) -> None:
+    """POST-only action logs (sensor reboot commands, PII delete
+    requests, migrations/moves/captures) record executed operations —
+    a restore that re-POSTs them re-executes history against the new
+    org. They surface as unrestorable with a reason, never as creates;
+    legitimate POST-only entities (splash themes, networks) and
+    PUT-bearing entities ending in a log noun are unaffected."""
+    parser = _action_log_spec(tmp_path)
+    plan = plan_restore(
+        _graph(
+            FeatureConfiguration(
+                SENSOR_COMMANDS, ("Q2AB-CDEF-GHIJ",),
+                {"items": [{"operation": "cycleDownstreamPower"}], "meta": {}},
+            ),
+            FeatureConfiguration(
+                PII_REQUEST_ITEM, ("N_1", "123"),
+                {"id": "123", "type": "delete"},
+            ),
+            FeatureConfiguration(
+                SPLASH_THEMES, ("org-123",), {"name": "Corp Theme"}
+            ),
+            FeatureConfiguration(
+                CONTROLLER_MOVES, ("N_1",), {"status": "complete"}
+            ),
+        ),
+        parser,
+    )
+    reasons = {u.api_path: u.reason for u in plan.unrestorable}
+    assert "re-execute" in reasons[SENSOR_COMMANDS]
+    assert "re-execute" in reasons[PII_REQUEST_ITEM]  # item paths too
+    by_path = {a.api_path: a for a in plan.actions}
+    assert SENSOR_COMMANDS not in by_path
+    assert PII_REQUEST_ITEM not in by_path
+    assert by_path[SPLASH_THEMES].kind == "create"
+    assert by_path[CONTROLLER_MOVES].kind == "configure"
+
+
 def test_redacted_secrets_become_reentry_pointers(tmp_path: Path) -> None:
     parser = _restore_spec(tmp_path)
     plan = plan_restore(
@@ -656,6 +731,37 @@ def test_journal_ignores_blank_lines(tmp_path: Path) -> None:
     path = tmp_path / "j.jsonl"
     path.write_text('{"kind": "done", "key": "a"}\n\n', encoding="utf-8")
     assert RestoreJournal(path).completed == {"a"}
+
+
+def test_executor_withholds_error_detail_for_pem_bearing_payloads(
+    tmp_path: Path,
+) -> None:
+    """The sanitizer treats PEM private-key blocks as secrets by value
+    (under non-secret keys like ``certificate``); a failed write whose
+    payload carries one must withhold SDK error text — the echo could
+    leak the key material into logs and alerts."""
+    parser = _restore_spec(tmp_path)
+    pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIB...\n-----END RSA PRIVATE KEY-----"
+    graph = _graph(
+        FeatureConfiguration(
+            SSID_ITEM, ("N_1", "0"),
+            {"number": 0, "name": "Corp", "certificate": pem},
+        ),
+        FeatureConfiguration(SNMP_PATH, ("N_1",), {"access": "none"}),
+    )
+    plan = plan_restore(graph, parser)
+    restorer, _calls = _executor(
+        tmp_path, fail_ops={"updateNetworkWirelessSsid", "updateNetworkSnmp"}
+    )
+    result = restorer.execute(graph, plan)
+
+    reasons = dict(result.failed)
+    ssid_reason = reasons[f"{SSID_ITEM}::N_1,0"]
+    assert "detail withheld" in ssid_reason
+    assert "simulated API failure" not in ssid_reason
+    assert "PRIVATE KEY" not in ssid_reason
+    # Secret-free payloads keep the actionable SDK error text.
+    assert "simulated API failure" in reasons[f"{SNMP_PATH}::N_1"]
 
 
 def test_executor_records_missing_sdk_method_as_failure(
@@ -1635,6 +1741,43 @@ def test_journal_tolerates_a_torn_final_line_only(tmp_path: Path) -> None:
     )
     with _pytest.raises(json.JSONDecodeError):
         RestoreJournal(corrupt)  # mid-file corruption still refuses
+
+
+def test_journal_truncates_the_torn_tail_so_appends_stay_parseable(
+    tmp_path: Path,
+) -> None:
+    """A tolerated torn line must also be removed: the resumed run's
+    first append would otherwise concatenate onto the fragment,
+    producing a mid-file unparseable line that strands the third run."""
+    from meraki2tf.restorer import RestoreJournal
+
+    path = tmp_path / "torn-append.jsonl"
+    journal = RestoreJournal(path)
+    journal.record_done("a::1")
+    intact = path.read_text(encoding="utf-8")
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write('{"kind": "ma')  # the process died mid-append
+
+    resumed = RestoreJournal(path)  # tolerated — and truncated away
+    assert resumed.completed == {"a::1"}
+    assert path.read_text(encoding="utf-8") == intact
+    assert oct(path.stat().st_mode & 0o777) == "0o600"
+
+    resumed.record_done("b::2")
+    third = RestoreJournal(path)  # every line parses again
+    assert third.completed == {"a::1", "b::2"}
+
+
+def test_journal_truncates_a_torn_only_line_to_empty(tmp_path: Path) -> None:
+    from meraki2tf.restorer import RestoreJournal
+
+    path = tmp_path / "torn-only.jsonl"
+    path.write_text('{"kind": "ma', encoding="utf-8")
+    journal = RestoreJournal(path)
+    assert journal.completed == set()
+    assert path.read_text(encoding="utf-8") == ""
+    journal.record_done("a::1")
+    assert RestoreJournal(path).completed == {"a::1"}
 
 
 # ------------------------------------------------------------------- wipe

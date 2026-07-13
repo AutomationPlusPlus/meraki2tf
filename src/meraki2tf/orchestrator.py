@@ -29,6 +29,7 @@ Sync-mode drift defaults (Meraki is the source of truth):
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -43,6 +44,7 @@ from meraki2tf.alerts import (
     run_success,
     unsupported_feature_flagged,
 )
+from meraki2tf.alerts.models import redact_diff
 from meraki2tf.config import API_KEY_ENV_VAR, api_key_present
 from meraki2tf.coverage import build_manifest, unsupported_payload, write_manifest
 from meraki2tf.hcl_generator import (
@@ -72,6 +74,13 @@ logger = logging.getLogger(__name__)
 
 #: Plan actions that do not mutate anything (imports plan as no-op).
 _HARMLESS_ACTIONS = frozenset({"no-op", "read"})
+
+#: Workdir file carrying the deletion addresses a DELETION_PENDING_
+#: CONFIRMATION alert already reached the operator with. A later
+#: ``--confirm-deletions`` may only remove addresses from this set —
+#: the human confirms what they reviewed, not whatever happens to be
+#: missing on the confirmation run. Plain address list, no secrets.
+PENDING_DELETIONS_FILENAME = "pending-deletions.json"
 
 
 class PipelineError(RuntimeError):
@@ -306,7 +315,10 @@ class PipelineOrchestrator:
                         "Configuration drift detected; dispatching "
                         "DRIFT_DETECTED alert."
                     )
-                    logger.debug("Full drift diff:\n%s", plan.stdout)
+                    # Same masking the alert payloads get: the log is a
+                    # transport too, and a debug run must not be the one
+                    # place a secret-named value survives unredacted.
+                    logger.debug("Full drift diff:\n%s", redact_diff(plan.stdout))
                     if self._sync:
                         stage = "sync drift handling"
                         (
@@ -547,6 +559,39 @@ class PipelineOrchestrator:
             )
         return report, unsupported_payload(report.unsupported)
 
+    def _load_alerted_deletions(self) -> frozenset[str]:
+        """The deletion addresses a previous run alerted the operator on."""
+        path = self._runner.workdir / PENDING_DELETIONS_FILENAME
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            addresses = payload["addresses"]
+            if not isinstance(addresses, list):
+                raise TypeError("'addresses' is not a list")
+        except FileNotFoundError:
+            return frozenset()
+        except (OSError, json.JSONDecodeError, TypeError, KeyError) as exc:
+            # An unreadable reviewed set must not authorize removals:
+            # degrade to "nothing was reviewed" so everything missing is
+            # re-alerted instead of removed on a corrupt file.
+            logger.warning(
+                "Pending-deletion record %s is unreadable (%s); treating "
+                "no deletions as reviewed — they will be re-alerted.",
+                path, exc,
+            )
+            return frozenset()
+        return frozenset(str(address) for address in addresses)
+
+    def _persist_alerted_deletions(self, addresses: tuple[str, ...]) -> None:
+        """Record (or clear) the alerted set the next confirmation covers."""
+        path = self._runner.workdir / PENDING_DELETIONS_FILENAME
+        if not addresses:
+            path.unlink(missing_ok=True)
+            return
+        path.write_text(
+            json.dumps({"addresses": sorted(addresses)}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
     def _review_deletions(
         self, existing: frozenset[str], report: GenerationReport
     ) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -554,7 +599,11 @@ class PipelineOrchestrator:
 
         Alert-only by default: an accidental clickops deletion must not
         quietly poison the rebuild baseline, so nothing is removed until
-        a human passes ``--confirm-deletions``.
+        a human passes ``--confirm-deletions`` — and even then only the
+        addresses a DELETION_PENDING_CONFIRMATION alert already carried
+        (persisted in the workdir). Anything that went missing *after*
+        the alert is a new event: it is alerted, recorded as the next
+        reviewed set, and left untouched this run.
 
         Resources whose endpoint could not be *read* this run are
         indistinguishable from deletions by absence alone — a transient
@@ -578,16 +627,40 @@ class PipelineOrchestrator:
                 len(exempt), ", ".join(sorted(exempt)),
             )
         if not deleted:
+            # Nothing is missing anymore (recreated, or the absence was
+            # transient): a stale reviewed set must not authorize a
+            # removal on some later run.
+            self._persist_alerted_deletions(())
             return (), ()
         if self._confirm_deletions:
-            logger.warning(
-                "Removing %d human-confirmed deletion(s) from the DR kit and "
-                "state: %s",
-                len(deleted), ", ".join(sorted(deleted)),
-            )
-            self._runner.init()  # `state rm` needs an initialized backend
-            self._runner.remove_resources(deleted)
-            return (), tuple(sorted(deleted))
+            alerted = self._load_alerted_deletions()
+            confirmed = tuple(sorted(deleted & alerted))
+            unalerted = tuple(sorted(deleted - alerted))
+            if confirmed:
+                logger.warning(
+                    "Removing %d human-confirmed deletion(s) from the DR "
+                    "kit and state (alerted for review on a previous run): "
+                    "%s",
+                    len(confirmed), ", ".join(confirmed),
+                )
+                self._runner.init()  # `state rm` needs an initialized backend
+                self._runner.remove_resources(frozenset(confirmed))
+            if unalerted:
+                logger.warning(
+                    "%d deletion(s) were first seen on this run and are NOT "
+                    "covered by --confirm-deletions (the operator reviewed "
+                    "an earlier alert, not these): %s. Alert-only — re-run "
+                    "with --confirm-deletions after review to remove them.",
+                    len(unalerted), ", ".join(unalerted),
+                )
+                self._dispatcher.dispatch(
+                    deletion_pending_confirmation(
+                        addresses=unalerted,
+                        workspace=str(self._runner.workdir),
+                    )
+                )
+            self._persist_alerted_deletions(unalerted)
+            return unalerted, confirmed
         pending = tuple(sorted(deleted))
         logger.warning(
             "%d resource(s) tracked in the DR kit were not discovered in "
@@ -600,6 +673,7 @@ class PipelineOrchestrator:
                 addresses=pending, workspace=str(self._runner.workdir)
             )
         )
+        self._persist_alerted_deletions(pending)
         return pending, ()
 
     def _handle_sync_drift(
@@ -665,9 +739,11 @@ class PipelineOrchestrator:
             }
             if blocking or not modified:
                 logger.error(
-                    "Sync auto-apply ABORTED: the plan proposes mutations "
-                    "that cannot be resolved by baseline regeneration (%s). "
-                    "A human must review the drift alert.",
+                    "Sync full-kit auto-apply ABORTED: the plan proposes "
+                    "mutations that cannot be resolved by baseline "
+                    "regeneration (%s). A human must review the drift "
+                    "alert; import-only chunks may still be applied "
+                    "through targeted windows this run.",
                     ", ".join(
                         f"{address}={'+'.join(acts)}"
                         for address, acts in sorted(blocking.items())
@@ -731,7 +807,9 @@ class PipelineOrchestrator:
             return plan, report, tuple(regenerated), deferred, False
         logger.error(
             "Drift persists after %d baseline regeneration round(s) and "
-            "deferral; aborting the sync auto-apply for human review.",
+            "deferral; aborting the full-kit sync auto-apply for human "
+            "review. Import-only chunks may still be applied through "
+            "targeted windows this run.",
             self._MAX_HEAL_ROUNDS,
         )
         self._dispatcher.dispatch(

@@ -38,7 +38,7 @@ import logging
 import os
 import re
 import subprocess
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -506,14 +506,7 @@ class TerraformRunner:
                 f"Existing state file {self._state_path} is unreadable: {exc}"
             ) from exc
         resources = document.get("resources", []) if isinstance(document, dict) else []
-        addresses = frozenset(
-            f"{resource['type']}.{resource['name']}"
-            for resource in resources
-            if isinstance(resource, dict)
-            and resource.get("mode") == "managed"
-            and resource.get("type")
-            and resource.get("name")
-        )
+        addresses = frozenset(_local_state_addresses(resources))
         logger.info(
             "Existing state tracks %d managed resource(s).", len(addresses)
         )
@@ -536,15 +529,7 @@ class TerraformRunner:
             ) from exc
         values = document.get("values") if isinstance(document, dict) else None
         root = values.get("root_module") if isinstance(values, dict) else None
-        resources = root.get("resources") if isinstance(root, dict) else None
-        addresses = frozenset(
-            f"{resource['type']}.{resource['name']}"
-            for resource in (resources if isinstance(resources, list) else ())
-            if isinstance(resource, dict)
-            and resource.get("mode") == "managed"
-            and resource.get("type")
-            and resource.get("name")
-        )
+        addresses = frozenset(_show_module_addresses(root))
         logger.info(
             "Existing %s state tracks %d managed resource(s).",
             self._backend.backend.value,
@@ -1050,11 +1035,32 @@ class TerraformRunner:
         if tracked:
             # `state rm` writes a full pre-removal state backup (secret
             # material included); route it to a fixed path instead of
-            # terraform's timestamped default so it can be kept 0600.
+            # terraform's timestamped default. The 0o077 subprocess
+            # umask (see _run) makes terraform create it owner-only
+            # from the first byte.
             backup = self._state_path.with_name(self._state_path.name + ".backup")
-            self._run("state", "rm", "-no-color", f"-backup={backup}", *tracked)
-            if backup.exists():
-                restrict_to_owner(backup)
+            try:
+                self._run("state", "rm", "-no-color", f"-backup={backup}", *tracked)
+            except TerraformError:
+                if backup.exists():
+                    # a failed removal may have half-modified the state;
+                    # the backup is the recovery copy — keep it, locked
+                    # down, and tell the operator where it landed.
+                    restrict_to_owner(backup)
+                    logger.warning(
+                        "terraform state rm failed; the pre-removal state "
+                        "backup was kept for manual recovery at %s "
+                        "(owner-only).",
+                        backup,
+                    )
+                raise
+            # The backup exists only to survive a crash mid-removal.
+            # Once the rm succeeded it is a plaintext secret-bearing
+            # state copy with no remaining purpose — under a remote
+            # backend it would be the only state material on local disk
+            # — so it must not persist (contract: only the snapshot and
+            # the state itself may carry secrets at rest).
+            backup.unlink(missing_ok=True)
             self._restrict_state_permissions()
             logger.info("Removed %d resource(s) from the Terraform state.", len(tracked))
 
@@ -1332,9 +1338,73 @@ class TerraformRunner:
         )
 
 
+def _local_state_addresses(resources: Any) -> Iterator[str]:
+    """Full managed-instance addresses from a raw local state document.
+
+    Addresses carry the module path and instance keys
+    (``module.m.type.name["key"]``) so before/after state comparisons
+    and the skip-existing set stay correct when an operator adds a
+    module or a counted resource to the workspace. A plain root-module
+    resource yields the bare ``type.name`` the generated kit uses —
+    identical to what tool-driven comparisons always keyed on.
+    """
+    for resource in resources if isinstance(resources, list) else ():
+        if not (
+            isinstance(resource, dict)
+            and resource.get("mode") == "managed"
+            and resource.get("type")
+            and resource.get("name")
+        ):
+            continue
+        base = f"{resource['type']}.{resource['name']}"
+        module = resource.get("module")
+        if module:
+            base = f"{module}.{base}"
+        instances = resource.get("instances")
+        keys = [
+            instance.get("index_key")
+            for instance in (instances if isinstance(instances, list) else ())
+            if isinstance(instance, dict)
+        ]
+        if not any(key is not None for key in keys):
+            # single-instance resource (or no instance detail): the
+            # address has no index part.
+            yield base
+            continue
+        for key in keys:
+            # count/for_each instances: [0] / ["key"] — json.dumps
+            # renders exactly terraform's index syntax for both.
+            yield base if key is None else f"{base}[{json.dumps(key)}]"
+
+
+def _show_module_addresses(module: Any) -> Iterator[str]:
+    """Managed resource addresses from one ``show -json`` module node.
+
+    Descends ``child_modules`` recursively so module-nested resources
+    are counted like root ones. Show output carries each instance's
+    full address (module path + index key) on the entry itself; the
+    ``type.name`` fallback covers only documents without it.
+    """
+    if not isinstance(module, dict):
+        return
+    resources = module.get("resources")
+    for resource in resources if isinstance(resources, list) else ():
+        if not isinstance(resource, dict) or resource.get("mode") != "managed":
+            continue
+        if resource.get("address"):
+            yield str(resource["address"])
+        elif resource.get("type") and resource.get("name"):
+            yield f"{resource['type']}.{resource['name']}"
+    children = module.get("child_modules")
+    for child in children if isinstance(children, list) else ():
+        yield from _show_module_addresses(child)
+
+
 def _document_malformed_entry_count(document: Any) -> int:
     """Resource-change entries a shown plan document carries that the
-    lenient parser would skip — the guard refuses when any exist."""
+    lenient parser would skip — the guard refuses when any exist. An
+    empty actions list is malformed too: it would pass the harmless
+    check vacuously, and the guard refuses anything it cannot verify."""
     changes = document.get("resource_changes") if isinstance(document, dict) else None
     return sum(
         1
@@ -1343,6 +1413,7 @@ def _document_malformed_entry_count(document: Any) -> int:
         or not change.get("address")
         or not isinstance(change.get("change"), dict)
         or not isinstance(change["change"].get("actions"), list)
+        or not change["change"]["actions"]
     )
 
 

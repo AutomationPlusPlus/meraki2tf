@@ -56,39 +56,78 @@ def test_up_to_date_local_spec_is_kept(
     assert path.read_text(encoding="utf-8") == original
 
 
-def test_outdated_local_spec_is_refreshed_from_github(
+def test_outdated_default_spec_is_refreshed_from_github(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    path = tmp_path / "spec3.json"
+    """--spec omitted: the tool owns ./spec3.json and refreshes it."""
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / DEFAULT_SPEC_FILENAME
     _write_spec(path, "1.40.0")
     remote_text = json.dumps(_spec("1.56.0"))
     _patch_remote(monkeypatch, remote_text)
 
-    assert resolve_spec(path) == path
+    assert resolve_spec(None) == Path(DEFAULT_SPEC_FILENAME)
     assert path.read_text(encoding="utf-8") == remote_text
 
 
-def test_unreadable_local_spec_is_treated_as_outdated(
+def test_user_supplied_spec_is_never_overwritten(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An explicit --spec file (hand-curated or a deliberate downgrade
+    pin) must survive every run: a version difference against the
+    latest release only warns and the user's file is used as-is."""
+    path = tmp_path / "pinned.json"
+    _write_spec(path, "1.40.0")
+    original = path.read_text(encoding="utf-8")
+    _patch_remote(monkeypatch, json.dumps(_spec("1.56.0")))
+
+    with caplog.at_level(logging.WARNING, logger="meraki2tf.spec_resolver"):
+        assert resolve_spec(path) == path
+    assert path.read_text(encoding="utf-8") == original
+    assert any(
+        "user-supplied" in record.message for record in caplog.records
+    )
+
+
+def test_user_supplied_downgrade_pin_survives(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    path = tmp_path / "spec3.json"
+    """A user spec *newer* than the published release (a downgrade of
+    the remote, e.g. a pre-release) is also kept untouched."""
+    path = tmp_path / "pinned.json"
+    _write_spec(path, "2.0.0")
+    original = path.read_text(encoding="utf-8")
+    _patch_remote(monkeypatch, json.dumps(_spec("1.56.0")))
+
+    assert resolve_spec(path) == path
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_unreadable_default_spec_is_treated_as_outdated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / DEFAULT_SPEC_FILENAME
     path.write_text("{not json", encoding="utf-8")
     remote_text = json.dumps(_spec("1.56.0"))
     _patch_remote(monkeypatch, remote_text)
 
-    resolve_spec(path)
+    resolve_spec(None)
     assert path.read_text(encoding="utf-8") == remote_text
 
 
-def test_non_utf8_local_spec_is_treated_as_outdated(
+def test_non_utf8_default_spec_is_treated_as_outdated(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    path = tmp_path / "spec3.json"
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / DEFAULT_SPEC_FILENAME
     path.write_bytes(b"\xff\xfe{}")
     remote_text = json.dumps(_spec("1.56.0"))
     _patch_remote(monkeypatch, remote_text)
 
-    resolve_spec(path)
+    resolve_spec(None)
     assert path.read_text(encoding="utf-8") == remote_text
 
 
@@ -163,12 +202,13 @@ def test_structurally_empty_remote_never_clobbers_a_good_local_spec(
     it over the working local spec would kill this run at ingestion and
     leave every scheduled rerun re-downloading the same broken document
     with no good copy left."""
-    path = tmp_path / "spec3.json"
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / DEFAULT_SPEC_FILENAME
     _write_spec(path, "1.40.0")
     original = path.read_text(encoding="utf-8")
     _patch_remote(monkeypatch, json.dumps({"message": "rate limited"}))
 
-    assert resolve_spec(path) == path
+    assert resolve_spec(None) == Path(DEFAULT_SPEC_FILENAME)
     assert path.read_text(encoding="utf-8") == original
 
 
@@ -182,15 +222,16 @@ def test_structurally_empty_remote_is_never_written_fresh(
     assert not path.exists()
 
 
-def test_remote_without_version_still_refreshes_local(
+def test_remote_without_version_still_refreshes_default_spec(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    path = tmp_path / "spec3.json"
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / DEFAULT_SPEC_FILENAME
     _write_spec(path, "1.40.0")
     remote_text = json.dumps({"openapi": "3.0.1", "paths": {}})
     _patch_remote(monkeypatch, remote_text)
 
-    resolve_spec(path)
+    resolve_spec(None)
     assert path.read_text(encoding="utf-8") == remote_text
 
 
@@ -253,3 +294,48 @@ def test_download_refuses_an_oversized_response(
     )
     with pytest.raises(SpecResolutionError, match="ceiling"):
         fetch_latest_spec()
+
+
+class _GarbledResponse:
+    """A body that is not valid UTF-8 (a truncated CDN error, say)."""
+
+    def __enter__(self) -> "_GarbledResponse":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        return None
+
+    def read(self, amount: int | None = None) -> bytes:
+        return b"\xff\xfe{}"
+
+
+def test_download_translates_undecodable_bodies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A garbled remote body must raise SpecResolutionError, not a raw
+    UnicodeDecodeError — callers rely on that type for fallbacks."""
+    monkeypatch.setattr(
+        urllib.request, "urlopen", lambda url, timeout: _GarbledResponse()
+    )
+    with pytest.raises(SpecResolutionError, match="UTF-8"):
+        fetch_latest_spec()
+
+
+def test_garbled_remote_body_falls_back_to_the_local_spec(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """End-to-end: undecodable download → the designed use-local-copy
+    fallback instead of crashing the run."""
+    path = tmp_path / "spec3.json"
+    _write_spec(path, "1.40.0")
+    original = path.read_text(encoding="utf-8")
+    monkeypatch.setattr(
+        urllib.request, "urlopen", lambda url, timeout: _GarbledResponse()
+    )
+
+    with caplog.at_level(logging.WARNING, logger="meraki2tf.spec_resolver"):
+        assert resolve_spec(path) == path
+    assert path.read_text(encoding="utf-8") == original
+    assert any("using local" in record.message for record in caplog.records)
