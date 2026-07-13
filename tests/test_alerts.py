@@ -260,6 +260,7 @@ class FakeSmtp:
     def __init__(self, host: str, port: int, timeout: float) -> None:
         self.host = host
         self.port = port
+        self.ehlo_count = 0
         FakeSmtp.last_timeout = timeout
 
     def __enter__(self) -> "FakeSmtp":
@@ -269,13 +270,16 @@ class FakeSmtp:
         return None
 
     def has_extn(self, name: str) -> bool:
-        return False  # relay advertises no STARTTLS
+        # Mirror smtplib: extensions are unknown until ehlo() runs. This
+        # relay advertises no STARTTLS even after EHLO.
+        assert self.ehlo_count > 0, "has_extn called before ehlo()"
+        return False
 
     def starttls(self) -> None:  # pragma: no cover - not reached here
         raise AssertionError("starttls attempted on a non-TLS relay")
 
-    def ehlo(self) -> None:  # pragma: no cover - not reached here
-        pass
+    def ehlo(self) -> None:
+        self.ehlo_count += 1
 
     def send_message(self, message: EmailMessage) -> None:
         FakeSmtp.sent.append(message)
@@ -330,13 +334,12 @@ def test_email_negotiates_starttls_when_the_relay_offers_it() -> None:
         started = False
 
         def has_extn(self, name: str) -> bool:
+            # smtplib contract: STARTTLS is only discoverable after EHLO.
+            assert self.ehlo_count > 0, "has_extn called before ehlo()"
             return name == "starttls"
 
         def starttls(self) -> None:
             TlsSmtp.started = True
-
-        def ehlo(self) -> None:
-            pass
 
     FakeSmtp.sent.clear()
     EmailNotifier(

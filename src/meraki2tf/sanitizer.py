@@ -43,6 +43,8 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
+import os
 import re
 import secrets
 from collections.abc import Mapping
@@ -56,6 +58,8 @@ from meraki2tf.models import (
     MerakiNetwork,
     NetworkGraph,
 )
+
+logger = logging.getLogger(__name__)
 
 REDACTED = "**REDACTED**"
 
@@ -134,6 +138,11 @@ def _is_structural_number(value: str) -> bool:
     return value.isdigit() and len(value) <= _STRUCTURAL_NUMBER_MAX_DIGITS
 
 
+#: Salt length in bytes; a read-back shorter than this is treated as
+#: torn/corrupt and regenerated rather than trusted.
+_SALT_BYTES = 16
+
+
 def load_or_create_salt(path: Path) -> bytes:
     """The workdir's persistent sanitizer salt (created 0600 on first use).
 
@@ -141,14 +150,36 @@ def load_or_create_salt(path: Path) -> bytes:
     preserves cross-run pseudonym stability for a given workdir while
     denying snapshot recipients the key needed for dictionary
     inversion.
+
+    A valid existing salt is reused. A missing, empty, truncated, or
+    non-hex file (e.g. a run interrupted mid-write) is regenerated
+    rather than trusted — an empty salt would silently defeat the
+    dictionary-inversion protection, and a corrupt one must not abort
+    every subsequent run. The write is atomic (temp + ``os.replace``,
+    0600 before content) so the file is never left half-written.
     """
     if path.exists():
-        return bytes.fromhex(path.read_text(encoding="utf-8").strip())
-    salt = secrets.token_bytes(16)
+        try:
+            existing = bytes.fromhex(path.read_text(encoding="utf-8").strip())
+        except ValueError:
+            existing = b""
+        if len(existing) >= _SALT_BYTES:
+            return existing
+        logger.warning(
+            "Sanitizer salt %s is empty or corrupt; regenerating it "
+            "(pseudonyms will differ from any prior run using it).", path,
+        )
+    salt = secrets.token_bytes(_SALT_BYTES)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.touch(mode=0o600)
-    restrict_to_owner(path)
-    path.write_text(salt.hex() + "\n", encoding="utf-8")
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.touch(mode=0o600, exist_ok=True)
+    restrict_to_owner(tmp)
+    try:
+        tmp.write_text(salt.hex() + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     return salt
 
 
