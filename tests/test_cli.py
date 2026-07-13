@@ -672,7 +672,9 @@ def test_rebaseline_without_api_key_refuses_and_keeps_baseline(
          "--workdir", str(workdir), "--rebaseline"]
     )
 
-    assert exit_code == 1
+    # 2 = clean precondition refusal (same class as the other guarded
+    # actions), detected before any pipeline work runs.
+    assert exit_code == 2
     assert baseline.read_text(encoding="utf-8") == "resource_old {}"
 
 
