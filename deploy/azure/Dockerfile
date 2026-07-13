@@ -12,14 +12,27 @@
 # storage account is the effective access control.
 
 # Project primary interpreter is CPython 3.14 (supports 3.11-3.14).
+#
+# Multi-stage: the wheel is built in a throwaway builder stage so the
+# repository contents never become a layer of the shipped image — a
+# single-stage `COPY . /src` persists in the layer history even after
+# an `rm -rf /src`, shipping the full source tree, git metadata, and
+# anything else in the build context to everyone who can pull the
+# image.
+FROM python:3.14-slim AS builder
+
+COPY . /src
+RUN pip wheel --no-deps --wheel-dir /wheels /src
+
 FROM python:3.14-slim
 
 ARG TERRAFORM_VERSION=1.9.8
 
-# Terraform is downloaded and its integrity verified against HashiCorp's
-# published SHA256SUMS before use: without this a compromised CDN or a
-# TLS-interception box could substitute a trojaned binary that then runs
-# every --sync job with the dashboard API key in its environment.
+# Terraform is downloaded and its checksum verified against HashiCorp's
+# published SHA256SUMS. Both files come from the same origin, so this
+# defends against a corrupted or truncated transfer — NOT against a
+# compromised releases.hashicorp.com, which could serve matching sums
+# for a trojaned binary.
 RUN set -eux \
     && apt-get update \
     && apt-get install -y --no-install-recommends curl unzip ca-certificates \
@@ -37,10 +50,12 @@ RUN set -eux \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
-COPY . /src
-RUN pip install --no-cache-dir /src \
-    && cp /src/deploy/azure/runbook.py /usr/local/bin/meraki2tf-runbook.py \
-    && rm -rf /src
+# Only the built wheel and the runbook wrapper cross into this stage;
+# dependencies resolve from PyPI during install.
+COPY --from=builder /wheels /wheels
+COPY deploy/azure/runbook.py /usr/local/bin/meraki2tf-runbook.py
+RUN pip install --no-cache-dir /wheels/*.whl \
+    && rm -rf /wheels
 
 # Run as an unprivileged user: any compromise of the SDK/terraform in
 # the job then does not execute as container root while holding the API

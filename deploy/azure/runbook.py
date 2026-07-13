@@ -6,13 +6,40 @@ Meraki API key on disk or on a command line:
 
 1. Fetch the dashboard API key from Azure Key Vault using the host's
    managed identity and export it as ``MERAKI_DASHBOARD_API_KEY`` for
-   the child process only.
-2. Execute ``meraki2tf --sync`` in the persistent workdir, writing the
-   unsanitized snapshot alongside the kit.
+   the child processes only.
+2. Execute meraki2tf twice, sequentially, sharing the workdir —
+   ``--dump-to`` and ``--sync`` are mutually exclusive at the CLI, so
+   one invocation cannot do both:
+
+   a. **Snapshot export**: ``--org-id X --workdir W --dump-to
+      W/snapshot.jsonl.gz`` discovers the org once, live, and writes
+      the unsanitized v2 stream snapshot.
+   b. **Sync pipeline**: ``--from-dump W/snapshot.jsonl.gz --workdir W
+      --sync`` consumes that fresh snapshot offline (no second
+      discovery pass) and materializes state under the import-only
+      apply guard. The API key stays in the env — --sync requires it
+      for terraform plan/apply.
+
+   If the export fails, the sync stage is NOT run and the wrapper
+   returns the export's exit code.
+
+   Pass-through ``extra_args`` are routed by a simple rule: flags the
+   CLI rejects alongside ``--dump-to`` (``--fail-on-gaps``,
+   ``--confirm-deletions``, ``--rebaseline``) go only to the sync
+   invocation; flags that shape the snapshot itself
+   (``--drift-baseline``, ``--sanitize``) go only to the export
+   invocation; everything else (``--webhook-url``, ``--spec``, email
+   and backend flags, …) goes to both.
 3. Archive the run's artifacts (snapshot, kit, coverage, runbook) to a
    locked-down Blob container so the DR kit survives the loss of the
    worker itself. The Terraform state is deliberately NOT uploaded: it
    is secret-bearing and fully re-materializable from the kit.
+   **Failed runs archive under ``runs/<timestamp>-failed/``** instead
+   of ``runs/<timestamp>/``: whatever is on disk after a failure is
+   (partly) the previous run's output, and archiving it under a clean
+   prefix would make storage look like a healthy weekly cadence when
+   the job is actually dying. The ``-failed`` marker keeps the
+   artifacts for forensics without faking health.
 
 Standard library only — no Azure SDK required. Both managed-identity
 token endpoints are supported:
@@ -47,7 +74,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 API_KEY_ENV_VAR = "MERAKI_DASHBOARD_API_KEY"
-SNAPSHOT_FILENAME = "snapshot.json"
+# .jsonl.gz selects meraki2tf's v2 stream snapshot format (one gzipped
+# record per line): the v1 single-JSON-object format buffers the whole
+# document and costs gigabytes at scale, while v2 streams and
+# compresses ~10-20x. --from-dump detects the format by content, so
+# the sync stage reads it back without any extra flag.
+SNAPSHOT_FILENAME = "snapshot.jsonl.gz"
 # Kit + reporting artifacts to archive after every run. The snapshot is
 # secret-bearing; the container must be RBAC-locked (see the guide).
 ARTIFACT_FILENAMES = (
@@ -130,12 +162,96 @@ _CREDENTIAL_FLAGS = frozenset({"--webhook-url"})
 
 
 def _redact_command(command: list[str]) -> list[str]:
-    """Copy of ``command`` with credential-flag values masked for logging."""
+    """Copy of ``command`` with credential-flag values masked for logging.
+
+    Both argparse spellings are covered: the two-token ``--flag VALUE``
+    form and the single-token ``--flag=VALUE`` form — the latter would
+    otherwise log the bearer-token URL verbatim into Azure job output.
+    """
     redacted = list(command)
-    for index, token in enumerate(redacted[:-1]):
-        if token in _CREDENTIAL_FLAGS:
-            redacted[index + 1] = "<redacted>"
+    for index, token in enumerate(redacted):
+        flag, separator, _value = token.partition("=")
+        if flag in _CREDENTIAL_FLAGS:
+            if separator:
+                redacted[index] = f"{flag}=<redacted>"
+            elif index + 1 < len(redacted):
+                redacted[index + 1] = "<redacted>"
     return redacted
+
+
+#: extra_args flags routed ONLY to the snapshot-export invocation
+#: (they shape what the snapshot contains and are only valid with
+#: --dump-to). Value: whether the flag consumes a following token in
+#: the two-token spelling.
+_EXPORT_ONLY_FLAGS = {"--drift-baseline": True, "--sanitize": False}
+#: extra_args flags routed ONLY to the sync invocation — the CLI
+#: rejects each of them when combined with --dump-to. All store_true.
+_SYNC_ONLY_FLAGS = frozenset(
+    {"--fail-on-gaps", "--confirm-deletions", "--rebaseline"}
+)
+
+
+def split_extra_args(extra_args: list[str]) -> tuple[list[str], list[str]]:
+    """Route pass-through args to the (export, sync) invocations.
+
+    Stage-specific flags go to exactly the stage that accepts them;
+    everything else (alerting, spec, backend flags, …) goes to both.
+    Both ``--flag VALUE`` and ``--flag=VALUE`` spellings are handled.
+    """
+    export_args: list[str] = []
+    sync_args: list[str] = []
+    index = 0
+    while index < len(extra_args):
+        token = extra_args[index]
+        flag, separator, _value = token.partition("=")
+        if flag in _EXPORT_ONLY_FLAGS:
+            export_args.append(token)
+            if _EXPORT_ONLY_FLAGS[flag] and not separator:
+                index += 1
+                if index < len(extra_args):
+                    export_args.append(extra_args[index])
+        elif flag in _SYNC_ONLY_FLAGS:
+            sync_args.append(token)
+        else:
+            export_args.append(token)
+            sync_args.append(token)
+        index += 1
+    return export_args, sync_args
+
+
+def build_export_command(
+    binary: str, org_id: str, workdir: Path, export_args: list[str]
+) -> list[str]:
+    """Stage 1: live discovery, written as a v2 stream snapshot."""
+    return [
+        binary,
+        "--org-id",
+        org_id,
+        "--workdir",
+        str(workdir),
+        "--dump-to",
+        str(workdir / SNAPSHOT_FILENAME),
+        *export_args,
+    ]
+
+
+def build_sync_command(
+    binary: str, workdir: Path, sync_args: list[str]
+) -> list[str]:
+    """Stage 2: offline pipeline over the fresh snapshot, with --sync.
+
+    No ``--org-id``: dump mode reads the organization recorded in the
+    snapshot, which is exactly the org stage 1 exported.
+    """
+    return [
+        binary,
+        "--from-dump",
+        str(workdir / SNAPSHOT_FILENAME),
+        "--workdir",
+        str(workdir),
+        "--sync",
+        *sync_args,
+    ]
 
 
 def run_meraki2tf(
@@ -145,28 +261,45 @@ def run_meraki2tf(
     api_key: str,
     extra_args: list[str],
 ) -> int:
-    """Run the weekly sync. The key travels via the child env only."""
-    command = [
-        binary,
-        "--org-id",
-        org_id,
-        "--sync",
-        "--workdir",
-        str(workdir),
-        "--dump-to",
-        str(workdir / SNAPSHOT_FILENAME),
-        *extra_args,
-    ]
+    """Run the weekly job: snapshot export, then the offline sync.
+
+    ``--dump-to`` and ``--sync`` are mutually exclusive at the CLI
+    (argparse exit 2), so the job is two sequential invocations sharing
+    the workdir; discovery runs once, in stage 1. A failed export
+    short-circuits — its exit code is returned and the sync stage never
+    runs against a stale snapshot. The key travels via the child env
+    only (both stages need it: live discovery, then terraform
+    plan/apply under --sync).
+    """
+    export_args, sync_args = split_extra_args(extra_args)
+    stages = (
+        ("snapshot export", build_export_command(binary, org_id, workdir, export_args)),
+        ("sync pipeline", build_sync_command(binary, workdir, sync_args)),
+    )
     env = dict(os.environ)
     env[API_KEY_ENV_VAR] = api_key
-    # Pass-through args can carry bearer-credential values (a Slack/Teams
-    # --webhook-url whose path IS the token); Azure job-output history is
-    # readable by a much broader RBAC set than Key Vault, so redact the
-    # value that follows any credential-shaped flag before logging.
-    logger.info("Running: %s", " ".join(_redact_command(command)))
-    completed = subprocess.run(command, env=env, check=False)
-    logger.info("meraki2tf exited with code %d", completed.returncode)
-    return completed.returncode
+    for stage, command in stages:
+        # Pass-through args can carry bearer-credential values (a
+        # Slack/Teams --webhook-url whose path IS the token); Azure
+        # job-output history is readable by a much broader RBAC set
+        # than Key Vault, so redact the value of any credential-shaped
+        # flag (both spellings) before logging.
+        logger.info("Running %s: %s", stage, " ".join(_redact_command(command)))
+        completed = subprocess.run(command, env=env, check=False)
+        logger.info(
+            "meraki2tf %s exited with code %d", stage, completed.returncode
+        )
+        if completed.returncode != 0:
+            return completed.returncode
+    return 0
+
+
+#: Size guard for the single-shot Put Blob upload. The service accepts
+#: up to 5000 MiB per Put Blob at this API version; we stop well short
+#: of it. Artifacts near this size (a v2 snapshot compresses ~10-20x,
+#: so this is an enormous org) need the multi-part Put Block flow —
+#: refusing loudly beats a mid-transfer HTTP 413.
+MAX_SINGLE_PUT_BYTES = 4 * 1024**3
 
 
 def upload_blob(
@@ -176,38 +309,60 @@ def upload_blob(
     path: Path,
     token: str,
 ) -> None:
-    """PUT one file as a block blob using the managed-identity token."""
+    """PUT one file as a block blob using the managed-identity token.
+
+    The body is the open file object, not ``read_bytes()``:
+    ``http.client`` streams ``read()``-able bodies in fixed-size blocks
+    when Content-Length is set, so a multi-hundred-MB snapshot never
+    has to fit in the worker's memory.
+    """
     url = (
         f"https://{storage_account}.blob.core.windows.net/"
         f"{container}/{urllib.parse.quote(blob_name)}"
     )
-    data = path.read_bytes()
-    request = urllib.request.Request(
-        url,
-        data=data,
-        method="PUT",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "x-ms-version": BLOB_API_VERSION,
-            "x-ms-blob-type": "BlockBlob",
-            "Content-Length": str(len(data)),
-        },
-    )
-    with urllib.request.urlopen(request, timeout=120):
-        pass
+    size = path.stat().st_size
+    if size > MAX_SINGLE_PUT_BYTES:
+        raise OSError(
+            f"{path.name} is {size} bytes, over the {MAX_SINGLE_PUT_BYTES}-"
+            "byte single-shot Put Blob guard; a multi-part upload is needed."
+        )
+    with path.open("rb") as body:
+        request = urllib.request.Request(
+            url,
+            data=body,
+            method="PUT",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "x-ms-version": BLOB_API_VERSION,
+                "x-ms-blob-type": "BlockBlob",
+                "Content-Length": str(size),
+            },
+        )
+        with urllib.request.urlopen(request, timeout=600):
+            pass
     logger.info("Archived %s -> %s/%s", path.name, container, blob_name)
 
 
 def archive_artifacts(
-    storage_account: str, container: str, workdir: Path
+    storage_account: str, container: str, workdir: Path,
+    run_failed: bool = False,
 ) -> list[str]:
     """Upload every present artifact under a per-run prefix.
+
+    When ``run_failed`` is set the prefix carries a ``-failed`` marker:
+    after a failed run the workdir holds (partly or wholly) the
+    PREVIOUS run's artifacts, and re-uploading them under a clean
+    ``runs/<timestamp>/`` prefix would make storage show a healthy
+    weekly cadence while the job is dying. The marked prefix preserves
+    the on-disk state for forensics without faking health.
 
     Returns the artifacts that failed to upload (empty on full success).
     All uploads are attempted even if one fails.
     """
     token = acquire_token(STORAGE_RESOURCE)
     run_prefix = datetime.now(timezone.utc).strftime("runs/%Y-%m-%dT%H%M%SZ")
+    if run_failed:
+        run_prefix += "-failed"
     failures: list[str] = []
     for filename in ARTIFACT_FILENAMES:
         path = workdir / filename
@@ -273,7 +428,14 @@ def main(argv: list[str] | None = None) -> int:
         args.meraki2tf_bin, args.org_id, args.workdir, api_key, args.extra_args
     )
 
-    failures = archive_artifacts(args.storage_account, args.container, args.workdir)
+    # Exit 3 is --fail-on-gaps: the run completed and the artifacts are
+    # fresh — it is a coverage gate, not a failure. Everything else
+    # nonzero means the workdir may still hold the previous run's
+    # artifacts, so archive under the -failed prefix.
+    failures = archive_artifacts(
+        args.storage_account, args.container, args.workdir,
+        run_failed=exit_code not in (0, 3),
+    )
     if failures:
         logger.error(
             "DR archive incomplete — failed artifacts: %s", ", ".join(failures)
