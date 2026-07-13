@@ -11,10 +11,16 @@ from __future__ import annotations
 import argparse
 import enum
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
 API_KEY_ENV_VAR = "MERAKI_DASHBOARD_API_KEY"
+#: Webhook URLs (which conventionally embed a bearer token in the path)
+#: may be supplied here instead of via ``--webhook-url`` so the secret
+#: never lands in argv / process listings / scheduler logs. Separate
+#: multiple targets with ``:::`` (a plain ``:`` occurs inside every URL).
+WEBHOOK_URL_ENV_VAR = "MERAKI2TF_WEBHOOK_URL"
 
 
 class ExecutionMode(enum.Enum):
@@ -58,6 +64,36 @@ _AZURERM_REQUIRED_KEYS = ("storage_account_name", "container_name", "key")
 
 class BackendConfigError(ValueError):
     """A ``--state-backend`` / ``--backend-config`` combination is invalid."""
+
+
+def _refuse_credential_keys_in_file(path: Path) -> None:
+    """Refuse credential-shaped keys inside a ``--backend-config-file``.
+
+    ``terraform init`` persists every backend setting — file-sourced
+    included — in plaintext into ``.terraform/terraform.tfstate``, so a
+    credential smuggled through the file would land on disk outside the
+    two sanctioned secret-bearing artifacts. Same rule, same remedy as
+    the argv form: credentials come from the environment or a managed
+    identity.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        # Missing/unreadable file: terraform init will fail loudly on
+        # the same path; nothing to scan here.
+        return
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", "//")):
+            continue
+        key = stripped.partition("=")[0].strip().strip('"')
+        if key.lower() in SECRET_BACKEND_KEYS:
+            raise BackendConfigError(
+                f"--backend-config-file {path} sets {key!r}, which is a "
+                "credential and must not be written to a config file; "
+                "terraform reads it from the environment instead (e.g. "
+                "ARM_ACCESS_KEY / ARM_SAS_TOKEN, or use a managed identity)."
+            )
 
 
 @dataclass(frozen=True)
@@ -111,8 +147,14 @@ class BackendConfig:
             key, sep, value = item.partition("=")
             key = key.strip()
             if not sep or not key:
+                # Echo only a leading identifier fragment: a mistyped
+                # credential (``access_key:hunter2``) must not have its
+                # value repeated into stderr/CI logs by the usage error.
+                match = re.match(r"[A-Za-z0-9_]*", item.strip())
+                fragment = match.group(0) if match else ""
                 raise BackendConfigError(
-                    f"--backend-config {item!r} must be in KEY=VALUE form."
+                    f"--backend-config {fragment!r}… must be in KEY=VALUE "
+                    "form (value omitted from this message)."
                 )
             if key.lower() in SECRET_BACKEND_KEYS:
                 raise BackendConfigError(
@@ -124,6 +166,8 @@ class BackendConfig:
             settings.append((key, value))
 
         file_path = Path(config_file) if config_file else None
+        if file_path is not None:
+            _refuse_credential_keys_in_file(file_path)
 
         if backend is StateBackend.LOCAL and (settings or file_path is not None):
             raise BackendConfigError(
@@ -252,13 +296,31 @@ class RuntimeConfig:
             state_file=Path(args.state_file) if args.state_file else None,
             backend=backend,
             verbose=args.verbose,
-            webhook_urls=tuple(args.webhook_url or ()),
+            webhook_urls=_webhook_urls(args.webhook_url),
             alert_emails=tuple(args.alert_email or ()),
             smtp_host=args.smtp_host,
             smtp_port=args.smtp_port,
             email_from=args.email_from,
             terraform_bin=args.terraform_bin,
         )
+
+
+def _webhook_urls(cli_values: list[str] | None) -> tuple[str, ...]:
+    """Webhook targets from the env var (preferred) plus any --webhook-url.
+
+    The env var keeps the token-bearing URL out of argv; the flag stays
+    supported for interactive use. Duplicates are collapsed, order
+    preserved (env-sourced first).
+    """
+    urls: list[str] = []
+    env_value = os.environ.get(WEBHOOK_URL_ENV_VAR, "").strip()
+    if env_value:
+        urls.extend(part.strip() for part in env_value.split(":::") if part.strip())
+    urls.extend(cli_values or ())
+    seen: dict[str, None] = {}
+    for url in urls:
+        seen.setdefault(url)
+    return tuple(seen)
 
 
 def api_key_present() -> bool:

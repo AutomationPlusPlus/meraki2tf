@@ -193,7 +193,17 @@ def _assets_by_key(
             payload=device.payload,
         )
     for feature in graph.features:
-        assets[(feature.api_path, feature.path_values)] = feature
+        key = (feature.api_path, feature.path_values)
+        if key in assets:
+            # Two assets sharing an identity key would silently shadow
+            # each other (last wins), hiding drift on the shadowed one.
+            # It shouldn't happen (ID-fallback collisions, duplicate gap
+            # records), so surface it rather than swallow it.
+            logger.warning(
+                "Duplicate asset key %s in snapshot; drift on the shadowed "
+                "instance will not be visible.", key,
+            )
+        assets[key] = feature
     return assets
 
 

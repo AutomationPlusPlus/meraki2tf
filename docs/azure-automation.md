@@ -61,10 +61,18 @@ python3 -m venv /opt/meraki2tf/.venv
 /opt/meraki2tf/.venv/bin/pip install --upgrade pip
 /opt/meraki2tf/.venv/bin/pip install /path/to/meraki2tf   # or from your registry
 
-# Terraform on PATH (pin the version you validate with)
-curl -fsSLo /tmp/terraform.zip \
-  https://releases.hashicorp.com/terraform/1.9.8/terraform_1.9.8_linux_amd64.zip
-sudo unzip /tmp/terraform.zip -d /usr/local/bin
+# Terraform on PATH (pin the version you validate with) — verify the
+# download against HashiCorp's published SHA256SUMS so a compromised CDN
+# or TLS-interception box cannot slip in a trojaned binary that would
+# then run every --sync job with the dashboard API key in its env.
+ver=1.9.8; tmp=$(mktemp -d)
+curl -fsSLo "$tmp/terraform.zip" \
+  "https://releases.hashicorp.com/terraform/$ver/terraform_${ver}_linux_amd64.zip"
+curl -fsSLo "$tmp/SHA256SUMS" \
+  "https://releases.hashicorp.com/terraform/$ver/terraform_${ver}_SHA256SUMS"
+(cd "$tmp" && grep "terraform_${ver}_linux_amd64.zip" SHA256SUMS \
+  | sed "s#terraform_${ver}_linux_amd64.zip#$tmp/terraform.zip#" | sha256sum -c -)
+sudo unzip "$tmp/terraform.zip" -d /usr/local/bin && rm -rf "$tmp"
 ```
 
 `/var/lib/meraki2tf` is the persistent workspace. It accumulates the
@@ -90,8 +98,12 @@ az automation hrwg hrw create --automation-account-name aa-netops \
 ## Step 2 — Key Vault
 
 ```bash
+# Read the key from a file (or stdin) rather than --value, so the
+# org-admin token never lands in shell history or the process list on a
+# shared jump host. Create the file 0600 and delete it afterwards.
 az keyvault secret set --vault-name kv-netops \
-  --name meraki-dashboard-api-key --value "<the-dashboard-api-key>"
+  --name meraki-dashboard-api-key --file ./dashboard-api-key.txt
+# (or interactively:  az keyvault secret set ... --file /dev/stdin  )
 
 # Grant ONLY secret-read to the VM's managed identity (RBAC mode):
 az role assignment create \
@@ -194,13 +206,19 @@ group. It is stdlib-only (no Azure SDK needed on the worker). The
 runbook parameters map to:
 
 ```bash
+# Prefer MERAKI2TF_WEBHOOK_URL (set in the job's environment) over a
+# --webhook-url pass-through arg: the URL path may itself be a bearer
+# token, and the wrapper logs the child argv to Azure job history (which
+# a broader RBAC set can read than Key Vault). The wrapper redacts
+# --webhook-url values it does log, but keeping the URL out of argv
+# entirely is stronger.
 python3 runbook.py \
   --vault-name kv-netops \
   --org-id 123456 \
   --workdir /var/lib/meraki2tf \
   --storage-account stmerakidr \
   --meraki2tf-bin /opt/meraki2tf/.venv/bin/meraki2tf \
-  -- --webhook-url https://hooks.example.com/meraki2tf --fail-on-gaps
+  -- --fail-on-gaps
 ```
 
 Everything after `--` is passed straight through to meraki2tf, so the

@@ -46,55 +46,82 @@ RUNBOOK_FILENAME = "runbook.md"
 _WRITE_METHOD_PRECEDENCE = ("put", "post")
 
 
-def redact_payload(value: Any, key: str | None = None) -> Any:
+def redact_payload(
+    value: Any, key: str | None = None, secret: bool = False
+) -> Any:
     """Deep-copy ``value`` with every secret-keyed field redacted.
 
     Detection matches the sanitizer's, so the runbook and shared
     snapshots agree on what counts as a credential: secret-shaped key
     names, plus PEM private-key blocks by *value* — those hide under
     non-secret-shaped keys like ``certificate``, and the runbook is a
-    world-readable artifact. The key context propagates through lists
-    exactly like the sanitizer's traversal does, so a secret-keyed
-    array of strings (``communityStrings: [...]``) is redacted too.
+    world-readable artifact. A secret-shaped key marks its whole
+    subtree (lists *and* nested objects — a ``credentials`` dict's
+    inner keys need not look secret-shaped themselves), and numbers
+    are redacted alongside strings (numeric PINs/passcodes arrive as
+    JSON numbers; booleans are flags and keep their type).
     """
+    secret = secret or bool(key and SECRET_KEY_PATTERN.search(key))
     if isinstance(value, Mapping):
         return {
-            inner_key: redact_payload(inner, inner_key)
+            inner_key: redact_payload(inner, inner_key, secret)
             for inner_key, inner in value.items()
         }
     if isinstance(value, (list, tuple)):
-        return [redact_payload(item, key) for item in value]
+        return [redact_payload(item, key, secret) for item in value]
     if isinstance(value, str) and "PRIVATE KEY-----" in value:
         return REDACTED
-    if (
-        key is not None
-        and SECRET_KEY_PATTERN.search(key)
-        and isinstance(value, str)
-        and value
-    ):
-        return REDACTED
+    if secret:
+        if isinstance(value, str) and value:
+            return REDACTED
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return REDACTED
     return value
 
 
-def _carries_secret_string(value: Any) -> bool:
-    """A non-empty string, or a list holding one at any depth — the
-    same reach ``redact_payload``'s key propagation covers (dict
-    values re-key on their own child names instead)."""
+def _carries_secret_value(value: Any) -> bool:
+    """A non-empty string or number, or a container holding one at any
+    depth — the same reach ``redact_payload``'s subtree redaction
+    covers."""
+    if isinstance(value, bool):
+        return False
     if isinstance(value, str):
         return bool(value)
+    if isinstance(value, (int, float)):
+        return True
     if isinstance(value, (list, tuple)):
-        return any(_carries_secret_string(item) for item in value)
+        return any(_carries_secret_value(item) for item in value)
+    if isinstance(value, Mapping):
+        return any(_carries_secret_value(inner) for inner in value.values())
     return False
 
 
 def secret_payload_keys(payload: Mapping[str, Any]) -> tuple[str, ...]:
-    """Top-level payload keys holding non-empty secret values — a bare
-    string, or a list carrying strings (``communityStrings``)."""
-    return tuple(
-        key
-        for key, value in payload.items()
-        if SECRET_KEY_PATTERN.search(key) and _carries_secret_string(value)
-    )
+    """Dotted paths of payload keys holding non-empty secret values, at
+    any depth — ``psk``, ``communityStrings``, ``radiusServers.secret``.
+
+    Depth matters on air-gapped runs: this scan is then the *only*
+    source of the secret re-entry list, and Meraki's most common secret
+    (``radiusServers[].secret``) is nested.
+    """
+    found: dict[str, None] = {}
+
+    def walk(value: Any, prefix: str) -> None:
+        if isinstance(value, Mapping):
+            for key, inner in value.items():
+                path = f"{prefix}.{key}" if prefix else str(key)
+                if SECRET_KEY_PATTERN.search(str(key)) and _carries_secret_value(
+                    inner
+                ):
+                    found.setdefault(path)
+                else:
+                    walk(inner, path)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                walk(item, prefix)
+
+    walk(payload, "")
+    return tuple(found)
 
 
 def write_operations(

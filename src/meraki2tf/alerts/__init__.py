@@ -22,7 +22,11 @@ from meraki2tf.alerts.models import (
     run_success,
     unsupported_feature_flagged,
 )
-from meraki2tf.alerts.webhook import WebhookDeliveryError, WebhookNotifier
+from meraki2tf.alerts.webhook import (
+    WebhookConfigError,
+    WebhookDeliveryError,
+    WebhookNotifier,
+)
 
 __all__ = [
     "AlertDispatcher",
@@ -31,6 +35,7 @@ __all__ = [
     "EventSeverity",
     "EventType",
     "Notifier",
+    "WebhookConfigError",
     "WebhookDeliveryError",
     "WebhookNotifier",
     "deletion_pending_confirmation",

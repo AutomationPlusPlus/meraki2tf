@@ -57,7 +57,13 @@ class EmailNotifier(Notifier):
 
     def build_message(self, event: AlertEvent) -> EmailMessage:
         message = EmailMessage()
-        message["Subject"] = f"[meraki2tf] {event.event_type.value}: {event.summary}"
+        # Summaries embed externally sourced strings (spec-derived
+        # api_path, dump/CLI org IDs); a stray CR/LF would make
+        # EmailMessage raise and drop the whole alert (and, on a laxer
+        # library, enable header injection). Collapse whitespace so the
+        # Subject is always a single safe line.
+        summary = " ".join(event.summary.split())
+        message["Subject"] = f"[meraki2tf] {event.event_type.value}: {summary}"
         message["From"] = self._sender
         message["To"] = ", ".join(self._recipients)
         message.set_content(json.dumps(event.to_payload(), indent=2))
@@ -66,6 +72,20 @@ class EmailNotifier(Notifier):
     def send(self, event: AlertEvent) -> None:
         message = self.build_message(event)
         with self._smtp_factory(self._host, self._port, self._timeout) as smtp:
+            # Opportunistic STARTTLS: alert bodies carry the full
+            # resource inventory and drift diffs, so encrypt the hop
+            # whenever the relay advertises it. Relays that don't are
+            # left as plaintext (the contract designates email a
+            # placeholder) rather than failing the alert.
+            try:
+                if smtp.has_extn("starttls"):
+                    smtp.starttls()
+                    smtp.ehlo()
+            except (smtplib.SMTPException, OSError) as exc:
+                logger.warning(
+                    "STARTTLS negotiation failed for event %s; sending over "
+                    "an unencrypted connection: %s", event.event_type.value, exc,
+                )
             refused = smtp.send_message(message)
         if refused:
             logger.error(

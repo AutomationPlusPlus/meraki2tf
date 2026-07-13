@@ -48,9 +48,11 @@ def test_redact_payload_masks_secret_keys_recursively() -> None:
     assert payload["psk"] == "wifi-secret"
 
 
-def test_redact_payload_leaves_non_string_and_empty_secret_values() -> None:
-    clean = redact_payload({"tokenCount": 4, "psk": ""})
-    assert clean == {"tokenCount": 4, "psk": ""}
+def test_redact_payload_redacts_numbers_but_keeps_flags_and_empties() -> None:
+    clean = redact_payload({"tokenCount": 4, "psk": "", "passwordEnabled": True})
+    # Numbers under secret-shaped keys redact (numeric PINs/passcodes);
+    # booleans are flags and empty strings carry nothing.
+    assert clean == {"tokenCount": REDACTED, "psk": "", "passwordEnabled": True}
 
 
 def test_redact_payload_masks_pem_blocks_under_any_key() -> None:
@@ -96,12 +98,15 @@ def test_secret_payload_keys_detects_list_valued_secrets() -> None:
     keys = secret_payload_keys(
         {
             "communityStrings": ["c1"],
-            "psks": [[]],  # no string anywhere → nothing to restore
-            "tokenCounts": [4],  # numbers are flags, not credentials
+            "psks": [[]],  # nothing anywhere → nothing to restore
+            "tokenCounts": [4],  # numbers count as secrets (PINs)
             "psk": "s",
+            "radiusServers": [{"host": "h", "secret": "r1"}],
         }
     )
-    assert keys == ("communityStrings", "psk")
+    assert keys == (
+        "communityStrings", "tokenCounts", "psk", "radiusServers.secret",
+    )
 
 
 def test_write_operations_prefers_update_on_own_path(

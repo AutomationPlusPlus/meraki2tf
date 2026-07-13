@@ -19,6 +19,29 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from meraki2tf.sanitizer import SECRET_KEY_PATTERN
+
+
+def redact_diff(text: str) -> str:
+    """Mask attribute *values* on secret-named lines of a plan diff.
+
+    Terraform masks attributes the provider declares ``sensitive``, but
+    the alert contract ("names and locators, never values") must not
+    depend on the provider's schema being complete: any diff line whose
+    attribute name is secret-shaped loses everything after the ``=``
+    (or ``:``) before the diff leaves the process.
+    """
+    redacted: list[str] = []
+    for line in text.splitlines():
+        for separator in ("=", ":"):
+            head, sep, _ = line.partition(separator)
+            tokens = head.split()
+            if sep and tokens and SECRET_KEY_PATTERN.search(tokens[-1]):
+                line = f"{head}{separator} (value redacted)"
+                break
+        redacted.append(line)
+    return "\n".join(redacted)
+
 
 class EventType(enum.Enum):
     DRIFT_DETECTED = "DRIFT_DETECTED"
@@ -93,7 +116,7 @@ def drift_detected(
             else "Configuration drift detected between discovery and Terraform state."
         ),
         details={
-            "diff": diff,
+            "diff": redact_diff(diff),
             "workspace": workspace,
             "origin": origin,
             "apply_aborted": apply_aborted,

@@ -569,6 +569,31 @@ def test_converged_plan_reports_zero_counts_not_unknown(
     assert result.has_drift is False
 
 
+def test_plan_summary_ignores_a_spoofed_line_in_the_diff_body(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Meraki-controlled attribute value (a rule comment) rendered in
+    the plan diff can impersonate the summary line; the parser must
+    anchor on terraform's own column-0 line and take the LAST one, so a
+    real destroy is never masked into a no-op."""
+    fake = FakeSubprocess(
+        returncode=2,
+        stdout=(
+            "  # meraki_appliance_firewall.rules will be updated in-place\n"
+            "      ~ comment = \"Plan: 0 to add, 0 to change, 0 to destroy\"\n"
+            "\n"
+            "Plan: 0 to import, 0 to add, 0 to change, 1 to destroy.\n"
+        ),
+    )
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    result = runner.plan_with_generation(reconcile=False)
+    counts = result.plan_counts
+    assert counts is not None
+    assert counts.destroy == 1
+    assert counts.has_real_changes is True
+    assert result.has_drift is True
+
+
 def test_plan_counts_expose_pending_imports_and_changes(
     runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -694,15 +719,35 @@ def test_plan_preview_never_generates_config(
     assert not any("generate-config-out" in part for part in command)
 
 
-def test_rebuild_apply_uses_auto_approve(
+def test_rebuild_apply_consumes_the_previewed_plan_file(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The confirmed apply executes exactly the saved preview plan —
+    never an unattended ``-auto-approve`` re-plan that could differ
+    from what the operator reviewed."""
+    fake = FakeSubprocess(stdout="Apply complete")
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    runner.workdir.mkdir(parents=True, exist_ok=True)
+    plan_file = runner.workdir / terraform_runner.REBUILD_PLAN_FILENAME
+    plan_file.write_text("saved-plan", encoding="utf-8")
+    runner.rebuild_apply()
+    assert fake.calls[0]["command"] == (
+        "terraform", "apply", "-input=false", "-no-color",
+        terraform_runner.REBUILD_PLAN_FILENAME,
+    )
+    # Consume-or-delete: saved plans embed refreshed sensitive values.
+    assert not plan_file.exists()
+
+
+def test_rebuild_apply_refuses_without_a_saved_plan(
     runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fake = FakeSubprocess(stdout="Apply complete")
     monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
-    runner.rebuild_apply()
-    assert fake.calls[0]["command"] == (
-        "terraform", "apply", "-input=false", "-no-color", "-auto-approve",
-    )
+    runner.workdir.mkdir(parents=True, exist_ok=True)
+    with pytest.raises(TerraformError, match="No saved rebuild plan"):
+        runner.rebuild_apply()
+    assert fake.calls == []
 
 
 def test_pipeline_surface_has_no_generic_apply() -> None:

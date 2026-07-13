@@ -4,7 +4,8 @@ Built for both ad-hoc invocation and unattended scheduled runs (e.g. a
 weekly cron job): every input arrives via flags or environment
 variables, no interactive prompts, and the exit code reports outcome
 (0 = clean aggregation, 1 = pipeline fault, 2 = usage error,
-3 = coverage gaps with --fail-on-gaps).
+3 = coverage gaps with --fail-on-gaps, 4 = sync-mode auto-apply aborted
+for human review — state did not grow this run).
 
 Mode gating: the default invocation is the ad-hoc/open-source mode —
 strictly read-only end-to-end (kit generation, speculative plan,
@@ -35,11 +36,13 @@ from meraki2tf.alerts import (
     restore_executed,
     AlertDispatcher,
     EmailNotifier,
+    WebhookConfigError,
     WebhookNotifier,
     gap_replay_executed,
 )
 from meraki2tf.config import (
     API_KEY_ENV_VAR,
+    WEBHOOK_URL_ENV_VAR,
     BackendConfigError,
     ExecutionMode,
     RuntimeConfig,
@@ -57,7 +60,7 @@ from meraki2tf.providers import (
     MerakiDataProvider,
     StaticJsonDataProvider,
 )
-from meraki2tf.sanitizer import sanitize_graph
+from meraki2tf.sanitizer import load_or_create_salt, sanitize_graph
 from meraki2tf.snapshot import write_snapshot
 from meraki2tf.spec_resolver import resolve_spec
 from meraki2tf.terraform_runner import (
@@ -332,7 +335,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--webhook-url",
         action="append",
         metavar="URL",
-        help="Webhook alert endpoint; repeat the flag for multiple targets.",
+        help=(
+            "HTTPS webhook alert endpoint; repeat the flag for multiple "
+            "targets. Prefer the MERAKI2TF_WEBHOOK_URL environment "
+            "variable (':::'-separated) for token-bearing URLs so the "
+            "secret stays out of argv and process listings."
+        ),
     )
     parser.add_argument(
         "--alert-email",
@@ -374,7 +382,12 @@ def build_dispatcher(config: RuntimeConfig) -> AlertDispatcher:
     """Assemble the alert fan-out from the configured destinations."""
     dispatcher = AlertDispatcher()
     for url in config.webhook_urls:
-        dispatcher.register(WebhookNotifier(url))
+        try:
+            dispatcher.register(WebhookNotifier(url))
+        except WebhookConfigError as exc:
+            # A misconfigured endpoint must not silently disable
+            # alerting for the whole run: refuse loudly at startup.
+            raise SystemExit(f"Invalid --webhook-url / {WEBHOOK_URL_ENV_VAR}: {exc}")
     if config.alert_emails:
         dispatcher.register(
             EmailNotifier(
@@ -421,7 +434,11 @@ def _export_snapshot(
                 )
             )
     if config.sanitize:
-        graph = sanitize_graph(graph)
+        # The workdir-persistent salt keeps pseudonyms stable across
+        # runs (sanitized snapshots stay diffable) without handing
+        # snapshot recipients a dictionary-invertible unsalted digest.
+        salt = load_or_create_salt(config.workdir / "sanitizer.salt")
+        graph = sanitize_graph(graph, salt)
         logger.info("Snapshot sanitized: secrets redacted, identity pseudonymized.")
     else:
         logger.warning(
@@ -482,12 +499,16 @@ def _rebuild(config: RuntimeConfig) -> int:
         return 1
     logger.info("Rebuild plan for workspace %s:\n%s", config.workdir, preview.stdout)
     if not preview.has_changes:
+        runner.discard_rebuild_plan()
         logger.info(
             "Nothing to rebuild: the organization already matches the "
             "generated artifacts."
         )
         return 0
     if not config.confirm:
+        # The saved plan embeds refreshed sensitive values; a preview-
+        # only run must not leave it on disk.
+        runner.discard_rebuild_plan()
         logger.warning(
             "Preview only — nothing was applied. Re-run with "
             "'--rebuild --confirm' to execute terraform apply and rebuild "
@@ -611,12 +632,23 @@ def _restore(config: RuntimeConfig) -> int:
     except Exception as exc:
         logger.critical("Restore could not load the snapshot: %s", exc)
         return 1
-    # A nested multi-org export records several source organizations;
-    # the interlock must refuse every one of them, not just the first
-    # (which is all graph.organization_id can carry).
-    source_org_ids = frozenset(provider.recorded_organization_ids) | {
-        graph.organization_id
-    }
+    # A nested multi-org export records several source organizations,
+    # but the executor can only remap ONE source org onto the target:
+    # actions belonging to any other recorded org would carry their
+    # real (live) organization IDs, so a multi-org snapshot is refused
+    # outright rather than partially restored.
+    recorded = frozenset(provider.recorded_organization_ids)
+    if len(recorded) > 1:
+        logger.critical(
+            "This snapshot records %d organizations; --restore rebuilds "
+            "exactly one organization per run. Export a single-org "
+            "snapshot for the organization you want to rebuild.",
+            len(recorded),
+        )
+        return 2
+    # The interlock must refuse every recorded source org, not just the
+    # first (which is all graph.organization_id can carry).
+    source_org_ids = recorded | {graph.organization_id}
     if config.target_org in source_org_ids:
         logger.critical(
             "--target-org matches the snapshot's source organization; "
@@ -1007,10 +1039,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _rebuild(config)
     if config.dump_to is not None and (
         config.sync or config.confirm_deletions or config.fail_on_gaps
+        or config.rebaseline
     ):
+        # --rebaseline resets the resources.tf baseline, which the
+        # export path never touches; accepting it silently would let an
+        # operator believe the baseline was reset when it was not.
         arg_parser.error(
             "--dump-to only exports a snapshot; it cannot be combined with "
-            "--sync, --confirm-deletions, or --fail-on-gaps."
+            "--sync, --confirm-deletions, --fail-on-gaps, or --rebaseline."
         )
     if config.mode is ExecutionMode.LIVE and not config.org_id:
         arg_parser.error("--org-id is required in live mode.")
@@ -1091,6 +1127,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             summary.unsupported_count,
         )
         return 3
+    if summary.apply_aborted:
+        # A sync run that refused to materialize any state (the plan
+        # carried mutations) must not report success — a scheduler
+        # gating on the exit code would otherwise believe state grew
+        # while it is stalled indefinitely. The drift alert already
+        # fired; this makes the stall visible to automation even if
+        # every notifier channel is down.
+        logger.error(
+            "--sync auto-apply was ABORTED: the plan proposed mutations, "
+            "so no state was materialized this run. A human must review "
+            "the DRIFT_DETECTED alert before state can grow."
+        )
+        return 4
     return 0
 
 

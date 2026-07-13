@@ -12,6 +12,7 @@ from __future__ import annotations
 import gzip
 import json
 import logging
+import os
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -93,18 +94,29 @@ def write_snapshot(
     v2 streams one small line at a time and compresses ~10-20×.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.touch(mode=0o600, exist_ok=True)
-    restrict_to_owner(path)
-    if _wants_v2(path):
-        _write_snapshot_v2(graph, path, sanitized=sanitized)
-    else:
-        document = graph_to_snapshot(graph)
-        if sanitized:
-            document["sanitized"] = True
-        path.write_text(
-            json.dumps(document, indent=2) + "\n",
-            encoding="utf-8",
-        )
+    # Write-then-rename: the snapshot is the org's only rebuild source
+    # of truth, so a crash or full disk mid-write must corrupt the
+    # temporary file, never the previous good snapshot. The temp file
+    # is created 0600 *before* any secret bytes land in it, and
+    # os.replace carries that mode onto the final path.
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.touch(mode=0o600, exist_ok=True)
+    restrict_to_owner(tmp)
+    try:
+        if _wants_v2(path):
+            _write_snapshot_v2(graph, path, tmp, sanitized=sanitized)
+        else:
+            document = graph_to_snapshot(graph)
+            if sanitized:
+                document["sanitized"] = True
+            with tmp.open("w", encoding="utf-8") as handle:
+                handle.write(json.dumps(document, indent=2) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     logger.info(
         "Snapshot written to %s: %d network(s), %d device(s), %d feature(s).",
         path, len(graph.networks), len(graph.devices), len(graph.features),
@@ -134,8 +146,10 @@ def _warn_kind_collision(
 
 
 def _write_snapshot_v2(
-    graph: NetworkGraph, path: Path, sanitized: bool = False
+    graph: NetworkGraph, path: Path, target: Path, sanitized: bool = False
 ) -> None:
+    # Format selection keys on the *final* path's name; bytes land in
+    # the temporary file the caller renames into place.
     opener = gzip.open if path.name.lower().endswith(".gz") else open
     header: dict[str, Any] = {
         SNAPSHOT_V2_MARKER: SNAPSHOT_V2_VERSION,
@@ -143,7 +157,7 @@ def _write_snapshot_v2(
     }
     if sanitized:
         header["sanitized"] = True
-    with opener(path, "wt", encoding="utf-8") as handle:
+    with opener(target, "wt", encoding="utf-8") as handle:
         handle.write(json.dumps(header) + "\n")
         for network in graph.networks:
             _warn_kind_collision("network", network.network_id, network.payload)
@@ -190,3 +204,5 @@ def _write_snapshot_v2(
                 )
                 + "\n"
             )
+        handle.flush()
+        os.fsync(handle.fileno())

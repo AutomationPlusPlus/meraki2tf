@@ -204,7 +204,7 @@ def test_download_uses_urllib_and_wraps_failures(
         def __exit__(self, *exc_info: object) -> None:
             return None
 
-        def read(self) -> bytes:
+        def read(self, amount: int | None = None) -> bytes:
             return json.dumps(_spec("1.56.0")).encode("utf-8")
 
     captured = SimpleNamespace(url=None, timeout=None)
@@ -225,4 +225,31 @@ def test_download_uses_urllib_and_wraps_failures(
 
     monkeypatch.setattr(urllib.request, "urlopen", failing_urlopen)
     with pytest.raises(SpecResolutionError, match="connection refused"):
+        fetch_latest_spec()
+
+
+def test_download_refuses_an_oversized_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A poisoned or wrong endpoint returning an unbounded body must not
+    OOM the unattended DR job — the read is capped and over-limit
+    responses are refused."""
+    over = spec_resolver._MAX_SPEC_BYTES + 1
+
+    class HugeResponse:
+        def __enter__(self) -> "HugeResponse":
+            return self
+
+        def __exit__(self, *exc_info: object) -> None:
+            return None
+
+        def read(self, amount: int | None = None) -> bytes:
+            # Honor the caller's cap so the test stays cheap, but return
+            # the full requested amount so the over-limit check trips.
+            return b"x" * (amount if amount is not None else over)
+
+    monkeypatch.setattr(
+        urllib.request, "urlopen", lambda url, timeout: HugeResponse()
+    )
+    with pytest.raises(SpecResolutionError, match="ceiling"):
         fetch_latest_spec()

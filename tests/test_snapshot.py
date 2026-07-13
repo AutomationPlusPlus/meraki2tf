@@ -22,6 +22,32 @@ def test_snapshot_round_trips_through_the_dump_provider(dump_file: Path, tmp_pat
     assert reloaded == graph
 
 
+def test_snapshot_write_preserves_the_prior_baseline_on_failure(
+    dump_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The snapshot is the org's only rebuild source of truth: a crash
+    mid-write must leave last week's good snapshot intact, never a
+    truncated file."""
+    graph = StaticJsonDataProvider(dump_file).fetch_network_graph()
+    out = tmp_path / "snapshot.json"
+    write_snapshot(graph, out)
+    good = out.read_text(encoding="utf-8")
+
+    real_replace = snapshot.os.replace
+
+    def boom(src: Any, dst: Any) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(snapshot.os, "replace", boom)
+    with pytest.raises(OSError, match="disk full"):
+        write_snapshot(graph, out)
+    monkeypatch.setattr(snapshot.os, "replace", real_replace)
+
+    # The previous good snapshot survived, and no temp file was left.
+    assert out.read_text(encoding="utf-8") == good
+    assert not out.with_name(out.name + ".tmp").exists()
+
+
 def test_snapshot_document_uses_the_canonical_contract(dump_file: Path) -> None:
     graph = StaticJsonDataProvider(dump_file).fetch_network_graph()
     document = graph_to_snapshot(graph)
@@ -53,7 +79,10 @@ def test_snapshot_routes_through_owner_only_helper(
 
     write_snapshot(graph, out)
 
-    assert restricted == [out]
+    # Enforcement targets the temp file the content lands in; the final
+    # path inherits its 0600 mode through os.replace.
+    assert restricted == [out.with_name(out.name + ".tmp")]
+    assert out.exists() and not restricted[0].exists()
 
 
 def test_snapshot_carries_full_network_and_device_payloads(tmp_path: Path) -> None:

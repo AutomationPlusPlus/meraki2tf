@@ -879,16 +879,27 @@ environment itself.
 ### Scheduled (cron) execution
 
 The CLI is non-interactive end to end and reports outcome via exit code
-(0 clean, 1 fault, 2 usage error, 3 coverage gaps with
-`--fail-on-gaps`), so a weekly headless run is one crontab line:
+(0 clean, 1 fault, 2 usage error, 3 coverage gaps with `--fail-on-gaps`,
+4 sync auto-apply aborted for human review), so a weekly headless run is
+one crontab line:
 
 ```cron
 # Every Monday 06:00 — stream live, materialize state, alert to the NetOps webhook.
 0 6 * * 1 cd /opt/meraki2tf && . .venv/bin/activate && \
   MERAKI_DASHBOARD_API_KEY=$(cat /etc/meraki2tf/token) \
+  MERAKI2TF_WEBHOOK_URL=$(cat /etc/meraki2tf/webhook-url) \
   meraki2tf --org-id 123456 --spec ./openapi.json --sync \
-  --webhook-url https://hooks.example.com/meraki2tf >> /var/log/meraki2tf.log 2>&1
+  >> /var/log/meraki2tf.log 2>&1
 ```
+
+Create the token (and webhook-URL) files owner-only so no other local
+account can read the org-admin key or the bearer-token-bearing webhook
+URL — e.g. `install -m 0600 /dev/null /etc/meraki2tf/token` then paste
+the value in. Passing the key via the environment (as above) keeps it
+out of the process list; the `MERAKI2TF_WEBHOOK_URL` variable does the
+same for the webhook URL, whose path may itself be a secret (use it
+instead of `--webhook-url` in scheduled jobs). Separate multiple webhook
+targets with `:::`.
 
 Drop `--sync` if you want the job to stay plan-only (state building
 then remains a manual step), and add `--fail-on-gaps` to turn

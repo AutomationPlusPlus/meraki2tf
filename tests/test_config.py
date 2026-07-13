@@ -121,6 +121,34 @@ def test_backend_config_requires_key_value_form() -> None:
         _config([*_AZURERM_MIN, "--backend-config", "not-a-pair"])
 
 
+def test_backend_config_key_value_error_does_not_echo_the_value() -> None:
+    """A mistyped credential (colon instead of =) must not have its
+    value repeated into the usage error / CI logs."""
+    with pytest.raises(BackendConfigError) as excinfo:
+        _config([*_AZURERM_MIN, "--backend-config", "access_key:SUPERSECRET"])
+    assert "SUPERSECRET" not in str(excinfo.value)
+
+
+def test_backend_config_file_credential_key_is_refused(tmp_path: Path) -> None:
+    """terraform init persists file-sourced backend settings in plaintext
+    into .terraform state, so a credential in the file is refused just
+    like the argv form."""
+    backend_file = tmp_path / "azure.tfbackend"
+    backend_file.write_text(
+        'storage_account_name = "sa"\n'
+        'container_name        = "tfstate"\n'
+        'key                   = "org.tfstate"\n'
+        'access_key            = "SUPERSECRET"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(BackendConfigError, match="credential") as excinfo:
+        _config(
+            ["--state-backend", "azurerm",
+             "--backend-config-file", str(backend_file)]
+        )
+    assert "SUPERSECRET" not in str(excinfo.value)
+
+
 def test_backend_config_rejected_for_local_backend() -> None:
     with pytest.raises(BackendConfigError, match="remote"):
         _config(["--backend-config", "container_name=tfstate"])
