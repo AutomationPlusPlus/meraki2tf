@@ -757,12 +757,25 @@ def _single_array_body_field(op: OperationSpec) -> str | None:
 
 
 def _strip_nulls(value: Any) -> Any:
-    """Deep-copy ``value`` without null-valued mapping entries."""
+    """Deep-copy ``value`` without null-valued or emptied-out entries.
+
+    GET echoes pad unset sub-features with nulls; once those are
+    stripped, the leftover empty object carries no data yet trips
+    strict write validators (an SSID VPN PUT rejects a bare
+    ``concentrator: {}`` with "Network not found"), so emptied mappings
+    are dropped with their key. Empty *lists* stay: ``rules: []`` is a
+    real instruction (clear the rules), not an artifact.
+    """
     if isinstance(value, Mapping):
-        return {
+        cleaned = {
             key: _strip_nulls(inner)
             for key, inner in value.items()
             if inner is not None
+        }
+        return {
+            key: inner
+            for key, inner in cleaned.items()
+            if not (isinstance(inner, Mapping) and not inner)
         }
     if isinstance(value, list):
         return [_strip_nulls(item) for item in value]

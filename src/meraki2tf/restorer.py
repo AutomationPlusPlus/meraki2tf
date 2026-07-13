@@ -37,11 +37,12 @@ from __future__ import annotations
 
 import inspect
 import json
+import hashlib
 import logging
 import os
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -722,6 +723,64 @@ def _remap_serial_fields(
     return value
 
 
+#: Body property names that bind a write to specific hardware.
+_SERIAL_PROPERTY = re.compile(r"(?i)serial")
+
+
+def _body_serial_properties(op: OperationSpec) -> frozenset[str]:
+    """Serial-bearing property names the write schema declares.
+
+    A configure operation whose schema takes serials (warm spare's
+    ``spareSerial``, …) sets device placement: on a hardware-free drill
+    org the dashboard rejects it whatever the payload says, so these
+    are drill-skipped verdicts, never failures.
+    """
+    return frozenset(
+        name
+        for name in _body_property_names(op)
+        if _SERIAL_PROPERTY.search(name)
+    )
+
+
+def _inject_drill_secrets(
+    payload: Mapping[str, Any],
+    paths: tuple[str, ...],
+    seed: str,
+) -> tuple[dict[str, Any], tuple[str, ...]]:
+    """Fill redacted secret slots with deterministic drill placeholders.
+
+    A sanitized snapshot strips secret values, but some writes are
+    invalid without one (a WPA SSID needs a psk, SNMP needs a community
+    string) — a drill would fail exactly the objects it is supposed to
+    rehearse. The placeholder shape satisfies the strictest validators
+    seen live (8+ chars, letters/digits/hyphens only) and is derived
+    from the action key + path, so resumed drills stay idempotent.
+    Only mapping paths are reconstructable; list slots (``a[]``) stay
+    omitted. Returns the filled payload and the paths actually filled.
+    """
+    filled = {key: value for key, value in payload.items()}
+    injected: list[str] = []
+    for path in paths:
+        if "[]" in path:
+            continue
+        parts = path.split(".")
+        node: Any = filled
+        for part in parts[:-1]:
+            child = node.get(part) if isinstance(node, Mapping) else None
+            if not isinstance(child, Mapping):
+                node = None
+                break
+            child = dict(child)
+            node[part] = child
+            node = child
+        if not isinstance(node, dict):
+            continue
+        digest = hashlib.sha256(f"{seed}:{path}".encode()).hexdigest()[:12]
+        node[parts[-1]] = f"drill-{digest}"
+        injected.append(path)
+    return filled, tuple(injected)
+
+
 def _own_identity(action: RestoreAction) -> tuple[str, str]:
     """(type stem, old ID) of the object an action creates or claims."""
     if action.wave == WAVE_NETWORKS:
@@ -901,6 +960,10 @@ class RestoreResult:
     executed: tuple[str, ...] = ()
     failed: tuple[tuple[str, str], ...] = ()
     skipped: tuple[dict[str, str], ...] = ()
+    #: action key → comma-joined secret paths that received drill
+    #: placeholders (sanitized-snapshot drills only). Real secrets must
+    #: be re-entered per the runbook if the org is ever kept.
+    drill_placeholders: tuple[tuple[str, str], ...] = ()
 
 
 class OrgRestorer:
@@ -969,6 +1032,7 @@ class OrgRestorer:
         executed: list[str] = []
         failed: list[tuple[str, str]] = []
         skipped: list[dict[str, str]] = []
+        drill_placeholders: list[tuple[str, str]] = []
         #: (type stem, old value) of creates/claims that failed this run.
         failed_parents: set[tuple[str, str]] = set()
         #: (type stem, old value) of drill-skipped parents: their
@@ -1011,6 +1075,21 @@ class OrgRestorer:
                          "is attached to another organization; device "
                          "claiming and device-scoped features only execute "
                          "in a real disaster recovery"}
+                    )
+                    continue
+                if (
+                    self._skip_claims
+                    and action.kind == "configure"
+                    and _body_serial_properties(action.operation)
+                ):
+                    # The write schema binds this feature to hardware
+                    # (warm spare's spareSerial, …); a device-free drill
+                    # org rejects it no matter what the payload says.
+                    skipped.append(
+                        {"target": action.key, "reason": "drill: the "
+                         "write schema binds this feature to device "
+                         "serials; it only restores in a real disaster "
+                         "recovery"}
                     )
                     continue
                 if self._skip_claims and _references_serials(
@@ -1101,6 +1180,18 @@ class OrgRestorer:
                              "claimed into the target organization yet")
                         )
                         continue
+                dispatch_action = action
+                injected_paths: tuple[str, ...] = ()
+                if self._skip_claims and action.secret_reentry:
+                    # A sanitized-snapshot drill: redacted secret slots
+                    # get valid placeholders so the write exercises the
+                    # same shape a real restore would ("Password is
+                    # required to enable WPA encryption" otherwise).
+                    filled, injected_paths = _inject_drill_secrets(
+                        action.payload, action.secret_reentry, action.key
+                    )
+                    if injected_paths:
+                        dispatch_action = replace(action, payload=filled)
                 try:
                     new_id: str | None
                     recovered: str | None = None
@@ -1126,31 +1217,44 @@ class OrgRestorer:
                         new_id = recovered
                     else:
                         new_id = self._dispatch(
-                            dashboard, action, resolver,
+                            dashboard, dispatch_action, resolver,
                             graph.organization_id,
                         )
                 except UnmappedReferenceError as exc:
                     deferred.append((action, str(exc)))
                     continue
                 except Exception as exc:  # noqa: BLE001 - per-object isolation
-                    message = str(exc)
-                    if _secret_paths(action.payload):
-                        # SDK error text can echo the rejected field
-                        # back; this payload carries live secret values,
-                        # so the echo must not reach logs or alerts.
-                        message = (
-                            f"{type(exc).__name__} (status "
-                            f"{getattr(exc, 'status', 'n/a')}); detail "
-                            "withheld — the request carried secret values"
-                        )
-                    failed.append((action.key, message))
-                    if action.kind in ("create", "claim"):
-                        # A failed claim poisons its serial too: the
-                        # hardware may still be claimed by the source
-                        # (production) organization, and serial-scoped
-                        # endpoints would write straight into it.
-                        failed_parents.add(_own_identity(action))
-                    continue
+                    if self._retry_disabled_minimal(
+                        dashboard, dispatch_action, resolver,
+                        graph.organization_id, exc,
+                    ):
+                        # The disabled state was restored; the extra
+                        # attributes the dashboard rejected only matter
+                        # once the feature is enabled (and configured)
+                        # for real.
+                        new_id = None
+                        injected_paths = ()
+                    else:
+                        message = str(exc)
+                        if _secret_paths(dispatch_action.payload):
+                            # SDK error text can echo the rejected field
+                            # back; this payload carries live secret
+                            # values (or drill placeholders standing in
+                            # for them), so the echo must not reach logs
+                            # or alerts.
+                            message = (
+                                f"{type(exc).__name__} (status "
+                                f"{getattr(exc, 'status', 'n/a')}); detail "
+                                "withheld — the request carried secret values"
+                            )
+                        failed.append((action.key, message))
+                        if action.kind in ("create", "claim"):
+                            # A failed claim poisons its serial too: the
+                            # hardware may still be claimed by the source
+                            # (production) organization, and serial-scoped
+                            # endpoints would write straight into it.
+                            failed_parents.add(_own_identity(action))
+                        continue
                 if action.kind == "claim":
                     unclaimed.discard(action.path_values[-1])
                 if new_id is None and action.kind == "create":
@@ -1189,6 +1293,10 @@ class OrgRestorer:
                     )
                 self._journal.record_done(action.key)
                 executed.append(action.key)
+                if injected_paths:
+                    drill_placeholders.append(
+                        (action.key, ",".join(injected_paths))
+                    )
             if not deferred:
                 break
             if len(deferred) == len(pending):
@@ -1198,11 +1306,56 @@ class OrgRestorer:
                     failed.append((action.key, reason))
                 break
             pending = [action for action, _ in deferred]
+        if drill_placeholders:
+            logger.warning(
+                "%d object(s) received drill placeholder secrets (their "
+                "real values are redacted in the sanitized snapshot): %s",
+                len(drill_placeholders),
+                "; ".join(
+                    f"{key} ({paths})" for key, paths in drill_placeholders
+                ),
+            )
         return RestoreResult(
             executed=tuple(executed),
             failed=tuple(failed),
             skipped=tuple(skipped),
+            drill_placeholders=tuple(drill_placeholders),
         )
+
+    def _retry_disabled_minimal(
+        self,
+        dashboard: Any,
+        action: RestoreAction,
+        resolver: ReferenceResolver,
+        source_org: str,
+        exc: Exception,
+    ) -> bool:
+        """Retry a rejected disabled-state configure with only the flag.
+
+        GET echoes of disabled features carry attribute skeletons their
+        PUT refuses to accept while disabled (OSPF demands areas, the
+        alternate management interface demands a VLAN). The disabled
+        bit alone restores the feature's actual state; the rejected
+        attributes only exist once an operator enables the feature.
+        """
+        if (
+            action.kind != "configure"
+            or getattr(exc, "status", None) != 400
+            or action.payload.get("enabled") is not False
+            or len(action.payload) <= 1
+        ):
+            return False
+        minimal = replace(action, payload={"enabled": False})
+        try:
+            self._dispatch(dashboard, minimal, resolver, source_org)
+        except Exception:  # noqa: BLE001 - the original error stands
+            return False
+        logger.warning(
+            "Restored %s as disabled-only: the dashboard rejected the "
+            "full disabled-state payload; its attributes apply only "
+            "when the feature is enabled.", action.key,
+        )
+        return True
 
     def _dispatch(
         self,

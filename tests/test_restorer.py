@@ -1926,3 +1926,206 @@ def test_wipe_reports_organization_delete_failure() -> None:
     result = wiper.execute("org-drill", "Drill Org")
     assert result.organization_deleted is False
     assert result.failed == (("org-drill", "org has pending licenses"),)
+
+
+def test_drill_secret_placeholders_fill_redacted_slots(tmp_path: Path) -> None:
+    """A sanitized-snapshot drill substitutes valid placeholder secrets
+    so secret-requiring writes rehearse instead of failing ('Password
+    is required to enable WPA encryption')."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(
+            SNMP_PATH, ("N_1",),
+            {"access": "community", "communityString": REDACTED},
+        )
+    )
+    plan = plan_restore(graph, parser)
+    calls: list = []
+    section = _RecordingSection(calls)
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "j.jsonl"), skip_claims=True
+    )
+    restorer._client = SimpleNamespace(
+        organizations=section, networks=section, wireless=section,
+        switch=section, appliance=section,
+    )
+    result = restorer.execute(graph, plan)
+
+    snmp = next(c for c in calls if c[0] == "updateNetworkSnmp")
+    placeholder = snmp[2]["communityString"]
+    assert placeholder.startswith("drill-") and len(placeholder) >= 8
+    assert result.drill_placeholders == (
+        (f"{SNMP_PATH}::N_1", "communityString"),
+    )
+    # Resumed drills stay idempotent: the placeholder is deterministic.
+    from meraki2tf.restorer import _inject_drill_secrets
+
+    again, _ = _inject_drill_secrets(
+        {"access": "community"}, ("communityString",), f"{SNMP_PATH}::N_1"
+    )
+    assert again["communityString"] == placeholder
+
+
+def test_real_restores_never_inject_placeholders(tmp_path: Path) -> None:
+    """Unsanitized payload secrets pass through untouched, and without
+    --skip-claims nothing is substituted at all."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(
+            SNMP_PATH, ("N_1",),
+            {"access": "community", "communityString": "real-value"},
+        )
+    )
+    plan = plan_restore(graph, parser)
+    calls: list = []
+    section = _RecordingSection(calls)
+    restorer = OrgRestorer("org-TARGET", RestoreJournal(tmp_path / "j.jsonl"))
+    restorer._client = SimpleNamespace(
+        organizations=section, networks=section, wireless=section,
+        switch=section, appliance=section,
+    )
+    result = restorer.execute(graph, plan)
+    snmp = next(c for c in calls if c[0] == "updateNetworkSnmp")
+    assert snmp[2]["communityString"] == "real-value"
+    assert result.drill_placeholders == ()
+
+
+def test_inject_drill_secrets_handles_nesting_and_list_slots() -> None:
+    from meraki2tf.restorer import _inject_drill_secrets
+
+    payload = {"radius": {"host": "10.0.0.1"}, "servers": [{"a": 1}]}
+    filled, injected = _inject_drill_secrets(
+        payload,
+        ("radius.secret", "servers[].secret", "missing.parent.secret"),
+        "seed",
+    )
+    assert injected == ("radius.secret",)
+    assert filled["radius"]["secret"].startswith("drill-")
+    assert payload["radius"] == {"host": "10.0.0.1"}  # input untouched
+    assert filled["servers"] == [{"a": 1}]  # list slots stay omitted
+
+
+def test_serial_schema_configures_are_drill_skipped(tmp_path: Path) -> None:
+    """A write schema that binds to device serials (warm spare's
+    spareSerial) cannot apply on a hardware-free drill org: drill-skip
+    verdict, never a failure."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    warm_path = "/networks/{networkId}/appliance/warmSpare"
+    op = dict(_op("updateNetworkApplianceWarmSpare", "appliance"))
+    op["requestBody"] = {
+        "content": {"application/json": {"schema": {
+            "type": "object",
+            "properties": {"enabled": {}, "spareSerial": {}},
+        }}}
+    }
+    spec = {
+        "openapi": "3.0.0", "info": {"title": "w", "version": "1"},
+        "paths": {
+            "/organizations/{organizationId}/networks": {
+                "get": _op("getOrganizationNetworks", "organizations"),
+                "post": _op("createOrganizationNetwork", "organizations"),
+            },
+            "/networks/{networkId}/devices/claim": {
+                "post": _op("claimNetworkDevices", "networks"),
+            },
+            warm_path: {
+                "get": _op("getNetworkApplianceWarmSpare", "appliance"),
+                "put": op,
+            },
+        },
+    }
+    path = tmp_path / "warm-spec.json"
+    path.write_text(json.dumps(spec), encoding="utf-8")
+    parser = OpenApiParser(path)
+    graph = _graph(
+        FeatureConfiguration(warm_path, ("N_1",), {"enabled": False})
+    )
+    plan = plan_restore(graph, parser)
+    calls: list = []
+    section = _RecordingSection(calls)
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "j.jsonl"), skip_claims=True
+    )
+    restorer._client = SimpleNamespace(
+        organizations=section, networks=section, appliance=section,
+    )
+    result = restorer.execute(graph, plan)
+    assert "updateNetworkApplianceWarmSpare" not in [c[0] for c in calls]
+    assert result.failed == ()
+    assert any(
+        "write schema binds this feature to device serials" in e["reason"]
+        for e in result.skipped
+    )
+
+
+def test_disabled_features_retry_with_minimal_payload(tmp_path: Path) -> None:
+    """GET echoes of disabled features carry skeletons their PUT
+    rejects (OSPF: 'There must be at least one area defined'); the
+    disabled bit alone restores the actual state."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    class Rejecting400(Exception):
+        status = 400
+
+    calls: list = []
+
+    class OspfSection(_RecordingSection):
+        def updateNetworkSwitchRoutingOspf(self, *args, **kwargs) -> dict:
+            self._calls.append(("updateNetworkSwitchRoutingOspf", args, kwargs))
+            if set(kwargs) != {"enabled"}:
+                raise Rejecting400("There must be at least one area defined.")
+            return {}
+
+    ospf_path = "/networks/{networkId}/switch/routing/ospf"
+    spec = {
+        "openapi": "3.0.0", "info": {"title": "o", "version": "1"},
+        "paths": {
+            "/organizations/{organizationId}/networks": {
+                "get": _op("getOrganizationNetworks", "organizations"),
+                "post": _op("createOrganizationNetwork", "organizations"),
+            },
+            "/networks/{networkId}/devices/claim": {
+                "post": _op("claimNetworkDevices", "networks"),
+            },
+            ospf_path: {
+                "get": _op("getNetworkSwitchRoutingOspf", "switch"),
+                "put": _op("updateNetworkSwitchRoutingOspf", "switch"),
+            },
+        },
+    }
+    path = tmp_path / "ospf-spec.json"
+    path.write_text(json.dumps(spec), encoding="utf-8")
+    parser = OpenApiParser(path)
+    graph = _graph(
+        FeatureConfiguration(
+            ospf_path, ("N_1",),
+            {"enabled": False, "areas": [], "helloTimerInSeconds": 10},
+        )
+    )
+    plan = plan_restore(graph, parser)
+    section = OspfSection(calls)
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "j.jsonl"), skip_claims=True
+    )
+    restorer._client = SimpleNamespace(
+        organizations=section, networks=section, switch=section,
+    )
+    result = restorer.execute(graph, plan)
+    ospf_calls = [c for c in calls if c[0] == "updateNetworkSwitchRoutingOspf"]
+    assert len(ospf_calls) == 2  # full payload, then the minimal retry
+    assert ospf_calls[1][2] == {"enabled": False}
+    assert result.failed == ()
+    assert f"{ospf_path}::N_1" in result.executed
