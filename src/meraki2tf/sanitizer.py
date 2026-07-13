@@ -27,12 +27,19 @@ seconds-of-compute dictionary attack. Three complementary rules:
   addresses, notes, tags, MACs, and stray serials become stable
   ``<kind>-<digest>`` placeholders; coordinates are zeroed.
 * **Identity-shaped values are pseudonymized wherever they appear.**
-  Regardless of key, URLs, email addresses (the whole ``user@host``,
-  never just the domain — a leftover local part is a username), and
-  FQDN-like strings become placeholders, IPv4 addresses/CIDRs become
-  deterministic fake ``10.x.y.z`` values (prefix length preserved, so
-  firewall rules and subnets keep their shape), and MAC addresses
-  become fake locally-administered MACs.
+  Regardless of key, URLs and FQDN-like strings become placeholders,
+  email addresses (the whole ``user@host``, never just the domain — a
+  leftover local part is a username) become valid fake addresses under
+  the reserved ``.invalid`` TLD, IPv4 addresses/CIDRs become
+  deterministic fake ``10.x.y.z`` values (prefix length preserved and
+  the fake network part keyed on the real /24, so subnets, appliance
+  IPs, and next hops stay mutually coherent), and MAC addresses become
+  fake locally-administered MACs.
+
+The output must stay **restore-drillable**: API keyword path selectors
+(pure-alpha values like ``firewalledServices/{service}``) survive
+untouched, and Liquid template code in webhook payload templates passes
+through verbatim (only the literal text between tags is rewritten).
 
 Everything else — product types, models, feature structure — is
 preserved so the snapshot remains a faithful structural replica of the
@@ -85,6 +92,12 @@ _IDENTITY_KEY = re.compile(
 _COORDINATE_KEYS = frozenset({"lat", "lng"})
 
 _URL_VALUE = re.compile(r"\w+://")
+#: Liquid template constructs (webhook payload templates): `{{ var }}`
+#: interpolations and `{% tag %}` logic. Template code is not identity
+#: — but dotted variable paths (`{{alertData.service.name}}`) look
+#: exactly like FQDNs to the value rewrites, and a rewritten variable
+#: makes the whole template fail to render on restore.
+_LIQUID_TAG = re.compile(r"(\{\{.*?\}\}|\{%.*?%\})", re.DOTALL)
 #: user@host shapes anywhere in a value. The local part is identity (a
 #: username) just like the domain, so the whole address maps to one
 #: pseudonym — the FQDN rewrite alone would leave ``jsmith@…`` behind.
@@ -137,10 +150,29 @@ _ID_REFERENCE_KEY = re.compile(r"^ids?$|Ids?$")
 #: far longer and leak the environment's identity if preserved.
 _STRUCTURAL_NUMBER_MAX_DIGITS = 4
 
+#: Path placeholders whose values are API keywords, not identity: pure
+#: short alpha tokens (``firewalledServices/{service}`` takes ``ICMP``/
+#: ``web``/``SNMP``) under a placeholder that is not name/ID/serial
+#: shaped. Meraki identifiers always carry digits or separators, so a
+#: letters-only selector pseudonymized into ``id-XXXX`` would 404 on
+#: restore while preserving it leaks nothing structural. The spec
+#: declares no enum for these params (the values live in prose), so the
+#: shape rule is the only future-proof classifier available.
+_KEYWORD_EXCLUDED_PLACEHOLDER = re.compile(r"(?i)name|id$|ids$|serial")
+_KEYWORD_PATH_VALUE = re.compile(r"[A-Za-z]{1,16}")
+
 
 def _is_structural_number(value: str) -> bool:
     """Small numerics are structure, not identity; long ones identify."""
     return value.isdigit() and len(value) <= _STRUCTURAL_NUMBER_MAX_DIGITS
+
+
+def _is_path_keyword(placeholder: str, value: str) -> bool:
+    """Whether a path value is a protocol/service keyword, not identity."""
+    return bool(
+        not _KEYWORD_EXCLUDED_PLACEHOLDER.search(placeholder)
+        and _KEYWORD_PATH_VALUE.fullmatch(value)
+    )
 
 
 #: Salt length in bytes; a read-back shorter than this is treated as
@@ -215,7 +247,11 @@ class _GraphSanitizer:
                 prefix = _PATH_PARAM_PREFIXES.get(name.lower())
                 if prefix:
                     self._assign(value, prefix)
-                elif value and not _is_structural_number(value):
+                elif (
+                    value
+                    and not _is_structural_number(value)
+                    and not _is_path_keyword(name, value)
+                ):
                     self._assign(value, "id")
 
     def _assign(self, value: str, prefix: str) -> None:
@@ -239,6 +275,13 @@ class _GraphSanitizer:
         # collision odds — a collision silently merges two identities.
         return f"{key.lower()}-{self._digest_bytes(value).hex()[:16]}"
 
+    def _fake_email(self, value: str) -> str:
+        # Pseudonymized recipients must still parse as email addresses:
+        # Meraki validates them on write, so a bare `email-<digest>`
+        # placeholder makes the sanitized snapshot fail restore drills.
+        # RFC 2606 reserves `.invalid` — the address can never route.
+        return f"user-{self._digest_bytes(value).hex()[:16]}@drill.invalid"
+
     @staticmethod
     def _masked(fake: str, prefix: str) -> str:
         # A prefixed value is a subnet: mask the host bits so the fake
@@ -252,10 +295,19 @@ class _GraphSanitizer:
             return fake + prefix
 
     def _fake_ip(self, value: str, prefix: str) -> str:
-        # Octets land in 1-254 so bare fake addresses never collide with
-        # network/broadcast shapes or a `10.255.` grep for real leftovers.
-        octets = [byte % 254 + 1 for byte in self._digest_bytes(value)[:3]]
-        fake = f"10.{octets[0]}.{octets[1]}.{octets[2]}"
+        # The fake network part is keyed on the real /24 prefix and the
+        # host octet is preserved, so addresses that share a real /24
+        # share a fake one: a VLAN subnet, its appliance IP, and a
+        # static route's next hop stay coherent and the sanitized
+        # snapshot remains restore-drillable ("next hop not on a
+        # configured subnet" otherwise). A lone host octet without its
+        # real network context carries no identity. Octets land in
+        # 1-254 so fake networks never collide with a `10.255.` grep
+        # for real leftovers.
+        address = value[: len(value) - len(prefix)] if prefix else value
+        head, _, host = address.rpartition(".")
+        octets = [byte % 254 + 1 for byte in self._digest_bytes(head)[:2]]
+        fake = f"10.{octets[0]}.{octets[1]}.{host}"
         return self._masked(fake, prefix) if prefix else fake
 
     def _fake_mac(self, value: str) -> str:
@@ -385,6 +437,8 @@ class _GraphSanitizer:
         if key.lower() in _COORDINATE_KEYS:
             return 0.0
         if _IDENTITY_KEY.search(key) and isinstance(value, str) and value:
+            if "email" in key.lower() or _EMAIL_VALUE.fullmatch(value):
+                return self._fake_email(value)
             return self._pseudonym(key, value)
         if isinstance(value, str):
             return self._clean_identity_shaped(value)
@@ -396,6 +450,13 @@ class _GraphSanitizer:
             # PEM private-key blocks (RADSEC, custom certs) are secrets
             # even under non-secret-shaped keys like `certificate`.
             return REDACTED
+        if _LIQUID_TAG.search(value):
+            # Template code passes through verbatim; the literal text
+            # between tags still gets every identity rewrite.
+            return "".join(
+                part if index % 2 else self._clean_identity_shaped(part)
+                for index, part in enumerate(_LIQUID_TAG.split(value))
+            )
         if "," in value:
             # Fields like firewall destCidr carry comma-separated lists;
             # spacing around the commas is preserved so benign free text
@@ -416,9 +477,15 @@ class _GraphSanitizer:
         )
         # Emails before FQDNs: the FQDN rewrite would otherwise consume
         # only the domain and leave the username-bearing local part.
-        value = _EMAIL_VALUE.sub(
-            lambda m: self._pseudonym("email", m.group(0)), value
-        )
+        # The fake addresses are valid emails (`user-…@drill.invalid`),
+        # so they hide behind NUL sentinels until every other pass ran —
+        # otherwise the FQDN rewrite would eat their own domain part.
+        fake_emails: list[str] = []
+
+        def _email_sentinel(match: re.Match[str]) -> str:
+            fake_emails.append(self._fake_email(match.group(0)))
+            return f"\x00{len(fake_emails) - 1}\x00"
+        value = _EMAIL_VALUE.sub(_email_sentinel, value)
         value = _FQDN_VALUE.sub(
             lambda m: self._pseudonym("host", m.group(0)), value
         )
@@ -428,7 +495,10 @@ class _GraphSanitizer:
         value = _IPV6_VALUE.sub(
             lambda m: self._fake_ipv6(m.group(0), m.group("prefix") or ""), value
         )
-        return _MAC_VALUE.sub(lambda m: self._fake_mac(m.group(0)), value)
+        value = _MAC_VALUE.sub(lambda m: self._fake_mac(m.group(0)), value)
+        for index, fake in enumerate(fake_emails):
+            value = value.replace(f"\x00{index}\x00", fake)
+        return value
 
     def _clean_list_part(self, part: str) -> str:
         """Clean one comma-list element, keeping its surrounding whitespace."""

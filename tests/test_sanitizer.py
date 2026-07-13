@@ -7,6 +7,8 @@ from meraki2tf.models import (
     MerakiNetwork,
     NetworkGraph,
 )
+import ipaddress
+import re
 import stat
 from pathlib import Path
 from typing import Any
@@ -769,9 +771,109 @@ def test_embedded_email_addresses_are_fully_pseudonymized() -> None:
     payload = sanitize_graph(graph, salt=b"fixed-salt").features[0].payload
     raw = str(payload)
     assert "jsmith" not in raw and "jdoe" not in raw and "corp" not in raw
-    assert payload["contact"].startswith("email-")
-    assert "escalate to email-" in payload["description"]
+    # The fake must still parse as an email (Meraki validates recipients
+    # on write, so the sanitized snapshot must stay restore-drillable)
+    # and its own domain must survive the FQDN rewrite.
+    assert re.fullmatch(r"user-[0-9a-f]{16}@drill\.invalid", payload["contact"])
+    assert "escalate to user-" in payload["description"]
+    assert "@drill.invalid" in payload["description"]
     # Deterministic under one salt: the same address maps to the same
     # pseudonym.
     again = sanitize_graph(graph, salt=b"fixed-salt").features[0].payload
     assert again == payload
+
+
+def test_alert_recipient_lists_stay_valid_emails() -> None:
+    """Pseudonymized recipients must pass Meraki's email validation."""
+    graph = NetworkGraph(
+        "org-123", (), (),
+        (
+            FeatureConfiguration(
+                "/networks/{networkId}/alerts/settings",
+                ("N_1",),
+                {"defaultDestinations": {"emails": ["noc@corp.example"]}},
+            ),
+        ),
+    )
+    payload = sanitize_graph(graph).features[0].payload
+    (fake,) = payload["defaultDestinations"]["emails"]
+    assert re.fullmatch(r"user-[0-9a-f]{16}@drill\.invalid", fake)
+
+
+def test_keyword_path_selectors_survive_sanitization() -> None:
+    """Pure-alpha path selectors (firewalledServices/{service}) are API
+    keywords, not identity — pseudonymizing them 404s the restore."""
+    graph = NetworkGraph(
+        "org-123", (), (),
+        (
+            FeatureConfiguration(
+                "/networks/{networkId}/appliance/firewall/"
+                "firewalledServices/{service}",
+                ("N_1", "ICMP"),
+                {"service": "ICMP", "access": "unrestricted"},
+            ),
+            FeatureConfiguration(
+                "/networks/{networkId}/appliance/staticRoutes/{staticRouteId}",
+                ("N_1", "d5f9e"),  # letters-and-digits opaque ID: still mapped
+                {"id": "d5f9e"},
+            ),
+        ),
+    )
+    sanitized = sanitize_graph(graph)
+    assert sanitized.features[0].path_values == ("net-0001", "ICMP")
+    assert sanitized.features[0].payload["service"] == "ICMP"
+    assert sanitized.features[1].path_values[1].startswith("id-")
+
+
+def test_liquid_template_code_passes_through_verbatim() -> None:
+    """Webhook payload templates are Liquid code; rewriting a dotted
+    variable path renders the template unrestorable ('undefined
+    variable host-…')."""
+    body = (
+        '{"text": "Alert from {{alertData.service.name}} at '
+        'sensor.corp.example {% if alertLevel %}({{alertLevel}}){% endif %}"}'
+    )
+    graph = NetworkGraph(
+        "org-123", (), (),
+        (
+            FeatureConfiguration(
+                "/networks/{networkId}/webhooks/payloadTemplates"
+                "/{payloadTemplateId}",
+                ("N_1", "wpt_1"),
+                {"body": body},
+            ),
+        ),
+    )
+    payload = sanitize_graph(graph).features[0].payload
+    assert "{{alertData.service.name}}" in payload["body"]
+    assert "{% if alertLevel %}" in payload["body"]
+    # Literal text between tags still gets the identity rewrites.
+    assert "sensor.corp.example" not in payload["body"]
+
+
+def test_fake_ips_keep_subnet_membership() -> None:
+    """A VLAN subnet, its appliance IP, and a static route's next hop
+    share a real /24, so their fakes must stay mutually coherent or the
+    sanitized snapshot fails restore drills."""
+    graph = NetworkGraph(
+        "org-123", (), (),
+        (
+            FeatureConfiguration(
+                "/networks/{networkId}/appliance/vlans/{vlanId}",
+                ("N_1", "10"),
+                {"subnet": "192.168.128.0/24", "applianceIp": "192.168.128.1"},
+            ),
+            FeatureConfiguration(
+                "/networks/{networkId}/appliance/staticRoutes/{staticRouteId}",
+                ("N_1", "route1"),
+                {"gatewayIp": "192.168.128.254", "subnet": "10.99.0.0/24"},
+            ),
+        ),
+    )
+    sanitized = sanitize_graph(graph)
+    vlan = sanitized.features[0].payload
+    route = sanitized.features[1].payload
+    network = ipaddress.ip_network(vlan["subnet"])
+    assert ipaddress.ip_address(vlan["applianceIp"]) in network
+    assert ipaddress.ip_address(route["gatewayIp"]) in network
+    assert "192.168.128" not in str(vlan) and "192.168.128" not in str(route)
