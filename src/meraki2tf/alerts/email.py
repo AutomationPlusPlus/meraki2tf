@@ -29,6 +29,12 @@ class EmailNotifier(Notifier):
 
     ``smtp_factory`` is injectable so tests (and future TLS/relay
     variants) can substitute the transport without touching sockets.
+
+    Partial recipient refusals (``smtplib`` raises only when *every*
+    recipient is refused) still count as delivered — at least one
+    recipient got the alert — but the refused addresses are logged at
+    ERROR so a silently dropped on-call recipient is visible in the
+    run log.
     """
 
     channel = "email"
@@ -60,7 +66,16 @@ class EmailNotifier(Notifier):
     def send(self, event: AlertEvent) -> None:
         message = self.build_message(event)
         with self._smtp_factory(self._host, self._port, self._timeout) as smtp:
-            smtp.send_message(message)
+            refused = smtp.send_message(message)
+        if refused:
+            logger.error(
+                "SMTP relay refused %d of %d recipient(s) for event %s: %s "
+                "— the alert did NOT reach them.",
+                len(refused),
+                len(self._recipients),
+                event.event_type.value,
+                ", ".join(sorted(refused)),
+            )
         logger.debug(
             "Email dispatched for event %s to %d recipient(s).",
             event.event_type.value,

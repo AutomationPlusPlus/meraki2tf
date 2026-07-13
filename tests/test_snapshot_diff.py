@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 from meraki2tf.models import (
     UNREADABLE_MARKER,
     FeatureConfiguration,
@@ -9,9 +11,12 @@ from meraki2tf.models import (
     MerakiNetwork,
     NetworkGraph,
 )
+from meraki2tf.snapshot import write_snapshot
 from meraki2tf.snapshot_diff import (
     AssetDiff,
+    SanitizedBaselineError,
     _suppress_rollouts,
+    baseline_drift,
     diff_graphs,
     render_diff,
 )
@@ -303,3 +308,27 @@ def test_render_diff_lists_added_and_removed_assets() -> None:
     current = _graph(_vlan("20", name="Voice"))
     text = render_diff(diff_graphs(previous, current))
     assert "+ " in text and "- " in text
+
+
+def test_baseline_drift_refuses_sanitized_baselines(tmp_path: Path) -> None:
+    """A sanitized snapshot's identifiers are pseudonyms; diffing them
+    against the real org would report the whole org as added+removed —
+    an alert storm, never meaningful drift. Refuse outright."""
+    graph = _graph(_vlan("10", name="Data"))
+    baseline = tmp_path / "baseline.json"
+    write_snapshot(graph, baseline, sanitized=True)
+    with pytest.raises(SanitizedBaselineError, match="'sanitized' marker"):
+        baseline_drift(graph, baseline, parser=None)
+
+
+def test_baseline_drift_diffs_against_unsanitized_baselines(
+    tmp_path: Path,
+) -> None:
+    previous = _graph(_vlan("10", name="Data"))
+    baseline = tmp_path / "baseline.json"
+    write_snapshot(previous, baseline)
+    diff = baseline_drift(
+        _graph(_vlan("10", name="Data-renamed")), baseline, parser=None
+    )
+    (mod,) = diff.modified
+    assert mod.changed == {"name": ("Data", "Data-renamed")}

@@ -395,15 +395,23 @@ def test_restore_journal_round_trips_and_resumes(tmp_path: Path) -> None:
 class _RecordingSection:
     """SDK-section stand-in recording every dispatched write."""
 
-    def __init__(self, calls: list, fail_ops: set[str] | None = None) -> None:
+    def __init__(
+        self,
+        calls: list,
+        fail_ops: set[str] | None = None,
+        responses: dict[str, dict] | None = None,
+    ) -> None:
         self._calls = calls
         self._fail = fail_ops or set()
+        self._responses = responses or {}
 
     def __getattr__(self, operation_id: str):  # noqa: ANN204
         def _dispatch(*args: object, **kwargs: object) -> dict:
             self._calls.append((operation_id, args, kwargs))
             if operation_id in self._fail:
                 raise RuntimeError("simulated API failure")
+            if operation_id in self._responses:
+                return self._responses[operation_id]
             if operation_id == "createOrganizationNetwork":
                 return {"id": "L_NEW"}
             if operation_id == "createNetworkGroupPolicy":
@@ -413,7 +421,11 @@ class _RecordingSection:
         return _dispatch
 
 
-def _executor(tmp_path: Path, fail_ops: set[str] | None = None):
+def _executor(
+    tmp_path: Path,
+    fail_ops: set[str] | None = None,
+    responses: dict[str, dict] | None = None,
+):
     from meraki2tf.restorer import OrgRestorer, RestoreJournal
 
     calls: list = []
@@ -422,7 +434,7 @@ def _executor(tmp_path: Path, fail_ops: set[str] | None = None):
         RestoreJournal(tmp_path / "journal.jsonl"),
         serial_map={"Q2AB-CDEF-GHIJ": "Q9ZZ-NEWW-HWSN"},
     )
-    section = _RecordingSection(calls, fail_ops)
+    section = _RecordingSection(calls, fail_ops, responses)
     restorer._client = __import__("types").SimpleNamespace(
         organizations=section, networks=section, wireless=section,
         switch=section, appliance=section,
@@ -576,6 +588,21 @@ def test_resolver_edge_cases() -> None:
     resolver.record("configtemplate", "T_1", "T_NEW", ())
     assert resolver.resolve_scope("networkId", "T_1", ("T_1",)) == "T_NEW"
     assert resolver.resolve_scope("networkId", "N_x", ("N_x",)) == "N_x"
+
+    # A declared-but-unmapped create identity must never pass through a
+    # scope lookup — the snapshot ID would address the source tenant's
+    # (possibly production) object. Both the typed and the flat lookup
+    # fail loudly; blank identities are ignored.
+    resolver.expect_remap("floorplan", "g_9")
+    resolver.expect_remap("", "")
+    with _pytest.raises(UnmappedReferenceError, match="no rebuilt"):
+        resolver.resolve_scope("floorPlanId", "g_9", ("N_1", "g_9"))
+    with _pytest.raises(UnmappedReferenceError, match="no rebuilt"):
+        resolver.resolve_scope("networkId", "g_9", ("g_9",))
+    # A fixed slot of the addressed type keeps its identity even when
+    # a created object of another type collides on the bare value.
+    resolver.expect_remap("grouppolicy", "100")
+    assert resolver.resolve_scope("vlanId", "100", ("N_2", "100")) == "100"
 
 
 def test_own_identity_covers_all_action_kinds(tmp_path: Path) -> None:
@@ -973,6 +1000,373 @@ def test_drill_mode_skips_objects_referencing_production_serials(
     assert all(c[0] != "updateNetworkSnmp" for c in calls)
     assert any(
         "production hardware serial" in e["reason"] for e in result.skipped
+    )
+
+
+# ------------------------------------ cross-scope and claim regressions
+
+
+PO_COLLECTION = "/organizations/{organizationId}/policyObjects"
+PO_ITEM = "/organizations/{organizationId}/policyObjects/{policyObjectId}"
+L3_RULES = "/networks/{networkId}/appliance/firewall/l3FirewallRules"
+CT_COLLECTION = "/organizations/{organizationId}/configTemplates"
+CT_ITEM = (
+    "/organizations/{organizationId}/configTemplates/{configTemplateId}"
+)
+FP_COLLECTION = "/networks/{networkId}/floorPlans"
+FP_ITEM = "/networks/{networkId}/floorPlans/{floorPlanId}"
+STACK_COLLECTION = "/networks/{networkId}/switch/stacks"
+STACK_ITEM = "/networks/{networkId}/switch/stacks/{switchStackId}"
+STACK_IF_COLLECTION = (
+    "/networks/{networkId}/switch/stacks/{switchStackId}/routing/interfaces"
+)
+STACK_IF_ITEM = STACK_IF_COLLECTION + "/{interfaceId}"
+
+
+def _cross_scope_spec(tmp_path: Path) -> OpenApiParser:
+    """Spec slice where org-scoped creates are referenced from network
+    scope and hardware-adjacent objects hang off networks/devices."""
+    spec = {
+        "openapi": "3.0.0",
+        "info": {"title": "cross", "version": "1"},
+        "paths": {
+            "/organizations/{organizationId}/networks": {
+                "get": _op("getOrganizationNetworks", "organizations"),
+                "post": _op("createOrganizationNetwork", "organizations"),
+            },
+            "/networks/{networkId}/devices/claim": {
+                "post": _op("claimNetworkDevices", "networks"),
+            },
+            PO_COLLECTION: {
+                "get": _op("getOrganizationPolicyObjects", "organizations"),
+                "post": _op(
+                    "createOrganizationPolicyObject", "organizations"
+                ),
+            },
+            PO_ITEM: {
+                "get": _op("getOrganizationPolicyObject", "organizations"),
+                "put": _op("updateOrganizationPolicyObject", "organizations"),
+            },
+            CT_COLLECTION: {
+                "get": _op("getOrganizationConfigTemplates", "organizations"),
+                "post": _op(
+                    "createOrganizationConfigTemplate", "organizations"
+                ),
+            },
+            CT_ITEM: {
+                "get": _op("getOrganizationConfigTemplate", "organizations"),
+                "put": _op(
+                    "updateOrganizationConfigTemplate", "organizations"
+                ),
+            },
+            L3_RULES: {
+                "get": _op("getNetworkApplianceFirewallL3Rules", "appliance"),
+                "put": _op(
+                    "updateNetworkApplianceFirewallL3Rules", "appliance"
+                ),
+            },
+            SNMP_PATH: {
+                "get": _op("getNetworkSnmp", "networks"),
+                "put": _op("updateNetworkSnmp", "networks"),
+            },
+            FP_COLLECTION: {
+                "get": _op("getNetworkFloorPlans", "networks"),
+                "post": _op("createNetworkFloorPlan", "networks"),
+            },
+            FP_ITEM: {
+                "get": _op("getNetworkFloorPlan", "networks"),
+                "put": _op("updateNetworkFloorPlan", "networks"),
+            },
+            PORT_ITEM: {
+                "get": _op("getDeviceSwitchPort", "switch"),
+                "put": _op("updateDeviceSwitchPort", "switch"),
+            },
+            STACK_COLLECTION: {
+                "get": _op("getNetworkSwitchStacks", "switch"),
+                "post": _op("createNetworkSwitchStack", "switch"),
+            },
+            STACK_ITEM: {
+                "get": _op("getNetworkSwitchStack", "switch"),
+            },
+            STACK_IF_COLLECTION: {
+                "get": _op("getStackRoutingInterfaces", "switch"),
+                "post": _op("createStackRoutingInterface", "switch"),
+            },
+            STACK_IF_ITEM: {
+                "get": _op("getStackRoutingInterface", "switch"),
+                "put": _op("updateStackRoutingInterface", "switch"),
+            },
+        },
+    }
+    path = tmp_path / "cross-spec.json"
+    path.write_text(json.dumps(spec), encoding="utf-8")
+    return OpenApiParser(path)
+
+
+def _template_graph() -> NetworkGraph:
+    """A template-bound network plus a template-held feature (swept
+    with the template ID as its ``{networkId}`` scope value)."""
+    return NetworkGraph(
+        organization_id="org-123",
+        networks=(
+            MerakiNetwork.from_payload(
+                {"id": "N_1", "organizationId": "org-123", "name": "HQ",
+                 "productTypes": ["appliance"], "timeZone": "UTC",
+                 "configTemplateId": "T_1"}
+            ),
+        ),
+        devices=(),
+        features=(
+            FeatureConfiguration(
+                CT_ITEM, ("org-123", "T_1"),
+                {"id": "T_1", "name": "Branch Template",
+                 "productTypes": ["appliance"]},
+            ),
+            FeatureConfiguration(
+                SNMP_PATH, ("T_1",), {"access": "community"}
+            ),
+        ),
+    )
+
+
+def test_org_scoped_creates_resolve_from_network_scope(
+    tmp_path: Path,
+) -> None:
+    """Policy objects are org-scoped; the GRP()/OBJ() grammar inside a
+    network's firewall rules must resolve to the NEW id once the object
+    is created (regression: the mapping context carried the source org
+    ID, which no network-scoped referrer's path values ever contain)."""
+    parser = _cross_scope_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(
+            PO_ITEM, ("org-123", "42"),
+            {"id": "42", "name": "web", "cidr": "203.0.113.0/24"},
+        ),
+        FeatureConfiguration(
+            L3_RULES, ("N_1",),
+            {"rules": [{"policy": "deny", "srcCidr": "OBJ(42)"}]},
+        ),
+    )
+    plan = plan_restore(graph, parser)
+    restorer, calls = _executor(
+        tmp_path,
+        responses={"createOrganizationPolicyObject": {"id": "9042"}},
+    )
+    result = restorer.execute(graph, plan)
+
+    assert result.failed == ()
+    rules = next(
+        c for c in calls
+        if c[0] == "updateNetworkApplianceFirewallL3Rules"
+    )
+    assert rules[1] == ("L_NEW",)
+    assert rules[2]["rules"][0]["srcCidr"] == "OBJ(9042)"
+
+
+def test_template_references_and_features_use_the_rebuilt_template(
+    tmp_path: Path,
+) -> None:
+    """A bound network's ``configTemplateId`` and template-held features
+    (addressed with the template ID as their ``{networkId}`` scope)
+    must both follow the template's NEW server-assigned id."""
+    parser = _cross_scope_spec(tmp_path)
+    graph = _template_graph()
+    plan = plan_restore(graph, parser)
+    restorer, calls = _executor(
+        tmp_path,
+        responses={"createOrganizationConfigTemplate": {"id": "T_NEW"}},
+    )
+    result = restorer.execute(graph, plan)
+
+    assert result.failed == ()
+    network = next(c for c in calls if c[0] == "createOrganizationNetwork")
+    assert network[2]["configTemplateId"] == "T_NEW"
+    snmp = next(c for c in calls if c[0] == "updateNetworkSnmp")
+    assert snmp[1] == ("T_NEW",)  # never the snapshot's template ID
+
+
+def test_template_features_fail_loudly_when_the_template_is_dead(
+    tmp_path: Path,
+) -> None:
+    """When the template create fails, nothing may dispatch at the OLD
+    template ID — against a still-live source org that ID addresses the
+    production template. Loud failures, never silent passthrough."""
+    parser = _cross_scope_spec(tmp_path)
+    graph = _template_graph()
+    plan = plan_restore(graph, parser)
+    restorer, calls = _executor(
+        tmp_path, fail_ops={"createOrganizationConfigTemplate"}
+    )
+    result = restorer.execute(graph, plan)
+
+    assert all(c[0] != "updateNetworkSnmp" for c in calls)
+    assert all("T_1" not in c[1] for c in calls)
+    reasons = dict(result.failed)
+    assert "no rebuilt counterpart" in reasons[f"{SNMP_PATH}::T_1"]
+    assert "no rebuilt counterpart" in reasons[
+        "/organizations/{organizationId}/networks::N_1"
+    ]
+
+
+def test_claims_ignore_placement_references_in_the_device_payload(
+    tmp_path: Path,
+) -> None:
+    """The claim body is only the serial; a ``floorPlanId`` in the
+    device payload — whose floor plan even failed to restore — must not
+    defer or fail the claim (regression: the payload was rewritten and
+    then discarded)."""
+    parser = _cross_scope_spec(tmp_path)
+    graph = NetworkGraph(
+        organization_id="org-123",
+        networks=(
+            MerakiNetwork.from_payload(
+                {"id": "N_1", "organizationId": "org-123", "name": "HQ",
+                 "productTypes": ["switch"], "timeZone": "UTC"}
+            ),
+        ),
+        devices=(
+            MerakiDevice.from_payload(
+                {"serial": "Q2AB-CDEF-GHIJ", "networkId": "N_1",
+                 "model": "MS120", "name": "sw1", "floorPlanId": "g_555"}
+            ),
+        ),
+        features=(
+            FeatureConfiguration(
+                FP_ITEM, ("N_1", "g_555"),
+                {"floorPlanId": "g_555", "name": "Floor 1"},
+            ),
+            FeatureConfiguration(
+                PORT_ITEM, ("Q2AB-CDEF-GHIJ", "1"),
+                {"portId": "1", "name": "uplink"},
+            ),
+        ),
+    )
+    plan = plan_restore(graph, parser)
+    restorer, calls = _executor(
+        tmp_path, fail_ops={"createNetworkFloorPlan"}
+    )
+    result = restorer.execute(graph, plan)
+
+    claim = next(c for c in calls if c[0] == "claimNetworkDevices")
+    assert claim[1] == ("L_NEW",)
+    assert claim[2] == {"serials": ["Q9ZZ-NEWW-HWSN"]}
+    # Only the floor plan failed; the claim and the port both landed.
+    assert [key for key, _ in result.failed] == [f"{FP_ITEM}::N_1,g_555"]
+    assert any(c[0] == "updateDeviceSwitchPort" for c in calls)
+
+
+def test_device_features_gate_on_a_failed_claim(tmp_path: Path) -> None:
+    """A failed claim leaves the hardware wherever it is currently
+    claimed (possibly the production org): serial-addressed writes must
+    be skipped and reported, never dispatched."""
+    parser = _cross_scope_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(
+            PORT_ITEM, ("Q2AB-CDEF-GHIJ", "1"),
+            {"portId": "1", "name": "uplink"},
+        ),
+    )
+    plan = plan_restore(graph, parser)
+    restorer, calls = _executor(tmp_path, fail_ops={"claimNetworkDevices"})
+    result = restorer.execute(graph, plan)
+
+    assert all(c[0] != "updateDeviceSwitchPort" for c in calls)
+    assert [key for key, _ in result.failed] == [
+        "/networks/{networkId}/devices/claim::N_1,Q2AB-CDEF-GHIJ"
+    ]
+    assert any(
+        "parent object Q2AB-CDEF-GHIJ failed" in e["reason"]
+        for e in result.skipped
+    )
+
+
+def test_device_features_wait_for_a_deferred_claim(tmp_path: Path) -> None:
+    """A claim that cannot dispatch yet (its network defers a round)
+    holds the device's serial-addressed features back with it, instead
+    of letting them fire at unclaimed (or production-claimed)
+    hardware."""
+    parser = _cross_scope_spec(tmp_path)
+    graph = NetworkGraph(
+        organization_id="org-123",
+        networks=(
+            MerakiNetwork.from_payload(
+                {"id": "N_1", "organizationId": "org-123", "name": "HQ",
+                 "productTypes": ["switch"], "timeZone": "UTC",
+                 # N_1 sorts before its referent, so it defers a round.
+                 "copyFromNetworkId": "N_2"}
+            ),
+            MerakiNetwork.from_payload(
+                {"id": "N_2", "organizationId": "org-123", "name": "Lab",
+                 "productTypes": ["switch"], "timeZone": "UTC"}
+            ),
+        ),
+        devices=(
+            MerakiDevice.from_payload(
+                {"serial": "Q2AB-CDEF-GHIJ", "networkId": "N_1",
+                 "model": "MS120", "name": "sw1"}
+            ),
+        ),
+        features=(
+            FeatureConfiguration(
+                PORT_ITEM, ("Q2AB-CDEF-GHIJ", "1"),
+                {"portId": "1", "name": "uplink"},
+            ),
+        ),
+    )
+    plan = plan_restore(graph, parser)
+    restorer, calls = _executor(tmp_path)
+    result = restorer.execute(graph, plan)
+
+    assert result.failed == ()
+    ops = [c[0] for c in calls]
+    assert ops.count("createOrganizationNetwork") == 2
+    # Without the wait, the port fires in round 1 — before the claim.
+    assert ops.index("claimNetworkDevices") < ops.index(
+        "updateDeviceSwitchPort"
+    )
+
+
+def test_drill_children_of_skipped_parents_are_drill_verdicts(
+    tmp_path: Path,
+) -> None:
+    """A drill-skipped switch stack takes its nested children with it:
+    drill verdicts, never failures fired at the old stack ID."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    parser = _cross_scope_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(
+            STACK_ITEM, ("N_1", "stack_1"),
+            {"id": "stack_1", "name": "core",
+             "serials": ["Q2AB-CDEF-GHIJ"]},
+        ),
+        FeatureConfiguration(
+            STACK_IF_ITEM, ("N_1", "stack_1", "if_9"),
+            {"interfaceId": "if_9", "name": "vlan10", "vlanId": 10},
+        ),
+    )
+    plan = plan_restore(graph, parser)
+    calls: list = []
+    section = _RecordingSection(calls)
+    restorer = OrgRestorer(
+        "org-TARGET",
+        RestoreJournal(tmp_path / "drill3.jsonl"),
+        skip_claims=True,
+    )
+    restorer._client = SimpleNamespace(
+        organizations=section, networks=section, switch=section
+    )
+    result = restorer.execute(graph, plan)
+
+    assert result.failed == ()
+    ops = [c[0] for c in calls]
+    assert "createNetworkSwitchStack" not in ops
+    assert "createStackRoutingInterface" not in ops
+    assert any(
+        "parent object stack_1 was skipped" in e["reason"]
+        for e in result.skipped
     )
 
 

@@ -1163,6 +1163,16 @@ class TerraformRunner:
         self._restrict_state_permissions()
         return result
 
+    def discard_saved_plan(self) -> None:
+        """Delete the saved sync plan file, if one is lingering.
+
+        The saved plan document embeds refreshed sensitive values
+        exactly like the state file; only the snapshot and the state may
+        hold secrets at rest, so a plan that will no longer be applied
+        must not outlive its run.
+        """
+        (self._workdir / SYNC_PLAN_FILENAME).unlink(missing_ok=True)
+
     def _restrict_plan_file_permissions(self) -> None:
         """Owner-only (0600) permissions on the saved plan file.
 
@@ -1280,7 +1290,12 @@ def _document_malformed_entry_count(document: Any) -> int:
 
 
 def _document_resource_actions(document: Any) -> dict[str, tuple[str, ...]]:
-    """Per-resource action tuples from a shown plan document."""
+    """Per-resource action tuples from a shown plan document.
+
+    One address can carry several entries — a deposed object rides
+    alongside the current one — so actions are accumulated, never
+    overwritten: a deposed ``delete`` must not be shadowed by the
+    current object's ``no-op`` inside the apply guard."""
     actions: dict[str, tuple[str, ...]] = {}
     changes = document.get("resource_changes") if isinstance(document, dict) else None
     for change in changes or ():
@@ -1288,7 +1303,10 @@ def _document_resource_actions(document: Any) -> dict[str, tuple[str, ...]]:
             continue
         change_body = change.get("change")
         raw = change_body.get("actions", ()) if isinstance(change_body, dict) else ()
-        actions[str(change["address"])] = tuple(str(action) for action in raw)
+        address = str(change["address"])
+        actions[address] = actions.get(address, ()) + tuple(
+            str(action) for action in raw
+        )
     return actions
 
 

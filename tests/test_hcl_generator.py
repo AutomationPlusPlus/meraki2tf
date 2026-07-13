@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from meraki2tf.alerts import AlertDispatcher, AlertEvent, EventType, Notifier
-from meraki2tf.hcl_generator import HclImportGenerator
+from meraki2tf.hcl_generator import ADDRESS_LEDGER_FILENAME, HclImportGenerator
 from meraki2tf.models import (
     UNREADABLE_MARKER,
     FeatureConfiguration,
@@ -331,6 +331,176 @@ def test_collision_suffixes_ignore_discovery_order(
         tmp_path,
     ).imports_file.read_text(encoding="utf-8")
     assert ordered == reordered
+
+
+def _ledger(tmp_path: Path) -> dict:  # type: ignore[type-arg]
+    return json.loads(
+        (tmp_path / ADDRESS_LEDGER_FILENAME).read_text(encoding="utf-8")
+    )["addresses"]
+
+
+def test_new_colliding_id_never_steals_a_state_tracked_address(
+    generator: HclImportGenerator, tmp_path: Path
+) -> None:
+    """An asset's identity is its import ID, not its ordinal position
+    among colliding labels: a new colliding ID appearing between runs
+    must not shift state-tracked addresses (address churn on a tracked
+    resource proposes destroys), must not be faked as already_in_state
+    (coverage may never claim an unimported asset is imported), and
+    must not re-import an already-tracked object at a second address."""
+    first = generator.generate(
+        _graph(networks=(_network("N-1"), _network("N.1")), devices=(), features=()),
+        tmp_path,
+    )
+    assert _ledger(tmp_path) == {
+        "meraki_network.n_1": "org-123,N-1",
+        "meraki_network.n_1_2": "org-123,N.1",
+    }
+
+    # "N,1" sorts before both existing IDs — pre-ledger ordinal
+    # assignment would hand it the state-tracked n_1 address.
+    second = generator.generate(
+        _graph(
+            networks=(_network("N-1"), _network("N.1"), _network("N,1")),
+            devices=(),
+            features=(),
+        ),
+        tmp_path,
+        existing_addresses=first.captured_addresses,
+    )
+    by_id = {asset.import_id: asset for asset in second.captured}
+    assert by_id["org-123,N-1"].address == "meraki_network.n_1"
+    assert by_id["org-123,N-1"].already_in_state is True
+    assert by_id["org-123,N.1"].address == "meraki_network.n_1_2"
+    assert by_id["org-123,N.1"].already_in_state is True
+    assert by_id["org-123,N,1"].address == "meraki_network.n_1_3"
+    assert by_id["org-123,N,1"].already_in_state is False
+    content = second.imports_file.read_text(encoding="utf-8")
+    assert second.imports_written == 1
+    assert "to = meraki_network.n_1_3\n" in content
+    assert 'id = "org-123,N,1"' in content
+
+
+def test_deleted_asset_slot_stays_reserved_while_state_tracks_it(
+    generator: HclImportGenerator, tmp_path: Path
+) -> None:
+    """A colliding newcomer must not inherit a deleted object's address
+    while its state entry awaits deletion review — the dead address must
+    stay absent from captured so the deletion alert still fires."""
+    first = generator.generate(
+        _graph(networks=(_network("N-1"), _network("N.1")), devices=(), features=()),
+        tmp_path,
+    )
+    # "N-1" left Meraki (state still tracks it); "N,1" is new.
+    second = generator.generate(
+        _graph(networks=(_network("N.1"), _network("N,1")), devices=(), features=()),
+        tmp_path,
+        existing_addresses=first.captured_addresses,
+    )
+    by_id = {asset.import_id: asset for asset in second.captured}
+    assert by_id["org-123,N.1"].address == "meraki_network.n_1_2"
+    assert by_id["org-123,N,1"].address == "meraki_network.n_1_3"
+    assert by_id["org-123,N,1"].already_in_state is False
+    assert "meraki_network.n_1" not in second.captured_addresses
+    # The dead slot stays reserved in the ledger while state has it.
+    assert _ledger(tmp_path)["meraki_network.n_1"] == "org-123,N-1"
+
+
+def test_ledger_prunes_addresses_confirmed_out_of_state(
+    generator: HclImportGenerator, tmp_path: Path
+) -> None:
+    """Once a deletion is confirmed out of state, its ledger entry goes
+    too — the ledger never grows beyond the state it protects."""
+    generator.generate(
+        _graph(networks=(_network("N-1"), _network("N.1")), devices=(), features=()),
+        tmp_path,
+    )
+    generator.generate(
+        _graph(networks=(_network("N.1"),), devices=(), features=()),
+        tmp_path,
+        existing_addresses=frozenset({"meraki_network.n_1_2"}),
+    )
+    assert _ledger(tmp_path) == {"meraki_network.n_1_2": "org-123,N.1"}
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["{not json", json.dumps(["not", "an", "object"]), json.dumps({"addresses": 7})],
+)
+def test_unreadable_ledger_degrades_to_ordinal_assignment(
+    generator: HclImportGenerator, tmp_path: Path, content: str
+) -> None:
+    """A corrupt sidecar ledger must never fail the DR run — collision
+    handling degrades to the deterministic ordinal behavior."""
+    (tmp_path / ADDRESS_LEDGER_FILENAME).write_text(content, encoding="utf-8")
+    report = generator.generate(
+        _graph(networks=(_network("N-1"), _network("N.1")), devices=(), features=()),
+        tmp_path,
+    )
+    assert {asset.address for asset in report.captured} == {
+        "meraki_network.n_1",
+        "meraki_network.n_1_2",
+    }
+    # The rewritten ledger is healthy again.
+    assert _ledger(tmp_path) == {
+        "meraki_network.n_1": "org-123,N-1",
+        "meraki_network.n_1_2": "org-123,N.1",
+    }
+
+
+def test_ledger_entries_without_string_ids_are_ignored(
+    generator: HclImportGenerator, tmp_path: Path
+) -> None:
+    (tmp_path / ADDRESS_LEDGER_FILENAME).write_text(
+        json.dumps(
+            {
+                "addresses": {
+                    "meraki_network.n_1": 7,
+                    "meraki_network.n_1_2": "org-123,N.1",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    report = generator.generate(
+        _graph(networks=(_network("N-1"), _network("N.1")), devices=(), features=()),
+        tmp_path,
+    )
+    by_id = {asset.import_id: asset for asset in report.captured}
+    # The malformed pin is dropped; the healthy one still holds.
+    assert by_id["org-123,N.1"].address == "meraki_network.n_1_2"
+    assert by_id["org-123,N-1"].address == "meraki_network.n_1"
+
+
+def test_stale_ledger_pin_with_changed_label_is_ignored(
+    generator: HclImportGenerator, tmp_path: Path
+) -> None:
+    """A pin from a renamed resource type (or changed label derivation)
+    must not resurrect the old address for a fresh asset."""
+    (tmp_path / ADDRESS_LEDGER_FILENAME).write_text(
+        json.dumps({"addresses": {"meraki_legacy_network.n_1": "org-123,N-1"}}),
+        encoding="utf-8",
+    )
+    report = generator.generate(
+        _graph(networks=(_network("N-1"),), devices=(), features=()), tmp_path
+    )
+    (asset,) = report.captured
+    assert asset.address == "meraki_network.n_1"
+
+
+def test_pinned_duplicate_assets_are_written_once(
+    generator: HclImportGenerator, tmp_path: Path
+) -> None:
+    """Identity-pinned resolution must still dedupe identical assets."""
+    generator.generate(
+        _graph(networks=(_network("N-1"),), devices=(), features=()), tmp_path
+    )
+    report = generator.generate(
+        _graph(networks=(_network("N-1"), _network("N-1")), devices=(), features=()),
+        tmp_path,
+    )
+    assert report.imports_written == 1
+    assert [asset.address for asset in report.captured] == ["meraki_network.n_1"]
 
 
 def test_empty_graph_writes_header_only_file(

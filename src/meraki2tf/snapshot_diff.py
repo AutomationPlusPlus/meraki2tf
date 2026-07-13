@@ -55,6 +55,17 @@ _ELEMENT_IDENTITY_KEYS = ("id", "serial", "number", "name")
 _ROLLOUT_MIN_ASSETS = 10
 
 
+class SanitizedBaselineError(ValueError):
+    """The drift baseline is a sanitized snapshot.
+
+    A sanitized snapshot's org/network IDs and serials are pseudonyms
+    (``net-0001``, ``dev-0042``), so every asset key would mismatch the
+    real organization and the whole org would falsely register as
+    added+removed — a drift-alert storm that buries real drift. Drift
+    baselines must be the unsanitized snapshot.
+    """
+
+
 @dataclass(frozen=True)
 class AssetDiff:
     """One modified asset with its attribute-level changes."""
@@ -142,12 +153,24 @@ def baseline_drift(
     baseline_path: Any,
     parser: OpenApiParser | None,
 ) -> SnapshotDiff:
-    """Diff a freshly discovered graph against a stored baseline snapshot."""
+    """Diff a freshly discovered graph against a stored baseline snapshot.
+
+    Refuses a sanitized baseline outright
+    (:class:`SanitizedBaselineError`): diffing pseudonyms against real
+    identifiers is never meaningful.
+    """
     from meraki2tf.providers.dump import StaticJsonDataProvider
 
-    baseline = StaticJsonDataProvider(
-        baseline_path, parser=parser
-    ).fetch_network_graph(graph.organization_id)
+    provider = StaticJsonDataProvider(baseline_path, parser=parser)
+    if provider.snapshot_sanitized:
+        raise SanitizedBaselineError(
+            f"Drift baseline {baseline_path} is a sanitized snapshot (it "
+            "carries the 'sanitized' marker): its identifiers are "
+            "pseudonyms, so every asset would falsely register as "
+            "added/removed. Point --drift-baseline at the unsanitized "
+            "snapshot."
+        )
+    baseline = provider.fetch_network_graph(graph.organization_id)
     return diff_graphs(baseline, graph, parser)
 
 

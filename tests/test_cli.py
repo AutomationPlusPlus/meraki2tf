@@ -688,6 +688,24 @@ def test_rebuild_apply_failure_exits_one(
     assert main(["--rebuild", "--confirm", "--workdir", str(workdir)]) == 1
 
 
+def test_rebuild_legacy_state_filename_is_a_clean_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A workspace-relative terraform.tfstate is refused with a clean
+    diagnostic, not an unhandled traceback."""
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    workdir = _rebuild_workspace(tmp_path)
+    exit_code = main(
+        ["--rebuild", "--workdir", str(workdir),
+         "--state-file", str(workdir / "terraform.tfstate")]
+    )
+    console = capsys.readouterr().err
+    assert exit_code == 1
+    assert "terraform.tfstate" in console
+
+
 # ---------------------------------------------------------------------------
 # Mode gating: --sync, --confirm-deletions, --fail-on-gaps
 # ---------------------------------------------------------------------------
@@ -1048,7 +1066,7 @@ def _install_fake_meraki_module(
     import sys
     import types
 
-    recorded: dict[str, Any] = {"ssid": [], "networks": 0}
+    recorded: dict[str, Any] = {"ssid": [], "admin": [], "networks": 0}
 
     class Wireless:
         @staticmethod
@@ -1062,9 +1080,16 @@ def _install_fake_meraki_module(
         recorded["networks"] += 1
         return [{"id": "N_1", "name": "HQ"}]
 
+    def update_admin(**kwargs: Any) -> dict[str, Any]:
+        recorded["admin"].append(kwargs)
+        return kwargs
+
     dashboard = SimpleNamespace(
         wireless=Wireless(),
-        organizations=SimpleNamespace(getOrganizationNetworks=get_networks),
+        organizations=SimpleNamespace(
+            getOrganizationNetworks=get_networks,
+            updateOrganizationAdmin=update_admin,
+        ),
     )
     stub = types.ModuleType("meraki")
     stub.DashboardAPI = lambda **kwargs: dashboard
@@ -1102,6 +1127,55 @@ def test_confirm_requires_a_dr_action(
     with pytest.raises(SystemExit) as excinfo:
         main(["--spec", str(spec_file), "--confirm"])
     assert excinfo.value.code == 2
+
+
+def test_orphan_mode_scoped_flags_are_usage_errors(spec_file: Path) -> None:
+    """Mode-scoped flags outside their parent mode are refused, never
+    silently ignored — a no-op flag would let the operator believe an
+    effect happened when it did not."""
+    for extra in (
+        ["--target-org", "org-999"],
+        ["--serial-map", "serials.json"],
+        ["--wipe-org-name", "Drill Org"],
+    ):
+        with pytest.raises(SystemExit) as excinfo:
+            main(["--spec", str(spec_file), "--org-id", "org-123", *extra])
+        assert excinfo.value.code == 2
+
+
+def test_wipe_org_rejects_skip_claims(spec_file: Path) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            ["--spec", str(spec_file), "--wipe-org", "org-drill",
+             "--wipe-org-name", "Drill Org", "--skip-claims"]
+        )
+    assert excinfo.value.code == 2
+
+
+def test_drift_baseline_rejected_with_dr_actions(
+    spec_file: Path, dump_file: Path
+) -> None:
+    """--drift-baseline only means something to pipeline/export runs;
+    every DR action refuses it instead of silently skipping the diff."""
+    for action in (
+        ["--rebuild"],
+        ["--replay-gaps", "--from-dump", str(dump_file)],
+        ["--restore", "--from-dump", str(dump_file), "--target-org", "org-999"],
+        ["--wipe-org", "org-drill", "--wipe-org-name", "Drill Org"],
+    ):
+        with pytest.raises(SystemExit) as excinfo:
+            main(
+                ["--spec", str(spec_file), *action,
+                 "--drift-baseline", "last-week.jsonl"]
+            )
+        assert excinfo.value.code == 2
+
+
+def test_rebuild_rejects_rebaseline_and_sanitize(spec_file: Path) -> None:
+    for extra in (["--rebaseline"], ["--sanitize"]):
+        with pytest.raises(SystemExit) as excinfo:
+            main(["--spec", str(spec_file), "--rebuild", *extra])
+        assert excinfo.value.code == 2
 
 
 def test_replay_gaps_preview_writes_nothing(
@@ -1228,6 +1302,84 @@ def test_replay_gaps_fails_cleanly_on_unreadable_snapshot(
          "--replay-gaps"]
     )
     assert exit_code == 1
+
+
+def test_replay_gaps_org_id_remaps_org_scoped_writes_to_target(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--org-id names the rebuilt TARGET org; the remap must key on the
+    snapshot's recorded source org, so an org-scoped write lands in the
+    target — never back in the snapshot's own organization."""
+    from conftest import DUMP_DOCUMENT
+
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    recorded = _install_fake_meraki_module(monkeypatch)
+    document = json.loads(json.dumps(DUMP_DOCUMENT))
+    document["features"].append(
+        {
+            "apiPath": "/organizations/{organizationId}/admins/{adminId}",
+            "pathValues": ["org-123", "A_1"],
+            "payload": {
+                "id": "A_1",
+                "name": "Jordan Sample",
+                "email": "jdoe@corp.example",
+                "apiKey": "fixture-secret",
+            },
+        }
+    )
+    dump = tmp_path / "org-scoped-snapshot.json"
+    dump.write_text(json.dumps(document), encoding="utf-8")
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(dump),
+         "--org-id", "org-999", "--workdir", str(tmp_path / "ws"),
+         "--replay-gaps", "--confirm"]
+    )
+    assert exit_code == 0
+    (call,) = recorded["admin"]
+    assert call["organizationId"] == "org-999"  # target, not the source org
+    assert call["adminId"] == "A_1"
+
+
+def test_replay_gaps_warns_on_sanitized_snapshots(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _no_network(monkeypatch)
+    document = json.loads((_secret_dump(tmp_path)).read_text(encoding="utf-8"))
+    document["sanitized"] = True
+    dump = tmp_path / "sanitized-snapshot.json"
+    dump.write_text(json.dumps(document), encoding="utf-8")
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(dump),
+         "--workdir", str(tmp_path / "ws"), "--replay-gaps"]
+    )
+    console = capsys.readouterr().err
+    assert exit_code == 0
+    assert "SANITIZED" in console
+
+
+def test_replay_gaps_legacy_state_filename_is_a_clean_error(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A workspace-relative terraform.tfstate is refused with a clean
+    diagnostic, not an unhandled traceback."""
+    _no_network(monkeypatch)
+    dump = _secret_dump(tmp_path)
+    workdir = tmp_path / "ws"
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(dump),
+         "--workdir", str(workdir), "--replay-gaps",
+         "--state-file", str(workdir / "terraform.tfstate")]
+    )
+    console = capsys.readouterr().err
+    assert exit_code == 1
+    assert "terraform.tfstate" in console
 
 
 def test_runbook_is_part_of_every_kit(
@@ -1399,6 +1551,118 @@ def test_restore_refuses_the_source_organization(
     exit_code = main(
         ["--spec", str(spec_file), "--restore", "--from-dump", str(dump),
          "--target-org", "org-123"]
+    )
+    assert exit_code == 2
+
+
+def test_restore_refuses_any_recorded_source_org(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A nested multi-org export records several source organizations;
+    the interlock must refuse every one of them, not just the first."""
+    _no_network(monkeypatch)
+    dump = tmp_path / "multi-org.json"
+    dump.write_text(
+        json.dumps(
+            {
+                "organizations": [
+                    {"info": {"id": "org-123", "name": "One"}, "networks": []},
+                    {"info": {"id": "org-456", "name": "Two"}, "networks": []},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    exit_code = main(
+        ["--spec", str(spec_file), "--restore", "--from-dump", str(dump),
+         "--target-org", "org-456"]
+    )
+    assert exit_code == 2
+
+
+def test_restore_execution_fault_alerts_and_exits_1(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An exception escaping the restore executor (here: SDK client
+    construction) must alert and exit cleanly, never die as an
+    unhandled traceback — the journal preserves completed work."""
+    import sys as _sys
+    import types as _types
+
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+
+    def exploding_client(**kwargs: Any) -> None:
+        raise RuntimeError("sdk client construction failed")
+
+    stub = _types.ModuleType("meraki")
+    stub.DashboardAPI = exploding_client  # type: ignore[attr-defined]
+    monkeypatch.setitem(_sys.modules, "meraki", stub)
+    delivered: list[dict[str, Any]] = []
+
+    def fake_urlopen(request: Any, timeout: float) -> FakeResponse:
+        delivered.append(json.loads(request.data.decode("utf-8")))
+        return FakeResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    dump = _restore_dump(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--restore", "--from-dump", str(dump),
+         "--target-org", "org-999", "--workdir", str(tmp_path / "ws"),
+         "--confirm", "--webhook-url", "https://hooks.example/dr"]
+    )
+    assert exit_code == 1
+    (event,) = delivered
+    assert event["event_type"] == "PROCESSING_FAULT"
+    assert "--restore --confirm" in event["details"]["stage"]
+    assert "sdk client construction failed" in event["details"]["error"]
+
+
+def test_restore_unreadable_journal_exits_2(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A corrupted journal (malformed non-final line) refuses the
+    restore instead of silently re-creating completed objects."""
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    workdir = tmp_path / "ws"
+    workdir.mkdir()
+    (workdir / "restore-journal.jsonl").write_text(
+        'not-json\n{"kind": "done", "key": "x"}\n', encoding="utf-8"
+    )
+    dump = _restore_dump(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--restore", "--from-dump", str(dump),
+         "--target-org", "org-999", "--workdir", str(workdir), "--confirm"]
+    )
+    assert exit_code == 2
+
+
+def test_restore_journal_mismatch_exits_2(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A journal bound to a different restore refuses to be reused."""
+    import sys as _sys
+    import types as _types
+
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    stub = _types.ModuleType("meraki")
+    stub.DashboardAPI = (  # type: ignore[attr-defined]
+        lambda **kwargs: SimpleNamespace()
+    )
+    monkeypatch.setitem(_sys.modules, "meraki", stub)
+    workdir = tmp_path / "ws"
+    workdir.mkdir()
+    (workdir / "restore-journal.jsonl").write_text(
+        json.dumps({"kind": "meta", "target": "org-888", "source": "org-123"})
+        + "\n",
+        encoding="utf-8",
+    )
+    dump = _restore_dump(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--restore", "--from-dump", str(dump),
+         "--target-org", "org-999", "--workdir", str(workdir), "--confirm"]
     )
     assert exit_code == 2
 
@@ -1876,6 +2140,11 @@ def test_wipe_execution_recheck_refusal_exits_2(
             device_state["count"] += 1  # second call sees a claim
             return [] if count == 0 else [{"serial": "Q1"}]
 
+        def getOrganizationInventoryDevices(
+            self, organizationId: str, total_pages: str = "all"
+        ) -> list:
+            return []
+
         def getOrganizationNetworks(
             self, organizationId: str, total_pages: str = "all"
         ) -> list:
@@ -1935,3 +2204,60 @@ def test_wipe_confirm_reports_failures_nonzero(
          "--wipe-org-name", "Drill Org", "--confirm"]
     )
     assert exit_code == 1
+
+
+def test_wipe_execution_fault_alerts_and_exits_1(
+    spec_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transient API fault mid-teardown must alert and exit cleanly,
+    never die as an unhandled traceback."""
+    import sys as _sys
+    import types as _types
+
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    listings = {"count": 0}
+
+    class Organizations:
+        def getOrganization(self, organizationId: str) -> dict:
+            return {"id": organizationId, "name": "Drill Org"}
+
+        def getOrganizationDevices(
+            self, organizationId: str, total_pages: str = "all"
+        ) -> list:
+            return []
+
+        def getOrganizationInventoryDevices(
+            self, organizationId: str, total_pages: str = "all"
+        ) -> list:
+            return []
+
+        def getOrganizationNetworks(
+            self, organizationId: str, total_pages: str = "all"
+        ) -> list:
+            listings["count"] += 1
+            if listings["count"] > 2:  # both interlock previews passed
+                raise RuntimeError("api unreachable mid-wipe")
+            return [{"id": "L_1"}]
+
+    dashboard = SimpleNamespace(organizations=Organizations())
+    stub = _types.ModuleType("meraki")
+    stub.DashboardAPI = lambda **kwargs: dashboard  # type: ignore[attr-defined]
+    monkeypatch.setitem(_sys.modules, "meraki", stub)
+    delivered: list[dict[str, Any]] = []
+
+    def fake_urlopen(request: Any, timeout: float) -> FakeResponse:
+        delivered.append(json.loads(request.data.decode("utf-8")))
+        return FakeResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    exit_code = main(
+        ["--spec", str(spec_file), "--wipe-org", "org-drill",
+         "--wipe-org-name", "Drill Org", "--confirm",
+         "--webhook-url", "https://hooks.example/dr"]
+    )
+    assert exit_code == 1
+    (event,) = delivered
+    assert event["event_type"] == "PROCESSING_FAULT"
+    assert "--wipe-org --confirm" in event["details"]["stage"]
+    assert "api unreachable mid-wipe" in event["details"]["error"]

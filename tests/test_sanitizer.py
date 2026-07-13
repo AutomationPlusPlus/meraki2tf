@@ -498,3 +498,29 @@ def test_fqdns_embedded_in_free_text_are_pseudonymized() -> None:
     payload = sanitize_graph(graph).features[0].payload
     assert "dc01.corp.example" not in payload["comment"]
     assert "allow AD to host-" in payload["comment"]
+
+
+def test_embedded_email_addresses_are_fully_pseudonymized() -> None:
+    """An email under a generic key must lose its local part too — the
+    FQDN rewrite alone would keep the username (`jsmith@host-…`)."""
+    graph = NetworkGraph(
+        "org-123", (), (),
+        (
+            FeatureConfiguration(
+                "/networks/{networkId}/snmp",
+                ("N_1",),
+                {
+                    "contact": "jsmith@corp.example",
+                    "description": "escalate to jdoe+oncall@ops.corp.example",
+                },
+            ),
+        ),
+    )
+    payload = sanitize_graph(graph).features[0].payload
+    raw = str(payload)
+    assert "jsmith" not in raw and "jdoe" not in raw and "corp" not in raw
+    assert payload["contact"].startswith("email-")
+    assert "escalate to email-" in payload["description"]
+    # Deterministic: the same address maps to the same pseudonym.
+    again = sanitize_graph(graph).features[0].payload
+    assert again == payload

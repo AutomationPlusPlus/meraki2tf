@@ -21,9 +21,10 @@ can never cascade into a delete.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,6 +37,15 @@ from meraki2tf.resource_matcher import MatchedResource, path_matches
 logger = logging.getLogger(__name__)
 
 IMPORTS_FILENAME = "imports.tf"
+
+#: Workdir ledger pinning each import ID to the resource address it was
+#: assigned. An asset's identity is its import ID, never its ordinal
+#: position among colliding labels: the ledger keeps addresses stable
+#: when the set of label-colliding assets changes between runs, so a
+#: new colliding asset can never steal a state-tracked address (which
+#: would fake ``already_in_state`` coverage and duplicate the shifted
+#: object in state). Carries locators only, never secret values.
+ADDRESS_LEDGER_FILENAME = "import_addresses.json"
 
 #: Canonical entity addresses for the graph's first-class objects. These
 #: are domain identities (how the Meraki API addresses a network or a
@@ -169,6 +179,11 @@ class HclImportGenerator:
         what marks them unsupported.
         """
         matches = self._match_table()
+        ledger = self._load_ledger(workdir)
+        #: import ID → the address a previous run assigned it.
+        pins: dict[str, str] = {}
+        for ledger_address, owner in ledger.items():
+            pins.setdefault(owner, ledger_address)
 
         blocks: list[str] = []
         #: address → import ID, so identical assets dedupe while distinct
@@ -249,7 +264,9 @@ class HclImportGenerator:
                 self._import_components(match, candidate, graph.organization_id)
             )
             base = f"{match.terraform_name}.{self._label(candidate.id_values)}"
-            address = self._resolve_address(base, import_id, seen_addresses)
+            address = self._resolve_address(
+                base, import_id, seen_addresses, ledger, pins
+            )
             if address is None:
                 logger.debug("Skipping duplicate import of id %s", import_id)
                 continue
@@ -282,6 +299,12 @@ class HclImportGenerator:
         imports_file = workdir / IMPORTS_FILENAME
         imports_file.write_text(
             _FILE_HEADER + "\n" + "\n".join(blocks), encoding="utf-8"
+        )
+        self._write_ledger(
+            workdir,
+            ledger,
+            {asset.address: asset.import_id for asset in captured},
+            existing_addresses,
         )
         logger.info(
             "Wrote %d import block(s) to %s (%d already in state, "
@@ -382,23 +405,103 @@ class HclImportGenerator:
 
     @staticmethod
     def _resolve_address(
-        base: str, import_id: str, seen: dict[str, str]
+        base: str,
+        import_id: str,
+        seen: dict[str, str],
+        ledger: Mapping[str, str],
+        pins: Mapping[str, str],
     ) -> str | None:
         """Unique address for the asset, or None for a true duplicate.
 
         Distinct IDs can sanitize to the same label (``N-1`` and ``N.1``
         both become ``n_1``); dropping one would silently lose an asset
         from the DR kit, so collisions get a deterministic numeric
-        suffix instead. Candidate order is stable, so the same graph
-        always yields the same addresses across runs.
+        suffix instead. The asset's identity is its import ID, never its
+        ordinal position among colliding labels: an address the workdir
+        ledger pins to this ID is reused verbatim (so previously
+        assigned — and state-tracked — addresses survive a new colliding
+        asset appearing), and ordinal probing never claims an address
+        the ledger records as belonging to a different ID (so a dead
+        object's slot is not silently inherited while its state entry
+        awaits deletion review). Without a ledger, candidate order is
+        stable, so the same graph always yields the same addresses
+        across runs — and the same addresses previous tool versions
+        assigned.
         """
+        pinned = pins.get(import_id)
+        if pinned is not None and (pinned == base or pinned.startswith(f"{base}_")):
+            # A pin whose label no longer matches (resource type or
+            # label derivation changed) is stale and falls through to
+            # ordinal assignment instead of resurrecting the old name.
+            return None if pinned in seen else pinned
         address, counter = base, 2
-        while address in seen:
-            if seen[address] == import_id:
+        while address in seen or ledger.get(address, import_id) != import_id:
+            if seen.get(address) == import_id:
                 return None
             address = f"{base}_{counter}"
             counter += 1
         return address
+
+    @staticmethod
+    def _load_ledger(workdir: Path) -> dict[str, str]:
+        """Previous runs' address → import-ID assignments, or ``{}``.
+
+        A missing ledger is the normal first run against a workdir; a
+        corrupt or alien document degrades to ordinal assignment with a
+        warning — exactly the pre-ledger behavior — because a broken
+        sidecar file must never fail the DR run.
+        """
+        path = workdir / ADDRESS_LEDGER_FILENAME
+        if not path.exists():
+            return {}
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning(
+                "Address ledger %s is unreadable (%s); collision suffixes "
+                "fall back to ordinal assignment this run.", path, exc,
+            )
+            return {}
+        addresses = (
+            document.get("addresses") if isinstance(document, Mapping) else None
+        )
+        if not isinstance(addresses, Mapping):
+            logger.warning(
+                "Address ledger %s has no 'addresses' object; collision "
+                "suffixes fall back to ordinal assignment this run.", path,
+            )
+            return {}
+        return {
+            str(address): owner
+            for address, owner in addresses.items()
+            if isinstance(owner, str)
+        }
+
+    @staticmethod
+    def _write_ledger(
+        workdir: Path,
+        previous: Mapping[str, str],
+        assignments: Mapping[str, str],
+        existing_addresses: frozenset[str],
+    ) -> None:
+        """Persist this run's assignments, retaining state-tracked pins.
+
+        Entries for addresses not captured this run are kept while the
+        state file still tracks them (a deleted object's slot must stay
+        reserved until its pending-deletion review removes it from
+        state) and pruned once it does not — so the ledger never grows
+        beyond the state it protects.
+        """
+        merged = {
+            address: owner
+            for address, owner in previous.items()
+            if address in existing_addresses and address not in assignments
+        }
+        merged.update(assignments)
+        document = {"addresses": dict(sorted(merged.items()))}
+        (workdir / ADDRESS_LEDGER_FILENAME).write_text(
+            json.dumps(document, indent=1) + "\n", encoding="utf-8"
+        )
 
     @staticmethod
     def _label(id_values: tuple[str, ...]) -> str:

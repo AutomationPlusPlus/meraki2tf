@@ -61,7 +61,11 @@ class FakeNetworksSection:
 
 class FakeSensor:
     def getNetworkSensorRelationships(self, networkId: str) -> list[dict[str, Any]]:
-        raise RuntimeError("400 Bad Request: sensor not available for this network")
+        # Mimics meraki.APIError's shape for a product-type refusal:
+        # a genuine 400 is "does not apply to this scope", not a gap.
+        error = RuntimeError("400 Bad Request: sensor not available for this network")
+        error.status = 400  # type: ignore[attr-defined]
+        raise error
 
 
 class FakeSwitch:
@@ -113,6 +117,46 @@ def test_dump_provider_builds_full_graph(dump_file: Path) -> None:
 def test_dump_provider_honors_org_override(dump_file: Path) -> None:
     graph = StaticJsonDataProvider(dump_file).fetch_network_graph("org-999")
     assert graph.organization_id == "org-999"
+
+
+def test_recorded_organization_ids_canonical(dump_file: Path) -> None:
+    provider = StaticJsonDataProvider(dump_file)
+    assert provider.recorded_organization_ids == ("org-123",)
+    # An --org-id override never rewrites the recorded source org — the
+    # restore interlock and the replay org remap both depend on it.
+    provider.fetch_network_graph("org-999")
+    assert provider.recorded_organization_ids == ("org-123",)
+
+
+def test_recorded_organization_ids_nested_lists_every_org(tmp_path: Path) -> None:
+    path = tmp_path / "multi-org.json"
+    path.write_text(
+        json.dumps(
+            {
+                "organizations": [
+                    {"info": {"id": "org-123", "name": "One"}, "networks": []},
+                    {"info": {"id": "org-456", "name": "Two"}, "networks": []},
+                    {"info": {"id": "org-123", "name": "Dup"}, "networks": []},
+                    {"networks": []},  # info-less entries carry no org ID
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    provider = StaticJsonDataProvider(path)
+    assert provider.recorded_organization_ids == ("org-123", "org-456")
+
+
+def test_recorded_organization_ids_absent(tmp_path: Path) -> None:
+    bare = tmp_path / "bare.json"
+    bare.write_text(
+        json.dumps({"networks": [], "devices": [], "features": []}),
+        encoding="utf-8",
+    )
+    assert StaticJsonDataProvider(bare).recorded_organization_ids == ()
+    weird = tmp_path / "weird.json"
+    weird.write_text(json.dumps({"organizations": "not-a-list"}), encoding="utf-8")
+    assert StaticJsonDataProvider(weird).recorded_organization_ids == ()
 
 
 def _canonical_snapshot(tmp_path: Path, features: list[dict[str, Any]]) -> Path:
@@ -717,6 +761,160 @@ def test_auth_refusals_become_coverage_gaps(
     assert len(gaps) == 1
     assert gaps[0].api_path.endswith("/admins")
     assert f"HTTP {status}" in gaps[0].payload[UNREADABLE_MARKER]
+
+
+def test_unparseable_200_response_becomes_coverage_gap(
+    live_provider: LiveApiDataProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The SDK raises an APIError carrying status 200 when a 200 body
+    never parses as JSON (truncated body, intercepting proxy). That is
+    an API failure, not a scope refusal — swallowing it at DEBUG would
+    silently drop the endpoint's objects behind a success notification."""
+
+    def _garble(self: Any, organizationId: str) -> list[dict[str, Any]]:
+        raise _FakeApiError(200)
+
+    monkeypatch.setattr(FakeOrganizations, "getOrganizationAdmins", _garble)
+    graph = live_provider.fetch_network_graph("org-123")
+
+    gaps = [f for f in graph.features if UNREADABLE_MARKER in f.payload]
+    assert len(gaps) == 1
+    assert gaps[0].api_path.endswith("/admins")
+    assert "HTTP 200" in gaps[0].payload[UNREADABLE_MARKER]
+
+
+def test_statusless_exception_becomes_coverage_gap(
+    live_provider: LiveApiDataProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exception with no HTTP status (a transport failure the SDK
+    re-raised, an unexpected SDK-internal error) is never 'this feature
+    does not apply' — refusals are data, API failures never are."""
+
+    def _explode(self: Any, organizationId: str) -> list[dict[str, Any]]:
+        raise RuntimeError("boom: no status attribute at all")
+
+    monkeypatch.setattr(FakeOrganizations, "getOrganizationAdmins", _explode)
+    graph = live_provider.fetch_network_graph("org-123")
+
+    gaps = [f for f in graph.features if UNREADABLE_MARKER in f.payload]
+    assert len(gaps) == 1
+    assert gaps[0].api_path.endswith("/admins")
+    assert "RuntimeError" in gaps[0].payload[UNREADABLE_MARKER]
+    # The genuine 400 product-type refusal (sensor) stayed a quiet
+    # skip: exactly one gap, and the rest of discovery survived.
+    assert len(graph.features) > 1
+
+
+def test_empty_org_manufactures_no_phantom_nested_gaps(tmp_path: Path) -> None:
+    """An organization with zero networks and zero devices has genuinely
+    nothing on network-/serial-scoped surfaces — nested surfaces must
+    not be recorded as coverage gaps, or --fail-on-gaps would refuse a
+    perfectly healthy (empty) drill org."""
+    import json as _json
+
+    from conftest import _op
+
+    spec = {
+        "openapi": "3.0.0",
+        "info": {"title": "empty", "version": "1"},
+        "paths": {
+            "/networks/{networkId}/wireless/ssids": {
+                "get": _op("getNetworkWirelessSsids", "wireless"),
+            },
+            "/networks/{networkId}/wireless/ssids/{number}": {
+                "get": _op("getNetworkWirelessSsid", "wireless"),
+                "put": _op("updateNetworkWirelessSsid", "wireless"),
+            },
+            "/networks/{networkId}/wireless/ssids/{number}/identityPsks": {
+                "get": _op("getNetworkWirelessSsidIdentityPsks", "wireless"),
+            },
+            "/networks/{networkId}/wireless/ssids/{number}/identityPsks"
+            "/{identityPskId}": {
+                "get": _op("getNetworkWirelessSsidIdentityPsk", "wireless"),
+                "put": _op("updateNetworkWirelessSsidIdentityPsk", "wireless"),
+            },
+        },
+    }
+    spec_path = tmp_path / "empty-spec.json"
+    spec_path.write_text(_json.dumps(spec), encoding="utf-8")
+
+    class EmptyOrganizations:
+        def getOrganizationNetworks(
+            self, org_id: str, total_pages: str
+        ) -> list[dict[str, Any]]:
+            return []
+
+        def getOrganizationDevices(
+            self, org_id: str, total_pages: str
+        ) -> list[dict[str, Any]]:
+            return []
+
+    provider = LiveApiDataProvider(parser=OpenApiParser(spec_path))
+    provider._client = types.SimpleNamespace(organizations=EmptyOrganizations())
+    graph = provider.fetch_network_graph("org-123")
+
+    assert graph.networks == () and graph.devices == ()
+    assert graph.features == ()  # no phantom UNREADABLE gap records
+
+
+def test_empty_parent_collection_does_not_cascade_phantom_gaps(
+    tmp_path: Path,
+) -> None:
+    """A swept-but-empty parent collection (a network with zero SSIDs)
+    marks its nested surfaces as swept too — deeper levels must not
+    degrade into 'parent not discoverable' gap records."""
+    import json as _json
+
+    from conftest import _op
+
+    spec = {
+        "openapi": "3.0.0",
+        "info": {"title": "empty-parent", "version": "1"},
+        "paths": {
+            "/networks/{networkId}/wireless/ssids": {
+                "get": _op("getNetworkWirelessSsids", "wireless"),
+            },
+            "/networks/{networkId}/wireless/ssids/{number}": {
+                "get": _op("getNetworkWirelessSsid", "wireless"),
+                "put": _op("updateNetworkWirelessSsid", "wireless"),
+            },
+            "/networks/{networkId}/wireless/ssids/{number}/identityPsks": {
+                "get": _op("getNetworkWirelessSsidIdentityPsks", "wireless"),
+            },
+            "/networks/{networkId}/wireless/ssids/{number}/identityPsks"
+            "/{identityPskId}": {
+                "get": _op("getNetworkWirelessSsidIdentityPsk", "wireless"),
+                "put": _op("updateNetworkWirelessSsidIdentityPsk", "wireless"),
+            },
+        },
+    }
+    spec_path = tmp_path / "empty-parent-spec.json"
+    spec_path.write_text(_json.dumps(spec), encoding="utf-8")
+
+    class Organizations:
+        def getOrganizationNetworks(
+            self, org_id: str, total_pages: str
+        ) -> list[dict[str, Any]]:
+            return [dict(NETWORK_PAYLOAD)]
+
+        def getOrganizationDevices(
+            self, org_id: str, total_pages: str
+        ) -> list[dict[str, Any]]:
+            return []
+
+    class Wireless:
+        def getNetworkWirelessSsids(self, networkId: str) -> list[dict[str, Any]]:
+            return []
+
+    provider = LiveApiDataProvider(parser=OpenApiParser(spec_path))
+    provider._client = types.SimpleNamespace(
+        organizations=Organizations(), wireless=Wireless()
+    )
+    graph = provider.fetch_network_graph("org-123")
+
+    assert [f for f in graph.features if UNREADABLE_MARKER in f.payload] == []
 
 
 def test_undiscoverable_nested_parents_become_coverage_gaps(

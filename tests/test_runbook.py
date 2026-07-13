@@ -73,6 +73,37 @@ def test_secret_payload_keys_detects_only_valued_string_secrets() -> None:
     assert keys == ("psk", "communityString")
 
 
+def test_redact_payload_masks_secret_keyed_string_lists() -> None:
+    """The sanitizer propagates the secret key through lists, so a
+    secret-keyed array of strings redacts; the world-readable runbook
+    must apply the identical rule or the values leak verbatim."""
+    clean = redact_payload(
+        {
+            "communityStrings": ["s3cr3t-A", "s3cr3t-B"],
+            "psks": [["nested-wifi-pass"], ""],
+            "ports": [161, 162],
+        }
+    )
+    assert clean["communityStrings"] == [REDACTED, REDACTED]
+    assert clean["psks"] == [[REDACTED], ""]
+    # Non-string members under secret keys keep their type (flags/ports).
+    assert clean["ports"] == [161, 162]
+
+
+def test_secret_payload_keys_detects_list_valued_secrets() -> None:
+    """A secret key whose value is a (possibly nested) list of strings
+    must reach the secrets-to-restore table like a bare string does."""
+    keys = secret_payload_keys(
+        {
+            "communityStrings": ["c1"],
+            "psks": [[]],  # no string anywhere → nothing to restore
+            "tokenCounts": [4],  # numbers are flags, not credentials
+            "psk": "s",
+        }
+    )
+    assert keys == ("communityStrings", "psk")
+
+
 def test_write_operations_prefers_update_on_own_path(
     spec_parser: OpenApiParser,
 ) -> None:

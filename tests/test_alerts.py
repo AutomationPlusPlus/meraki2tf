@@ -330,3 +330,73 @@ def test_gap_replay_executed_shapes_and_severity() -> None:
     )
     assert dirty.severity is EventSeverity.WARNING
     assert dirty.details["failed"] == [["object: /x (ids=1) via createX", "boom"]]
+
+
+def test_dispatcher_logs_error_when_every_channel_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Per-channel isolation must not let a total delivery failure look
+    like success: a drift alert that reached nobody is unmissable in
+    the run log."""
+    dispatcher = AlertDispatcher([ExplodingNotifier(), ExplodingNotifier()])
+    with caplog.at_level("ERROR", logger="meraki2tf.alerts.dispatcher"):
+        delivered = dispatcher.dispatch(
+            drift_detected(diff="delta", workspace="generated")
+        )
+    assert delivered == 0
+    (record,) = [r for r in caplog.records if "ALL" in r.message]
+    assert "2 configured channel(s)" in record.message
+    assert "DRIFT_DETECTED" in record.message
+
+
+def test_dispatcher_without_notifiers_stays_quiet(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Zero configured channels is a deliberate setup (ad-hoc runs), not
+    a delivery failure."""
+    with caplog.at_level("ERROR", logger="meraki2tf.alerts.dispatcher"):
+        delivered = AlertDispatcher().dispatch(
+            drift_detected(diff="delta", workspace="generated")
+        )
+    assert delivered == 0
+    assert not [r for r in caplog.records if "ALL" in r.message]
+
+
+def test_partial_success_does_not_log_total_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    dispatcher = AlertDispatcher([ExplodingNotifier(), RecordingNotifier()])
+    with caplog.at_level("ERROR", logger="meraki2tf.alerts.dispatcher"):
+        delivered = dispatcher.dispatch(
+            drift_detected(diff="delta", workspace="generated")
+        )
+    assert delivered == 1
+    assert not [r for r in caplog.records if "ALL" in r.message]
+
+
+def test_email_notifier_logs_partial_recipient_refusals(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """smtplib raises only when EVERY recipient is refused; a partial
+    refusal comes back as a dict and still counts as delivered, but the
+    dropped recipients must be visible at ERROR."""
+
+    class PartialRefusalSmtp(FakeSmtp):
+        def send_message(  # type: ignore[override]
+            self, message: EmailMessage
+        ) -> dict[str, tuple[int, bytes]]:
+            FakeSmtp.sent.append(message)
+            return {"sec@example.com": (550, b"user unknown")}
+
+    notifier = EmailNotifier(
+        host="smtp.example",
+        port=2525,
+        sender="meraki2tf@example.com",
+        recipients=["netops@example.com", "sec@example.com"],
+        smtp_factory=PartialRefusalSmtp,
+    )
+    with caplog.at_level("ERROR", logger="meraki2tf.alerts.email"):
+        notifier.send(drift_detected(diff="delta", workspace="generated"))
+    (record,) = [r for r in caplog.records if "refused" in r.message]
+    assert "sec@example.com" in record.message
+    assert "1 of 2 recipient(s)" in record.message

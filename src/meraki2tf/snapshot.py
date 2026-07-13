@@ -12,6 +12,7 @@ from __future__ import annotations
 import gzip
 import json
 import logging
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -111,6 +112,27 @@ def write_snapshot(
     return path
 
 
+def _warn_kind_collision(
+    record_kind: str, identifier: str, payload: Any
+) -> None:
+    """WARN loudly when a payload's own ``kind`` field is displaced.
+
+    The v2 stream reserves ``kind`` for its record discriminator, so a
+    network/device payload that legitimately carries one loses it in
+    this format — the loss must never be silent (the snapshot is the
+    restore-grade source of truth). Preserving the field would need a
+    versioned format migration; until then, the v1 ``.json`` format
+    keeps it.
+    """
+    if isinstance(payload, Mapping) and "kind" in payload:
+        logger.warning(
+            "%s %s: payload field 'kind' collides with the v2 stream's "
+            "record discriminator and is NOT preserved in this snapshot. "
+            "Write a v1 (.json) snapshot to keep it.",
+            record_kind.capitalize(), identifier,
+        )
+
+
 def _write_snapshot_v2(
     graph: NetworkGraph, path: Path, sanitized: bool = False
 ) -> None:
@@ -124,6 +146,7 @@ def _write_snapshot_v2(
     with opener(path, "wt", encoding="utf-8") as handle:
         handle.write(json.dumps(header) + "\n")
         for network in graph.networks:
+            _warn_kind_collision("network", network.network_id, network.payload)
             handle.write(
                 json.dumps(
                     {
@@ -141,6 +164,7 @@ def _write_snapshot_v2(
                 + "\n"
             )
         for device in graph.devices:
+            _warn_kind_collision("device", device.serial, device.payload)
             handle.write(
                 json.dumps(
                     {
