@@ -403,6 +403,13 @@ class ReferenceResolver:
         #: Identities the snapshot's own objects carry, per stem and flat.
         self._known_scoped: set[tuple[str, str]] = set()
         self._known_flat: set[str] = set()
+        #: Identities the executor will remap (created objects get
+        #: fresh server-assigned IDs). A scope lookup that cannot
+        #: resolve one of these must fail loudly instead of passing the
+        #: snapshot ID through — dispatching at a source-tenant ID
+        #: would address the wrong (possibly production) object.
+        self._pending_scoped: set[tuple[str, str]] = set()
+        self._pending_flat: set[str] = set()
         self._register_known("organization", graph.organization_id)
         for network in graph.networks:
             self._register_known("network", network.network_id)
@@ -410,10 +417,16 @@ class ReferenceResolver:
             self._register_known("serial", device.serial)
         for feature in graph.features:
             placeholders = _PATH_PARAM_RE.findall(feature.api_path)
-            if placeholders and feature.path_values:
-                # Only the feature's own identity (its last path value)
-                # is registered under a stem; parent values are known
-                # through the parent objects themselves.
+            if (
+                placeholders
+                and feature.path_values
+                and feature.api_path.endswith("}")
+            ):
+                # Only an item path's own identity (its last path value)
+                # is registered under a stem; a singleton's last value
+                # is its *parent scope* (a template swept as networkId),
+                # and parent values are known through the parent objects
+                # themselves.
                 self._register_known(
                     _scope_stem(placeholders[-1]), feature.path_values[-1]
                 )
@@ -432,6 +445,18 @@ class ReferenceResolver:
         entry = (frozenset(context), new)
         self._entries.setdefault((stem, old), []).append(entry)
         self._by_old.setdefault(old, []).append(entry)
+
+    def expect_remap(self, stem: str, old: str) -> None:
+        """Declare an identity that only exists after its create runs.
+
+        Registered for every planned create so :meth:`resolve_scope`
+        can tell a fixed slot that keeps its identity from a created
+        object whose old ID must never reach the API."""
+        if not old:
+            return
+        self._pending_flat.add(old)
+        if stem:
+            self._pending_scoped.add((stem, old))
 
     def resolve_reference(
         self,
@@ -492,12 +517,16 @@ class ReferenceResolver:
     def resolve_scope(
         self, key: str, old: str, context: tuple[str, ...]
     ) -> str:
-        """Lenient resolution for path parameters (never raises).
+        """Lenient resolution for path parameters.
 
-        A parameter with no mapping addresses a fixed-slot object that
-        kept its identity (SSID numbers, per-scope singletons); wave
-        ordering guarantees created parents are mapped before their
-        children dispatch, and a failed parent skips them instead.
+        A parameter with no mapping normally addresses a fixed-slot
+        object that kept its identity (SSID numbers, per-scope
+        singletons) and passes through. The exception fails loudly: a
+        value declared via :meth:`expect_remap` (a created object —
+        including a config template addressed through a ``{networkId}``
+        scope) whose rebuilt counterpart does not exist yet. Passing
+        the snapshot ID through would dispatch the write at the source
+        tenant's object, so the caller defers or fails instead.
         """
         referrer = frozenset(context)
         stem = _scope_stem(key)
@@ -516,6 +545,17 @@ class ReferenceResolver:
         }
         if len(candidates) == 1:
             return next(iter(candidates))
+        if (stem, old) in self._pending_scoped or (
+            old in self._pending_flat
+            # A genuine identity of the addressed type that is not
+            # being remapped (a fixed slot) may collide with another
+            # type's created ID — the slot keeps its value.
+            and (stem, old) not in self._known_scoped
+        ):
+            raise UnmappedReferenceError(
+                f"scope {key}={old!r} addresses a created object with "
+                "no rebuilt counterpart yet"
+            )
         return old
 
 
@@ -861,11 +901,28 @@ class OrgRestorer:
         resolver.record("organization", graph.organization_id, self._target)
         for old_serial, new_serial in self._serial_map.items():
             resolver.record("serial", old_serial, new_serial)
+        for action in plan.actions:
+            if action.kind == "create":
+                resolver.expect_remap(*_own_identity(action))
         executed: list[str] = []
         failed: list[tuple[str, str]] = []
         skipped: list[dict[str, str]] = []
-        #: (type stem, old value) of creates that failed this run.
+        #: (type stem, old value) of creates/claims that failed this run.
         failed_parents: set[tuple[str, str]] = set()
+        #: (type stem, old value) of drill-skipped parents: their
+        #: children must be drill verdicts too, never writes fired at
+        #: the old parent ID and reported as failures.
+        skipped_parents: set[tuple[str, str]] = set()
+        #: Old serials whose claim has not succeeded yet this run.
+        #: ``/devices/{serial}/…`` endpoints address hardware wherever
+        #: it is currently claimed — possibly the production org — so
+        #: serial-scoped writes wait for their claim to land first.
+        unclaimed = {
+            action.path_values[-1]
+            for action in plan.actions
+            if action.kind == "claim"
+            and action.key not in self._journal.completed
+        }
 
         # Alphabetical wave order can place a referrer before its
         # referent (an appliance VLAN carrying groupPolicyId before the
@@ -889,6 +946,8 @@ class OrgRestorer:
                 if self._skip_claims and _references_serials(
                     action, drill_serials
                 ):
+                    if action.kind in ("create", "claim"):
+                        skipped_parents.add(_own_identity(action))
                     skipped.append(
                         {"target": action.key, "reason": "drill: the "
                          "payload references production hardware serials; "
@@ -919,6 +978,43 @@ class OrgRestorer:
                          f"{dead[0]} failed to restore"}
                     )
                     continue
+                held = [
+                    value
+                    for name, value in zip(
+                        _PATH_PARAM_RE.findall(action.api_path),
+                        action.path_values,
+                    )
+                    if (_scope_stem(name), value) in skipped_parents
+                ]
+                if held:
+                    # Propagate the drill verdict down the tree: a
+                    # skipped child that is itself a parent holds its
+                    # own children back too.
+                    if action.kind in ("create", "claim"):
+                        skipped_parents.add(_own_identity(action))
+                    skipped.append(
+                        {"target": action.key, "reason": "drill: parent "
+                         f"object {held[0]} was skipped for this drill; "
+                         "its children only restore in a real disaster "
+                         "recovery"}
+                    )
+                    continue
+                if action.kind != "claim":
+                    waiting = [
+                        value
+                        for name, value in zip(
+                            _PATH_PARAM_RE.findall(action.api_path),
+                            action.path_values,
+                        )
+                        if _scope_stem(name) == "serial"
+                        and value in unclaimed
+                    ]
+                    if waiting:
+                        deferred.append(
+                            (action, f"device {waiting[0]} has not been "
+                             "claimed into the target organization yet")
+                        )
+                        continue
                 try:
                     new_id: str | None
                     recovered: str | None = None
@@ -952,15 +1048,30 @@ class OrgRestorer:
                     continue
                 except Exception as exc:  # noqa: BLE001 - per-object isolation
                     failed.append((action.key, str(exc)))
-                    if action.kind == "create":
+                    if action.kind in ("create", "claim"):
+                        # A failed claim poisons its serial too: the
+                        # hardware may still be claimed by the source
+                        # (production) organization, and serial-scoped
+                        # endpoints would write straight into it.
                         failed_parents.add(_own_identity(action))
                     continue
+                if action.kind == "claim":
+                    unclaimed.discard(action.path_values[-1])
                 if new_id is not None:
                     own_stem, own_old = _own_identity(action)
+                    # The organization is a global singleton scope, so
+                    # it never disambiguates anything — and keeping it
+                    # would make org-scoped objects (policy objects,
+                    # config templates) unresolvable from network scope,
+                    # whose referrer path values never carry the org ID.
                     mapping_context = (
                         ()
                         if action.wave == WAVE_NETWORKS
-                        else tuple(action.path_values[:-1])
+                        else tuple(
+                            value
+                            for value in action.path_values[:-1]
+                            if value != graph.organization_id
+                        )
                     )
                     resolver.record(own_stem, own_old, new_id, mapping_context)
                     self._journal.record_mapping(
@@ -1015,29 +1126,38 @@ class OrgRestorer:
             for key, value in action.payload.items()
             if key not in params
         }
-        exclude: str | None = None
-        if action.kind == "create":
-            # The object's own identity is server-assigned on create:
-            # strip self-referential fields the write schema does not
-            # declare, so the stale snapshot ID is neither POSTed nor
-            # mistaken for a dangling reference. Schema-declared fields
-            # keep their value even when it equals the old ID — an
-            # appliance VLAN's client-assigned `id` is required by its
-            # create operation.
-            _, own_old = _own_identity(action)
-            accepted = _body_property_names(op)
-            body = {
-                k: v for k, v in body.items() if v != own_old or k in accepted
-            }
-            exclude = own_old
-        body = rewrite_references(
-            body, resolver, action.path_values, exclude
-        )
-        if self._serial_map:
-            body = _remap_serial_fields(body, self._serial_map)
         if action.kind == "claim":
+            # The claim body is only the (possibly replaced) serial.
+            # The discovered device payload is placement data restored
+            # by later waves (floorPlanId, switchProfileId, …) —
+            # rewriting it here would defer or fail the claim on
+            # references the call never sends.
             serial = action.path_values[1]
             body = {"serials": [self._serial_map.get(serial, serial)]}
+        else:
+            exclude: str | None = None
+            if action.kind == "create":
+                # The object's own identity is server-assigned on
+                # create: strip self-referential fields the write
+                # schema does not declare, so the stale snapshot ID is
+                # neither POSTed nor mistaken for a dangling reference.
+                # Schema-declared fields keep their value even when it
+                # equals the old ID — an appliance VLAN's
+                # client-assigned `id` is required by its create
+                # operation.
+                _, own_old = _own_identity(action)
+                accepted = _body_property_names(op)
+                body = {
+                    k: v
+                    for k, v in body.items()
+                    if v != own_old or k in accepted
+                }
+                exclude = own_old
+            body = rewrite_references(
+                body, resolver, action.path_values, exclude
+            )
+            if self._serial_map:
+                body = _remap_serial_fields(body, self._serial_map)
         items = _collection_items(body)
         if items is not None:
             # Collection envelopes ({"items": [...], "meta": …}) are

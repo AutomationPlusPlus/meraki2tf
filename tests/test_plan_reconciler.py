@@ -814,6 +814,76 @@ def test_block_span_at_end_of_file_without_trailing_newline(
     assert drop_resource_blocks((config,), {"meraki_network_snmp.l_1"}) == 0
 
 
+def test_one_line_block_span_never_swallows_the_next_block(
+    tmp_path: Path,
+) -> None:
+    """A one-line ``resource "t" "n" {}`` block spans exactly its own
+    line — searching for a multi-line closer used to absorb (and then
+    delete or mis-edit) the innocent block that follows it."""
+    config = tmp_path / "resources.tf"
+    config.write_text(
+        'resource "meraki_networks" "oneliner" {}\n' + BLOCK,
+        encoding="utf-8",
+    )
+    assert drop_resource_blocks((config,), {"meraki_networks.oneliner"}) == 1
+    text = config.read_text(encoding="utf-8")
+    assert '"oneliner"' not in text
+    assert text == BLOCK  # the neighbor survives intact
+
+
+def test_one_line_block_as_last_block_is_dropped(tmp_path: Path) -> None:
+    config = tmp_path / "resources.tf"
+    config.write_text(
+        BLOCK + '\nresource "meraki_networks" "oneliner" {}\n',
+        encoding="utf-8",
+    )
+    assert drop_resource_blocks((config,), {"meraki_networks.oneliner"}) == 1
+    assert '"oneliner"' not in config.read_text(encoding="utf-8")
+    # and without a trailing newline at EOF (previously a silent no-op)
+    config.write_text(
+        'resource "meraki_networks" "oneliner" {}', encoding="utf-8"
+    )
+    assert drop_resource_blocks((config,), {"meraki_networks.oneliner"}) == 1
+    assert config.read_text(encoding="utf-8") == ""
+
+
+def test_editors_reopen_one_line_blocks(tmp_path: Path) -> None:
+    """Insertions into a one-line block must land inside the braces —
+    they used to be appended after the same-line closing brace, emitting
+    invalid top-level HCL."""
+    one_liner = 'resource "meraki_networks" "oneliner" {}\n'
+    edited = insert_ignore_changes(one_liner, ("psk",))
+    assert edited == (
+        'resource "meraki_networks" "oneliner" {\n'
+        "  lifecycle {\n"
+        "    ignore_changes = [psk]\n"
+        "  }\n"
+        "}\n"
+    )
+    injected = inject_attribute(one_liner, "name", "lab")
+    assert injected == (
+        'resource "meraki_networks" "oneliner" {\n'
+        '  name = "lab"\n'
+        "}\n"
+    )
+    # remediation end-to-end through the file editor
+    config = tmp_path / "resources.tf"
+    config.write_text(one_liner + BLOCK, encoding="utf-8")
+    plan = ReconciliationPlan(
+        remediations=(
+            ResourceRemediation(
+                address="meraki_networks.oneliner",
+                secret_attrs=("psk",),
+            ),
+        )
+    )
+    ignored, _ = apply_remediations(tmp_path, plan, ("resources.tf",))
+    assert ignored == {"meraki_networks.oneliner": ("psk",)}
+    text = config.read_text(encoding="utf-8")
+    assert text.endswith(BLOCK)  # the neighbor is untouched
+    assert "ignore_changes = [psk]" in text.split("meraki_network_snmp")[0]
+
+
 def test_apply_remediations_combines_all_edit_kinds(tmp_path: Path) -> None:
     config = tmp_path / "resources.tf"
     config.write_text(

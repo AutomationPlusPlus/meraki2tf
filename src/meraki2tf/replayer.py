@@ -19,10 +19,10 @@ Safety properties:
   from the OpenAPI document (see :func:`runbook.write_operations`) —
   no hard-coded endpoint tables.
 * **Identifier remapping.** A rebuilt organization issues new network
-  IDs; snapshot path values are remapped to the live tenant by network
-  name before any call. Values *embedded inside payloads* are not
-  rewritten — failures surface per object and the runbook remains the
-  manual fallback.
+  and config-template IDs; snapshot path values are remapped to the
+  live tenant by name before any call. Values *embedded inside
+  payloads* are not rewritten — failures surface per object and the
+  runbook remains the manual fallback.
 """
 
 from __future__ import annotations
@@ -37,6 +37,7 @@ from meraki2tf.config import read_api_key
 from meraki2tf.hcl_generator import GenerationReport
 from meraki2tf.models import UNREADABLE_MARKER, NetworkGraph
 from meraki2tf.openapi_parser import OpenApiParser
+from meraki2tf.providers.live import CONFIG_TEMPLATE_ITEM_PATH
 from meraki2tf.runbook import payload_index, write_operations
 from meraki2tf.sanitizer import REDACTED, SECRET_KEY_PATTERN
 from meraki2tf.spec.engine import OperationSpec
@@ -246,33 +247,76 @@ class GapReplayer:
     def network_id_map(
         self, target_organization_id: str, graph: NetworkGraph
     ) -> dict[str, str]:
-        """Snapshot network ID → live network ID, joined by name.
+        """Snapshot scope ID → live ID for ``{networkId}`` scopes.
 
-        A rebuilt tenant issues fresh IDs; matching by name is the only
-        stable join. An ID that still exists live maps to itself, and a
-        snapshot network with no live counterpart stays unmapped — its
-        replays will fail loudly rather than write to a wrong target.
+        Covers networks *and* config templates: template-held features
+        are addressed with the template ID as their ``{networkId}``
+        scope, so replays must resolve both. A rebuilt tenant issues
+        fresh IDs; matching by name is the only stable join. An ID that
+        still exists live maps to itself, and a snapshot scope with no
+        live counterpart stays unmapped — its replays will fail loudly
+        rather than write to a wrong target.
         """
-        live = self._dashboard().organizations.getOrganizationNetworks(
-            target_organization_id, total_pages="all"
+        organizations = self._dashboard().organizations
+        mapping = self._join_by_name(
+            {network.network_id: network.name for network in graph.networks},
+            organizations.getOrganizationNetworks(
+                target_organization_id, total_pages="all"
+            ),
+            "network",
         )
-        live_ids = {str(item.get("id", "")) for item in live}
-        by_name = {str(item.get("name", "")): str(item.get("id", "")) for item in live}
+        templates = {
+            feature.path_values[-1]: str(feature.payload.get("name", ""))
+            for feature in graph.features
+            if feature.api_path == CONFIG_TEMPLATE_ITEM_PATH
+            and feature.path_values
+        }
+        if templates:
+            reader = getattr(
+                organizations, "getOrganizationConfigTemplates", None
+            )
+            if reader is None:
+                logger.warning(
+                    "SDK exposes no getOrganizationConfigTemplates; "
+                    "template-scoped replays will be refused rather "
+                    "than guessed."
+                )
+            else:
+                mapping.update(
+                    self._join_by_name(
+                        templates,
+                        reader(target_organization_id),
+                        "config template",
+                    )
+                )
+        return mapping
+
+    @staticmethod
+    def _join_by_name(
+        snapshot: Mapping[str, str], live: Any, label: str
+    ) -> dict[str, str]:
+        """Old→live IDs for one scope kind: identity first, then name."""
+        items = live if isinstance(live, list) else []
+        live_ids = {str(item.get("id", "")) for item in items}
+        by_name = {
+            str(item.get("name", "")): str(item.get("id", ""))
+            for item in items
+        }
         mapping: dict[str, str] = {}
-        for network in graph.networks:
-            if network.network_id in live_ids:
-                mapping[network.network_id] = network.network_id
-            elif network.name in by_name:
-                mapping[network.network_id] = by_name[network.name]
+        for old, name in snapshot.items():
+            if old in live_ids:
+                mapping[old] = old
+            elif name in by_name:
+                mapping[old] = by_name[name]
                 logger.info(
-                    "Remapped network %r: snapshot id %s -> live id %s.",
-                    network.name, network.network_id, by_name[network.name],
+                    "Remapped %s %r: snapshot id %s -> live id %s.",
+                    label, name, old, by_name[name],
                 )
             else:
                 logger.warning(
-                    "Snapshot network %r (%s) has no live counterpart; its "
+                    "Snapshot %s %r (%s) has no live counterpart; its "
                     "replays will be skipped.",
-                    network.name, network.network_id,
+                    label, name, old,
                 )
         return mapping
 
@@ -335,6 +379,17 @@ class GapReplayer:
                 raise ReplayDispatchError(
                     f"Network {known[name]} has no live counterpart; refusing "
                     "to guess a replay target."
+                )
+            if name == "organizationId" and known[name] != target_organization_id:
+                # Defense in depth: an org-scoped write may only ever hit
+                # the named target org. A value the remap did not resolve
+                # means the caller wired the wrong snapshot org — refuse
+                # rather than write into a foreign (possibly production)
+                # organization.
+                raise ReplayDispatchError(
+                    f"Organization {known[name]} is not the replay target "
+                    f"({target_organization_id}); refusing to write into a "
+                    "foreign organization."
                 )
             params[name] = known[name]
         return params

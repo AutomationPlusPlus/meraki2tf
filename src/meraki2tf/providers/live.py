@@ -87,6 +87,13 @@ _SERVER_ERROR_HTTP_STATUSES = frozenset({500, 502, 503, 504})
 #: or an admin scope that 403s an endpoint every week must surface as a
 #: coverage gap, never read as "this feature does not apply".
 _AUTH_HTTP_STATUSES = frozenset({401, 403})
+#: The only statuses that genuinely mean "this feature does not apply
+#: to that scope" (product-type refusals, endpoints absent for the
+#: network). Every other failure shape — including an APIError carrying
+#: status 200 (the SDK raises one when a 200 body never parses as
+#: JSON) and exceptions with no status at all — is an API failure and
+#: must surface as a coverage gap, never as a quiet skip.
+_SCOPE_REFUSAL_HTTP_STATUSES = frozenset({400, 404})
 
 
 def _scope_label(params: dict[str, str]) -> str:
@@ -359,13 +366,18 @@ class LiveApiDataProvider(MerakiDataProvider):
             # surface in today's spec folds, hence uncoverable.
             if not _folds_elsewhere(op)  # pragma: no branch
         ]
-        # Collection paths this run actually queried (or captures
-        # first-class via folding): a nested op whose parent collection
-        # is in this set and simply yielded zero elements is genuine
-        # emptiness; one whose parent collection was never queryable at
-        # all is a structural blind spot that must be reported, not
-        # silently skipped (Cardinal Rule 2).
+        # Collection paths this run swept (or captures first-class via
+        # folding): a nested op whose parent collection is in this set
+        # and simply yielded zero elements is genuine emptiness; one
+        # whose parent collection was never queryable at all is a
+        # structural blind spot that must be reported, not silently
+        # skipped (Cardinal Rule 2). Sweepable single-scope collections
+        # count even when their scope list was empty — an org with zero
+        # networks or devices has genuinely nothing there, and must not
+        # manufacture phantom gap records for every nested surface.
         queried_paths = {op.path for op, _ in level}
+        queried_paths.update(op.path for op in network_ops)
+        queried_paths.update(op.path for op in serial_ops)
         queried_paths.update(
             op.path
             for op in parser.endpoints()
@@ -385,31 +397,37 @@ class LiveApiDataProvider(MerakiDataProvider):
                 ]
                 if scopes:
                     nested_level.extend((op, values) for values in scopes)
+                    queried_paths.add(op.path)
                     continue
                 parent_collection = parent.rsplit("/", 1)[0]
-                if parent_collection not in queried_paths:
-                    logger.warning(
-                        "Nested surface %s cannot be swept: its parent "
-                        "collection %s is not discoverable (read-only or "
-                        "filtered out); recorded as a coverage gap — any "
-                        "configuration there must be verified manually.",
-                        op.path, parent_collection,
+                if parent_collection in queried_paths:
+                    # The parent was sweepable and simply held zero
+                    # elements — genuine emptiness. This surface counts
+                    # as swept too, so surfaces nested deeper under it
+                    # don't cascade into phantom gap records.
+                    queried_paths.add(op.path)
+                    continue
+                logger.warning(
+                    "Nested surface %s cannot be swept: its parent "
+                    "collection %s is not discoverable (read-only or "
+                    "filtered out); recorded as a coverage gap — any "
+                    "configuration there must be verified manually.",
+                    op.path, parent_collection,
+                )
+                features.append(
+                    FeatureConfiguration(
+                        api_path=op.path,
+                        path_values=(),
+                        payload={
+                            UNREADABLE_MARKER: (
+                                "parent collection "
+                                f"{parent_collection} is not "
+                                "discoverable, so this surface was "
+                                "never queried"
+                            )
+                        },
                     )
-                    features.append(
-                        FeatureConfiguration(
-                            api_path=op.path,
-                            path_values=(),
-                            payload={
-                                UNREADABLE_MARKER: (
-                                    "parent collection "
-                                    f"{parent_collection} is not "
-                                    "discoverable, so this surface was "
-                                    "never queried"
-                                )
-                            },
-                        )
-                    )
-            queried_paths.update(op.path for op, _ in nested_level)
+                )
             _run_level(nested_level)
         return features
 
@@ -433,9 +451,11 @@ class LiveApiDataProvider(MerakiDataProvider):
         organization budget stays saturated); a call that exhausts the
         attempt budget aborts discovery (LiveRetryExhaustedError) rather
         than emit an incomplete snapshot that looks complete. A
-        persistent server error raises _EndpointUnreadable so the caller
-        records that one endpoint as a coverage gap without losing the
-        rest of the run.
+        persistent server error — or any failure that is not a genuine
+        400/404 scope refusal, e.g. a 200 whose body never parsed or a
+        statusless transport exception — raises _EndpointUnreadable so
+        the caller records that one endpoint as a coverage gap without
+        losing the rest of the run.
         """
         with undispatchable_lock:
             if op.operation_id in undispatchable:
@@ -488,11 +508,27 @@ class LiveApiDataProvider(MerakiDataProvider):
                         f"HTTP {status}: the API key was refused for this "
                         "endpoint (rotated key or missing admin scope)"
                     ) from exc
-                logger.debug(
-                    "Feature endpoint %s unavailable for %s: %s",
-                    op.path, _scope_label(params), exc,
+                if status in _SCOPE_REFUSAL_HTTP_STATUSES:
+                    logger.debug(
+                        "Feature endpoint %s unavailable for %s: %s",
+                        op.path, _scope_label(params), exc,
+                    )
+                    return None
+                # Anything else — an APIError with status 200 (a body
+                # that never parsed as JSON), an unexpected 4xx, or a
+                # statusless transport/SDK exception — is an API
+                # failure, not a scope refusal. Refusals are data, API
+                # failures never are: record the endpoint as a coverage
+                # gap instead of silently shrinking the snapshot.
+                label = (
+                    f"HTTP {status}"
+                    if status is not None
+                    else type(exc).__name__
                 )
-                return None
+                raise _EndpointUnreadable(
+                    f"{label}: unclassifiable API failure while reading "
+                    "this endpoint"
+                ) from exc
             bucket.on_success()
             return result
         return None

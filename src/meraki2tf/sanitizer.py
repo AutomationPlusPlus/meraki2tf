@@ -23,10 +23,12 @@ across runs):
   addresses, notes, tags, MACs, and stray serials become stable
   ``<kind>-<digest>`` placeholders; coordinates are zeroed.
 * **Identity-shaped values are pseudonymized wherever they appear.**
-  Regardless of key, URLs and FQDN-like strings become placeholders,
-  IPv4 addresses/CIDRs become deterministic fake ``10.x.y.z`` values
-  (prefix length preserved, so firewall rules and subnets keep their
-  shape), and MAC addresses become fake locally-administered MACs.
+  Regardless of key, URLs, email addresses (the whole ``user@host``,
+  never just the domain — a leftover local part is a username), and
+  FQDN-like strings become placeholders, IPv4 addresses/CIDRs become
+  deterministic fake ``10.x.y.z`` values (prefix length preserved, so
+  firewall rules and subnets keep their shape), and MAC addresses
+  become fake locally-administered MACs.
 
 Everything else — product types, models, feature structure — is
 preserved so the snapshot remains a faithful structural replica of the
@@ -66,6 +68,10 @@ _IDENTITY_KEY = re.compile(
 _COORDINATE_KEYS = frozenset({"lat", "lng"})
 
 _URL_VALUE = re.compile(r"\w+://")
+#: user@host shapes anywhere in a value. The local part is identity (a
+#: username) just like the domain, so the whole address maps to one
+#: pseudonym — the FQDN rewrite alone would leave ``jsmith@…`` behind.
+_EMAIL_VALUE = re.compile(r"[\w.+-]+@[\w-]+(\.[\w-]+)+")
 #: Dotted, letter-bearing hostname shapes (wildcards allowed) — catches
 #: FQDNs under generic keys like `host`, `fqdn`, or filter `patterns`,
 #: including trailing-dot forms, ports, and scheme-less URL paths
@@ -294,6 +300,11 @@ class _GraphSanitizer:
         # hosts; DHCP option strings carry `MCIPADD=10.0.0.1,MCPORT=…`).
         value = _ID_TOKEN.sub(
             lambda m: self._id_map.get(m.group(0), m.group(0)), value
+        )
+        # Emails before FQDNs: the FQDN rewrite would otherwise consume
+        # only the domain and leave the username-bearing local part.
+        value = _EMAIL_VALUE.sub(
+            lambda m: _pseudonym("email", m.group(0)), value
         )
         value = _FQDN_VALUE.sub(
             lambda m: _pseudonym("host", m.group(0)), value

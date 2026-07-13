@@ -144,6 +144,7 @@ class StubRunner:
         self.config_baseline = True
         self.state_addresses: set[str] = set()
         self.removed: list[tuple[str, ...]] = []
+        self.saved_plan_discarded = False
         #: Reconciliation outcomes every plan_with_generation reports.
         self.reconciliation_dropped: dict[str, str] = {}
         self.reconciliation_secrets: dict[str, tuple[str, ...]] = {}
@@ -196,6 +197,9 @@ class StubRunner:
         if self.actions_queue:
             return self.actions_queue.pop(0)
         return self.actions
+
+    def discard_saved_plan(self) -> None:
+        self.saved_plan_discarded = True
 
     def plan_targeted(self, addresses: list[str]) -> TerraformCommandResult:
         self.targeted_calls.append(tuple(addresses))
@@ -444,6 +448,19 @@ def test_fault_dispatches_processing_fault_and_raises(
     assert fault.details["stage"] == "terraform init"
     assert "boom" in fault.details["error"]
     assert not runner.applied
+    # even a faulted run must not leave the secret-bearing saved plan
+    assert runner.saved_plan_discarded
+
+
+def test_every_run_discards_the_saved_sync_plan(
+    tmp_path: Path, api_key: None
+) -> None:
+    """The saved plan embeds refreshed secrets like the state file; any
+    run that plans but never applies (converged plan, aborted heal,
+    skipped window) must remove it before finishing."""
+    orchestrator, _, _, runner = _orchestrator(tmp_path, plan_stdout="")
+    orchestrator.run("org-123")
+    assert runner.saved_plan_discarded
 
 
 # ---------------------------------------------------------------------------

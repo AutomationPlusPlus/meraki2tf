@@ -181,6 +181,29 @@ class StaticJsonDataProvider(MerakiDataProvider):
         """
         return bool(self._document.get("sanitized"))
 
+    @property
+    def recorded_organization_ids(self) -> tuple[str, ...]:
+        """Organization IDs the snapshot itself records, in file order.
+
+        These are *source* organizations — never an ``--org-id``
+        override. A canonical snapshot records at most one
+        (``organizationId``); a nested export may carry several (each
+        entry's ``info.id``). The restore interlock refuses a
+        ``--target-org`` matching **any** of them, and the gap replayer
+        keys its organization remap on the recorded source so an
+        ``--org-id`` (naming the rebuilt target) can never alias it.
+        """
+        if _NESTED_MARKER in self._document:
+            entries = self._document.get(_NESTED_MARKER)
+            recorded = [
+                str(entry["info"].get("id") or "").strip()
+                for entry in (entries if isinstance(entries, list) else ())
+                if isinstance(entry, dict) and isinstance(entry.get("info"), dict)
+            ]
+            return tuple(dict.fromkeys(org_id for org_id in recorded if org_id))
+        org_id = str(self._document.get("organizationId") or "").strip()
+        return (org_id,) if org_id else ()
+
     def fetch_network_graph(self, organization_id: str | None = None) -> NetworkGraph:
         if _NESTED_MARKER in self._document:
             return self._graph_from_nested(organization_id)

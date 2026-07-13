@@ -481,7 +481,8 @@ def classify_plan(document: Any) -> ReconciliationPlan:
 
 def _block_span(text: str, address: str) -> tuple[int, int] | None:
     """(start, end) offsets of ``resource "type" "name" { … }`` for the
-    address, using terraform's emitted shape (closing brace at column 0)."""
+    address, using terraform's emitted shape (closing brace at column 0,
+    or the one-line ``resource "t" "n" {}`` form)."""
     rtype, _, name = address.partition(".")
     opener = re.compile(
         r'^resource\s+"%s"\s+"%s"\s*\{' % (re.escape(rtype), re.escape(name)),
@@ -490,6 +491,12 @@ def _block_span(text: str, address: str) -> tuple[int, int] | None:
     match = opener.search(text)
     if match is None:
         return None
+    line_end = text.find("\n", match.start())
+    opener_line = text[match.start(): line_end if line_end >= 0 else len(text)]
+    if not opener_line.rstrip().endswith("{"):
+        # One-line block: the span is exactly its own line — searching
+        # for a ``\n}\n`` closer would swallow the *next* block.
+        return match.start(), (len(text) if line_end < 0 else line_end + 1)
     close = text.find("\n}\n", match.start())
     if close < 0:
         if text.endswith("\n}"):
@@ -557,9 +564,24 @@ def drop_import_blocks(imports_file: Path, addresses: set[str]) -> int:
     return removed
 
 
+def _reopen_one_line_block(block: str) -> str:
+    """Rewrite terraform's one-line ``resource "t" "n" {}`` shape into an
+    open multi-line block, so head-insertion editors place content inside
+    the braces instead of after the (same-line) closing brace."""
+    head, newline, tail = block.partition("\n")
+    stripped = head.rstrip()
+    if stripped.endswith("{") or tail:
+        return block
+    reopened, count = re.subn(r"\{\s*\}\s*$", "{", stripped)
+    if not count:
+        return block
+    return reopened + "\n}" + newline
+
+
 def insert_ignore_changes(block: str, attrs: tuple[str, ...]) -> str:
     """Add (or merge into) a ``lifecycle { ignore_changes = […] }``
     block so plans stop proposing to null out unmanaged secrets."""
+    block = _reopen_one_line_block(block)
     existing = _LIFECYCLE_IGNORE_RE.search(block)
     merged = set(attrs)
     if existing:
@@ -681,6 +703,7 @@ def inject_attribute(block: str, attr: str, value: Any) -> str:
     replaced = replace_attribute_value(block, attr, literal)
     if replaced is not None:
         return replaced
+    block = _reopen_one_line_block(block)
     head, newline, tail = block.partition("\n")
     return f"{head}{newline}  {attr} = {literal}\n{tail}"
 

@@ -46,37 +46,54 @@ RUNBOOK_FILENAME = "runbook.md"
 _WRITE_METHOD_PRECEDENCE = ("put", "post")
 
 
-def redact_payload(value: Any) -> Any:
+def redact_payload(value: Any, key: str | None = None) -> Any:
     """Deep-copy ``value`` with every secret-keyed field redacted.
 
     Detection matches the sanitizer's, so the runbook and shared
     snapshots agree on what counts as a credential: secret-shaped key
     names, plus PEM private-key blocks by *value* — those hide under
     non-secret-shaped keys like ``certificate``, and the runbook is a
-    world-readable artifact.
+    world-readable artifact. The key context propagates through lists
+    exactly like the sanitizer's traversal does, so a secret-keyed
+    array of strings (``communityStrings: [...]``) is redacted too.
     """
     if isinstance(value, Mapping):
         return {
-            key: (
-                REDACTED
-                if SECRET_KEY_PATTERN.search(key) and isinstance(inner, str) and inner
-                else redact_payload(inner)
-            )
-            for key, inner in value.items()
+            inner_key: redact_payload(inner, inner_key)
+            for inner_key, inner in value.items()
         }
     if isinstance(value, (list, tuple)):
-        return [redact_payload(item) for item in value]
+        return [redact_payload(item, key) for item in value]
     if isinstance(value, str) and "PRIVATE KEY-----" in value:
+        return REDACTED
+    if (
+        key is not None
+        and SECRET_KEY_PATTERN.search(key)
+        and isinstance(value, str)
+        and value
+    ):
         return REDACTED
     return value
 
 
+def _carries_secret_string(value: Any) -> bool:
+    """A non-empty string, or a list holding one at any depth — the
+    same reach ``redact_payload``'s key propagation covers (dict
+    values re-key on their own child names instead)."""
+    if isinstance(value, str):
+        return bool(value)
+    if isinstance(value, (list, tuple)):
+        return any(_carries_secret_string(item) for item in value)
+    return False
+
+
 def secret_payload_keys(payload: Mapping[str, Any]) -> tuple[str, ...]:
-    """Top-level payload keys holding non-empty secret values."""
+    """Top-level payload keys holding non-empty secret values — a bare
+    string, or a list carrying strings (``communityStrings``)."""
     return tuple(
         key
         for key, value in payload.items()
-        if SECRET_KEY_PATTERN.search(key) and isinstance(value, str) and value
+        if SECRET_KEY_PATTERN.search(key) and _carries_secret_string(value)
     )
 
 

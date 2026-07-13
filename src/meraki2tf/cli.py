@@ -456,12 +456,19 @@ def _rebuild(config: RuntimeConfig) -> int:
             PROVIDER_FILENAME,
         )
         return 1
-    runner = TerraformRunner(
-        config.workdir,
-        executable=config.terraform_bin,
-        state_path=config.state_file,
-        backend=config.backend,
-    )
+    try:
+        runner = TerraformRunner(
+            config.workdir,
+            executable=config.terraform_bin,
+            state_path=config.state_file,
+            backend=config.backend,
+        )
+    except TerraformError as exc:
+        # e.g. --state-file named terraform.tfstate inside the workdir;
+        # surface the same clean diagnostic the pipeline path gives
+        # instead of an unhandled traceback.
+        logger.critical("%s", exc)
+        return 1
     if config.state_file is not None:
         # Re-anchor the backend at the explicitly requested state file;
         # otherwise init would silently use whatever path the previous
@@ -547,6 +554,17 @@ def _wipe_org(config: RuntimeConfig) -> int:
     except WipeRefusedError as exc:
         logger.critical("Wipe refused at execution recheck: %s", exc)
         return 2
+    except Exception as exc:
+        # A transient API fault mid-teardown must reach the notification
+        # channels and exit cleanly, not die as an unhandled traceback
+        # (the contract's "critical script processing faults" trigger).
+        logger.critical("Wipe execution failed: %s", exc)
+        build_dispatcher(config).dispatch(
+            processing_fault(
+                stage="drill-org wipe (--wipe-org --confirm)", error=str(exc)
+            )
+        )
+        return 1
     for target, reason in result.failed:
         logger.error("Wipe FAILED for %s: %s", target, reason)
     logger.warning(
@@ -593,7 +611,13 @@ def _restore(config: RuntimeConfig) -> int:
     except Exception as exc:
         logger.critical("Restore could not load the snapshot: %s", exc)
         return 1
-    if config.target_org == graph.organization_id:
+    # A nested multi-org export records several source organizations;
+    # the interlock must refuse every one of them, not just the first
+    # (which is all graph.organization_id can carry).
+    source_org_ids = frozenset(provider.recorded_organization_ids) | {
+        graph.organization_id
+    }
+    if config.target_org in source_org_ids:
         logger.critical(
             "--target-org matches the snapshot's source organization; "
             "a restore never writes to the org it was captured from. "
@@ -665,6 +689,23 @@ def _restore(config: RuntimeConfig) -> int:
     except RestoreJournalMismatchError as exc:
         logger.critical("%s", exc)
         return 2
+    except Exception as exc:
+        # Per-object failures are isolated inside the restorer; anything
+        # that still escapes (SDK construction, a journal write) must
+        # alert and exit cleanly — completed work stays journaled, so a
+        # re-run resumes instead of duplicating creates.
+        logger.critical(
+            "Restore execution failed: %s (completed writes are journaled "
+            "at %s; re-run with --restore --confirm to resume).",
+            exc, config.workdir / "restore-journal.jsonl",
+        )
+        build_dispatcher(config).dispatch(
+            processing_fault(
+                stage="organization restore (--restore --confirm)",
+                error=str(exc),
+            )
+        )
+        return 1
     for key, reason in result.failed:
         logger.error("Restore FAILED for %s: %s", key, reason)
     for entry in result.skipped:
@@ -710,13 +751,26 @@ def _replay_gaps(config: RuntimeConfig) -> int:
             "attributes will be skipped and reported for manual "
             "re-entry."
         )
+    # The organization remap keys on the snapshot's RECORDED source org:
+    # --org-id names the (rebuilt) target organization, and using the
+    # override as the source would defeat the remap and misdirect
+    # org-scoped writes back into the snapshot's own organization.
+    recorded_orgs = provider.recorded_organization_ids
+    snapshot_org = recorded_orgs[0] if recorded_orgs else graph.organization_id
     dispatcher = build_dispatcher(config)
-    runner = TerraformRunner(
-        config.workdir,
-        executable=config.terraform_bin,
-        state_path=config.state_file,
-        backend=config.backend,
-    )
+    try:
+        runner = TerraformRunner(
+            config.workdir,
+            executable=config.terraform_bin,
+            state_path=config.state_file,
+            backend=config.backend,
+        )
+    except TerraformError as exc:
+        # e.g. --state-file named terraform.tfstate inside the workdir;
+        # surface the same clean diagnostic the pipeline path gives
+        # instead of an unhandled traceback.
+        logger.critical("%s", exc)
+        return 1
     generator = HclImportGenerator(
         spec_parser,
         dispatcher,
@@ -769,7 +823,7 @@ def _replay_gaps(config: RuntimeConfig) -> int:
         logger.critical("Gap replay could not enumerate live networks: %s", exc)
         return 1
     executed, failed = replayer.execute(
-        actions, target_org, graph.organization_id, network_ids
+        actions, target_org, snapshot_org, network_ids
     )
     dispatcher.dispatch(
         gap_replay_executed(
@@ -819,6 +873,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             "--confirm is only valid together with --rebuild, --replay-gaps, "
             "--restore, or --wipe-org."
         )
+    # Orphaned mode-scoped flags are refused, never silently ignored: a
+    # flag that does nothing would let an operator believe an effect
+    # (a serial remap, a name second factor) happened when it did not.
+    if config.target_org and not config.restore:
+        arg_parser.error("--target-org is only valid together with --restore.")
+    if config.serial_map is not None and not config.restore:
+        arg_parser.error("--serial-map is only valid together with --restore.")
+    if config.skip_claims and not config.restore:
+        arg_parser.error("--skip-claims is only valid together with --restore.")
+    if config.wipe_org_name and not config.wipe_org:
+        arg_parser.error(
+            "--wipe-org-name is only valid together with --wipe-org."
+        )
     if config.wipe_org:
         if not config.wipe_org_name:
             arg_parser.error(
@@ -830,6 +897,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             or config.sync or config.confirm_deletions or config.fail_on_gaps
             or config.rebaseline or config.dump_to is not None
             or config.sanitize or config.dump_path is not None
+            or config.drift_baseline is not None
         ):
             arg_parser.error(
                 "--wipe-org is a standalone drill-teardown action; do not "
@@ -844,8 +912,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             "meraki2tf starting in drill-wipe (disaster recovery) mode."
         )
         return _wipe_org(config)
-    if config.skip_claims and not config.restore:
-        arg_parser.error("--skip-claims is only valid together with --restore.")
     if config.restore:
         if config.dump_path is None:
             arg_parser.error(
@@ -880,6 +946,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             or config.rebaseline
             or config.dump_to is not None
             or config.sanitize
+            or config.drift_baseline is not None
         ):
             arg_parser.error(
                 "--restore cannot be combined with pipeline or export flags."
@@ -909,11 +976,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             or config.confirm_deletions
             or config.fail_on_gaps
             or config.rebaseline
+            or config.drift_baseline is not None
         ):
             arg_parser.error(
                 "--replay-gaps cannot be combined with the pipeline flags "
-                "--sync, --confirm-deletions, --fail-on-gaps, or "
-                "--rebaseline."
+                "--sync, --confirm-deletions, --fail-on-gaps, "
+                "--rebaseline, or --drift-baseline."
             )
         logger.info(
             "meraki2tf starting in gap replay (disaster recovery) mode."
@@ -925,10 +993,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "--rebuild operates on an existing --workdir; it cannot be "
                 "combined with --from-dump or --dump-to."
             )
-        if config.sync or config.confirm_deletions or config.fail_on_gaps:
+        if (
+            config.sync or config.confirm_deletions or config.fail_on_gaps
+            or config.rebaseline or config.sanitize
+            or config.drift_baseline is not None
+        ):
             arg_parser.error(
                 "--rebuild cannot be combined with the pipeline flags "
-                "--sync, --confirm-deletions, or --fail-on-gaps."
+                "--sync, --confirm-deletions, --fail-on-gaps, "
+                "--rebaseline, --sanitize, or --drift-baseline."
             )
         logger.info("meraki2tf starting in rebuild (disaster recovery) mode.")
         return _rebuild(config)

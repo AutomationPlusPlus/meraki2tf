@@ -24,7 +24,10 @@ class AlertDispatcher:
         """Send ``event`` to all channels; returns the count delivered.
 
         A failing channel is logged and skipped so one broken endpoint
-        never suppresses drift or success alerts on the others.
+        never suppresses drift or success alerts on the others. When
+        every configured channel fails, an ERROR makes the total
+        delivery failure unmissable in the run log — a drift alert that
+        reached nobody must never look like a delivered one.
         """
         delivered = 0
         for notifier in self._notifiers:
@@ -37,4 +40,12 @@ class AlertDispatcher:
                     notifier.channel,
                     event.event_type.value,
                 )
+        if self._notifiers and not delivered:
+            logger.error(
+                "Alert delivery failed on ALL %d configured channel(s) for "
+                "event %s — nobody was notified. Check the notifier "
+                "endpoints/configuration.",
+                len(self._notifiers),
+                event.event_type.value,
+            )
         return delivered

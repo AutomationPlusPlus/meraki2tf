@@ -834,6 +834,50 @@ def test_guard_refuses_saved_plans_with_mutations(
     assert "meraki_network_snmp.l_1" in excinfo.value.plan_output
 
 
+def test_guard_refuses_deposed_delete_shadowed_by_current_noop(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One address can carry two entries — a deposed object's delete
+    alongside the current object's no-op import. The delete used to be
+    dict-overwritten by the later entry, letting a mutating plan pass
+    the import-only guard."""
+    runner.prepare_workspace()
+    (runner.workdir / SYNC_PLAN_FILENAME).write_bytes(b"opaque-plan")
+    show_json = json.dumps(
+        {
+            "resource_changes": [
+                {
+                    "address": "meraki_networks.n_1",
+                    "deposed": "abcd1234",
+                    "change": {"actions": ["delete"]},
+                },
+                {
+                    "address": "meraki_networks.n_1",
+                    "change": {"actions": ["no-op"], "importing": {"id": "N_1"}},
+                },
+            ]
+        }
+    )
+    scripted = ScriptedSubprocess((0, show_json, None))
+    monkeypatch.setattr(terraform_runner.subprocess, "run", scripted.run)
+    with pytest.raises(ImportGuardViolation, match="mutations"):
+        runner.apply_import_plan()
+    assert len(scripted.calls) == 1  # refused before any apply
+
+
+def test_discard_saved_plan_removes_the_secret_bearing_file(
+    runner: TerraformRunner,
+) -> None:
+    """Sync paths that plan but never apply must not leave the saved
+    plan (which embeds refreshed secrets like the state file) at rest."""
+    runner.prepare_workspace()
+    plan_file = runner.workdir / SYNC_PLAN_FILENAME
+    plan_file.write_bytes(b"opaque-plan")
+    runner.discard_saved_plan()
+    assert not plan_file.exists()
+    runner.discard_saved_plan()  # idempotent when nothing lingers
+
+
 def test_guard_refuses_unverifiable_plans(
     runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:

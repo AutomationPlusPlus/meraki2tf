@@ -344,6 +344,77 @@ def test_network_id_map_prefers_identity_then_name(
     assert mapping == {"N_1": "N_1", "N_2": "N_9"}  # N_3 stays unmapped
 
 
+def test_network_id_map_covers_config_templates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Template-held features address the template ID as a
+    ``{networkId}`` scope, so the map must cover config templates too —
+    identity first, then name, unmapped otherwise (refuse-to-guess)."""
+    from meraki2tf.providers.live import CONFIG_TEMPLATE_ITEM_PATH
+
+    dashboard = _FakeDashboard(networks=[{"id": "N_1", "name": "HQ"}])
+    dashboard.organizations.getOrganizationConfigTemplates = lambda org: [
+        {"id": "T_1", "name": "Kept"},
+        {"id": "T_NEW", "name": "Branch Template"},
+    ]
+    _install_fake_meraki(monkeypatch, dashboard)
+    graph = _graph(
+        FeatureConfiguration(
+            CONFIG_TEMPLATE_ITEM_PATH, ("org-123", "T_1"),
+            {"id": "T_1", "name": "Kept"},
+        ),
+        FeatureConfiguration(
+            CONFIG_TEMPLATE_ITEM_PATH, ("org-123", "T_2"),
+            {"id": "T_2", "name": "Branch Template"},
+        ),
+        FeatureConfiguration(
+            CONFIG_TEMPLATE_ITEM_PATH, ("org-123", "T_3"),
+            {"id": "T_3", "name": "Ghost"},
+        ),
+        networks=(MerakiNetwork("N_1", "org-123", "HQ", ()),),
+    )
+    mapping = GapReplayer().network_id_map("org-123", graph)
+    assert mapping == {"N_1": "N_1", "T_1": "T_1", "T_2": "T_NEW"}
+
+
+def test_network_id_map_warns_without_a_template_reader(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An SDK without the template listing leaves template scopes
+    unmapped — their replays are refused loudly, never guessed."""
+    from meraki2tf.providers.live import CONFIG_TEMPLATE_ITEM_PATH
+
+    dashboard = _FakeDashboard(networks=[])
+    _install_fake_meraki(monkeypatch, dashboard)
+    graph = _graph(
+        FeatureConfiguration(
+            CONFIG_TEMPLATE_ITEM_PATH, ("org-123", "T_1"), {"name": "X"}
+        )
+    )
+    mapping = GapReplayer().network_id_map("org-123", graph)
+    assert mapping == {}
+    assert "template-scoped replays will be refused" in caplog.text
+
+
+def test_execute_reaches_template_scoped_targets(
+    monkeypatch: pytest.MonkeyPatch, spec_parser: OpenApiParser
+) -> None:
+    """A template-scoped write dispatches at the LIVE template ID once
+    the map covers it (regression: it was always refused)."""
+    dashboard = _FakeDashboard(networks=[])
+    _install_fake_meraki(monkeypatch, dashboard)
+    executed, failed = GapReplayer().execute(
+        (_vlan_action(spec_parser, network="T_1"),),
+        target_organization_id="org-999",
+        snapshot_organization_id="org-123",
+        network_ids={"T_1": "T_NEW"},
+    )
+    assert failed == ()
+    assert len(executed) == 1
+    assert dashboard.appliance.calls[0][1]["networkId"] == "T_NEW"
+
+
 # -------------------------------------------------------------- execution
 
 
@@ -474,6 +545,28 @@ def test_parameters_injects_organization_for_org_scoped_writes(
     )
     params = GapReplayer._parameters(action, "org-999", "org-123", {})
     assert params == {"organizationId": "org-999"}  # snapshot org remapped
+
+
+def test_parameters_refuse_writes_into_a_foreign_organization(
+    spec_parser: OpenApiParser,
+) -> None:
+    """Defense in depth: when the recorded org value does not remap to
+    the target (mis-wired snapshot org), the write is refused rather
+    than dispatched into a foreign — possibly production — org."""
+    create = next(
+        op
+        for op in spec_parser.endpoints()
+        if op.operation_id == "createOrganizationNetwork"
+    )
+    action = ReplayAction(
+        kind="object",
+        api_path="/organizations/{organizationId}/networks",
+        path_values=("org-123",),
+        payload={"name": "HQ"},
+        operation=create,
+    )
+    with pytest.raises(ReplayDispatchError, match="foreign organization"):
+        GapReplayer._parameters(action, "org-999", "org-777", {})
 
 
 def test_call_filters_body_to_explicit_signatures(

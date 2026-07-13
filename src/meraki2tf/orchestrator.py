@@ -457,6 +457,13 @@ class PipelineOrchestrator:
             logger.exception("Pipeline fault during %s.", stage)
             self._dispatcher.dispatch(processing_fault(stage=stage, error=str(exc)))
             raise PipelineError(f"Pipeline failed during {stage}: {exc}") from exc
+        finally:
+            # The saved sync plan embeds refreshed sensitive values just
+            # like the state file. Applies consume-and-delete it, but any
+            # path that plans and then never applies (aborted heal,
+            # skipped window, converged plan, fault) must not leave a
+            # third secret-bearing artifact in the workspace.
+            self._runner.discard_saved_plan()
 
     def _report_reconciliation(
         self, plan: ReconciledPlanResult, report: GenerationReport

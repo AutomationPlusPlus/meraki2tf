@@ -205,6 +205,46 @@ def test_snapshot_v2_survives_payload_key_named_kind(tmp_path: Path) -> None:
     assert [n.network_id for n in loaded.networks] == ["N_1"]
 
 
+def test_snapshot_v2_warns_when_kind_payload_field_is_displaced(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The v2 stream reserves "kind" for its record discriminator, so a
+    payload's own "kind" field is not preserved — that loss must be
+    loud, never silent (the snapshot is the restore-grade source of
+    truth). v1 keeps the field and stays quiet."""
+    from meraki2tf.models import MerakiDevice, MerakiNetwork, NetworkGraph
+
+    graph = NetworkGraph(
+        organization_id="org-123",
+        networks=(
+            MerakiNetwork.from_payload(
+                {"id": "N_1", "organizationId": "org-123", "name": "HQ",
+                 "productTypes": ["wireless"], "kind": "template-child"}
+            ),
+        ),
+        devices=(
+            MerakiDevice.from_payload(
+                {"serial": "Q2AB-CDEF-GHIJ", "networkId": "N_1",
+                 "model": "MX68", "name": "edge", "kind": "spare"}
+            ),
+        ),
+        features=(),
+    )
+    with caplog.at_level("WARNING", logger="meraki2tf.snapshot"):
+        write_snapshot(graph, tmp_path / "kindful.jsonl")
+    collisions = [r for r in caplog.records if "discriminator" in r.message]
+    assert len(collisions) == 2
+    assert any("Network N_1" in r.message for r in collisions)
+    assert any("Device Q2AB-CDEF-GHIJ" in r.message for r in collisions)
+
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="meraki2tf.snapshot"):
+        v1 = write_snapshot(graph, tmp_path / "kindful.json")
+    assert not [r for r in caplog.records if "discriminator" in r.message]
+    loaded = StaticJsonDataProvider(v1).fetch_network_graph()
+    assert loaded.networks[0].payload["kind"] == "template-child"
+
+
 def test_sanitized_marker_round_trips_in_both_formats(tmp_path: Path) -> None:
     """A sanitized snapshot must be distinguishable from the real one:
     its identifiers are pseudonyms, so the restore source-org interlock
