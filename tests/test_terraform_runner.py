@@ -1216,6 +1216,40 @@ resource "meraki_devices" "q2ab" {
 resource "meraki_networks" "oneliner" {}
 """
 
+GENERATED_BASELINE = """\
+# __generated__ by Terraform from "L_1,route-1"
+resource "meraki_appliance_static_route" "l_1_route_1" {
+  name = "rt-a"
+}
+
+# __generated__ by Terraform from "L_1,route-2"
+resource "meraki_appliance_static_route" "l_1_route_2" {
+  name = "rt-b"
+}
+"""
+
+
+def test_prune_baseline_removes_generated_comment_with_block(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pruned block's __generated__ header must not orphan above the next."""
+    runner.prepare_workspace()
+    (runner.workdir / AGGREGATED_CONFIG_FILENAME).write_text(
+        GENERATED_BASELINE, encoding="utf-8"
+    )
+    fake = FakeSubprocess(returncode=0)
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+
+    runner.remove_resources({"meraki_appliance_static_route.l_1_route_1"})
+
+    content = (runner.workdir / AGGREGATED_CONFIG_FILENAME).read_text(
+        encoding="utf-8"
+    )
+    assert "route-1" not in content  # comment went with its block
+    assert "rt-a" not in content
+    assert '# __generated__ by Terraform from "L_1,route-2"' in content
+    assert "rt-b" in content
+
 
 def test_remove_resources_prunes_baseline_and_state(
     runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch

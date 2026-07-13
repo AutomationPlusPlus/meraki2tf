@@ -1083,6 +1083,11 @@ class TerraformRunner:
             match = _RESOURCE_BLOCK_RE.match(lines[index])
             if match and f"{match['type']}.{match['name']}" in remove:
                 pruned += 1
+                # The block's `# __generated__ by Terraform from "<id>"`
+                # header travels with it; leaving it behind would stack
+                # stale deleted-object locators above the next block.
+                while kept and kept[-1].lstrip().startswith("#"):
+                    kept.pop()
                 if not lines[index].rstrip().endswith("{"):  # one-line block
                     index += 1
                 else:
@@ -1130,13 +1135,17 @@ class TerraformRunner:
         """Whether the workspace holds accumulated resource configuration."""
         return (self._workdir / AGGREGATED_CONFIG_FILENAME).exists()
 
-    def reset_baseline(self, existing_addresses: frozenset[str]) -> None:
-        """Discard resources.tf so this run regenerates it from live data.
+    def ensure_baseline_resettable(
+        self, existing_addresses: frozenset[str]
+    ) -> None:
+        """Raise unless --rebaseline may discard the configuration baseline.
 
         Refused while the state tracks resources: their configuration
         cannot be regenerated (they are skipped from imports.tf, and
         terraform only generates config for import targets), so deleting
         the baseline would make the plan propose destroying all of them.
+        Split out so the orchestrator can refuse before spending a full
+        discovery pass on a run that cannot proceed.
         """
         if existing_addresses:
             raise TerraformError(
@@ -1146,6 +1155,10 @@ class TerraformRunner:
                 "would propose destroying them. Reset or relocate the state "
                 "file first."
             )
+
+    def reset_baseline(self, existing_addresses: frozenset[str]) -> None:
+        """Discard resources.tf so this run regenerates it from live data."""
+        self.ensure_baseline_resettable(existing_addresses)
         aggregated = self._workdir / AGGREGATED_CONFIG_FILENAME
         if aggregated.exists():
             aggregated.unlink()
