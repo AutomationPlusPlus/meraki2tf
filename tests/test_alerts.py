@@ -14,6 +14,7 @@ from meraki2tf.alerts import (
     EventSeverity,
     EventType,
     Notifier,
+    WebhookConfigError,
     WebhookDeliveryError,
     WebhookNotifier,
     deletion_pending_confirmation,
@@ -220,10 +221,29 @@ def test_webhook_wraps_transport_failures(monkeypatch: pytest.MonkeyPatch) -> No
         )
 
 
-def test_webhook_failure_never_leaks_the_url() -> None:
-    """A scheme-less URL fails inside urllib with the full URL (and its
-    embedded secret) in the message; the wrapped error must scrub it."""
+def test_webhook_rejects_insecure_scheme_without_echoing_the_token() -> None:
+    """A scheme-less/plain-http URL (whose path may be the secret) is
+    refused at construction; the refusal names the scheme, not the token."""
     url = "hooks.example.com/services/T000/B000/SECRETTOKEN"
+    with pytest.raises(WebhookConfigError) as excinfo:
+        WebhookNotifier(url)
+    assert "SECRETTOKEN" not in str(excinfo.value)
+    assert "https" in str(excinfo.value)
+    with pytest.raises(WebhookConfigError):
+        WebhookNotifier("http://hooks.example/plain")
+
+
+def test_webhook_https_failure_never_leaks_the_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An https transport failure whose message embeds the URL (and its
+    path secret) must be scrubbed before it leaves the notifier."""
+    url = "https://hooks.example.com/services/T000/B000/SECRETTOKEN"
+
+    def fake_urlopen(request: urllib.request.Request, timeout: float) -> FakeResponse:
+        raise OSError(f"connection to {url} refused")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     with pytest.raises(WebhookDeliveryError) as excinfo:
         WebhookNotifier(url).send(processing_fault(stage="x", error="y"))
     assert "SECRETTOKEN" not in str(excinfo.value)
@@ -248,6 +268,15 @@ class FakeSmtp:
     def __exit__(self, *exc_info: object) -> None:
         return None
 
+    def has_extn(self, name: str) -> bool:
+        return False  # relay advertises no STARTTLS
+
+    def starttls(self) -> None:  # pragma: no cover - not reached here
+        raise AssertionError("starttls attempted on a non-TLS relay")
+
+    def ehlo(self) -> None:  # pragma: no cover - not reached here
+        pass
+
     def send_message(self, message: EmailMessage) -> None:
         FakeSmtp.sent.append(message)
 
@@ -271,6 +300,75 @@ def test_email_notifier_builds_and_sends_json_report() -> None:
     assert message["From"] == "meraki2tf@example.com"
     assert message["To"] == "netops@example.com, sec@example.com"
     assert json.loads(message.get_content()) == event.to_payload()
+
+
+def test_email_subject_collapses_newlines_from_untrusted_summaries() -> None:
+    """A CR/LF in an (externally sourced) summary must not reach the
+    Subject header: EmailMessage would raise and drop the alert, and a
+    laxer library would allow header injection."""
+    from meraki2tf.alerts.models import AlertEvent, EventSeverity, EventType
+
+    FakeSmtp.sent.clear()
+    event = AlertEvent(
+        event_type=EventType.UNSUPPORTED_FEATURE_FLAGGED,
+        severity=EventSeverity.WARNING,
+        summary="bad\r\nBcc: attacker@evil.example\r\n path /x",
+    )
+    EmailNotifier(
+        host="smtp.example", port=25, sender="a@example.com",
+        recipients=["b@example.com"], smtp_factory=FakeSmtp,
+    ).send(event)
+    subject = FakeSmtp.sent[0]["Subject"]
+    assert "\n" not in subject and "\r" not in subject
+
+
+def test_email_negotiates_starttls_when_the_relay_offers_it() -> None:
+    """Opportunistic encryption: the alert body carries the full
+    inventory, so STARTTLS is used whenever the relay advertises it."""
+
+    class TlsSmtp(FakeSmtp):
+        started = False
+
+        def has_extn(self, name: str) -> bool:
+            return name == "starttls"
+
+        def starttls(self) -> None:
+            TlsSmtp.started = True
+
+        def ehlo(self) -> None:
+            pass
+
+    FakeSmtp.sent.clear()
+    EmailNotifier(
+        host="smtp.example", port=587, sender="a@example.com",
+        recipients=["b@example.com"], smtp_factory=TlsSmtp,
+    ).send(drift_detected(diff="d", workspace="w"))
+    assert TlsSmtp.started is True
+    assert len(FakeSmtp.sent) == 1
+
+
+def test_redact_diff_masks_values_on_secret_named_lines() -> None:
+    from meraki2tf.alerts.models import redact_diff
+
+    diff = (
+        "  ~ name             = \"Corp WiFi\"\n"
+        "  ~ psk              = \"hunter2\" -> \"letmein\"\n"
+        "  ~ radiusSecret     = \"abc\"\n"
+        "  + community_string : public"
+    )
+    out = redact_diff(diff)
+    assert "hunter2" not in out and "letmein" not in out
+    assert "abc" not in out and "public" not in out
+    assert "Corp WiFi" in out  # non-secret attribute values survive
+    assert out.count("(value redacted)") == 3
+
+
+def test_drift_alert_payload_redacts_secret_values() -> None:
+    event = drift_detected(
+        diff='  ~ psk = "hunter2" -> "letmein"', workspace="w"
+    )
+    assert "hunter2" not in event.details["diff"]
+    assert "(value redacted)" in event.details["diff"]
 
 
 def test_default_smtp_factory_applies_timeout(

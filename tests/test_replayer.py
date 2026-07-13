@@ -528,6 +528,56 @@ def test_parameters_rejects_arity_and_unknown_placeholders(
         GapReplayer._parameters(foreign, "org", "org-123", {"N_2": "N_9"})
 
 
+def test_parameters_refuse_serial_not_claimed_in_target(
+    spec_parser: OpenApiParser,
+) -> None:
+    """A device-scoped write must never fire at a serial that is not
+    verifiably claimed in the target org — the device would be addressed
+    wherever it is currently claimed (possibly production)."""
+    device_op = next(
+        op for op in spec_parser.endpoints() if op.operation_id == "updateDevice"
+    )
+    action = ReplayAction(
+        kind="object",
+        api_path="/devices/{serial}",
+        path_values=("Q2XX-AAAA-BBBB",),
+        payload={"name": "edge"},
+        operation=device_op,
+    )
+    # No claimed-serial set available → refuse rather than write blind.
+    with pytest.raises(ReplayDispatchError, match="Cannot verify device"):
+        GapReplayer._parameters(action, "org-1", "org-123", {}, None)
+    # Serial absent from the target's claimed set → refuse.
+    with pytest.raises(ReplayDispatchError, match="not claimed"):
+        GapReplayer._parameters(
+            action, "org-1", "org-123", {}, frozenset({"Q2XX-OTHER"})
+        )
+    # Serial present → allowed through.
+    params = GapReplayer._parameters(
+        action, "org-1", "org-123", {}, frozenset({"Q2XX-AAAA-BBBB"})
+    )
+    assert params == {"serial": "Q2XX-AAAA-BBBB"}
+
+
+def test_secret_paths_detects_secret_keyed_string_lists_and_numbers() -> None:
+    from meraki2tf.replayer import _secret_paths
+
+    paths = _secret_paths(
+        {
+            "communityStrings": ["c1", "c2"],
+            "passcode": 4321,
+            "radiusServers": [{"host": "h", "secret": "r1"}],
+            "passwordEnabled": True,  # a flag, never a secret
+            "emptyPsk": "",
+        }
+    )
+    assert "communityStrings[]" in paths
+    assert "passcode" in paths
+    assert "radiusServers[].secret" in paths
+    assert not any("passwordEnabled" in p for p in paths)
+    assert not any("emptyPsk" in p for p in paths)
+
+
 def test_parameters_injects_organization_for_org_scoped_writes(
     spec_parser: OpenApiParser,
 ) -> None:

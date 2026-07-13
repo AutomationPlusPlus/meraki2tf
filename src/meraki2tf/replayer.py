@@ -320,6 +320,32 @@ class GapReplayer:
                 )
         return mapping
 
+    def claimed_serials(self, target_organization_id: str) -> frozenset[str]:
+        """Serials currently claimed in the target organization.
+
+        Covers network-assigned devices and inventory-only hardware:
+        ``/devices/{serial}/…`` endpoints address a device wherever it
+        is claimed, so a serial outside this set would replay against a
+        foreign (possibly the still-alive source) organization.
+        """
+        organizations = self._dashboard().organizations
+        devices = organizations.getOrganizationDevices(
+            target_organization_id, total_pages="all"
+        )
+        inventory_reader = getattr(
+            organizations, "getOrganizationInventoryDevices", None
+        )
+        inventory = (
+            inventory_reader(target_organization_id, total_pages="all")
+            if inventory_reader is not None
+            else []
+        )
+        return frozenset(
+            str(entry.get("serial", ""))
+            for entry in (*devices, *inventory)
+            if isinstance(entry, Mapping)
+        ) - {""}
+
     def execute(
         self,
         actions: tuple[ReplayAction, ...],
@@ -330,16 +356,40 @@ class GapReplayer:
         """Perform the writes; every failure is recorded, never raised."""
         executed: list[str] = []
         failed: list[tuple[str, str]] = []
+        serials: frozenset[str] | None = None
+        if any(
+            "serial" in _placeholders(action.operation.path)
+            for action in actions
+        ):
+            try:
+                serials = self.claimed_serials(target_organization_id)
+            except Exception as exc:  # noqa: BLE001 - verified per action
+                logger.error(
+                    "Cannot enumerate the target organization's claimed "
+                    "devices: %s", exc,
+                )
         for action in actions:
             try:
                 params = self._parameters(
                     action, target_organization_id,
-                    snapshot_organization_id, network_ids,
+                    snapshot_organization_id, network_ids, serials,
                 )
                 self._call(action.operation, params, action.payload)
             except Exception as exc:  # per-object isolation by design
-                logger.error("Replay failed for %s: %s", action.target, exc)
-                failed.append((action.target, str(exc)))
+                message = str(exc)
+                if action.kind == "secrets" and not isinstance(
+                    exc, ReplayDispatchError
+                ):
+                    # The request body carried live secret values, and
+                    # SDK error text can echo the rejected field back —
+                    # keep it out of logs and alert payloads.
+                    message = (
+                        f"{type(exc).__name__} (status "
+                        f"{getattr(exc, 'status', 'n/a')}); detail "
+                        "withheld — the request carried secret values"
+                    )
+                logger.error("Replay failed for %s: %s", action.target, message)
+                failed.append((action.target, message))
                 continue
             logger.info("Replayed %s", action.target)
             executed.append(action.target)
@@ -351,6 +401,7 @@ class GapReplayer:
         target_organization_id: str,
         snapshot_organization_id: str,
         network_ids: Mapping[str, str],
+        claimed_serials: frozenset[str] | None = None,
     ) -> dict[str, str]:
         """Path parameters for the write call, remapped to the live tenant."""
         def remap(value: str) -> str:
@@ -380,6 +431,23 @@ class GapReplayer:
                     f"Network {known[name]} has no live counterpart; refusing "
                     "to guess a replay target."
                 )
+            if name == "serial":
+                # Same defense as networkId: device endpoints address
+                # hardware wherever it is currently claimed — possibly
+                # the still-alive source organization — so a serial not
+                # verifiably claimed in the target org is refused.
+                if claimed_serials is None:
+                    raise ReplayDispatchError(
+                        f"Cannot verify device {known[name]} is claimed in "
+                        f"the target organization; refusing to replay a "
+                        "device-scoped write blind."
+                    )
+                if known[name] not in claimed_serials:
+                    raise ReplayDispatchError(
+                        f"Device {known[name]} is not claimed in the target "
+                        "organization; refusing to write to hardware "
+                        "belonging to another organization."
+                    )
             if name == "organizationId" and known[name] != target_organization_id:
                 # Defense in depth: an org-scoped write may only ever hit
                 # the named target org. A value the remap did not resolve
@@ -473,18 +541,36 @@ def split_redacted(
     return clean_mapping(payload, ""), tuple(sorted(redacted))
 
 
+def _secret_value(value: Any) -> bool:
+    """A scalar that can *be* a secret: a non-empty string or a number
+    (numeric PINs/passcodes arrive as JSON numbers; booleans are flags
+    like ``passwordEnabled``, never secrets)."""
+    if isinstance(value, bool):
+        return False
+    return (isinstance(value, str) and bool(value)) or isinstance(
+        value, (int, float)
+    )
+
+
 def _secret_paths(value: Any, prefix: str = "") -> tuple[str, ...]:
-    """Dotted paths of non-empty secret-keyed string values, any depth."""
+    """Dotted paths of non-empty secret-keyed values, any depth.
+
+    A secret-keyed list of scalars (``communityStrings: [...]``) counts
+    as one secret path — the sanitizer redacts exactly that shape, so
+    the replay/report side must see it too.
+    """
     paths: list[str] = []
     if isinstance(value, Mapping):
         for key, inner in value.items():
             path = f"{prefix}.{key}" if prefix else str(key)
-            if (
-                SECRET_KEY_PATTERN.search(str(key))
-                and isinstance(inner, str)
-                and inner
-            ):
+            if SECRET_KEY_PATTERN.search(str(key)) and _secret_value(inner):
                 paths.append(path)
+            elif (
+                SECRET_KEY_PATTERN.search(str(key))
+                and isinstance(inner, list)
+                and any(_secret_value(item) for item in inner)
+            ):
+                paths.append(f"{path}[]")
             else:
                 paths.extend(_secret_paths(inner, path))
     elif isinstance(value, list):

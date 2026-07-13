@@ -125,6 +125,19 @@ def fetch_key_vault_secret(vault_name: str, secret_name: str) -> str:
     return str(value)
 
 
+#: Pass-through flags whose following value is a bearer credential.
+_CREDENTIAL_FLAGS = frozenset({"--webhook-url"})
+
+
+def _redact_command(command: list[str]) -> list[str]:
+    """Copy of ``command`` with credential-flag values masked for logging."""
+    redacted = list(command)
+    for index, token in enumerate(redacted[:-1]):
+        if token in _CREDENTIAL_FLAGS:
+            redacted[index + 1] = "<redacted>"
+    return redacted
+
+
 def run_meraki2tf(
     binary: str,
     org_id: str,
@@ -146,7 +159,11 @@ def run_meraki2tf(
     ]
     env = dict(os.environ)
     env[API_KEY_ENV_VAR] = api_key
-    logger.info("Running: %s", " ".join(command))
+    # Pass-through args can carry bearer-credential values (a Slack/Teams
+    # --webhook-url whose path IS the token); Azure job-output history is
+    # readable by a much broader RBAC set than Key Vault, so redact the
+    # value that follows any credential-shaped flag before logging.
+    logger.info("Running: %s", " ".join(_redact_command(command)))
     completed = subprocess.run(command, env=env, check=False)
     logger.info("meraki2tf exited with code %d", completed.returncode)
     return completed.returncode

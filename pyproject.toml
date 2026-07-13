@@ -15,7 +15,11 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
 ]
-dependencies = ["meraki"]
+# Bounded to the validated major line so an unattended worker rebuild
+# mid-incident can't silently pull an untested SDK (DR reproducibility)
+# or a compromised future major. For the deployment path, resolve this
+# through a hash-pinned constraints file (pip install --require-hashes).
+dependencies = ["meraki>=3.0,<4"]
 
 [project.scripts]
 meraki2tf = "meraki2tf.cli:main"

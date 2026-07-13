@@ -66,6 +66,54 @@ def test_secrets_are_redacted_but_flags_keep_their_type() -> None:
     assert payload["authMode"] == "psk"  # a mode value, not a secret key
 
 
+def test_secret_keyed_container_values_are_fully_redacted() -> None:
+    """A secret-shaped key marks its whole subtree: a nested credentials
+    object (whose inner keys are not secret-shaped) and a numeric
+    passcode must not survive, and neither may a keyless list/string
+    payload's PEM block."""
+    graph = NetworkGraph(
+        "org-123", (), (),
+        (
+            FeatureConfiguration(
+                "/networks/{networkId}/x",
+                ("N_1",),
+                {
+                    "credentials": {"user": "jdoe", "pass": "hunter2"},
+                    "sharedSecret": ["tok-abc", "tok-def"],
+                    "pin": 123456789,
+                },
+            ),
+        ),
+    )
+    payload = sanitize_graph(graph, salt=b"fixed").features[0].payload
+    raw = str(payload)
+    assert "hunter2" not in raw and "tok-abc" not in raw
+    assert "123456789" not in raw
+    assert payload["credentials"]["pass"] == REDACTED
+    assert payload["credentials"]["user"] == REDACTED  # whole subtree
+    assert payload["sharedSecret"] == [REDACTED, REDACTED]
+    assert payload["pin"] == REDACTED
+
+
+def test_keyless_list_and_string_payloads_are_scrubbed() -> None:
+    """A canonical snapshot may carry a list- or string-rooted payload;
+    the value-shaped rules (PEM redaction, identity rewrites) still
+    apply even though no key addresses the scalars."""
+    pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIE\n"
+    graph = NetworkGraph(
+        "org-123", (), (),
+        (
+            FeatureConfiguration("/networks/{networkId}/a", ("N_1",),
+                                 [pem, "jdoe@corp.example"]),
+            FeatureConfiguration("/networks/{networkId}/b", ("N_1",), pem),
+        ),
+    )
+    features = sanitize_graph(graph, salt=b"fixed").features
+    assert features[0].payload[0] == REDACTED
+    assert "jdoe" not in str(features[0].payload[1])
+    assert features[1].payload == REDACTED
+
+
 def test_extended_secret_keys_are_redacted() -> None:
     """SNMP v3 passes, PINs, passcodes, private keys, credentials, and
     license keys are credentials too and must never survive --sanitize."""
@@ -365,9 +413,13 @@ def test_ipv6_addresses_are_pseudonymized() -> None:
 
 def test_sanitization_is_deterministic_and_non_destructive() -> None:
     graph = _graph()
-    first = sanitize_graph(graph)
-    second = sanitize_graph(graph)
+    first = sanitize_graph(graph, salt=b"fixed-salt")
+    second = sanitize_graph(graph, salt=b"fixed-salt")
     assert first == second
+    # Pseudonyms are keyed by the salt: without it (a fresh random one
+    # per call) they must not be reproducible — that irreproducibility
+    # is what defeats dictionary inversion of the digests.
+    assert sanitize_graph(graph) != first
     # The input graph is left completely untouched.
     assert graph.features[0].payload["psk"] == "hunter2"
     assert graph.networks[0].name == "HQ"
@@ -410,7 +462,7 @@ def test_empty_comma_list_parts_are_preserved() -> None:
 
 def test_keyless_scalars_pass_through_unchanged() -> None:
     """A payload that is not key-addressed has no rule to apply."""
-    sanitizer = _GraphSanitizer(_graph())
+    sanitizer = _GraphSanitizer(_graph(), salt=b"fixed-salt")
     assert sanitizer._clean("free-floating", None) == "free-floating"
     assert sanitizer._clean("N_1", None) == "net-0001"  # IDs still map
 
@@ -516,11 +568,12 @@ def test_embedded_email_addresses_are_fully_pseudonymized() -> None:
             ),
         ),
     )
-    payload = sanitize_graph(graph).features[0].payload
+    payload = sanitize_graph(graph, salt=b"fixed-salt").features[0].payload
     raw = str(payload)
     assert "jsmith" not in raw and "jdoe" not in raw and "corp" not in raw
     assert payload["contact"].startswith("email-")
     assert "escalate to email-" in payload["description"]
-    # Deterministic: the same address maps to the same pseudonym.
-    again = sanitize_graph(graph).features[0].payload
+    # Deterministic under one salt: the same address maps to the same
+    # pseudonym.
+    again = sanitize_graph(graph, salt=b"fixed-salt").features[0].payload
     assert again == payload

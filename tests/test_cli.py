@@ -551,13 +551,24 @@ def test_rebuild_with_confirm_applies(
 
     def fake_run(command: tuple[str, ...], **kwargs: Any) -> SimpleNamespace:
         calls.append(command)
-        exit_code = 2 if command[1] == "plan" else 0
+        exit_code = 0
+        if command[1] == "plan":
+            exit_code = 2
+            for part in command:  # terraform writes the -out plan file
+                if part.startswith("-out="):
+                    (Path(kwargs["cwd"]) / part[5:]).write_text(
+                        "saved-plan", encoding="utf-8"
+                    )
         return SimpleNamespace(returncode=exit_code, stdout="Plan: 5 to add", stderr="")
 
     monkeypatch.setattr(terraform_runner.subprocess, "run", fake_run)
 
     assert main(["--rebuild", "--confirm", "--workdir", str(workdir)]) == 0
     assert [call[1] for call in calls] == ["init", "plan", "apply"]
+    # The apply consumed the exact previewed plan file, not -auto-approve.
+    apply_command = calls[-1]
+    assert terraform_runner.REBUILD_PLAN_FILENAME in apply_command
+    assert "-auto-approve" not in apply_command
 
 
 def test_rebuild_with_nothing_to_do_never_applies(
@@ -948,7 +959,9 @@ def test_sync_end_to_end_aborts_mutating_plan(
          "--webhook-url", "https://hooks.example/alerts"]
     )
 
-    assert exit_code == 0
+    # An aborted sync auto-apply exits 4 (not 0): the scheduler must be
+    # able to page on a run that materialized no state.
+    assert exit_code == 4
     assert "apply" not in [call[1] for call in terraform_calls]
     assert [event["event_type"] for event in delivered] == [
         "DRIFT_DETECTED", "RUN_SUCCESS",
@@ -1555,11 +1568,13 @@ def test_restore_refuses_the_source_organization(
     assert exit_code == 2
 
 
-def test_restore_refuses_any_recorded_source_org(
+def test_restore_refuses_a_multi_org_snapshot(
     spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A nested multi-org export records several source organizations;
-    the interlock must refuse every one of them, not just the first."""
+    """The executor can only remap ONE source org onto the target, so a
+    nested multi-org export is refused outright — even when the target
+    is a fresh org outside every recorded source (which would otherwise
+    slip past the source-org interlock and mutate source orgs #2..N)."""
     _no_network(monkeypatch)
     dump = tmp_path / "multi-org.json"
     dump.write_text(
@@ -1575,7 +1590,7 @@ def test_restore_refuses_any_recorded_source_org(
     )
     exit_code = main(
         ["--spec", str(spec_file), "--restore", "--from-dump", str(dump),
-         "--target-org", "org-456"]
+         "--target-org", "org-fresh-scratch"]
     )
     assert exit_code == 2
 

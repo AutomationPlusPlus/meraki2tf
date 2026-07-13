@@ -34,6 +34,10 @@ SPEC_REMOTE_URL = (
 DEFAULT_SPEC_FILENAME = "spec3.json"
 
 _DOWNLOAD_TIMEOUT_SECONDS = 60.0
+#: The published Meraki spec is a few MB; cap the download so a
+#: poisoned or wrong endpoint cannot OOM the unattended DR job with an
+#: unbounded response body.
+_MAX_SPEC_BYTES = 128 * 1024 * 1024
 
 
 class SpecResolutionError(RuntimeError):
@@ -43,11 +47,19 @@ class SpecResolutionError(RuntimeError):
 def _download(url: str) -> str:
     try:
         with urllib.request.urlopen(url, timeout=_DOWNLOAD_TIMEOUT_SECONDS) as response:
-            return str(response.read().decode("utf-8"))
+            # Read one byte past the ceiling so an oversized body is
+            # detected rather than silently truncated.
+            raw = response.read(_MAX_SPEC_BYTES + 1)
     except Exception as exc:
         raise SpecResolutionError(
             f"Could not download the Meraki OpenAPI spec from {url}: {exc}"
         ) from exc
+    if len(raw) > _MAX_SPEC_BYTES:
+        raise SpecResolutionError(
+            f"Spec download from {url} exceeds the {_MAX_SPEC_BYTES}-byte "
+            "ceiling; refusing to load a suspiciously large document."
+        )
+    return str(raw.decode("utf-8"))
 
 
 def _parse_spec(text: str, source: str) -> dict[str, Any]:

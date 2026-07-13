@@ -55,6 +55,7 @@ from meraki2tf.fsperms import restrict_to_owner
 from meraki2tf.providers.ratelimit import AdaptiveTokenBucket
 from meraki2tf.replayer import (
     _collection_items,
+    _secret_paths,
     _single_array_body_field,
     _strip_nulls,
     split_redacted as _split_redacted,
@@ -347,6 +348,13 @@ class UnmappedReferenceError(RuntimeError):
     so the action fails loudly instead of guessing."""
 
 
+class ForeignScopeError(RuntimeError):
+    """A path parameter addresses a tenant location outside the
+    snapshot — dispatching it would write into a live organization or
+    onto live hardware the restore does not own, so the action is
+    refused outright (never deferred, never passed through)."""
+
+
 #: Policy-object grammar embedded in firewall rule strings, and the
 #: reference-key stems its two verbs resolve through.
 _OBJ_GRP_RE = re.compile(r"\b(GRP|OBJ)\((\d+)\)")
@@ -521,12 +529,21 @@ class ReferenceResolver:
 
         A parameter with no mapping normally addresses a fixed-slot
         object that kept its identity (SSID numbers, per-scope
-        singletons) and passes through. The exception fails loudly: a
-        value declared via :meth:`expect_remap` (a created object —
-        including a config template addressed through a ``{networkId}``
-        scope) whose rebuilt counterpart does not exist yet. Passing
-        the snapshot ID through would dispatch the write at the source
-        tenant's object, so the caller defers or fails instead.
+        singletons) and passes through. Two exceptions fail loudly
+        instead of passing the snapshot ID through — dispatching at a
+        source-tenant ID would address the wrong (possibly production)
+        object:
+
+        * a value declared via :meth:`expect_remap` (a created object —
+          including a config template addressed through a
+          ``{networkId}`` scope) whose rebuilt counterpart does not
+          exist yet: the caller defers or fails;
+        * an ``{organizationId}``/``{networkId}`` scope with no
+          mapping at all. Those stems are tenant locations, never fixed
+          slots — every legitimate value is either the snapshot's own
+          org (mapped to the target up front) or an object this restore
+          creates — so an unmapped one can only point *outside* the
+          rebuilt organization (a crafted or inconsistent snapshot).
         """
         referrer = frozenset(context)
         stem = _scope_stem(key)
@@ -555,6 +572,12 @@ class ReferenceResolver:
             raise UnmappedReferenceError(
                 f"scope {key}={old!r} addresses a created object with "
                 "no rebuilt counterpart yet"
+            )
+        if stem in ("organization", "network"):
+            raise ForeignScopeError(
+                f"scope {key}={old!r} does not correspond to any object "
+                "recorded in the snapshot; refusing to dispatch a write "
+                "outside the rebuilt organization"
             )
         return old
 
@@ -795,6 +818,18 @@ class RestoreJournal:
                     "new restore."
                 )
             return
+        if self.completed or self.attempted or self.mappings:
+            # Records without a meta line: a journal from a version
+            # that predates target/source binding. Adopting it would
+            # replay another restore's skips and ID mappings against
+            # this target — the exact mis-direction bind() exists to
+            # prevent — so it is refused, never claimed.
+            raise RestoreJournalMismatchError(
+                f"Restore journal {self._path} carries restore records "
+                "but no target/source binding, so which restore it "
+                "belongs to cannot be verified. Use a fresh --workdir "
+                "(or remove the journal) to start a new restore."
+            )
         self.meta = dict(claim)
         self._append({"kind": "meta", **claim})
 
@@ -923,6 +958,14 @@ class OrgRestorer:
             if action.kind == "claim"
             and action.key not in self._journal.completed
         }
+        #: Serials the restore legitimately owns: hardware the snapshot
+        #: records (claimed into the target by the claim wave) or an
+        #: explicit --serial-map replacement. Any other serial in a
+        #: scope addresses live hardware wherever it is currently
+        #: claimed — possibly production — and is refused outright.
+        known_serials = frozenset(
+            device.serial for device in graph.devices
+        ) | frozenset(self._serial_map)
 
         # Alphabetical wave order can place a referrer before its
         # referent (an appliance VLAN carrying groupPolicyId before the
@@ -959,6 +1002,22 @@ class OrgRestorer:
                     skipped.append(
                         {"target": action.key, "reason": "already restored "
                          "(journal); resume skips completed actions"}
+                    )
+                    continue
+                foreign_serials = [
+                    value
+                    for name, value in zip(
+                        _PATH_PARAM_RE.findall(action.api_path),
+                        action.path_values,
+                    )
+                    if _scope_stem(name) == "serial"
+                    and value not in known_serials
+                ]
+                if foreign_serials:
+                    failed.append(
+                        (action.key, f"device {foreign_serials[0]} is not "
+                         "recorded in the snapshot; refusing to write to "
+                         "hardware the restore does not own")
                     )
                     continue
                 # Parents are matched by (type stem, value): a bare
@@ -1047,7 +1106,17 @@ class OrgRestorer:
                     deferred.append((action, str(exc)))
                     continue
                 except Exception as exc:  # noqa: BLE001 - per-object isolation
-                    failed.append((action.key, str(exc)))
+                    message = str(exc)
+                    if _secret_paths(action.payload):
+                        # SDK error text can echo the rejected field
+                        # back; this payload carries live secret values,
+                        # so the echo must not reach logs or alerts.
+                        message = (
+                            f"{type(exc).__name__} (status "
+                            f"{getattr(exc, 'status', 'n/a')}); detail "
+                            "withheld — the request carried secret values"
+                        )
+                    failed.append((action.key, message))
                     if action.kind in ("create", "claim"):
                         # A failed claim poisons its serial too: the
                         # hardware may still be claimed by the source
@@ -1057,6 +1126,19 @@ class OrgRestorer:
                     continue
                 if action.kind == "claim":
                     unclaimed.discard(action.path_values[-1])
+                if new_id is None and action.kind == "create":
+                    # The API accepted the create but returned no
+                    # usable ID, so no old→new mapping can be recorded:
+                    # children referencing the snapshot ID will fail
+                    # loudly on this and every resumed run. Surface the
+                    # remediation instead of leaving a silent strand.
+                    logger.error(
+                        "Create %s returned no object ID; its old "
+                        "identifier cannot be remapped and any children "
+                        "referencing it will fail. Verify the object in "
+                        "the target organization and restore its "
+                        "children manually.", action.key,
+                    )
                 if new_id is not None:
                     own_stem, own_old = _own_identity(action)
                     # The organization is a global singleton scope, so
@@ -1116,6 +1198,18 @@ class OrgRestorer:
             params[name] = resolver.resolve_scope(
                 name, value, action.path_values
             )
+            # Final interlock: whatever the resolver produced, an
+            # organization scope other than the restore target must
+            # never reach the dashboard — a restore only ever writes
+            # into --target-org.
+            if (
+                _scope_stem(name) == "organization"
+                and params[name] != self._target
+            ):
+                raise ForeignScopeError(
+                    f"resolved organization scope {params[name]!r} is not "
+                    "the restore target organization; refusing to dispatch"
+                )
         # Path parameters win over any payload field of the same name —
         # the payload echoes the snapshot tenant's identifiers
         # (organizationId in network payloads, number in SSIDs, portId
@@ -1389,6 +1483,11 @@ class OrgWiper:
         org_deleted = False
         if not failed:
             try:
+                # The network loop above can run for a long time on a
+                # large drill org; re-run the claimed-device interlock
+                # once more so hardware claimed mid-teardown stops the
+                # organization deletion instead of vanishing with it.
+                self.preview(organization_id, expected_name)
                 self._bucket.acquire()
                 dashboard.organizations.deleteOrganization(organization_id)
                 self._bucket.on_success()

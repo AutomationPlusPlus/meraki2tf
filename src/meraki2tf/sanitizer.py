@@ -2,9 +2,13 @@
 
 Backs the ``--sanitize`` flag so a snapshot can be shared for testing,
 demos, or bug reports without leaking credentials or identifying
-details. Three complementary rules, all deterministic (the same input
-always sanitizes to the same output, so sanitized snapshots stay diffable
-across runs):
+details. All rewrites are keyed by a **salt** the sanitized artifact
+never carries: pseudonyms are deterministic under one salt (the same
+input always sanitizes to the same output, so sanitized snapshots stay
+diffable across runs of the same workdir, whose salt persists), but
+without the salt they cannot be inverted by hashing candidate values —
+an unsalted digest of e.g. the RFC 1918 IPv4 space is a
+seconds-of-compute dictionary attack. Three complementary rules:
 
 * **Structural IDs are pseudonymized consistently.** Organization IDs,
   network IDs, and device serials become sequential placeholders
@@ -38,10 +42,14 @@ environment.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import re
+import secrets
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
+from meraki2tf.fsperms import restrict_to_owner
 from meraki2tf.models import (
     FeatureConfiguration,
     MerakiDevice,
@@ -126,38 +134,29 @@ def _is_structural_number(value: str) -> bool:
     return value.isdigit() and len(value) <= _STRUCTURAL_NUMBER_MAX_DIGITS
 
 
-def _pseudonym(key: str, value: str) -> str:
-    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:10]
-    return f"{key.lower()}-{digest}"
+def load_or_create_salt(path: Path) -> bytes:
+    """The workdir's persistent sanitizer salt (created 0600 on first use).
 
-
-def _digest_bytes(value: str) -> bytes:
-    return hashlib.sha256(value.encode("utf-8")).digest()
-
-
-def _fake_ip(value: str, prefix: str) -> str:
-    # Octets land in 1-254 so fake addresses never collide with
-    # network/broadcast shapes or a `10.255.` grep for real leftovers.
-    octets = [byte % 254 + 1 for byte in _digest_bytes(value)[:3]]
-    return f"10.{octets[0]}.{octets[1]}.{octets[2]}{prefix}"
-
-
-def _fake_mac(value: str) -> str:
-    tail = _digest_bytes(value)[:5]
-    return ":".join(["02", *(f"{byte:02x}" for byte in tail)])
-
-
-def _fake_ipv6(value: str, prefix: str) -> str:
-    # Deterministic addresses inside the 2001:db8::/32 documentation
-    # range, prefix length preserved (mirrors the IPv4 treatment).
-    a, b, c, d = _digest_bytes(value)[:4]
-    return f"2001:db8:{a:02x}{b:02x}:{c:02x}{d:02x}::1{prefix}"
+    Keeping the salt beside — never inside — the sanitized artifact
+    preserves cross-run pseudonym stability for a given workdir while
+    denying snapshot recipients the key needed for dictionary
+    inversion.
+    """
+    if path.exists():
+        return bytes.fromhex(path.read_text(encoding="utf-8").strip())
+    salt = secrets.token_bytes(16)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch(mode=0o600)
+    restrict_to_owner(path)
+    path.write_text(salt.hex() + "\n", encoding="utf-8")
+    return salt
 
 
 class _GraphSanitizer:
     """One sanitization pass; holds the consistent structural-ID map."""
 
-    def __init__(self, graph: NetworkGraph) -> None:
+    def __init__(self, graph: NetworkGraph, salt: bytes) -> None:
+        self._salt = salt
         self._id_map: dict[str, str] = {}
         self._counters: dict[str, int] = {}
         self._assign(graph.organization_id, "org")
@@ -191,6 +190,32 @@ class _GraphSanitizer:
     def _mapped(self, value: str) -> str:
         return self._id_map.get(value, value)
 
+    def _digest_bytes(self, value: str) -> bytes:
+        # Keyed (HMAC) digests: without the salt, pseudonyms cannot be
+        # confirmed or inverted by hashing candidate values.
+        return hmac.new(
+            self._salt, value.encode("utf-8"), hashlib.sha256
+        ).digest()
+
+    def _pseudonym(self, key: str, value: str) -> str:
+        return f"{key.lower()}-{self._digest_bytes(value).hex()[:10]}"
+
+    def _fake_ip(self, value: str, prefix: str) -> str:
+        # Octets land in 1-254 so fake addresses never collide with
+        # network/broadcast shapes or a `10.255.` grep for real leftovers.
+        octets = [byte % 254 + 1 for byte in self._digest_bytes(value)[:3]]
+        return f"10.{octets[0]}.{octets[1]}.{octets[2]}{prefix}"
+
+    def _fake_mac(self, value: str) -> str:
+        tail = self._digest_bytes(value)[:5]
+        return ":".join(["02", *(f"{byte:02x}" for byte in tail)])
+
+    def _fake_ipv6(self, value: str, prefix: str) -> str:
+        # Deterministic addresses inside the 2001:db8::/32 documentation
+        # range, prefix length preserved (mirrors the IPv4 treatment).
+        a, b, c, d = self._digest_bytes(value)[:4]
+        return f"2001:db8:{a:02x}{b:02x}:{c:02x}{d:02x}::1{prefix}"
+
     def sanitize(self, graph: NetworkGraph) -> NetworkGraph:
         return NetworkGraph(
             organization_id=self._mapped(graph.organization_id),
@@ -198,7 +223,7 @@ class _GraphSanitizer:
                 MerakiNetwork(
                     network_id=self._mapped(network.network_id),
                     organization_id=self._mapped(network.organization_id),
-                    name=_pseudonym("network", network.name) if network.name else "",
+                    name=self._pseudonym("network", network.name) if network.name else "",
                     product_types=network.product_types,
                     payload=self._clean(dict(network.payload), None),
                 )
@@ -209,7 +234,7 @@ class _GraphSanitizer:
                     serial=self._mapped(device.serial),
                     network_id=self._mapped(device.network_id),
                     model=device.model,
-                    name=_pseudonym("device", device.name) if device.name else "",
+                    name=self._pseudonym("device", device.name) if device.name else "",
                     payload=self._clean(dict(device.payload), None),
                 )
                 for device in graph.devices
@@ -226,24 +251,30 @@ class _GraphSanitizer:
             ),
         )
 
-    def _clean(self, node: Any, key: str | None) -> Any:
+    def _clean(self, node: Any, key: str | None, secret: bool = False) -> Any:
+        # A secret-shaped key marks its WHOLE subtree: a credentials
+        # object's inner keys ({"credentials": {"user", "pass"}}) need
+        # not look secret-shaped themselves.
+        secret = secret or bool(key and _SECRET_KEY.search(key))
         if isinstance(node, Mapping):
             # Keys are data too: fixed-IP assignments key on MACs,
             # per-device maps key on serials.
             return {
-                self._clean_key(child): self._clean(value, child)
+                self._clean_key(child): self._clean(value, child, secret)
                 for child, value in node.items()
             }
         if isinstance(node, (list, tuple)):
-            return [self._clean(value, key) for value in node]
-        return self._clean_scalar(node, key)
+            return [self._clean(value, key, secret) for value in node]
+        return self._clean_scalar(node, key, secret)
 
     def _clean_key(self, key: str) -> str:
         if key in self._id_map:
             return self._id_map[key]
         return self._clean_identity_shaped(key)
 
-    def _clean_scalar(self, value: Any, key: str | None) -> Any:
+    def _clean_scalar(
+        self, value: Any, key: str | None, secret: bool = False
+    ) -> Any:
         # Structural IDs map consistently wherever they appear, before
         # any key-based rule can obscure the reference.
         if isinstance(value, str) and value in self._id_map:
@@ -262,17 +293,28 @@ class _GraphSanitizer:
             if _ID_REFERENCE_KEY.search(key) and not _is_structural_number(value):
                 self._assign(value, "id")
                 return self._id_map[value]
-        if key is None:
+        if secret:
+            # Everything under a secret-shaped key is a credential —
+            # strings and numbers alike (numeric PINs/passcodes arrive
+            # as JSON numbers). Booleans stay: `passwordEnabled` is a
+            # flag, not a secret; empty strings carry nothing.
+            if isinstance(value, str):
+                return REDACTED if value else value
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return REDACTED
             return value
-        if _SECRET_KEY.search(key):
-            # Only string values are replaced: booleans/numbers under
-            # secret-adjacent names (e.g. `passwordEnabled`) are flags,
-            # not credentials, and must keep their type.
-            return REDACTED if isinstance(value, str) and value else value
+        if key is None:
+            # Root-level scalars (list/string payloads accepted verbatim
+            # from canonical snapshots) still get the value-shaped
+            # rules — the PEM redaction and identity rewrites apply "no
+            # matter what key" a value sits under.
+            if isinstance(value, str) and value:
+                return self._clean_identity_shaped(value)
+            return value
         if key.lower() in _COORDINATE_KEYS:
             return 0.0
         if _IDENTITY_KEY.search(key) and isinstance(value, str) and value:
-            return _pseudonym(key, value)
+            return self._pseudonym(key, value)
         if isinstance(value, str):
             return self._clean_identity_shaped(value)
         return value
@@ -292,9 +334,9 @@ class _GraphSanitizer:
                 for index, part in enumerate(re.split(r"(\s*,\s*)", value))
             )
         if _URL_VALUE.search(value):
-            return _pseudonym("url", value)
+            return self._pseudonym("url", value)
         if _FQDN_VALUE.fullmatch(value):
-            return _pseudonym("host", value)
+            return self._pseudonym("host", value)
         # Known structural IDs, FQDNs, IPs, and MACs are rewritten even
         # when embedded in free text (rule comments name networks and
         # hosts; DHCP option strings carry `MCIPADD=10.0.0.1,MCPORT=…`).
@@ -304,18 +346,18 @@ class _GraphSanitizer:
         # Emails before FQDNs: the FQDN rewrite would otherwise consume
         # only the domain and leave the username-bearing local part.
         value = _EMAIL_VALUE.sub(
-            lambda m: _pseudonym("email", m.group(0)), value
+            lambda m: self._pseudonym("email", m.group(0)), value
         )
         value = _FQDN_VALUE.sub(
-            lambda m: _pseudonym("host", m.group(0)), value
+            lambda m: self._pseudonym("host", m.group(0)), value
         )
         value = _IPV4_VALUE.sub(
-            lambda m: _fake_ip(m.group(0), m.group("prefix") or ""), value
+            lambda m: self._fake_ip(m.group(0), m.group("prefix") or ""), value
         )
         value = _IPV6_VALUE.sub(
-            lambda m: _fake_ipv6(m.group(0), m.group("prefix") or ""), value
+            lambda m: self._fake_ipv6(m.group(0), m.group("prefix") or ""), value
         )
-        return _MAC_VALUE.sub(lambda m: _fake_mac(m.group(0)), value)
+        return _MAC_VALUE.sub(lambda m: self._fake_mac(m.group(0)), value)
 
     def _clean_list_part(self, part: str) -> str:
         """Clean one comma-list element, keeping its surrounding whitespace."""
@@ -325,6 +367,17 @@ class _GraphSanitizer:
         return part.replace(stripped, self._clean_identity_shaped(stripped), 1)
 
 
-def sanitize_graph(graph: NetworkGraph) -> NetworkGraph:
-    """A sanitized deep copy of ``graph``; the input is left untouched."""
-    return _GraphSanitizer(graph).sanitize(graph)
+def sanitize_graph(
+    graph: NetworkGraph, salt: bytes | None = None
+) -> NetworkGraph:
+    """A sanitized deep copy of ``graph``; the input is left untouched.
+
+    ``salt`` keys every pseudonym. Passing the workdir's persistent
+    salt (:func:`load_or_create_salt`) keeps sanitized snapshots
+    diffable across runs; omitting it uses a fresh random salt, so
+    pseudonyms are consistent within the output but deliberately not
+    comparable to any other run's.
+    """
+    return _GraphSanitizer(
+        graph, secrets.token_bytes(16) if salt is None else salt
+    ).sanitize(graph)

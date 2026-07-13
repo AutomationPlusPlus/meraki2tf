@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import urllib.request
+from urllib.parse import urlsplit
 
 from meraki2tf.alerts.base import Notifier
 from meraki2tf.alerts.models import AlertEvent
@@ -18,15 +19,29 @@ class WebhookDeliveryError(RuntimeError):
     """The endpoint refused or failed to accept the payload."""
 
 
-class WebhookNotifier(Notifier):
-    """POSTs the event payload as JSON to a configured HTTP endpoint.
+class WebhookConfigError(ValueError):
+    """The configured webhook URL is unusable (e.g. an insecure scheme)."""
 
-    The URL may carry an embedded secret, so it is never logged in full.
+
+class WebhookNotifier(Notifier):
+    """POSTs the event payload as JSON to a configured HTTPS endpoint.
+
+    The URL may carry an embedded secret (Slack/Teams incoming-webhook
+    tokens live in the path), so it is never logged in full and only
+    ``https`` is accepted — payloads and any URL-embedded credential
+    must never cross the network in cleartext.
     """
 
     channel = "webhook"
 
     def __init__(self, url: str, timeout: float = _DEFAULT_TIMEOUT_SECONDS) -> None:
+        scheme = urlsplit(url).scheme.lower()
+        if scheme != "https":
+            raise WebhookConfigError(
+                f"webhook URL must use https (got {scheme or 'no'} scheme); "
+                "the payload and any token embedded in the URL would "
+                "otherwise cross the network in cleartext."
+            )
         self._url = url
         self._timeout = timeout
 

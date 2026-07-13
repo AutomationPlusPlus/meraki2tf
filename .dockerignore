@@ -1,0 +1,29 @@
+# Keep secret-bearing and local-only artifacts out of the Docker build
+# context: `docker build .` copies the whole tree into an image layer,
+# and .gitignore does NOT filter the build context. The unsanitized
+# snapshot and terraform state (both possibly present under generated/)
+# carry live credentials; .git and the venv are large and needless.
+.git
+.gitignore
+generated/
+*.tfstate
+*.tfstate.*
+*.tfplan
+.terraform/
+snapshot.json
+*.jsonl
+*.jsonl.gz
+.env
+.env.*
+sanitizer.salt
+restore-journal.jsonl
+.venv/
+venv/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.tox/
+htmlcov/
+.coverage
+spec3.json

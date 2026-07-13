@@ -97,6 +97,28 @@ def test_cache_file_rejects_malformed_payloads(
         ProviderCatalog.from_cache_file(cache)
 
 
+def test_catalog_rejects_hcl_injecting_resource_names() -> None:
+    """Catalog names become the resource-type half of an import block's
+    address, written verbatim into HCL; a tampered name carrying HCL
+    metacharacters must be refused at ingestion (schema and cache)."""
+    injected = 'meraki_network" "x" {}\nremoved {}'
+    document = {
+        "provider_schemas": {
+            "registry.terraform.io/ciscodevnet/meraki": {
+                "resource_identity_schemas": {
+                    injected: {"attributes": []},
+                }
+            }
+        }
+    }
+    with pytest.raises(CatalogError, match="not a valid meraki"):
+        ProviderCatalog.from_schema_document(document)
+    with pytest.raises(CatalogError, match="not a valid meraki"):
+        ProviderCatalog._from_cache_payload(
+            {"resources": {injected: []}}, source="tampered-cache"
+        )
+
+
 def test_from_schema_document_tolerates_null_attributes() -> None:
     """A provider schema quirk (attributes: null) degrades to an
     attributeless identity instead of crashing catalog resolution."""

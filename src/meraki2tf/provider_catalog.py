@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from importlib import resources as importlib_resources
@@ -44,9 +45,26 @@ CATALOG_CACHE_FILENAME = "provider_catalog.json"
 
 _BUNDLED_RESOURCE = "provider_catalog.json"
 
+#: A Terraform resource type name for this provider. The catalog name
+#: becomes the resource-type half of an ``import`` block's address,
+#: interpolated raw into generated HCL — so it is validated at
+#: ingestion (a tampered cache carrying HCL metacharacters cannot
+#: reach the kit; only the import ID is quote-escaped downstream).
+_RESOURCE_NAME_RE = re.compile(r"^meraki_[a-z0-9_]+$")
+
 
 class CatalogError(RuntimeError):
     """A catalog document was malformed or missing identity schemas."""
+
+
+def _validate_resource_name(name: str, source: str) -> str:
+    if not _RESOURCE_NAME_RE.match(name):
+        raise CatalogError(
+            f"Catalog from {source} carries resource name {name!r}, which "
+            "is not a valid meraki_* Terraform type; refusing it (it would "
+            "be written verbatim into generated HCL)."
+        )
+    return name
 
 
 @dataclass(frozen=True)
@@ -98,7 +116,7 @@ class ProviderCatalog:
                 "meraki2tf requires CiscoDevNet/meraki >= 1.12.0."
             )
         resources = {
-            str(name): _attribute_names(schema)
+            _validate_resource_name(str(name), source): _attribute_names(schema)
             for name, schema in identity.items()
             if isinstance(schema, Mapping)
         }
@@ -142,7 +160,9 @@ class ProviderCatalog:
                     f"Catalog payload from {source} has malformed "
                     f"attributes for {name!r}."
                 )
-            resources[str(name)] = frozenset(str(attr) for attr in attrs)
+            resources[_validate_resource_name(str(name), source)] = frozenset(
+                str(attr) for attr in attrs
+            )
         return cls(resources=resources, source=source)
 
     def to_cache_payload(self) -> dict[str, Any]:

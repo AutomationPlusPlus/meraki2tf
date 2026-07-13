@@ -584,10 +584,19 @@ def test_resolver_edge_cases() -> None:
         resolver.resolve_reference("someIds", "N_1", ())
 
     # Lenient path-parameter resolution: flat-unique wins (a config
-    # template ID used as a {networkId} scope), unknowns pass through.
+    # template ID used as a {networkId} scope). An organization or
+    # network scope with no mapping at all is refused outright — it can
+    # only address a tenant location outside the snapshot.
+    from meraki2tf.restorer import ForeignScopeError
+
     resolver.record("configtemplate", "T_1", "T_NEW", ())
     assert resolver.resolve_scope("networkId", "T_1", ("T_1",)) == "T_NEW"
-    assert resolver.resolve_scope("networkId", "N_x", ("N_x",)) == "N_x"
+    with _pytest.raises(ForeignScopeError, match="outside the rebuilt"):
+        resolver.resolve_scope("networkId", "N_x", ("N_x",))
+    with _pytest.raises(ForeignScopeError, match="outside the rebuilt"):
+        resolver.resolve_scope("organizationId", "org-999", ())
+    # Non-tenant scopes (fixed slots) still pass through.
+    assert resolver.resolve_scope("wirelessProfileId", "7", ("N_1",)) == "7"
 
     # A declared-but-unmapped create identity must never pass through a
     # scope lookup — the snapshot ID would address the source tenant's
@@ -1477,6 +1486,9 @@ def test_recovery_lookup_edge_branches(tmp_path: Path) -> None:
     from meraki2tf.spec.engine import OperationSpec
 
     resolver = ReferenceResolver(_NetworkGraph("org-123", (), (), ()))
+    # Tenant scopes never pass through unmapped; the lookup's network
+    # scope must resolve to a rebuilt counterpart.
+    resolver.record("network", "N_1", "N_LIVE", ())
     restorer = OrgRestorer("org-TARGET", RestoreJournal(tmp_path / "e.jsonl"))
     lookup = OperationSpec(
         operation_id="getNetworkGroupPolicies",
@@ -1543,6 +1555,7 @@ def test_recovery_lookup_falls_back_to_the_create(tmp_path: Path) -> None:
     network_key = "/organizations/{organizationId}/networks::N_1"
 
     journal = RestoreJournal(tmp_path / "nomatch.jsonl")
+    journal.bind(target="org-TARGET", source="org-123")
     journal.record_attempt(network_key)
 
     calls: list = []
@@ -1584,6 +1597,24 @@ def test_journal_binds_to_one_target_and_source(tmp_path: Path) -> None:
         RestoreJournal(path).bind(target="org-B", source="org-123")
     with _pytest.raises(RestoreJournalMismatchError, match="refusing"):
         RestoreJournal(path).bind(target="org-A", source="org-456")
+
+
+def test_journal_with_records_but_no_meta_is_refused(tmp_path: Path) -> None:
+    """A journal from a version predating target/source binding carries
+    done/map lines but no meta; adopting it would replay another
+    restore's skips and mappings against this target."""
+    import pytest as _pytest
+
+    from meraki2tf.restorer import RestoreJournal, RestoreJournalMismatchError
+
+    legacy = tmp_path / "legacy.jsonl"
+    legacy.write_text(
+        '{"kind": "done", "key": "/organizations/{organizationId}/networks::N_1"}\n'
+        '{"kind": "map", "old": "N_1", "new": "L_OLD"}\n',
+        encoding="utf-8",
+    )
+    with _pytest.raises(RestoreJournalMismatchError, match="no target/source"):
+        RestoreJournal(legacy).bind(target="org-A", source="org-123")
 
 
 def test_journal_tolerates_a_torn_final_line_only(tmp_path: Path) -> None:

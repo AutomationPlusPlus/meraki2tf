@@ -972,6 +972,12 @@ class PipelineOrchestrator:
                     )
                     self._runner.defer_resources(frozenset(racy))
                     deferred.extend(racy)
+                    # The deferred addresses no longer exist in config
+                    # or state; retrying with them still in -target
+                    # would error the replan and skip the whole chunk.
+                    chunk = [a for a in chunk if a not in set(racy)]
+                    if not chunk:
+                        return ()
                     continue
             logger.warning(
                 "Targeted window %d/%d still proposes mutations after "
