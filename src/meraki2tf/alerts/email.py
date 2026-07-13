@@ -78,6 +78,11 @@ class EmailNotifier(Notifier):
             # left as plaintext (the contract designates email a
             # placeholder) rather than failing the alert.
             try:
+                # EHLO first: has_extn() reads esmtp_features, which is
+                # only populated by ehlo() — connect() does not send it,
+                # so without this has_extn("starttls") is always False
+                # and the hop is never encrypted.
+                smtp.ehlo()
                 if smtp.has_extn("starttls"):
                     smtp.starttls()
                     smtp.ehlo()

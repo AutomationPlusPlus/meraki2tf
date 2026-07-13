@@ -7,7 +7,42 @@ from meraki2tf.models import (
     MerakiNetwork,
     NetworkGraph,
 )
-from meraki2tf.sanitizer import REDACTED, _GraphSanitizer, sanitize_graph
+import stat
+from pathlib import Path
+
+import pytest
+
+from meraki2tf.sanitizer import (
+    REDACTED,
+    _GraphSanitizer,
+    load_or_create_salt,
+    sanitize_graph,
+)
+
+
+def test_load_or_create_salt_persists_and_is_owner_only(tmp_path: Path) -> None:
+    path = tmp_path / "sub" / "sanitizer.salt"  # parent created on demand
+    first = load_or_create_salt(path)
+    assert len(first) == 16
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    # A valid existing salt is reused verbatim (cross-run stability).
+    assert load_or_create_salt(path) == first
+    assert not path.with_name(path.name + ".tmp").exists()
+
+
+@pytest.mark.parametrize("content", ["", "  \n", "not-hex-content", "ab"])
+def test_load_or_create_salt_regenerates_a_corrupt_or_empty_file(
+    tmp_path: Path, content: str
+) -> None:
+    """An empty salt would silently defeat dictionary-inversion
+    protection and a non-hex one must not crash every run; both are
+    regenerated to a full-length salt rather than trusted."""
+    path = tmp_path / "sanitizer.salt"
+    path.write_text(content, encoding="utf-8")
+    salt = load_or_create_salt(path)
+    assert len(salt) == 16
+    # The regenerated file is now valid and reused on the next call.
+    assert load_or_create_salt(path) == salt
 
 
 def _graph() -> NetworkGraph:
