@@ -15,6 +15,7 @@ from meraki2tf.orchestrator import (
     PENDING_DELETIONS_FILENAME,
     PipelineError,
     PipelineOrchestrator,
+    PreflightRefusalError,
 )
 from meraki2tf.providers.base import MerakiDataProvider
 from meraki2tf.terraform_runner import (
@@ -43,8 +44,10 @@ class StubProvider(MerakiDataProvider):
 
     def __init__(self) -> None:
         self.closed = False
+        self.fetched = False
 
     def fetch_network_graph(self, organization_id: str | None = None) -> NetworkGraph:
+        self.fetched = True
         return NetworkGraph(
             organization_id=organization_id or "org-123",
             networks=(),
@@ -166,9 +169,14 @@ class StubRunner:
     def has_config_baseline(self) -> bool:
         return self.config_baseline
 
-    def reset_baseline(self, existing_addresses: frozenset[str]) -> None:
+    def ensure_baseline_resettable(
+        self, existing_addresses: frozenset[str]
+    ) -> None:
         if existing_addresses:
             raise TerraformError("cannot rebaseline with tracked resources")
+
+    def reset_baseline(self, existing_addresses: frozenset[str]) -> None:
+        self.ensure_baseline_resettable(existing_addresses)
         self.baseline_reset = True
 
     def init(self) -> TerraformCommandResult:
@@ -414,14 +422,32 @@ def test_rebaseline_resets_before_generation(tmp_path: Path, api_key: None) -> N
     assert [e.event_type for e in recorder.events] == [EventType.RUN_SUCCESS]
 
 
-def test_rebaseline_with_tracked_state_is_a_fault(
+def test_rebaseline_with_tracked_state_refuses_before_discovery(
     tmp_path: Path, api_key: None
 ) -> None:
-    orchestrator, recorder, _, runner = _orchestrator(tmp_path, rebaseline=True)
+    orchestrator, recorder, provider, runner = _orchestrator(
+        tmp_path, rebaseline=True
+    )
     runner.state_addresses = {"meraki_networks.n_1"}
-    with pytest.raises(PipelineError, match="baseline reset"):
+    with pytest.raises(PreflightRefusalError, match="tracked resources"):
         orchestrator.run("org-123")
-    assert recorder.events[0].details["stage"] == "baseline reset"
+    # An expected refusal: no discovery spent, no fault alert paged.
+    assert not provider.fetched
+    assert recorder.events == []
+    assert not runner.baseline_reset
+
+
+def test_rebaseline_without_api_key_refuses_before_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    orchestrator, recorder, provider, runner = _orchestrator(
+        tmp_path, rebaseline=True
+    )
+    with pytest.raises(PreflightRefusalError, match=API_KEY_ENV_VAR):
+        orchestrator.run("org-123")
+    assert not provider.fetched
+    assert recorder.events == []
     assert not runner.baseline_reset
 
 

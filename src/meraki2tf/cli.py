@@ -46,7 +46,7 @@ from meraki2tf.alerts import (
     WebhookNotifier,
     gap_replay_executed,
 )
-from meraki2tf.alerts.models import redact_diff
+from meraki2tf.alerts.models import condense_diff, redact_diff
 from meraki2tf.config import (
     API_KEY_ENV_VAR,
     WEBHOOK_URL_ENV_VAR,
@@ -61,7 +61,12 @@ from meraki2tf.hcl_generator import HclImportGenerator
 from meraki2tf.logging_setup import configure_logging
 from meraki2tf.models import NetworkGraph
 from meraki2tf.openapi_parser import OpenApiParser
-from meraki2tf.orchestrator import PipelineError, PipelineOrchestrator, RunSummary
+from meraki2tf.orchestrator import (
+    PipelineError,
+    PipelineOrchestrator,
+    PreflightRefusalError,
+    RunSummary,
+)
 from meraki2tf.provider_catalog import (
     CATALOG_CACHE_FILENAME,
     CatalogError,
@@ -612,7 +617,7 @@ def _rebuild(config: RuntimeConfig) -> int:
     # values, and the log must carry names and locators, never secrets.
     logger.info(
         "Rebuild plan for workspace %s:\n%s",
-        config.workdir, redact_diff(preview.stdout),
+        config.workdir, redact_diff(condense_diff(preview.stdout)),
     )
     if not preview.has_changes:
         runner.discard_rebuild_plan()
@@ -1256,6 +1261,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             drift_baseline=config.drift_baseline,
         )
         summary = orchestrator.run(config.org_id)
+    except PreflightRefusalError as exc:
+        # An expected refusal (preconditions unmet); nothing ran and no
+        # fault alert belongs to it — same clean-refusal exit the other
+        # guarded actions use.
+        logger.critical("%s", exc)
+        return 2
     except PipelineError as exc:
         # The orchestrator already dispatched PROCESSING_FAULT for this
         # failure; a second alert here would double-report it.
