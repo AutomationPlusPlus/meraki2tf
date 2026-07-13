@@ -15,11 +15,45 @@ structural data: never credentials.
 from __future__ import annotations
 
 import enum
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from meraki2tf.sanitizer import SECRET_KEY_PATTERN
+
+#: Terraform's per-resource progress chatter in ``-no-color`` plan/apply
+#: output. These lines open at column 0 with the resource address, so
+#: they cannot be confused with diff hunks (always indented) or with the
+#: plan summary/header lines (which never start with an address-colon).
+_PLAN_PROGRESS_RE = re.compile(
+    r"^\S+: (?:"
+    r"Refreshing state|Still refreshing|Preparing import"
+    r"|Reading|Still reading|Read complete"
+    r")\.*(?:\s|$)"
+)
+
+
+def condense_diff(text: str) -> str:
+    """Drop terraform's progress chatter from a plan diff.
+
+    A refresh over a large state emits one ``address: Refreshing
+    state...`` line per tracked resource — tens of thousands of lines
+    on a production organization — burying the actual change hunks an
+    operator must review and inflating alert payloads past what many
+    webhook receivers accept. Only the progress lines go; hunks,
+    headers, and the plan summary stay untouched.
+    """
+    kept: list[str] = []
+    for line in text.splitlines():
+        if _PLAN_PROGRESS_RE.match(line):
+            continue
+        if not line.strip() and kept and not kept[-1].strip():
+            continue  # collapse the blank runs the removals leave behind
+        kept.append(line)
+    while kept and not kept[0].strip():
+        kept.pop(0)
+    return "\n".join(kept)
 
 
 def redact_diff(text: str) -> str:
@@ -116,7 +150,7 @@ def drift_detected(
             else "Configuration drift detected between discovery and Terraform state."
         ),
         details={
-            "diff": redact_diff(diff),
+            "diff": redact_diff(condense_diff(diff)),
             "workspace": workspace,
             "origin": origin,
             "apply_aborted": apply_aborted,

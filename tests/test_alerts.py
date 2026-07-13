@@ -380,6 +380,60 @@ def test_drift_alert_payload_redacts_secret_values() -> None:
     assert "(value redacted)" in event.details["diff"]
 
 
+def test_condense_diff_strips_plan_progress_noise() -> None:
+    from meraki2tf.alerts.models import condense_diff
+
+    diff = (
+        "meraki_wireless_ssid.l_1_0: Refreshing state... [id=1,0]\n"
+        "meraki_network_snmp.l_1: Still refreshing... [10s elapsed]\n"
+        "data.meraki_networks.all: Reading...\n"
+        "data.meraki_networks.all: Still reading... [10s elapsed]\n"
+        "data.meraki_networks.all: Read complete after 11s\n"
+        "meraki_wireless_ssid.l_1_0: Preparing import... [id=1,0]\n"
+        "\n"
+        "Terraform will perform the following actions:\n"
+        "\n"
+        "  # meraki_wireless_ssid.l_1_0 will be updated in-place\n"
+        "  ~ resource \"meraki_wireless_ssid\" \"l_1_0\" {\n"
+        "      ~ name = \"a\" -> \"b\"\n"
+        "    }\n"
+        "\n"
+        "Plan: 0 to add, 1 to change, 0 to destroy.\n"
+    )
+    out = condense_diff(diff)
+    assert "Refreshing state" not in out
+    assert "Still refreshing" not in out
+    assert "Reading..." not in out
+    assert "Read complete" not in out
+    assert "Preparing import" not in out
+    assert "will be updated in-place" in out
+    assert '~ name = "a" -> "b"' in out
+    assert "Plan: 0 to add, 1 to change, 0 to destroy." in out
+    assert not out.startswith("\n")
+    assert "\n\n\n" not in out  # removals leave no blank runs
+
+
+def test_condense_diff_keeps_indented_hunks_that_mention_progress() -> None:
+    from meraki2tf.alerts.models import condense_diff
+
+    # Indented diff content is never progress chatter, even when an
+    # attribute value happens to contain the same words.
+    diff = '      ~ note = "Refreshing state: manual"'
+    assert condense_diff(diff) == diff
+
+
+def test_drift_alert_payload_drops_refresh_noise() -> None:
+    event = drift_detected(
+        diff=(
+            "meraki_networks.n_1: Refreshing state... [id=1]\n"
+            '  ~ name = "a" -> "b"'
+        ),
+        workspace="w",
+    )
+    assert "Refreshing state" not in event.details["diff"]
+    assert '~ name = "a" -> "b"' in event.details["diff"]
+
+
 def test_default_smtp_factory_applies_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
