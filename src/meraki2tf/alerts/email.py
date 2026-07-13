@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import smtplib
+import ssl
 from collections.abc import Callable, Sequence
 from email.message import EmailMessage
 
@@ -72,11 +73,19 @@ class EmailNotifier(Notifier):
     def send(self, event: AlertEvent) -> None:
         message = self.build_message(event)
         with self._smtp_factory(self._host, self._port, self._timeout) as smtp:
-            # Opportunistic STARTTLS: alert bodies carry the full
-            # resource inventory and drift diffs, so encrypt the hop
-            # whenever the relay advertises it. Relays that don't are
-            # left as plaintext (the contract designates email a
-            # placeholder) rather than failing the alert.
+            # Opportunistic STARTTLS with a VERIFIED context: alert
+            # bodies carry the full resource inventory and drift diffs,
+            # so when the relay advertises STARTTLS the hop is encrypted
+            # with certificate and hostname validation (the ssl-module
+            # default context). Without verification an active MITM can
+            # present any certificate, so an unverified handshake would
+            # protect against passive sniffing only. Note the honest
+            # limits: relays that never advertise STARTTLS still get
+            # plaintext (the contract designates email a placeholder),
+            # and relays whose certificate fails validation (e.g.
+            # self-signed internal relays) now fail the handshake — the
+            # failure lands in the warning below and delivery over the
+            # broken connection then typically fails too.
             try:
                 # EHLO first: has_extn() reads esmtp_features, which is
                 # only populated by ehlo() — connect() does not send it,
@@ -84,7 +93,7 @@ class EmailNotifier(Notifier):
                 # and the hop is never encrypted.
                 smtp.ehlo()
                 if smtp.has_extn("starttls"):
-                    smtp.starttls()
+                    smtp.starttls(context=ssl.create_default_context())
                     smtp.ehlo()
             except (smtplib.SMTPException, OSError) as exc:
                 logger.warning(

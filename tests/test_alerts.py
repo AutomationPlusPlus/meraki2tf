@@ -275,7 +275,9 @@ class FakeSmtp:
         assert self.ehlo_count > 0, "has_extn called before ehlo()"
         return False
 
-    def starttls(self) -> None:  # pragma: no cover - not reached here
+    def starttls(  # pragma: no cover - not reached here
+        self, *, context: Any = None
+    ) -> None:
         raise AssertionError("starttls attempted on a non-TLS relay")
 
     def ehlo(self) -> None:
@@ -338,7 +340,11 @@ def test_email_negotiates_starttls_when_the_relay_offers_it() -> None:
             assert self.ehlo_count > 0, "has_extn called before ehlo()"
             return name == "starttls"
 
-        def starttls(self) -> None:
+        def starttls(self, *, context: Any = None) -> None:
+            # The notifier must hand over a verified context — an
+            # unverified handshake protects against passive sniffing
+            # only (see test_email_tls.py for the full contract).
+            assert context is not None, "starttls called without a context"
             TlsSmtp.started = True
 
     FakeSmtp.sent.clear()
@@ -473,6 +479,36 @@ def test_partial_success_does_not_log_total_failure(
         )
     assert delivered == 1
     assert not [r for r in caplog.records if "ALL" in r.message]
+
+
+def test_dispatcher_counts_total_delivery_failures() -> None:
+    """The counter feeds the CLI's exit-5 contract: an event no channel
+    accepted must be visible to the caller after the run."""
+    dispatcher = AlertDispatcher([ExplodingNotifier()])
+    assert dispatcher.failed_event_count == 0
+    dispatcher.dispatch(drift_detected(diff="delta", workspace="generated"))
+    dispatcher.dispatch(drift_detected(diff="delta", workspace="generated"))
+    assert dispatcher.failed_event_count == 2
+
+
+def test_partial_delivery_does_not_count_as_failure() -> None:
+    dispatcher = AlertDispatcher([ExplodingNotifier(), RecordingNotifier()])
+    dispatcher.dispatch(drift_detected(diff="delta", workspace="generated"))
+    assert dispatcher.failed_event_count == 0
+
+
+def test_zero_channels_never_count_as_failure() -> None:
+    """No channels is a deliberate ad-hoc setup, not an outage."""
+    dispatcher = AlertDispatcher()
+    assert dispatcher.channel_count == 0
+    dispatcher.dispatch(drift_detected(diff="delta", workspace="generated"))
+    assert dispatcher.failed_event_count == 0
+
+
+def test_dispatcher_reports_registered_channel_count() -> None:
+    dispatcher = AlertDispatcher([RecordingNotifier()])
+    dispatcher.register(RecordingNotifier())
+    assert dispatcher.channel_count == 2
 
 
 def test_email_notifier_logs_partial_recipient_refusals(

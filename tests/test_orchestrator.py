@@ -11,7 +11,11 @@ from meraki2tf.config import API_KEY_ENV_VAR
 from meraki2tf.coverage import COVERAGE_JSON_FILENAME, COVERAGE_SUMMARY_FILENAME
 from meraki2tf.hcl_generator import CapturedAsset, GenerationReport, UnsupportedAsset
 from meraki2tf.models import FeatureConfiguration, NetworkGraph
-from meraki2tf.orchestrator import PipelineError, PipelineOrchestrator
+from meraki2tf.orchestrator import (
+    PENDING_DELETIONS_FILENAME,
+    PipelineError,
+    PipelineOrchestrator,
+)
 from meraki2tf.providers.base import MerakiDataProvider
 from meraki2tf.terraform_runner import (
     ImportGuardViolation,
@@ -753,6 +757,37 @@ def test_targeted_window_defers_racy_import_and_retries(
     assert len(deferral_alerts) == 1
 
 
+def test_targeted_window_with_every_import_racy_defers_them_all(
+    tmp_path: Path,
+    api_key: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A window whose every pending import is racy has nothing left to
+    replan after deferral: the chunk applies nothing and the run goes
+    on — the deferred imports land on the next run."""
+    monkeypatch.setattr(
+        PipelineOrchestrator, "_MATERIALIZE_CHUNK_SIZE", 2
+    )
+    orchestrator, _, _, runner = _orchestrator(
+        tmp_path, plan_exit=2, plan_stdout=PLAN_WITH_CHANGES, sync=True
+    )
+    runner.actions_queue = [
+        {"meraki_networks.ghost": ("delete",)},   # heal: blocking → abort
+        {   # chunk catch: the whole window is racy
+            "meraki_devices.q2ab": ("update",),
+            "meraki_networks.n_1": ("update",),
+        },
+    ]
+    runner.targeted_plans = [(2, PLAN_WITH_CHANGES)]
+    summary = orchestrator.run("org-123")
+
+    assert not runner.applied
+    assert summary.resources_added_to_state == ()
+    assert summary.deferred_addresses == (
+        "meraki_devices.q2ab", "meraki_networks.n_1",
+    )
+
+
 def test_targeted_window_skipped_when_still_dirty_after_deferral(
     tmp_path: Path,
     api_key: None,
@@ -942,6 +977,13 @@ def test_runner_guard_violation_aborts_with_alert_not_fault(
 # ---------------------------------------------------------------------------
 
 
+def _seed_alerted_deletions(workdir: Path, addresses: list[str]) -> Path:
+    """A pending-deletions record as a previous alerting run left it."""
+    path = workdir / PENDING_DELETIONS_FILENAME
+    path.write_text(json.dumps({"addresses": addresses}), encoding="utf-8")
+    return path
+
+
 def test_meraki_deletions_are_alert_only(tmp_path: Path, api_key: None) -> None:
     orchestrator, recorder, _, runner = _orchestrator(tmp_path)
     runner.state_addresses = {"meraki_networks.n_1", "meraki_networks.deleted"}
@@ -959,6 +1001,12 @@ def test_meraki_deletions_are_alert_only(tmp_path: Path, api_key: None) -> None:
     assert recorder.events[1].details["deletions_pending_confirmation"] == [
         "meraki_networks.deleted"
     ]
+    # The alerted set is persisted: it is exactly what a future
+    # --confirm-deletions is allowed to remove.
+    record = json.loads(
+        (tmp_path / PENDING_DELETIONS_FILENAME).read_text(encoding="utf-8")
+    )
+    assert record["addresses"] == ["meraki_networks.deleted"]
 
 
 def test_deletions_detected_even_without_api_key(
@@ -980,6 +1028,7 @@ def test_confirm_deletions_removes_from_kit_and_state(
     orchestrator, recorder, _, runner = _orchestrator(
         tmp_path, confirm_deletions=True
     )
+    _seed_alerted_deletions(tmp_path, ["meraki_networks.deleted"])
     runner.state_addresses = {"meraki_networks.n_1", "meraki_networks.deleted"}
     summary = orchestrator.run("org-123")
 
@@ -989,6 +1038,112 @@ def test_confirm_deletions_removes_from_kit_and_state(
     assert summary.deletions_pending == ()
     # Confirmed removals need no pending-confirmation alert.
     assert [e.event_type for e in recorder.events] == [EventType.RUN_SUCCESS]
+    # The confirmed set is spent: a later run must not reuse it.
+    assert not (tmp_path / PENDING_DELETIONS_FILENAME).exists()
+
+
+def test_confirm_deletions_covers_only_the_alerted_set(
+    tmp_path: Path, api_key: None
+) -> None:
+    """The operator confirmed the alert they reviewed, not whatever
+    happens to be missing on the confirmation run: an address that went
+    missing after the alert is alerted anew, never removed."""
+    orchestrator, recorder, _, runner = _orchestrator(
+        tmp_path, confirm_deletions=True
+    )
+    _seed_alerted_deletions(tmp_path, ["meraki_networks.reviewed"])
+    runner.state_addresses = {
+        "meraki_networks.n_1",
+        "meraki_networks.reviewed",  # alerted on a previous run
+        "meraki_networks.fresh",  # went missing after the alert
+    }
+    summary = orchestrator.run("org-123")
+
+    assert runner.removed == [("meraki_networks.reviewed",)]
+    assert summary.deletions_removed == ("meraki_networks.reviewed",)
+    assert summary.deletions_pending == ("meraki_networks.fresh",)
+    assert [e.event_type for e in recorder.events] == [
+        EventType.DELETION_PENDING_CONFIRMATION,
+        EventType.RUN_SUCCESS,
+    ]
+    assert recorder.events[0].details["addresses"] == ["meraki_networks.fresh"]
+    # The freshly alerted set becomes the next confirmable set.
+    record = json.loads(
+        (tmp_path / PENDING_DELETIONS_FILENAME).read_text(encoding="utf-8")
+    )
+    assert record["addresses"] == ["meraki_networks.fresh"]
+
+
+def test_confirm_deletions_without_prior_alert_removes_nothing(
+    tmp_path: Path, api_key: None
+) -> None:
+    """--confirm-deletions on a run with no persisted alerted set (first
+    sighting of the deletions) only alerts — there was nothing reviewed
+    to confirm."""
+    orchestrator, recorder, _, runner = _orchestrator(
+        tmp_path, confirm_deletions=True
+    )
+    runner.state_addresses = {"meraki_networks.n_1", "meraki_networks.deleted"}
+    summary = orchestrator.run("org-123")
+
+    assert runner.removed == []
+    assert summary.deletions_removed == ()
+    assert summary.deletions_pending == ("meraki_networks.deleted",)
+    assert recorder.events[0].event_type is (
+        EventType.DELETION_PENDING_CONFIRMATION
+    )
+
+
+def test_confirm_deletions_ignores_a_corrupt_pending_record(
+    tmp_path: Path, api_key: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An unreadable reviewed set must degrade to 'nothing reviewed'
+    (re-alert), never authorize a removal."""
+    (tmp_path / PENDING_DELETIONS_FILENAME).write_text(
+        "not json", encoding="utf-8"
+    )
+    orchestrator, recorder, _, runner = _orchestrator(
+        tmp_path, confirm_deletions=True
+    )
+    runner.state_addresses = {"meraki_networks.n_1", "meraki_networks.deleted"}
+    with caplog.at_level("WARNING", logger="meraki2tf.orchestrator"):
+        summary = orchestrator.run("org-123")
+
+    assert runner.removed == []
+    assert summary.deletions_pending == ("meraki_networks.deleted",)
+    assert "unreadable" in caplog.text
+    assert recorder.events[0].event_type is (
+        EventType.DELETION_PENDING_CONFIRMATION
+    )
+
+
+def test_confirm_deletions_rejects_a_non_list_pending_record(
+    tmp_path: Path, api_key: None
+) -> None:
+    (tmp_path / PENDING_DELETIONS_FILENAME).write_text(
+        json.dumps({"addresses": "meraki_networks.deleted"}), encoding="utf-8"
+    )
+    orchestrator, _, _, runner = _orchestrator(
+        tmp_path, confirm_deletions=True
+    )
+    runner.state_addresses = {"meraki_networks.n_1", "meraki_networks.deleted"}
+    summary = orchestrator.run("org-123")
+    assert runner.removed == []
+    assert summary.deletions_pending == ("meraki_networks.deleted",)
+
+
+def test_stale_pending_record_is_cleared_when_nothing_is_missing(
+    tmp_path: Path, api_key: None
+) -> None:
+    """A resource recreated (or transiently absent) after its alert must
+    drop out of the confirmable set — a stale record must not authorize
+    a removal on some later run."""
+    path = _seed_alerted_deletions(tmp_path, ["meraki_networks.n_1"])
+    orchestrator, _, _, runner = _orchestrator(tmp_path)
+    runner.state_addresses = {"meraki_networks.n_1"}
+    summary = orchestrator.run("org-123")
+    assert summary.deletions_pending == ()
+    assert not path.exists()
 
 
 def test_confirm_deletions_is_a_noop_without_deletions(
@@ -1012,6 +1167,11 @@ def test_unreadable_endpoints_do_not_read_as_deletions(
     )
     orchestrator, recorder, _, runner = _orchestrator(
         tmp_path, generator=generator, confirm_deletions=True
+    )
+    # Even a previously alerted address stays exempt while its endpoint
+    # is unreadable: absence alone is not evidence of deletion.
+    _seed_alerted_deletions(
+        tmp_path, ["meraki_networks.deleted", "meraki_wireless_ssids.s_1"]
     )
     runner.state_addresses = {
         "meraki_networks.n_1",

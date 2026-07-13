@@ -4,8 +4,13 @@ Built for both ad-hoc invocation and unattended scheduled runs (e.g. a
 weekly cron job): every input arrives via flags or environment
 variables, no interactive prompts, and the exit code reports outcome
 (0 = clean aggregation, 1 = pipeline fault, 2 = usage error,
-3 = coverage gaps with --fail-on-gaps, 4 = sync-mode auto-apply aborted
-for human review — state did not grow this run).
+3 = coverage gaps with --fail-on-gaps, 4 = sync-mode full-kit
+auto-apply aborted for human review — mutations blocked the full apply,
+though import-only chunks may still have grown state, 5 = the run
+itself succeeded but at least one alert event reached no configured
+channel). When several codes apply the most severe wins: 1/2 (nothing
+usable happened) over 4 (state materialization is stalled on a human)
+over 3 (known coverage gaps) over 5 (silent notifier outage).
 
 Mode gating: the default invocation is the ad-hoc/open-source mode —
 strictly read-only end-to-end (kit generation, speculative plan,
@@ -34,12 +39,14 @@ from meraki2tf.alerts import (
     org_wipe_executed,
     processing_fault,
     restore_executed,
+    run_success,
     AlertDispatcher,
     EmailNotifier,
     WebhookConfigError,
     WebhookNotifier,
     gap_replay_executed,
 )
+from meraki2tf.alerts.models import redact_diff
 from meraki2tf.config import (
     API_KEY_ENV_VAR,
     WEBHOOK_URL_ENV_VAR,
@@ -49,11 +56,18 @@ from meraki2tf.config import (
     StateBackend,
     api_key_present,
 )
+from meraki2tf.coverage import build_manifest, unsupported_payload, write_manifest
 from meraki2tf.hcl_generator import HclImportGenerator
 from meraki2tf.logging_setup import configure_logging
+from meraki2tf.models import NetworkGraph
 from meraki2tf.openapi_parser import OpenApiParser
 from meraki2tf.orchestrator import PipelineError, PipelineOrchestrator, RunSummary
-from meraki2tf.provider_catalog import resolve_catalog
+from meraki2tf.provider_catalog import (
+    CATALOG_CACHE_FILENAME,
+    CatalogError,
+    ProviderCatalog,
+    resolve_catalog,
+)
 from meraki2tf.replayer import GapReplayer, plan_replay
 from meraki2tf.providers import (
     LiveApiDataProvider,
@@ -397,6 +411,15 @@ def build_dispatcher(config: RuntimeConfig) -> AlertDispatcher:
                 recipients=config.alert_emails,
             )
         )
+    if dispatcher.channel_count == 0:
+        # Legitimate for ad-hoc terminal runs, but a scheduled DR job
+        # without channels would drop every drift/fault/coverage alert
+        # on the floor with nobody watching the log.
+        logger.warning(
+            "No alert channels are configured (--webhook-url / "
+            "--alert-email): drift, deletions, coverage gaps, and faults "
+            "will reach the run log only."
+        )
     return dispatcher
 
 
@@ -406,15 +429,97 @@ def build_provider(config: RuntimeConfig, parser: OpenApiParser) -> MerakiDataPr
     return LiveApiDataProvider(parser=parser)
 
 
+def _offline_catalog(config: RuntimeConfig) -> ProviderCatalog:
+    """Keyless catalog resolution without a TerraformRunner.
+
+    The export path must never touch terraform, so this walks only the
+    tail of :func:`resolve_catalog`'s chain: the workdir cache a keyed
+    pipeline run left behind, then the bundled catalog.
+    """
+    cache = config.workdir / CATALOG_CACHE_FILENAME
+    if cache.exists():
+        try:
+            return ProviderCatalog.from_cache_file(cache)
+        except CatalogError as exc:
+            logger.warning("%s; falling back to the bundled catalog.", exc)
+    return ProviderCatalog.bundled()
+
+
+def _export_coverage(
+    graph: NetworkGraph,
+    config: RuntimeConfig,
+    parser: OpenApiParser,
+    dispatcher: AlertDispatcher,
+    drift_was_detected: bool,
+) -> None:
+    """Coverage manifest + RUN_SUCCESS for a snapshot-export run.
+
+    The scheduled weekly job is a --dump-to invocation, and Cardinal
+    Rule 2 does not pause for it: every run must answer "what is and
+    isn't covered by Terraform?" and push the unsupported list to the
+    operator. Classification reuses the pipeline's generator against a
+    throwaway directory — terraform itself is never invoked, and the
+    workdir's accumulated kit is not touched.
+    """
+    from meraki2tf.restorer import plan_restore, restore_verdicts
+    from meraki2tf.runbook import payload_index, secret_attribute_union
+
+    generator = HclImportGenerator(
+        parser,
+        dispatcher,
+        catalog_provider=lambda: _offline_catalog(config),
+    )
+    with tempfile.TemporaryDirectory(prefix="meraki2tf-export-") as tmp:
+        report = generator.generate(graph, Path(tmp))
+    # The plan reconciliation never runs here, so the payload scan alone
+    # carries the "restore manually after a rebuild" secret set.
+    unmanaged_secrets = secret_attribute_union(
+        report.captured, {}, payload_index(graph)
+    )
+    manifest = build_manifest(
+        organization_id=graph.organization_id,
+        captured=report.captured,
+        unsupported=report.unsupported,
+        # Export runs never read Terraform state; every capturable
+        # asset is honestly "in the kit, not known to be in state".
+        state_addresses=frozenset(),
+        unmanaged_secret_attributes=unmanaged_secrets,
+        restore_via=restore_verdicts(plan_restore(graph, parser)),
+    )
+    config.workdir.mkdir(parents=True, exist_ok=True)
+    write_manifest(manifest, config.workdir)
+    logger.info(
+        "Snapshot export complete; dispatching RUN_SUCCESS notification. "
+        "The Meraki organization was not modified — every run is "
+        "read-only toward Meraki."
+    )
+    dispatcher.dispatch(
+        run_success(
+            imports_written=report.imports_written,
+            drift_was_detected=drift_was_detected,
+            workspace=str(config.workdir),
+            discovered_assets=graph.asset_count(),
+            imports_already_tracked=report.skipped_existing,
+            unsupported=unsupported_payload(report.unsupported),
+            pending_imports=None,
+            comparison_performed=False,
+            coverage_percent=float(manifest["coverage_percent"]),
+            unmanaged_secret_attributes=unmanaged_secrets,
+        )
+    )
+
+
 def _export_snapshot(
     provider: MerakiDataProvider,
     config: RuntimeConfig,
     parser: OpenApiParser,
+    dispatcher: AlertDispatcher,
 ) -> int:
     """Discover the graph and write it as an offline snapshot (--dump-to)."""
     assert config.dump_to is not None  # guarded by the caller
     with provider as source:
         graph = source.fetch_network_graph(config.org_id)
+    drift_was_detected = False
     if config.drift_baseline is not None:
         from meraki2tf.snapshot_diff import baseline_drift, render_diff
 
@@ -422,17 +527,22 @@ def _export_snapshot(
         if drift.is_empty:
             logger.info("Snapshot drift vs baseline: none.")
         else:
+            drift_was_detected = True
             logger.warning(
                 "Snapshot drift vs baseline (%s); dispatching "
                 "DRIFT_DETECTED alert.", drift.summary(),
             )
-            build_dispatcher(config).dispatch(
+            dispatcher.dispatch(
                 drift_detected(
                     diff=render_diff(drift),
                     workspace=str(config.dump_to),
                     origin="snapshot-diff",
                 )
             )
+    # Classification keys on the raw graph: after sanitization the
+    # identifiers are pseudonyms and the manifest would name objects
+    # the operator cannot find in the dashboard.
+    raw_graph = graph
     if config.sanitize:
         # The workdir-persistent salt keeps pseudonyms stable across
         # runs (sanitized snapshots stay diffable) without handing
@@ -448,6 +558,7 @@ def _export_snapshot(
             "use --sanitize for any copy that leaves the DR vault."
         )
     write_snapshot(graph, config.dump_to, sanitized=config.sanitize)
+    _export_coverage(raw_graph, config, parser, dispatcher, drift_was_detected)
     return 0
 
 
@@ -497,7 +608,12 @@ def _rebuild(config: RuntimeConfig) -> int:
     except (TerraformError, OSError) as exc:
         logger.critical("Rebuild planning failed: %s", exc)
         return 1
-    logger.info("Rebuild plan for workspace %s:\n%s", config.workdir, preview.stdout)
+    # Same masking the alert payloads get: a plan echoes attribute
+    # values, and the log must carry names and locators, never secrets.
+    logger.info(
+        "Rebuild plan for workspace %s:\n%s",
+        config.workdir, redact_diff(preview.stdout),
+    )
     if not preview.has_changes:
         runner.discard_rebuild_plan()
         logger.info(
@@ -543,6 +659,10 @@ def _wipe_org(config: RuntimeConfig) -> int:
             "delete the drill organization.", API_KEY_ENV_VAR,
         )
         return 1
+    # Built before any write: a misconfigured channel must refuse the
+    # whole action up front, never after the org is already gone with
+    # the mandated executed-alert left undeliverable.
+    dispatcher = build_dispatcher(config)
     wiper = OrgWiper()
     try:
         preview = wiper.preview(config.wipe_org, config.wipe_org_name)
@@ -580,7 +700,7 @@ def _wipe_org(config: RuntimeConfig) -> int:
         # channels and exit cleanly, not die as an unhandled traceback
         # (the contract's "critical script processing faults" trigger).
         logger.critical("Wipe execution failed: %s", exc)
-        build_dispatcher(config).dispatch(
+        dispatcher.dispatch(
             processing_fault(
                 stage="drill-org wipe (--wipe-org --confirm)", error=str(exc)
             )
@@ -593,7 +713,7 @@ def _wipe_org(config: RuntimeConfig) -> int:
         len(result.deleted_networks),
         "deleted" if result.organization_deleted else "NOT deleted",
     )
-    build_dispatcher(config).dispatch(
+    dispatcher.dispatch(
         org_wipe_executed(
             organization_id=config.wipe_org,
             deleted_networks=len(result.deleted_networks),
@@ -621,6 +741,10 @@ def _restore(config: RuntimeConfig) -> int:
         render_restore_plan,
     )
 
+    # Built before any write: a misconfigured channel must refuse the
+    # whole action up front, never after the target org was already
+    # written to with the mandated executed-alert left undeliverable.
+    dispatcher = build_dispatcher(config)
     try:
         spec_parser = OpenApiParser(resolve_spec(config.spec_path))
         provider = StaticJsonDataProvider(config.dump_path, parser=spec_parser)
@@ -731,7 +855,7 @@ def _restore(config: RuntimeConfig) -> int:
             "at %s; re-run with --restore --confirm to resume).",
             exc, config.workdir / "restore-journal.jsonl",
         )
-        build_dispatcher(config).dispatch(
+        dispatcher.dispatch(
             processing_fault(
                 stage="organization restore (--restore --confirm)",
                 error=str(exc),
@@ -748,7 +872,7 @@ def _restore(config: RuntimeConfig) -> int:
         config.target_org, len(result.executed), len(result.failed),
         len(result.skipped), config.workdir / "restore-journal.jsonl",
     )
-    build_dispatcher(config).dispatch(
+    dispatcher.dispatch(
         restore_executed(
             target_organization_id=config.target_org,
             executed=result.executed,
@@ -935,10 +1059,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "--wipe-org is a standalone drill-teardown action; do not "
                 "combine it with any other mode."
             )
-        if config.org_id and config.org_id == config.wipe_org:
+        if config.org_id:
+            # A differing --org-id would be silently ignored while the
+            # operator believes it scoped the wipe (no-silent-orphans);
+            # a matching one marks a production-shaped target.
             arg_parser.error(
-                "--wipe-org matches --org-id; the wipe is for drill "
-                "organizations only, never a production target."
+                "--org-id cannot be combined with --wipe-org: the wipe "
+                "targets exactly the organization named by --wipe-org."
             )
         logger.info(
             "meraki2tf starting in drill-wipe (disaster recovery) mode."
@@ -1052,16 +1179,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         arg_parser.error("--org-id is required in live mode.")
     if config.sanitize and config.dump_to is None:
         arg_parser.error("--sanitize requires --dump-to.")
+    if config.sanitize and config.drift_baseline is not None:
+        # A sanitized export cannot serve as the next run's baseline
+        # (snapshot_diff refuses pseudonymized identifiers), so the
+        # combination structurally breaks from the second run onward.
+        arg_parser.error(
+            "--sanitize cannot be combined with --drift-baseline: drift "
+            "baselines must be unsanitized snapshots, and the sanitized "
+            "export written by this run would be refused as the baseline "
+            "of the next one. Export the unsanitized snapshot for the "
+            "drift chain and sanitize a separate copy for sharing."
+        )
+    # The dispatcher only needs config, so it exists before anything
+    # that can fail: every fatal path below — spec resolution, provider
+    # or runner construction included — gets at least one
+    # PROCESSING_FAULT attempt before the nonzero exit.
+    dispatcher = build_dispatcher(config)
+
     if config.sync and not api_key_present():
         # Sync exists to materialize state unattended; silently skipping
         # the apply would leave the weekly DR job believing it built
         # state when it did not. Fail loudly so the scheduler notices.
-        logger.critical(
-            "--sync requires %s: state materialization runs terraform "
-            "plan/apply, which must authenticate against the Meraki "
-            "dashboard.",
-            API_KEY_ENV_VAR,
+        message = (
+            f"--sync requires {API_KEY_ENV_VAR}: state materialization "
+            "runs terraform plan/apply, which must authenticate against "
+            "the Meraki dashboard."
         )
+        logger.critical("%s", message)
+        dispatcher.dispatch(processing_fault(stage="startup", error=message))
         return 1
 
     logger.info("meraki2tf starting in %s mode.", config.mode.value)
@@ -1074,16 +1219,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             # channels, not just the local log (the contract's
             # "critical script processing faults" trigger).
             try:
-                return _export_snapshot(provider, config, spec_parser)
+                _export_snapshot(provider, config, spec_parser, dispatcher)
             except Exception as exc:
                 logger.critical("Snapshot export failed: %s", exc)
-                build_dispatcher(config).dispatch(
+                dispatcher.dispatch(
                     processing_fault(
                         stage="snapshot export (--dump-to)", error=str(exc)
                     )
                 )
                 return 1
-        dispatcher = build_dispatcher(config)
+            return _alert_outage_exit(dispatcher)
         runner = TerraformRunner(
             config.workdir,
             executable=config.terraform_bin,
@@ -1112,13 +1257,40 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         summary = orchestrator.run(config.org_id)
     except PipelineError as exc:
+        # The orchestrator already dispatched PROCESSING_FAULT for this
+        # failure; a second alert here would double-report it.
         logger.critical("%s", exc)
         return 1
     except Exception as exc:
         logger.critical("meraki2tf could not start: %s", exc)
+        dispatcher.dispatch(processing_fault(stage="startup", error=str(exc)))
         return 1
 
     _report(summary)
+    # Exit-code priority (see the module docstring): a stalled full-kit
+    # materialization (4) outranks known coverage gaps (3), which
+    # outrank a silent notifier outage (5).
+    if summary.apply_aborted:
+        # A sync run whose full-kit apply was refused (the plan carried
+        # mutations) must not report success — a scheduler gating on the
+        # exit code would otherwise believe the whole kit materialized
+        # while it is stalled on a human. The drift alert already fired;
+        # this makes the stall visible to automation even if every
+        # notifier channel is down.
+        if summary.resources_added_to_state:
+            growth = (
+                f"; {len(summary.resources_added_to_state)} import-only "
+                "resource(s) were still applied through targeted chunks"
+            )
+        else:
+            growth = "; no state was materialized this run"
+        logger.error(
+            "--sync full-kit auto-apply was ABORTED: mutations blocked "
+            "the full apply%s. A human must review the DRIFT_DETECTED "
+            "alert before the remaining state can grow.",
+            growth,
+        )
+        return 4
     if config.fail_on_gaps and summary.unsupported_count > 0:
         logger.error(
             "--fail-on-gaps: %d discovered object(s) cannot be rebuilt by "
@@ -1127,19 +1299,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             summary.unsupported_count,
         )
         return 3
-    if summary.apply_aborted:
-        # A sync run that refused to materialize any state (the plan
-        # carried mutations) must not report success — a scheduler
-        # gating on the exit code would otherwise believe state grew
-        # while it is stalled indefinitely. The drift alert already
-        # fired; this makes the stall visible to automation even if
-        # every notifier channel is down.
+    return _alert_outage_exit(dispatcher)
+
+
+def _alert_outage_exit(dispatcher: AlertDispatcher) -> int:
+    """0, or 5 when any event suffered total delivery failure.
+
+    The lowest-priority nonzero code: the run's work product is intact,
+    but at least one mandated alert reached no configured channel —
+    without a nonzero exit a scheduler would believe the operator was
+    notified when nobody was.
+    """
+    if dispatcher.failed_event_count:
         logger.error(
-            "--sync auto-apply was ABORTED: the plan proposed mutations, "
-            "so no state was materialized this run. A human must review "
-            "the DRIFT_DETECTED alert before state can grow."
+            "%d alert event(s) could not be delivered on any configured "
+            "channel this run; exiting 5 so schedulers notice the "
+            "notifier outage.",
+            dispatcher.failed_event_count,
         )
-        return 4
+        return 5
     return 0
 
 
