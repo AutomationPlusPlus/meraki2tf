@@ -302,6 +302,55 @@ def test_existing_addresses_reads_managed_resources(tmp_path: Path) -> None:
     )
 
 
+def test_existing_addresses_include_module_paths_and_index_keys(
+    tmp_path: Path,
+) -> None:
+    """Operator-added modules and counted resources must be tracked by
+    their full addresses, or the before/after "added to state" report
+    and the skip-existing set silently miscount them. Flat tool-
+    generated resources keep the bare type.name address."""
+    state = tmp_path / "terraform.tfstate"
+    state.write_text(
+        json.dumps(
+            {
+                "resources": [
+                    {"mode": "managed", "type": "meraki_networks", "name": "n_1"},
+                    {
+                        "module": "module.extras",
+                        "mode": "managed",
+                        "type": "meraki_networks",
+                        "name": "site",
+                        "instances": [{"index_key": 0}, {"index_key": 1}],
+                    },
+                    {
+                        "mode": "managed",
+                        "type": "meraki_devices",
+                        "name": "edge",
+                        "instances": [{"index_key": "hq"}],
+                    },
+                    {
+                        "mode": "managed",
+                        "type": "meraki_devices",
+                        "name": "single",
+                        "instances": [{}],  # single instance: no index part
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    runner = TerraformRunner(tmp_path / "ws", state_path=state)
+    assert runner.existing_addresses() == frozenset(
+        {
+            "meraki_networks.n_1",
+            "module.extras.meraki_networks.site[0]",
+            "module.extras.meraki_networks.site[1]",
+            'meraki_devices.edge["hq"]',
+            "meraki_devices.single",
+        }
+    )
+
+
 def test_existing_addresses_tolerates_non_object_state(tmp_path: Path) -> None:
     state = tmp_path / "terraform.tfstate"
     state.write_text("[]", encoding="utf-8")
@@ -425,6 +474,91 @@ def test_azurerm_existing_addresses_read_via_show_json(
     assert script.calls[0][1] == "init"
     assert script.calls[1][:2] == ("terraform", "show")
     assert SYNC_PLAN_FILENAME not in script.calls[1]
+
+
+def test_azurerm_existing_addresses_descend_child_modules(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """show -json nests module resources under child_modules (itself
+    recursive) and carries full addresses (module path + index key) on
+    each entry; the remote reader must not lose either."""
+    runner = _azurerm_runner(tmp_path / "ws")
+    state_json = json.dumps(
+        {
+            "values": {
+                "root_module": {
+                    "resources": [
+                        {
+                            "address": "meraki_networks.n_1",
+                            "mode": "managed",
+                            "type": "meraki_networks",
+                            "name": "n_1",
+                        },
+                        {
+                            "address": 'meraki_devices.edge["hq"]',
+                            "mode": "managed",
+                            "type": "meraki_devices",
+                            "name": "edge",
+                            "index": "hq",
+                        },
+                    ],
+                    "child_modules": [
+                        {
+                            "address": "module.extras",
+                            "resources": [
+                                {
+                                    "address": (
+                                        "module.extras.meraki_networks.site[0]"
+                                    ),
+                                    "mode": "managed",
+                                    "type": "meraki_networks",
+                                    "name": "site",
+                                    "index": 0,
+                                },
+                                {
+                                    "address": (
+                                        "module.extras.data.meraki_networks.look"
+                                    ),
+                                    "mode": "data",
+                                    "type": "meraki_networks",
+                                    "name": "look",
+                                },
+                            ],
+                            "child_modules": [
+                                {
+                                    "address": "module.extras.module.deep",
+                                    "resources": [
+                                        {
+                                            "address": (
+                                                "module.extras.module.deep."
+                                                "meraki_devices.q2ab"
+                                            ),
+                                            "mode": "managed",
+                                            "type": "meraki_devices",
+                                            "name": "q2ab",
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            }
+        }
+    )
+    script = ScriptedSubprocess(
+        (0, "Initialized", None),
+        (0, state_json, None),
+    )
+    monkeypatch.setattr(terraform_runner.subprocess, "run", script.run)
+    assert runner.existing_addresses() == frozenset(
+        {
+            "meraki_networks.n_1",
+            'meraki_devices.edge["hq"]',
+            "module.extras.meraki_networks.site[0]",
+            "module.extras.module.deep.meraki_devices.q2ab",
+        }
+    )
 
 
 def test_azurerm_existing_addresses_empty_when_no_remote_state(
@@ -1004,6 +1138,27 @@ def test_guard_refuses_malformed_plan_document_entries(
     assert len(scripted.calls) == 1  # refused before any apply
 
 
+def test_guard_refuses_empty_actions_list_as_malformed(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An entry with an EMPTY actions list would pass the harmless
+    check vacuously; the guard refuses anything it cannot verify."""
+    runner.prepare_workspace()
+    (runner.workdir / SYNC_PLAN_FILENAME).write_bytes(b"opaque-plan")
+    show_json = json.dumps(
+        {
+            "resource_changes": [
+                {"address": "meraki_networks.n_1", "change": {"actions": []}}
+            ]
+        }
+    )
+    scripted = ScriptedSubprocess((0, show_json, None))
+    monkeypatch.setattr(terraform_runner.subprocess, "run", scripted.run)
+    with pytest.raises(ImportGuardViolation, match="shape cannot be verified"):
+        runner.apply_import_plan()
+    assert len(scripted.calls) == 1  # refused before any apply
+
+
 def test_plan_resource_actions_parses_show_json(
     runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1081,8 +1236,11 @@ def test_remove_resources_prunes_baseline_and_state(
 
     runner.remove_resources({"meraki_networks.n_1", "meraki_networks.oneliner"})
 
-    # The full-state backup is secret material like the state itself.
-    assert (backup.stat().st_mode & 0o777) == 0o600
+    # The backup exists only to survive a crash mid-removal; after a
+    # successful rm it is a plaintext secret-bearing state copy with no
+    # purpose (under a remote backend it would be the only local state
+    # material), so it must not persist.
+    assert not backup.exists()
 
     content = (runner.workdir / AGGREGATED_CONFIG_FILENAME).read_text(encoding="utf-8")
     assert 'resource "meraki_networks" "n_1"' not in content
@@ -1097,6 +1255,48 @@ def test_remove_resources_prunes_baseline_and_state(
         f"-backup={runner.state_path.with_name(runner.state_path.name + '.backup')}",
         "meraki_networks.n_1",
     )
+
+
+def test_remove_resources_failure_keeps_backup_for_recovery(
+    runner: TerraformRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failed state rm may have half-modified the state; the
+    pre-removal backup is the recovery copy — kept, owner-only, with
+    its location logged for the operator."""
+    runner.prepare_workspace()
+    _write_state(runner.state_path, "meraki_networks.n_1")
+    backup = runner.state_path.with_name(runner.state_path.name + ".backup")
+
+    def write_backup() -> None:
+        backup.write_text("{}", encoding="utf-8")
+        backup.chmod(0o644)  # terraform writes with umask defaults
+
+    fake = FakeSubprocess(
+        returncode=1, stderr="state rm blew up", on_run=write_backup
+    )
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    with caplog.at_level("WARNING", logger="meraki2tf.terraform_runner"):
+        with pytest.raises(TerraformError, match="state rm blew up"):
+            runner.remove_resources({"meraki_networks.n_1"})
+    assert backup.exists()
+    assert (backup.stat().st_mode & 0o777) == 0o600
+    assert any(str(backup) in record.message for record in caplog.records)
+
+
+def test_remove_resources_failure_without_backup_just_raises(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """state rm can fail before terraform ever writes the backup."""
+    runner.prepare_workspace()
+    _write_state(runner.state_path, "meraki_networks.n_1")
+    fake = FakeSubprocess(returncode=1, stderr="no lock")
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    with pytest.raises(TerraformError, match="no lock"):
+        runner.remove_resources({"meraki_networks.n_1"})
+    backup = runner.state_path.with_name(runner.state_path.name + ".backup")
+    assert not backup.exists()
 
 
 def test_remove_resources_without_tracked_state_skips_state_rm(
