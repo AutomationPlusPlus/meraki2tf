@@ -91,6 +91,9 @@ class EventType(enum.Enum):
     #: A human-invoked --restore --confirm rebuilt a target organization
     #: from a snapshot (never the source organization).
     RESTORE_EXECUTED = "RESTORE_EXECUTED"
+    #: A human-invoked --heal --confirm recreated accidentally deleted
+    #: objects in the snapshot's OWN organization (additive-only).
+    HEAL_EXECUTED = "HEAL_EXECUTED"
     #: A human-invoked --wipe-org --confirm tore down a hardware-free
     #: drill organization after a restore rehearsal.
     ORG_WIPE_EXECUTED = "ORG_WIPE_EXECUTED"
@@ -289,6 +292,36 @@ def restore_executed(
         ),
         details={
             "target_organization_id": target_organization_id,
+            "executed": list(executed),
+            "failed": [list(item) for item in failed],
+            "skipped": [dict(item) for item in skipped],
+        },
+    )
+
+
+def heal_executed(
+    organization_id: str,
+    surviving: int,
+    executed: Sequence[str],
+    failed: Sequence[Sequence[str]],
+    skipped: Sequence[Mapping[str, Any]],
+) -> AlertEvent:
+    """Contract payload for a human-invoked same-org heal: accidentally
+    deleted objects recreated from a snapshot, surviving objects never
+    touched. Entries are value-free action labels."""
+    severity = EventSeverity.WARNING if failed else EventSeverity.INFO
+    return AlertEvent(
+        event_type=EventType.HEAL_EXECUTED,
+        severity=severity,
+        summary=(
+            f"Heal of organization {organization_id}: {len(executed)} "
+            f"missing object(s) recreated, {len(failed)} failed, "
+            f"{len(skipped)} skipped; {surviving} surviving object(s) "
+            "untouched."
+        ),
+        details={
+            "organization_id": organization_id,
+            "surviving_untouched": surviving,
             "executed": list(executed),
             "failed": [list(item) for item in failed],
             "skipped": [dict(item) for item in skipped],

@@ -36,6 +36,7 @@ from pathlib import Path
 
 from meraki2tf.alerts import (
     drift_detected,
+    heal_executed,
     org_wipe_executed,
     processing_fault,
     restore_executed,
@@ -201,6 +202,20 @@ def build_parser() -> argparse.ArgumentParser:
             "feature written in dependency order with ID remapping). Add "
             "--confirm to execute. Refuses to target the snapshot's own "
             "source organization."
+        ),
+    )
+    parser.add_argument(
+        "--heal",
+        action="store_true",
+        help=(
+            "Partial recovery: preview recreating snapshot objects that "
+            "are missing from the live organization (accidental "
+            "deletions) — the SAME organization the --from-dump snapshot "
+            "was captured from. Additive-only: objects still present are "
+            "never modified. A deleted parent's children are rewired to "
+            "its new ID. Requires --org-id (must match the snapshot's "
+            "source org) and an unsanitized snapshot. Add --confirm to "
+            "execute."
         ),
     )
     parser.add_argument(
@@ -895,6 +910,143 @@ def _restore(config: RuntimeConfig) -> int:
     return 0 if not result.failed else 1
 
 
+def _heal(config: RuntimeConfig) -> int:
+    """Same-organization partial recovery from accidental deletions.
+
+    Diffs the snapshot against fresh live discovery of the SAME org and
+    recreates only what is missing (additive-only — surviving objects
+    are never dispatched). Preview by default; --confirm executes.
+    """
+    assert config.dump_path is not None  # guarded by the caller
+    assert config.org_id  # guarded by the caller
+    from meraki2tf.healer import plan_heal
+    from meraki2tf.restorer import (
+        OrgRestorer,
+        RestoreJournal,
+        RestoreJournalMismatchError,
+        render_restore_plan,
+    )
+
+    if not api_key_present():
+        # Even the preview needs the live API: what is "missing" is
+        # decided by discovering the organization as it is right now.
+        logger.critical(
+            "--heal requires %s: live discovery of the organization "
+            "decides which snapshot objects are missing.", API_KEY_ENV_VAR,
+        )
+        return 1
+    dispatcher = build_dispatcher(config)
+    try:
+        spec_parser = OpenApiParser(resolve_spec(config.spec_path))
+        provider = StaticJsonDataProvider(config.dump_path, parser=spec_parser)
+        with provider as source:
+            snapshot = source.fetch_network_graph(None)
+    except Exception as exc:
+        logger.critical("Heal could not load the snapshot: %s", exc)
+        return 1
+    if provider.snapshot_sanitized:
+        logger.critical(
+            "--heal requires the unsanitized snapshot: a sanitized "
+            "snapshot's identifiers are pseudonyms and cannot be matched "
+            "against the live organization."
+        )
+        return 2
+    # The inverse of --restore's interlock: heal writes into exactly the
+    # organization the snapshot came from, never anywhere else.
+    recorded = frozenset(provider.recorded_organization_ids) | {
+        snapshot.organization_id
+    }
+    if config.org_id not in recorded:
+        logger.critical(
+            "--org-id does not match the snapshot's source organization; "
+            "--heal recreates deleted objects in the very organization "
+            "the snapshot was captured from. To rebuild a different "
+            "organization, use --restore --target-org."
+        )
+        return 2
+    try:
+        with LiveApiDataProvider(parser=spec_parser) as live_source:
+            live = live_source.fetch_network_graph(config.org_id)
+    except Exception as exc:
+        logger.critical(
+            "Heal could not discover the live organization: %s", exc
+        )
+        return 1
+    plan = plan_heal(snapshot, live, spec_parser)
+    logger.info(
+        "Heal plan for organization %s: %s", config.org_id, plan.summary()
+    )
+    for item in plan.missing.unrestorable:
+        logger.warning(
+            "Cannot heal %s (ids=%s): %s",
+            item.api_path, ",".join(item.path_values) or "<none>",
+            item.reason,
+        )
+    if not plan.missing.actions:
+        logger.info(
+            "Nothing to heal: every restorable snapshot asset is still "
+            "present in the live organization."
+        )
+        return 0
+    logger.info(
+        "Missing objects to recreate:\n%s",
+        render_restore_plan(plan.missing),
+    )
+    if not config.confirm:
+        logger.warning(
+            "Preview only — nothing was written to Meraki. Re-run with "
+            "'--heal --confirm' to recreate the %d missing object(s) in "
+            "organization %s.", len(plan.missing.actions), config.org_id,
+        )
+        return 0
+    try:
+        journal = RestoreJournal(config.workdir / "heal-journal.jsonl")
+    except ValueError as exc:
+        logger.critical("Heal journal is unreadable: %s", exc)
+        return 2
+    restorer = OrgRestorer(
+        config.org_id, journal, preset_mappings=plan.identity_mappings
+    )
+    try:
+        result = restorer.execute(snapshot, plan.missing)
+    except RestoreJournalMismatchError as exc:
+        logger.critical("%s", exc)
+        return 2
+    except Exception as exc:
+        logger.critical(
+            "Heal execution failed: %s (completed writes are journaled "
+            "at %s; re-run with --heal --confirm to resume).",
+            exc, config.workdir / "heal-journal.jsonl",
+        )
+        dispatcher.dispatch(
+            processing_fault(
+                stage="organization heal (--heal --confirm)", error=str(exc)
+            )
+        )
+        return 1
+    for key, reason in result.failed:
+        logger.error("Heal FAILED for %s: %s", key, reason)
+    for entry in result.skipped:
+        logger.warning("Heal skipped %s: %s", entry["target"], entry["reason"])
+    logger.info(
+        "Heal of %s complete: %d recreated, %d failed, %d skipped, "
+        "%d surviving object(s) untouched (journal: %s).",
+        config.org_id, len(result.executed), len(result.failed),
+        len(result.skipped), plan.surviving_count,
+        config.workdir / "heal-journal.jsonl",
+    )
+    dispatcher.dispatch(
+        heal_executed(
+            organization_id=config.org_id,
+            surviving=plan.surviving_count,
+            executed=result.executed,
+            failed=result.failed,
+            skipped=result.skipped,
+        )
+    )
+    return 0 if not result.failed else 1
+
+
 def _replay_gaps(config: RuntimeConfig) -> int:
     """Explicit DR action: preview or execute a snapshot gap replay.
 
@@ -1035,11 +1187,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if config.confirm and not (
         config.rebuild or config.replay_gaps or config.restore
-        or config.wipe_org
+        or config.heal or config.wipe_org
     ):
         arg_parser.error(
             "--confirm is only valid together with --rebuild, --replay-gaps, "
-            "--restore, or --wipe-org."
+            "--restore, --heal, or --wipe-org."
         )
     # Orphaned mode-scoped flags are refused, never silently ignored: a
     # flag that does nothing would let an operator believe an effect
@@ -1062,6 +1214,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         if (
             config.rebuild or config.replay_gaps or config.restore
+            or config.heal
             or config.sync or config.confirm_deletions or config.fail_on_gaps
             or config.rebaseline or config.dump_to is not None
             or config.sanitize or config.dump_path is not None
@@ -1083,6 +1236,36 @@ def main(argv: Sequence[str] | None = None) -> int:
             "meraki2tf starting in drill-wipe (disaster recovery) mode."
         )
         return _wipe_org(config)
+    if config.heal:
+        if config.dump_path is None:
+            arg_parser.error(
+                "--heal recreates missing objects from an offline "
+                "snapshot; pass the unsanitized export via --from-dump."
+            )
+        if not config.org_id:
+            arg_parser.error(
+                "--heal requires --org-id: the organization to heal, "
+                "which must be the snapshot's own source organization."
+            )
+        if config.restore or config.rebuild or config.replay_gaps:
+            arg_parser.error(
+                "--heal is a standalone DR action; do not combine it "
+                "with --restore, --rebuild, or --replay-gaps."
+            )
+        if (
+            config.sync
+            or config.confirm_deletions
+            or config.fail_on_gaps
+            or config.rebaseline
+            or config.dump_to is not None
+            or config.sanitize
+            or config.drift_baseline is not None
+        ):
+            arg_parser.error(
+                "--heal cannot be combined with pipeline or export flags."
+            )
+        logger.info("meraki2tf starting in heal (partial recovery) mode.")
+        return _heal(config)
     if config.restore:
         if config.dump_path is None:
             arg_parser.error(

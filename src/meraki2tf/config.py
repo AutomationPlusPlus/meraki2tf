@@ -226,6 +226,10 @@ class RuntimeConfig:
     #: (never the source). Preview by default; --confirm executes.
     restore: bool
     target_org: str | None
+    #: Same-organization partial recovery: recreate snapshot objects
+    #: missing from live discovery (accidental deletions). Additive-only;
+    #: preview by default, --confirm executes.
+    heal: bool
     #: Optional old→new device serial map (hardware-loss DR).
     serial_map: Path | None
     #: Drill mode for --restore: skip device claiming + device-scoped
@@ -284,6 +288,7 @@ class RuntimeConfig:
             replay_gaps=args.replay_gaps,
             restore=args.restore,
             target_org=args.target_org,
+            heal=args.heal,
             serial_map=Path(args.serial_map) if args.serial_map else None,
             skip_claims=args.skip_claims,
             wipe_org=args.wipe_org,

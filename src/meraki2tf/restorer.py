@@ -983,6 +983,7 @@ class OrgRestorer:
         serial_map: Mapping[str, str] | None = None,
         bucket: AdaptiveTokenBucket | None = None,
         skip_claims: bool = False,
+        preset_mappings: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (),
     ) -> None:
         self._target = target_organization_id
         self._journal = journal
@@ -993,6 +994,10 @@ class OrgRestorer:
         #: are structurally untestable — skipped with explicit drill
         #: verdicts, never reported as failures.
         self._skip_claims = skip_claims
+        #: Pre-resolved (stem, old, new, context) rows recorded before
+        #: execution — heal seeds identity mappings for objects that
+        #: survived the incident so references to them resolve in place.
+        self._preset_mappings = preset_mappings
         self._client: Any = None
 
     def _dashboard(self) -> Any:
@@ -1021,6 +1026,8 @@ class OrgRestorer:
             device.serial for device in graph.devices
         ) - frozenset(self._serial_map)
         resolver = ReferenceResolver(graph)
+        for scope, old, new, mapping_context in self._preset_mappings:
+            resolver.record(scope, old, new, mapping_context)
         for scope, old, new, mapping_context in self._journal.mappings:
             resolver.record(scope, old, new, mapping_context)
         resolver.record("organization", graph.organization_id, self._target)
