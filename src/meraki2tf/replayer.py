@@ -49,6 +49,38 @@ class ReplayDispatchError(RuntimeError):
     """A replay operation could not be resolved onto the Meraki SDK."""
 
 
+#: Terminal nouns of one-shot operational "action log" collections:
+#: POST-only, GET-discoverable surfaces whose entries record executed
+#: actions (sensor reboot commands, PII delete requests, controller
+#: migrations, network moves, packet captures). Re-POSTing a snapshot
+#: entry re-executes the recorded action — a captured PII delete
+#: request would re-trigger real data deletion. Meraki's own tags do
+#: not discriminate (action logs are tagged "configure" like real
+#: configuration), so — like resource_matcher's _SCOPE_NOUNS — this is
+#: a small domain constant. Gated on the absence of any PUT so a
+#: future config endpoint gaining an update is unaffected.
+_ACTION_LOG_NOUNS = frozenset(
+    {"commands", "requests", "migrations", "moves", "captures"}
+)
+
+ACTION_LOG_REASON = (
+    "Historical action log, not configuration — replaying would "
+    "re-execute the recorded action(s); review manually."
+)
+
+
+def is_action_log(api_path: str, ops: tuple[OperationSpec, ...]) -> bool:
+    """POST-only entity whose collection records one-shot actions."""
+    if any(op.method == "put" for op in ops):
+        return False
+    segments = [
+        segment
+        for segment in api_path.split("/")
+        if segment and not segment.startswith("{")
+    ]
+    return bool(segments) and segments[-1] in _ACTION_LOG_NOUNS
+
+
 @dataclass(frozen=True)
 class ReplayAction:
     """One write the replay would perform against the live tenant."""
@@ -65,6 +97,11 @@ class ReplayAction:
     #: Terraform address (secret restorations) for operator-facing
     #: reporting; empty for gap objects.
     address: str = ""
+    #: The GET on a POST-only create's collection, when the spec has
+    #: one: the executor reads it back to skip an object a previous
+    #: partially-failed replay already created (there is no journal),
+    #: instead of duplicating it on every retry.
+    lookup: OperationSpec | None = None
 
     @property
     def target(self) -> str:
@@ -98,6 +135,9 @@ def plan_replay(
     """
     payloads = payload_index(graph)
     ops = write_operations(parser)
+    lookups = {
+        op.path: op for op in parser.endpoints() if op.method == "get"
+    }
     actions: list[ReplayAction] = []
     skipped: list[SkippedReplay] = []
 
@@ -110,6 +150,15 @@ def plan_replay(
                     asset.api_path,
                     asset.identifiers,
                     "No write operation in the API spec — dashboard-only.",
+                )
+            )
+            continue
+        if is_action_log(asset.api_path, writes):
+            skipped.append(
+                SkippedReplay(
+                    asset.api_path,
+                    asset.identifiers,
+                    ACTION_LOG_REASON,
                 )
             )
             continue
@@ -171,6 +220,14 @@ def plan_replay(
                 path_values=asset.identifiers,
                 payload=clean,
                 operation=writes[0],
+                # POST-only creates carry the collection GET (same path
+                # as the collection POST) so a retried replay can skip
+                # objects an earlier run already created.
+                lookup=(
+                    lookups.get(writes[0].path)
+                    if writes[0].method == "post"
+                    else None
+                ),
             )
         )
 
@@ -374,15 +431,38 @@ class GapReplayer:
                     action, target_organization_id,
                     snapshot_organization_id, network_ids, serials,
                 )
+                if (
+                    action.kind == "object"
+                    and action.operation.method == "post"
+                    and self._already_present(action, params)
+                ):
+                    # No journal exists for gap replays: a retry after
+                    # a partial failure would re-create every object
+                    # that already succeeded. Counted alongside the
+                    # executed writes (the object is present), labeled
+                    # so logs and the alert show it was not re-created.
+                    logger.warning(
+                        "Skipped %s: an object with the same name "
+                        "already exists in the target organization "
+                        "(a previous replay created it); not "
+                        "re-creating.", action.target,
+                    )
+                    executed.append(
+                        f"{action.target} [already present; skipped]"
+                    )
+                    continue
                 self._call(action.operation, params, action.payload)
             except Exception as exc:  # per-object isolation by design
                 message = str(exc)
-                if action.kind == "secrets" and not isinstance(
-                    exc, ReplayDispatchError
+                if not isinstance(exc, ReplayDispatchError) and (
+                    action.kind == "secrets"
+                    or _secret_paths(action.payload)
                 ):
-                    # The request body carried live secret values, and
-                    # SDK error text can echo the rejected field back —
-                    # keep it out of logs and alert payloads.
+                    # The request body carried live secret values —
+                    # gap-object payloads keep secret-named attributes
+                    # too (split_redacted only strips redacted ones) —
+                    # and SDK error text can echo the rejected field
+                    # back; keep it out of logs and alert payloads.
                     message = (
                         f"{type(exc).__name__} (status "
                         f"{getattr(exc, 'status', 'n/a')}); detail "
@@ -394,6 +474,55 @@ class GapReplayer:
             logger.info("Replayed %s", action.target)
             executed.append(action.target)
         return tuple(executed), tuple(failed)
+
+    def _already_present(
+        self, action: ReplayAction, params: Mapping[str, str]
+    ) -> bool:
+        """Does the target already hold a same-named counterpart?
+
+        Mirrors the restorer's crash-recovery adoption: the POST-only
+        create's collection is read back and matched by name. Anything
+        short of a usable answer (no lookup GET in the spec, no name in
+        the payload, unreadable collection) keeps today's behavior and
+        proceeds with the create — worst case the API rejects one
+        duplicate per object, exactly as before.
+        """
+        op = action.lookup
+        name = action.payload.get("name")
+        if op is None or not isinstance(name, str) or not name:
+            return False
+        lookup_params: dict[str, str] = {}
+        for param in _placeholders(op.path):
+            if param not in params:
+                return False
+            lookup_params[param] = params[param]
+        dashboard = self._dashboard()
+        section = getattr(dashboard, op.tags[0], None) if op.tags else None
+        method = (
+            getattr(section, op.operation_id, None)
+            if section is not None
+            else None
+        )
+        if method is None:
+            return False
+        try:
+            listing = (
+                method(**lookup_params, total_pages="all")
+                if "total_pages" in inspect.signature(method).parameters
+                else method(**lookup_params)
+            )
+        except Exception as exc:  # noqa: BLE001 - fall back to the POST
+            logger.debug(
+                "Already-present lookup for %s failed (%s); proceeding "
+                "with the create.", action.target, exc,
+            )
+            return False
+        if isinstance(listing, Mapping):
+            listing = listing.get("items")
+        return any(
+            isinstance(item, Mapping) and item.get("name") == name
+            for item in (listing if isinstance(listing, list) else [])
+        )
 
     @staticmethod
     def _parameters(
@@ -541,6 +670,12 @@ def split_redacted(
     return clean_mapping(payload, ""), tuple(sorted(redacted))
 
 
+#: The sanitizer's by-value secret rule (sanitizer._clean_identity_
+#: shaped): PEM private-key blocks are secrets no matter what key they
+#: sit under (``certificate`` carries RADSEC/custom-cert keypairs).
+_PEM_PRIVATE_KEY_MARKER = "PRIVATE KEY-----"
+
+
 def _secret_value(value: Any) -> bool:
     """A scalar that can *be* a secret: a non-empty string or a number
     (numeric PINs/passcodes arrive as JSON numbers; booleans are flags
@@ -553,9 +688,11 @@ def _secret_value(value: Any) -> bool:
 
 
 def _secret_paths(value: Any, prefix: str = "") -> tuple[str, ...]:
-    """Dotted paths of non-empty secret-keyed values, any depth.
+    """Dotted paths of non-empty secret values, any depth.
 
-    A secret-keyed list of scalars (``communityStrings: [...]``) counts
+    Secret-keyed values plus the sanitizer's by-value PEM rule — what
+    this reports must agree with what the sanitizer would redact. A
+    secret-keyed list of scalars (``communityStrings: [...]``) counts
     as one secret path — the sanitizer redacts exactly that shape, so
     the replay/report side must see it too.
     """
@@ -571,11 +708,16 @@ def _secret_paths(value: Any, prefix: str = "") -> tuple[str, ...]:
                 and any(_secret_value(item) for item in inner)
             ):
                 paths.append(f"{path}[]")
+            elif isinstance(inner, str) and _PEM_PRIVATE_KEY_MARKER in inner:
+                paths.append(path)
             else:
                 paths.extend(_secret_paths(inner, path))
     elif isinstance(value, list):
         for item in value:
-            paths.extend(_secret_paths(item, f"{prefix}[]"))
+            if isinstance(item, str) and _PEM_PRIVATE_KEY_MARKER in item:
+                paths.append(f"{prefix}[]")
+            else:
+                paths.extend(_secret_paths(item, f"{prefix}[]"))
     return tuple(paths)
 
 

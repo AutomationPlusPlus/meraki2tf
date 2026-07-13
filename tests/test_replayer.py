@@ -1,11 +1,13 @@
 """Gap replayer: planning branches, ID remapping, and SDK dispatch."""
 
+import json
 import sys
 import types
 from pathlib import Path
 from typing import Any
 
 import pytest
+from conftest import _op
 
 from meraki2tf.config import API_KEY_ENV_VAR
 from meraki2tf.hcl_generator import (
@@ -26,6 +28,7 @@ from meraki2tf.replayer import (
     ReplayDispatchError,
     _collection_items,
     _single_array_body_field,
+    is_action_log,
     plan_replay,
 )
 from meraki2tf.sanitizer import REDACTED
@@ -323,6 +326,135 @@ def test_plan_replay_object_strips_redacted_values(
     assert "re-enter manually" in item.reason and "certificate" in item.reason
 
 
+PII_REQUESTS_PATH = "/networks/{networkId}/pii/requests"
+SENSOR_COMMANDS_PATH = "/devices/{serial}/sensor/commands"
+SPLASH_THEMES_PATH = "/organizations/{organizationId}/splash/themes"
+CONTROLLER_MOVES_PATH = "/networks/{networkId}/controller/moves"
+
+
+def _action_log_spec(tmp_path: Path) -> OpenApiParser:
+    """Spec slice with POST-only action logs, a legitimate POST-only
+    entity, and a PUT-bearing entity ending in an action-log noun."""
+    spec = {
+        "openapi": "3.0.0",
+        "info": {"title": "logs", "version": "1"},
+        "paths": {
+            PII_REQUESTS_PATH: {
+                "get": _op("getNetworkPiiRequests", "networks"),
+                "post": _op("createNetworkPiiRequest", "networks"),
+            },
+            SENSOR_COMMANDS_PATH: {
+                "get": _op("getDeviceSensorCommands", "sensor"),
+                "post": _op("createDeviceSensorCommand", "sensor"),
+            },
+            SPLASH_THEMES_PATH: {
+                "get": _op("getOrganizationSplashThemes", "organizations"),
+                "post": _op("createOrganizationSplashTheme", "organizations"),
+            },
+            CONTROLLER_MOVES_PATH: {
+                "get": _op("getNetworkControllerMoves", "networks"),
+                "put": _op("updateNetworkControllerMoves", "networks"),
+            },
+        },
+    }
+    path = tmp_path / "action-log-spec.json"
+    path.write_text(json.dumps(spec), encoding="utf-8")
+    return OpenApiParser(path)
+
+
+def test_plan_replay_never_replays_action_logs(tmp_path: Path) -> None:
+    """POST-only action logs record executed operations; re-POSTing a
+    snapshot entry re-executes it (a captured PII delete request would
+    re-trigger real data deletion, sensor commands reboot hardware).
+    They surface as skipped-with-reason, never as planned writes."""
+    parser = _action_log_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(
+            PII_REQUESTS_PATH, ("N_1",),
+            {"items": [{"id": "1", "type": "delete"}], "meta": {}},
+        ),
+        FeatureConfiguration(
+            SENSOR_COMMANDS_PATH, ("Q2XX-AAAA-BBBB",),
+            {"items": [{"operation": "cycleDownstreamPower"}], "meta": {}},
+        ),
+        FeatureConfiguration(
+            SPLASH_THEMES_PATH, ("org-123",), {"name": "Corp Theme"}
+        ),
+        FeatureConfiguration(
+            CONTROLLER_MOVES_PATH, ("N_1",), {"status": "complete"}
+        ),
+    )
+    report = _report(
+        unsupported=(
+            UnsupportedAsset(PII_REQUESTS_PATH, "no match", ("N_1",)),
+            UnsupportedAsset(
+                SENSOR_COMMANDS_PATH, "no match", ("Q2XX-AAAA-BBBB",)
+            ),
+            UnsupportedAsset(SPLASH_THEMES_PATH, "no match", ("org-123",)),
+            UnsupportedAsset(CONTROLLER_MOVES_PATH, "no match", ("N_1",)),
+        )
+    )
+    actions, skipped = plan_replay(graph, report, parser)
+    reasons = {item.api_path: item.reason for item in skipped}
+    assert "re-execute" in reasons[PII_REQUESTS_PATH]
+    assert "re-execute" in reasons[SENSOR_COMMANDS_PATH]
+    planned = {action.api_path for action in actions}
+    assert PII_REQUESTS_PATH not in planned
+    assert SENSOR_COMMANDS_PATH not in planned
+    # Legitimate POST-only entities (splash themes, networks, camera
+    # artifacts) still replay; a PUT-bearing entity ending in an
+    # action-log noun is unaffected by the guard.
+    assert planned == {SPLASH_THEMES_PATH, CONTROLLER_MOVES_PATH}
+
+
+def test_is_action_log_is_gated_on_the_absence_of_a_put() -> None:
+    post = OperationSpec(
+        operation_id="createNetworkPiiRequest", method="post",
+        path=PII_REQUESTS_PATH, path_params=("networkId",),
+        tags=("networks",),
+    )
+    put = OperationSpec(
+        operation_id="updateNetworkControllerMoves", method="put",
+        path=CONTROLLER_MOVES_PATH, path_params=("networkId",),
+        tags=("networks",),
+    )
+    assert is_action_log(PII_REQUESTS_PATH, (post,)) is True
+    # Item paths resolve through their collection's writes.
+    assert is_action_log(PII_REQUESTS_PATH + "/{requestId}", (post,)) is True
+    # A PUT anywhere on the entity means configuration, not a log.
+    assert is_action_log(CONTROLLER_MOVES_PATH, (put, post)) is False
+    # Non-log terminal nouns never match.
+    assert is_action_log(
+        "/organizations/{organizationId}/networks", (post,)
+    ) is False
+
+
+def test_plan_replay_threads_the_collection_lookup_for_post_only_creates(
+    spec_parser: OpenApiParser,
+) -> None:
+    """POST-only creates carry the collection GET so a retried replay
+    can skip objects an earlier partially-failed run already created;
+    PUT-backed objects need no lookup (updates are idempotent)."""
+    networks_path = "/organizations/{organizationId}/networks"
+    graph = _graph(
+        FeatureConfiguration(networks_path, ("org-123",), {"name": "HQ"}),
+        FeatureConfiguration(VLAN_PATH, ("N_1", "10"), {"id": 10, "name": "Data"}),
+    )
+    report = _report(
+        unsupported=(
+            UnsupportedAsset(networks_path, "no match", ("org-123",)),
+            UnsupportedAsset(VLAN_PATH, "no match", ("N_1", "10")),
+        )
+    )
+    actions, _ = plan_replay(graph, report, spec_parser)
+    by_path = {action.api_path: action for action in actions}
+    create = by_path[networks_path]
+    assert create.operation.method == "post"
+    assert create.lookup is not None
+    assert create.lookup.operation_id == "getOrganizationNetworks"
+    assert by_path[VLAN_PATH].lookup is None
+
+
 # ------------------------------------------------------------- id mapping
 
 
@@ -484,6 +616,262 @@ def test_execute_isolates_failures_per_action(
     assert "wifi-secret" not in failed[0][0]  # targets carry no values
 
 
+def test_execute_withholds_error_detail_for_secret_bearing_objects(
+    monkeypatch: pytest.MonkeyPatch,
+    spec_parser: OpenApiParser,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """kind == "object" payloads carry live secret values too
+    (split_redacted keeps secret-named attributes); a failed write's
+    SDK error can echo them back and must be withheld exactly like a
+    secrets-kind failure."""
+
+    class EchoingSection:
+        @staticmethod
+        def updateNetworkWirelessSsid(**kwargs: Any) -> None:
+            raise RuntimeError(f"psk {kwargs.get('psk')!r} was rejected")
+
+    dashboard = types.SimpleNamespace(wireless=EchoingSection())
+    stub = types.ModuleType("meraki")
+    stub.DashboardAPI = lambda **kwargs: dashboard  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "meraki", stub)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "unit-test-key")
+
+    ssid_op = next(
+        op
+        for op in spec_parser.endpoints()
+        if op.operation_id == "updateNetworkWirelessSsid"
+    )
+    action = ReplayAction(
+        kind="object",  # a gap object, not a secrets restoration
+        api_path=SSID_PATH,
+        path_values=("N_2", "0"),
+        payload={"number": 0, "name": "Corp", "psk": "hunter2"},
+        operation=ssid_op,
+    )
+    executed, failed = GapReplayer().execute(
+        (action,),
+        target_organization_id="org-999",
+        snapshot_organization_id="org-123",
+        network_ids={"N_2": "N_9"},
+    )
+    assert executed == ()
+    ((_, message),) = failed
+    assert "hunter2" not in message
+    assert "detail withheld" in message
+    assert "hunter2" not in caplog.text
+
+
+def test_execute_keeps_dispatch_error_text_for_secret_payloads(
+    monkeypatch: pytest.MonkeyPatch, spec_parser: OpenApiParser
+) -> None:
+    """ReplayDispatchError text is ours (value-free by construction);
+    withholding it would hide the actionable refusal reason."""
+    dashboard = _FakeDashboard(networks=[])
+    _install_fake_meraki(monkeypatch, dashboard)
+    ssid_op = next(
+        op
+        for op in spec_parser.endpoints()
+        if op.operation_id == "updateNetworkWirelessSsid"
+    )
+    action = ReplayAction(
+        kind="object",
+        api_path=SSID_PATH,
+        path_values=("N_GONE", "0"),
+        payload={"psk": "hunter2"},
+        operation=ssid_op,
+    )
+    executed, failed = GapReplayer().execute(
+        (action,),
+        target_organization_id="org-999",
+        snapshot_organization_id="org-123",
+        network_ids={},
+    )
+    assert executed == ()
+    ((_, message),) = failed
+    assert "no live counterpart" in message
+    assert "hunter2" not in message
+
+
+# --------------------------------------------------- replay idempotency
+
+
+def _networks_create_action(
+    spec_parser: OpenApiParser, name: str
+) -> ReplayAction:
+    create = next(
+        op
+        for op in spec_parser.endpoints()
+        if op.operation_id == "createOrganizationNetwork"
+    )
+    lookup = next(
+        op
+        for op in spec_parser.endpoints()
+        if op.operation_id == "getOrganizationNetworks"
+    )
+    return ReplayAction(
+        kind="object",
+        api_path="/organizations/{organizationId}/networks",
+        path_values=("org-123",),
+        payload={"name": name},
+        operation=create,
+        lookup=lookup,
+    )
+
+
+class _IdempotencySection:
+    """Org section with a listable collection and a recording create."""
+
+    def __init__(self, existing: list[dict[str, str]] | Exception) -> None:
+        self.calls: list[tuple[str, Any]] = []
+        self._existing = existing
+
+    def getOrganizationNetworks(
+        self, organizationId: str, total_pages: str = "all"
+    ) -> list[dict[str, str]]:
+        self.calls.append(("getOrganizationNetworks", organizationId))
+        if isinstance(self._existing, Exception):
+            raise self._existing
+        return list(self._existing)
+
+    def createOrganizationNetwork(
+        self, organizationId: str, **kwargs: Any
+    ) -> dict[str, Any]:
+        self.calls.append(("createOrganizationNetwork", kwargs))
+        return {"id": "L_NEW", **kwargs}
+
+
+def _run_idempotency(
+    monkeypatch: pytest.MonkeyPatch,
+    section: _IdempotencySection,
+    actions: tuple[ReplayAction, ...],
+) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
+    dashboard = types.SimpleNamespace(organizations=section)
+    stub = types.ModuleType("meraki")
+    stub.DashboardAPI = lambda **kwargs: dashboard  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "meraki", stub)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "unit-test-key")
+    return GapReplayer().execute(
+        actions,
+        target_organization_id="org-999",
+        snapshot_organization_id="org-123",
+        network_ids={},
+    )
+
+
+def test_execute_skips_post_only_creates_that_already_exist(
+    monkeypatch: pytest.MonkeyPatch, spec_parser: OpenApiParser
+) -> None:
+    """A --replay-gaps --confirm retry after a partial failure must not
+    duplicate every object that already succeeded: same-named items in
+    the collection are skipped with a reason, never re-POSTed."""
+    section = _IdempotencySection(existing=[{"id": "L_1", "name": "HQ"}])
+    executed, failed = _run_idempotency(
+        monkeypatch,
+        section,
+        (
+            _networks_create_action(spec_parser, "HQ"),
+            _networks_create_action(spec_parser, "Branch"),
+        ),
+    )
+    assert failed == ()
+    creates = [c for c in section.calls if c[0] == "createOrganizationNetwork"]
+    assert creates == [("createOrganizationNetwork", {"name": "Branch"})]
+    # Both actions stay accounted for — one write, one labeled skip.
+    assert len(executed) == 2
+    assert sum(
+        entry.endswith("[already present; skipped]") for entry in executed
+    ) == 1
+
+
+def test_already_present_lookup_failures_fall_back_to_the_create(
+    monkeypatch: pytest.MonkeyPatch, spec_parser: OpenApiParser
+) -> None:
+    """An unreadable collection keeps today's behavior — the POST fires
+    and, worst case, the API rejects one duplicate per object."""
+    section = _IdempotencySection(existing=RuntimeError("listing exploded"))
+    executed, failed = _run_idempotency(
+        monkeypatch, section, (_networks_create_action(spec_parser, "HQ"),)
+    )
+    assert failed == ()
+    assert len(executed) == 1
+    assert any(c[0] == "createOrganizationNetwork" for c in section.calls)
+
+
+def test_already_present_needs_a_lookup_and_a_name(
+    monkeypatch: pytest.MonkeyPatch, spec_parser: OpenApiParser
+) -> None:
+    """No collection GET or no name-like attribute → current behavior."""
+    import dataclasses
+
+    section = _IdempotencySection(existing=[{"id": "L_1", "name": "HQ"}])
+    no_lookup = dataclasses.replace(
+        _networks_create_action(spec_parser, "HQ"), lookup=None
+    )
+    nameless = dataclasses.replace(
+        _networks_create_action(spec_parser, "HQ"), payload={"timeZone": "UTC"}
+    )
+    executed, failed = _run_idempotency(
+        monkeypatch, section, (no_lookup, nameless)
+    )
+    assert failed == ()
+    creates = [c for c in section.calls if c[0] == "createOrganizationNetwork"]
+    assert len(creates) == 2  # both POSTed, no lookup consulted for them
+    assert all("already present" not in entry for entry in executed)
+
+
+def test_already_present_edge_branches(
+    monkeypatch: pytest.MonkeyPatch, spec_parser: OpenApiParser
+) -> None:
+    """A lookup the write's parameters cannot satisfy, or an SDK
+    without the lookup method, proceeds with the create."""
+    import dataclasses
+
+    section = _IdempotencySection(existing=[{"id": "L_1", "name": "HQ"}])
+    dashboard = types.SimpleNamespace(organizations=section)
+    stub = types.ModuleType("meraki")
+    stub.DashboardAPI = lambda **kwargs: dashboard  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "meraki", stub)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "unit-test-key")
+
+    replayer = GapReplayer()
+    action = _networks_create_action(spec_parser, "HQ")
+    params = {"organizationId": "org-999"}
+    assert replayer._already_present(action, params) is True
+
+    vlans_lookup = next(
+        op
+        for op in spec_parser.endpoints()
+        if op.operation_id == "getNetworkApplianceVlans"
+    )
+    mismatched = dataclasses.replace(action, lookup=vlans_lookup)
+    assert replayer._already_present(mismatched, params) is False
+
+    assert action.lookup is not None
+    sectionless = dataclasses.replace(
+        action, lookup=dataclasses.replace(action.lookup, tags=("nowhere",))
+    )
+    assert replayer._already_present(sectionless, params) is False
+
+
+def test_already_present_unwraps_envelope_listings(
+    monkeypatch: pytest.MonkeyPatch, spec_parser: OpenApiParser
+) -> None:
+    section = _IdempotencySection(existing=[])
+
+    def envelope(organizationId: str, total_pages: str = "all") -> dict:
+        section.calls.append(("getOrganizationNetworks", organizationId))
+        return {"items": [{"id": "L_1", "name": "HQ"}], "meta": {}}
+
+    section.getOrganizationNetworks = envelope  # type: ignore[method-assign]
+    executed, failed = _run_idempotency(
+        monkeypatch, section, (_networks_create_action(spec_parser, "HQ"),)
+    )
+    assert failed == ()
+    assert all(c[0] != "createOrganizationNetwork" for c in section.calls)
+    assert any("already present; skipped" in entry for entry in executed)
+
+
 def test_execute_refuses_unmapped_network(
     monkeypatch: pytest.MonkeyPatch, spec_parser: OpenApiParser
 ) -> None:
@@ -576,6 +964,28 @@ def test_secret_paths_detects_secret_keyed_string_lists_and_numbers() -> None:
     assert "radiusServers[].secret" in paths
     assert not any("passwordEnabled" in p for p in paths)
     assert not any("emptyPsk" in p for p in paths)
+
+
+def test_secret_paths_flags_pem_private_keys_by_value() -> None:
+    """The sanitizer redacts PEM private-key blocks under any key
+    (certificate payloads carry RADSEC/custom-cert keypairs); the
+    error-suppression side must agree on what counts as a secret."""
+    from meraki2tf.replayer import _secret_paths
+
+    pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIB...\n-----END RSA PRIVATE KEY-----"
+    paths = _secret_paths(
+        {
+            "certificate": pem,
+            "chain": ["cert-only-material", pem],
+            "nested": {"contents": pem},
+            "publicCertificate": "-----BEGIN CERTIFICATE-----\nMIIB...",
+        }
+    )
+    assert "certificate" in paths
+    assert "chain[]" in paths
+    assert "nested.contents" in paths
+    # Public certificate material is not a secret.
+    assert not any("publicCertificate" in p for p in paths)
 
 
 def test_parameters_injects_organization_for_org_scoped_writes(
