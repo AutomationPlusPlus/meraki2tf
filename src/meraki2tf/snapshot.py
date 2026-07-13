@@ -10,12 +10,14 @@ air-gapped runtimes, scheduled offline parsing, and regression tests.
 from __future__ import annotations
 
 import gzip
+import io
 import json
 import logging
 import os
+import tempfile
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 from meraki2tf.fsperms import restrict_to_owner
 from meraki2tf.models import NetworkGraph
@@ -96,11 +98,17 @@ def write_snapshot(
     path.parent.mkdir(parents=True, exist_ok=True)
     # Write-then-rename: the snapshot is the org's only rebuild source
     # of truth, so a crash or full disk mid-write must corrupt the
-    # temporary file, never the previous good snapshot. The temp file
-    # is created 0600 *before* any secret bytes land in it, and
-    # os.replace carries that mode onto the final path.
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.touch(mode=0o600, exist_ok=True)
+    # temporary file, never the previous good snapshot. mkstemp gives a
+    # per-process unique name in the target directory (same filesystem,
+    # so the rename stays atomic; two concurrent runs can never
+    # interleave writes into one temp file) and creates it 0600
+    # *before* any secret bytes land in it; os.replace carries that
+    # mode onto the final path.
+    fd, tmp_name = tempfile.mkstemp(
+        dir=path.parent, prefix=path.name + ".", suffix=".tmp"
+    )
+    os.close(fd)
+    tmp = Path(tmp_name)
     restrict_to_owner(tmp)
     try:
         if _wants_v2(path):
@@ -117,11 +125,30 @@ def write_snapshot(
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
+    # Make the rename itself durable: without a directory fsync a crash
+    # can roll the directory entry back to the previous snapshot — or,
+    # on some filesystems, to a zero-length file. Best-effort: not every
+    # platform/filesystem supports fsync on a directory handle.
+    _fsync_directory(path.parent)
     logger.info(
         "Snapshot written to %s: %d network(s), %d device(s), %d feature(s).",
         path, len(graph.networks), len(graph.devices), len(graph.features),
     )
     return path
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Flush a completed rename to disk, where the platform allows it."""
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:  # pragma: no cover - platform/filesystem dependent
+        pass
+    finally:
+        os.close(dir_fd)
 
 
 def _warn_kind_collision(
@@ -150,59 +177,76 @@ def _write_snapshot_v2(
 ) -> None:
     # Format selection keys on the *final* path's name; bytes land in
     # the temporary file the caller renames into place.
-    opener = gzip.open if path.name.lower().endswith(".gz") else open
     header: dict[str, Any] = {
         SNAPSHOT_V2_MARKER: SNAPSHOT_V2_VERSION,
         "organizationId": graph.organization_id,
     }
     if sanitized:
         header["sanitized"] = True
-    with opener(target, "wt", encoding="utf-8") as handle:
-        handle.write(json.dumps(header) + "\n")
-        for network in graph.networks:
-            _warn_kind_collision("network", network.network_id, network.payload)
-            handle.write(
-                json.dumps(
-                    {
-                        # Spread first: a payload key named "kind" must
-                        # never overwrite the record discriminator (the
-                        # reader silently drops unknown kinds).
-                        **dict(network.payload),
-                        "kind": "network",
-                        "id": network.network_id,
-                        "organizationId": network.organization_id,
-                        "name": network.name,
-                        "productTypes": list(network.product_types),
-                    }
-                )
-                + "\n"
+    with target.open("wb") as raw:
+        if path.name.lower().endswith(".gz"):
+            # The gzip layer must be CLOSED before the fsync below: the
+            # final deflate block and CRC trailer are written on close,
+            # so an earlier fsync could persist — and then atomically
+            # rename into place — a truncated stream.
+            with gzip.GzipFile(fileobj=raw, mode="wb") as compressed:
+                with io.TextIOWrapper(compressed, encoding="utf-8") as handle:
+                    _write_v2_records(handle, graph, header)
+        else:
+            plain = io.TextIOWrapper(raw, encoding="utf-8")
+            _write_v2_records(plain, graph, header)
+            plain.flush()
+            plain.detach()  # keep `raw` open for the fsync below
+        raw.flush()
+        os.fsync(raw.fileno())
+
+
+def _write_v2_records(
+    handle: TextIO, graph: NetworkGraph, header: dict[str, Any]
+) -> None:
+    handle.write(json.dumps(header) + "\n")
+    for network in graph.networks:
+        _warn_kind_collision("network", network.network_id, network.payload)
+        handle.write(
+            json.dumps(
+                {
+                    # Spread first: a payload key named "kind" must
+                    # never overwrite the record discriminator (the
+                    # reader silently drops unknown kinds).
+                    **dict(network.payload),
+                    "kind": "network",
+                    "id": network.network_id,
+                    "organizationId": network.organization_id,
+                    "name": network.name,
+                    "productTypes": list(network.product_types),
+                }
             )
-        for device in graph.devices:
-            _warn_kind_collision("device", device.serial, device.payload)
-            handle.write(
-                json.dumps(
-                    {
-                        **dict(device.payload),
-                        "kind": "device",
-                        "serial": device.serial,
-                        "networkId": device.network_id,
-                        "model": device.model,
-                        "name": device.name,
-                    }
-                )
-                + "\n"
+            + "\n"
+        )
+    for device in graph.devices:
+        _warn_kind_collision("device", device.serial, device.payload)
+        handle.write(
+            json.dumps(
+                {
+                    **dict(device.payload),
+                    "kind": "device",
+                    "serial": device.serial,
+                    "networkId": device.network_id,
+                    "model": device.model,
+                    "name": device.name,
+                }
             )
-        for feature in graph.features:
-            handle.write(
-                json.dumps(
-                    {
-                        "kind": "feature",
-                        "apiPath": feature.api_path,
-                        "pathValues": list(feature.path_values),
-                        "payload": feature.payload,
-                    }
-                )
-                + "\n"
+            + "\n"
+        )
+    for feature in graph.features:
+        handle.write(
+            json.dumps(
+                {
+                    "kind": "feature",
+                    "apiPath": feature.api_path,
+                    "pathValues": list(feature.path_values),
+                    "payload": feature.payload,
+                }
             )
-        handle.flush()
-        os.fsync(handle.fileno())
+            + "\n"
+        )

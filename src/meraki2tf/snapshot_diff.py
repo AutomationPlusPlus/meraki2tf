@@ -19,9 +19,13 @@ Noise control is spec-driven, per the project contract:
   carrying an identity key (``id``/``serial``/``number``/``name``)
   compare order-insensitively; bare arrays (firewall rules, whose order
   *is* the configuration) stay ordered.
-* **Population-wide key additions are suppressed** — a brand-new
-  attribute appearing across every modified asset of one endpoint is a
-  fleet/API rollout, not an operator change.
+* **Population-wide key additions are suppressed — but reported.** A
+  brand-new attribute appearing across every modified asset of one
+  endpoint is *probably* a fleet/API rollout, not an operator change —
+  but a dashboard bulk edit setting a previously-unset field produces
+  the exact same shape, so the suppression is carried on the diff
+  (attribute names and asset counts, never values) and rendered into
+  the alert digest for the operator to verify. Nothing goes unreported.
 """
 
 from __future__ import annotations
@@ -77,22 +81,53 @@ class AssetDiff:
 
 
 @dataclass(frozen=True)
+class SuppressedRollout:
+    """Attributes withheld from ``modified`` as a probable API rollout.
+
+    Names and counts only — never values — so the record is safe for
+    alert payloads. The operator must verify the addition was a Meraki
+    fleet rollout and not a dashboard bulk edit: the two are
+    indistinguishable from snapshot shape alone.
+    """
+
+    api_path: str
+    attributes: tuple[str, ...]
+    asset_count: int
+
+
+@dataclass(frozen=True)
 class SnapshotDiff:
     """Everything that changed between two snapshots."""
 
     added: tuple[FeatureConfiguration, ...] = ()
     removed: tuple[FeatureConfiguration, ...] = ()
     modified: tuple[AssetDiff, ...] = ()
+    suppressed_rollouts: tuple[SuppressedRollout, ...] = ()
 
     @property
     def is_empty(self) -> bool:
-        return not (self.added or self.removed or self.modified)
+        # Suppressed rollouts count as content: a diff that is ONLY
+        # probable rollouts must still reach the operator (a dashboard
+        # bulk edit looks identical), so callers keying "anything to
+        # alert about?" on this property alert on it too.
+        return not (
+            self.added
+            or self.removed
+            or self.modified
+            or self.suppressed_rollouts
+        )
 
     def summary(self) -> str:
-        return (
+        base = (
             f"{len(self.added)} added, {len(self.modified)} modified, "
             f"{len(self.removed)} removed"
         )
+        if self.suppressed_rollouts:
+            base += (
+                f"; {len(self.suppressed_rollouts)} endpoint(s) with "
+                "attribute additions suppressed as probable API rollouts"
+            )
+        return base
 
 
 def diff_graphs(
@@ -144,8 +179,13 @@ def diff_graphs(
                     changed=changed,
                 )
             )
-    modified = _suppress_rollouts(modified)
-    return SnapshotDiff(added=added, removed=removed, modified=tuple(modified))
+    survivors, suppressed = _suppress_rollouts(modified)
+    return SnapshotDiff(
+        added=added,
+        removed=removed,
+        modified=tuple(survivors),
+        suppressed_rollouts=suppressed,
+    )
 
 
 def baseline_drift(
@@ -301,17 +341,24 @@ def _canonical_multiset(items: list[Any]) -> dict[str, int]:
     return counts
 
 
-def _suppress_rollouts(modified: list[AssetDiff]) -> list[AssetDiff]:
-    """Drop pure key-additions that hit every modified asset of a path.
+def _suppress_rollouts(
+    modified: list[AssetDiff],
+) -> tuple[list[AssetDiff], tuple[SuppressedRollout, ...]]:
+    """Withhold pure key-additions that hit every modified asset of a path.
 
     When Meraki rolls out a new (writable) response field, every asset
     of that endpoint "gains" the attribute in the same window — that is
-    an API change, not operator drift.
+    an API change, not operator drift. But an operator bulk edit that
+    sets a previously-unset field on the whole fleet produces the same
+    shape, so every suppression is returned as a
+    :class:`SuppressedRollout` record (names and counts only) and must
+    reach the alert digest — suppressed never means silent.
     """
     per_path: dict[str, list[AssetDiff]] = {}
     for diff in modified:
         per_path.setdefault(diff.api_path, []).append(diff)
     survivors: list[AssetDiff] = []
+    suppressed: list[SuppressedRollout] = []
     for api_path, diffs in per_path.items():
         rollout_keys = set()
         if len(diffs) >= _ROLLOUT_MIN_ASSETS:
@@ -328,6 +375,13 @@ def _suppress_rollouts(modified: list[AssetDiff]) -> list[AssetDiff]:
                     "(added across all %d modified assets): %s",
                     api_path, len(diffs), ", ".join(sorted(rollout_keys)),
                 )
+                suppressed.append(
+                    SuppressedRollout(
+                        api_path=api_path,
+                        attributes=tuple(sorted(rollout_keys)),
+                        asset_count=len(diffs),
+                    )
+                )
         for diff in diffs:
             kept = {
                 key: values
@@ -343,7 +397,8 @@ def _suppress_rollouts(modified: list[AssetDiff]) -> list[AssetDiff]:
                     )
                 )
     survivors.sort(key=lambda d: (d.api_path, d.path_values))
-    return survivors
+    suppressed.sort(key=lambda s: s.api_path)
+    return survivors, tuple(suppressed)
 
 
 def render_diff(diff: SnapshotDiff, limit: int = 50) -> str:
@@ -367,4 +422,14 @@ def render_diff(diff: SnapshotDiff, limit: int = 50) -> str:
     )
     if hidden:
         lines.append(f"... and {hidden} more (see coverage artifacts)")
+    if diff.suppressed_rollouts:
+        lines.append(
+            "suppressed as probable API rollout — verify these were NOT "
+            "an operator bulk change:"
+        )
+        for rollout in diff.suppressed_rollouts:
+            lines.append(
+                f"! {rollout.api_path} ({rollout.asset_count} assets): "
+                f"{', '.join(rollout.attributes)}"
+            )
     return "\n".join(lines)

@@ -9,6 +9,7 @@ from meraki2tf.models import (
 )
 import stat
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -27,6 +28,25 @@ def test_load_or_create_salt_persists_and_is_owner_only(tmp_path: Path) -> None:
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     # A valid existing salt is reused verbatim (cross-run stability).
     assert load_or_create_salt(path) == first
+    assert not path.with_name(path.name + ".tmp").exists()
+
+
+def test_load_or_create_salt_cleans_up_the_temp_file_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed atomic write must not leave a half-written temp salt
+    behind to be mistaken for the real one later."""
+    import meraki2tf.sanitizer as sanitizer_module
+
+    path = tmp_path / "sanitizer.salt"
+
+    def boom(src: Any, dst: Any) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(sanitizer_module.os, "replace", boom)
+    with pytest.raises(OSError, match="disk full"):
+        load_or_create_salt(path)
+    assert not path.exists()
     assert not path.with_name(path.name + ".tmp").exists()
 
 
@@ -446,6 +466,148 @@ def test_ipv6_addresses_are_pseudonymized() -> None:
     assert payload["bssid"].startswith("02:")  # not eaten by the IPv6 rule
 
 
+def test_prefixed_fake_addresses_are_valid_network_addresses() -> None:
+    """Sanitized CIDRs feed restore drills: a fake subnet with host bits
+    set ("10.7.9.3/24") fails strict API/parser validation, so prefixed
+    values must be masked to their network address — deterministically."""
+    import ipaddress
+
+    graph = NetworkGraph(
+        "org-123", (), (),
+        (
+            FeatureConfiguration(
+                "/networks/{networkId}/appliance/firewall/l3FirewallRules",
+                ("N_1",),
+                {
+                    "rules": [
+                        {"destCidr": "192.168.10.0/24"},
+                        {"destCidr": "10.20.0.0/16"},
+                        {"destCidr": "2001:db8:abcd::/48"},
+                        {"destCidr": "fd00:1234::/64"},
+                    ],
+                    "bareIp": "192.168.10.7",
+                    "bareIpv6": "fd00::1",
+                },
+            ),
+        ),
+    )
+    payload = sanitize_graph(graph, salt=b"fixed").features[0].payload
+    rules = [r["destCidr"] for r in payload["rules"]]
+    for value, original in zip(
+        rules,
+        ["192.168.10.0/24", "10.20.0.0/16",
+         "2001:db8:abcd::/48", "fd00:1234::/64"],
+    ):
+        assert value != original
+        # Round-trips as a strictly valid network address, prefix kept.
+        network = ipaddress.ip_network(value, strict=True)
+        assert value.endswith(f"/{network.prefixlen}")
+        assert original.endswith(f"/{network.prefixlen}")
+    assert rules[0].startswith("10.")
+    assert rules[2].startswith("2001:db8:")
+    # Bare IPs (no prefix) stay valid single addresses.
+    ipaddress.ip_address(payload["bareIp"])
+    ipaddress.ip_address(payload["bareIpv6"])
+    # Deterministic under one salt.
+    again = sanitize_graph(graph, salt=b"fixed").features[0].payload
+    assert again == payload
+
+
+def test_impossible_prefix_lengths_keep_the_legacy_shape() -> None:
+    """The value regex admits prefixes ipaddress rejects (/99); those
+    keep the bare fake-address concatenation instead of crashing."""
+    graph = NetworkGraph(
+        "org-123", (), (),
+        (
+            FeatureConfiguration(
+                "/networks/{networkId}/x", ("N_1",),
+                {"weird": "10.1.2.3/99"},
+            ),
+        ),
+    )
+    value = sanitize_graph(graph, salt=b"fixed").features[0].payload["weird"]
+    assert value.startswith("10.") and value.endswith("/99")
+    assert "10.1.2.3" not in value
+
+
+def test_device_identity_keys_are_pseudonymized() -> None:
+    """IMEI/ICCID/EID/MEID/MSISDN values are bare digit strings with no
+    recognizable shape; the key rule must catch them like serials."""
+    graph = NetworkGraph(
+        "org-123", (), (),
+        (
+            FeatureConfiguration(
+                "/organizations/{organizationId}/cellularGateway/esims/inventory",
+                ("org-123",),
+                {
+                    "imei": "356938035643809",
+                    "iccid": "8991101200003204510",
+                    "eid": "89049032004008882600508297723225",
+                    "meid": "35693803564380",
+                    "msisdn": "14155550100",
+                    "model": "MG21",  # non-identity config survives
+                },
+            ),
+        ),
+    )
+    payload = sanitize_graph(graph, salt=b"fixed").features[0].payload
+    for key in ("imei", "iccid", "eid", "meid", "msisdn"):
+        assert payload[key].startswith(f"{key}-"), key
+    raw = str(payload)
+    assert "356938035643809" not in raw and "8991101200003204510" not in raw
+    assert payload["model"] == "MG21"
+
+
+def test_numeric_id_references_are_pseudonymized_consistently() -> None:
+    """ID references arriving as JSON numbers are the same identifiers
+    as their string form and must map through the same pseudonym table
+    (the pseudonym is a string — an acceptable JSON-type change for a
+    sanitized structural replica)."""
+    graph = NetworkGraph(
+        "org-123", (), (),
+        (
+            FeatureConfiguration(
+                "/networks/{networkId}/appliance/vpn/bgp",
+                ("N_1",),
+                {
+                    "interfaceId": "1112223334445556679",
+                    "interfaceIdEcho": 1112223334445556679,
+                    "adminId": 2038677111,
+                    "networkId": 998877665544,  # structural key, numeric
+                    "vlanId": 10,  # short numeric stays structure
+                    "enabled": True,  # bools are ints — never IDs
+                },
+            ),
+        ),
+    )
+    payload = sanitize_graph(graph, salt=b"fixed").features[0].payload
+    # The numeric echo maps to the SAME pseudonym as the string form.
+    assert payload["interfaceIdEcho"] == payload["interfaceId"]
+    assert payload["interfaceId"].startswith("id-")
+    assert payload["adminId"].startswith("id-")
+    # Numeric structural references get the same net-NNNN pseudonyms.
+    assert payload["networkId"].startswith("net-")
+    assert 1112223334445556679 not in payload.values()
+    assert 998877665544 not in payload.values()
+    assert payload["vlanId"] == 10
+    assert payload["enabled"] is True
+    # Determinism survives the type widening.
+    again = sanitize_graph(graph, salt=b"fixed").features[0].payload
+    assert again == payload
+
+
+def test_pseudonyms_carry_64_bits_of_digest() -> None:
+    """10 hex chars (40 bits) carries ~2% birthday-collision odds at the
+    200k-object scale the v2 snapshot targets; 16 hex chars (64 bits)
+    makes silent identity merges implausible."""
+    sanitizer = _GraphSanitizer(_graph(), salt=b"fixed")
+    pseudonym = sanitizer._pseudonym("host", "dc01.corp.example")
+    prefix, digest = pseudonym.rsplit("-", 1)
+    assert prefix == "host"
+    assert len(digest) == 16
+    int(digest, 16)  # pure hex
+
+
 def test_sanitization_is_deterministic_and_non_destructive() -> None:
     graph = _graph()
     first = sanitize_graph(graph, salt=b"fixed-salt")
@@ -500,6 +662,7 @@ def test_keyless_scalars_pass_through_unchanged() -> None:
     sanitizer = _GraphSanitizer(_graph(), salt=b"fixed-salt")
     assert sanitizer._clean("free-floating", None) == "free-floating"
     assert sanitizer._clean("N_1", None) == "net-0001"  # IDs still map
+    assert sanitizer._clean(42, None) == 42  # numbers carry no identity
 
 
 def test_network_and_device_payloads_are_sanitized() -> None:

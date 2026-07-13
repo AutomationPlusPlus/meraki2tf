@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import logging
 import os
 import re
@@ -73,8 +74,12 @@ SECRET_KEY_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _SECRET_KEY = SECRET_KEY_PATTERN
+#: Device-identity keys (imei, iccid, eid, meid, msisdn) carry
+#: bare-digit hardware/subscriber identifiers with no recognizable
+#: value shape, so they must be caught by key like names and serials.
 _IDENTITY_KEY = re.compile(
-    r"name$|names$|email|url$|urls$|address|notes|^mac$|^tags$|serial|phone",
+    r"name$|names$|email|url$|urls$|address|notes|^mac$|^tags$|serial|phone"
+    r"|^imei$|^iccid$|^eid$|^meid$|^msisdn$",
     re.IGNORECASE,
 )
 _COORDINATE_KEYS = frozenset({"lat", "lng"})
@@ -229,13 +234,29 @@ class _GraphSanitizer:
         ).digest()
 
     def _pseudonym(self, key: str, value: str) -> str:
-        return f"{key.lower()}-{self._digest_bytes(value).hex()[:10]}"
+        # 16 hex chars (64 bits): at the 200k-object scale the v2
+        # snapshot format targets, a 40-bit digest carries ~2% birthday
+        # collision odds — a collision silently merges two identities.
+        return f"{key.lower()}-{self._digest_bytes(value).hex()[:16]}"
+
+    @staticmethod
+    def _masked(fake: str, prefix: str) -> str:
+        # A prefixed value is a subnet: mask the host bits so the fake
+        # is a valid network address — the sanitized snapshot feeds
+        # restore drills, and "10.7.9.3/24" fails strict CIDR parsing.
+        # A prefix the regex admitted but ipaddress rejects (e.g. /99)
+        # keeps the legacy bare concatenation.
+        try:
+            return str(ipaddress.ip_network(fake + prefix, strict=False))
+        except ValueError:
+            return fake + prefix
 
     def _fake_ip(self, value: str, prefix: str) -> str:
-        # Octets land in 1-254 so fake addresses never collide with
+        # Octets land in 1-254 so bare fake addresses never collide with
         # network/broadcast shapes or a `10.255.` grep for real leftovers.
         octets = [byte % 254 + 1 for byte in self._digest_bytes(value)[:3]]
-        return f"10.{octets[0]}.{octets[1]}.{octets[2]}{prefix}"
+        fake = f"10.{octets[0]}.{octets[1]}.{octets[2]}"
+        return self._masked(fake, prefix) if prefix else fake
 
     def _fake_mac(self, value: str) -> str:
         tail = self._digest_bytes(value)[:5]
@@ -245,7 +266,8 @@ class _GraphSanitizer:
         # Deterministic addresses inside the 2001:db8::/32 documentation
         # range, prefix length preserved (mirrors the IPv4 treatment).
         a, b, c, d = self._digest_bytes(value)[:4]
-        return f"2001:db8:{a:02x}{b:02x}:{c:02x}{d:02x}::1{prefix}"
+        fake = f"2001:db8:{a:02x}{b:02x}:{c:02x}{d:02x}::1"
+        return self._masked(fake, prefix) if prefix else fake
 
     def sanitize(self, graph: NetworkGraph) -> NetworkGraph:
         return NetworkGraph(
@@ -324,6 +346,24 @@ class _GraphSanitizer:
             if _ID_REFERENCE_KEY.search(key) and not _is_structural_number(value):
                 self._assign(value, "id")
                 return self._id_map[value]
+        if isinstance(value, int) and not isinstance(value, bool):
+            # ID references arrive as JSON numbers too (writers vary);
+            # a numeric ID is the same identifier as its string form and
+            # must map through the same pseudonym table or it leaks and
+            # breaks referential consistency. The pseudonym is a string,
+            # which changes the JSON type — acceptable for a sanitized
+            # structural replica. Bools are ints in Python; excluded.
+            text = str(value)
+            if text in self._id_map:
+                return self._id_map[text]
+            if key is not None:
+                prefix = _STRUCTURAL_KEYS.get(key.lower())
+                if prefix:
+                    self._assign(text, prefix)
+                    return self._id_map[text]
+                if _ID_REFERENCE_KEY.search(key) and not _is_structural_number(text):
+                    self._assign(text, "id")
+                    return self._id_map[text]
         if secret:
             # Everything under a secret-shaped key is a credential —
             # strings and numbers alike (numeric PINs/passcodes arrive

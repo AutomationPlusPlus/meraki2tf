@@ -199,6 +199,26 @@ def test_expand_endpoint_payload_shapes(parser: OpenApiParser) -> None:
     assert expand_endpoint_payload(parser, vlans, "N_1", []) == []
 
 
+@pytest.mark.parametrize("scalar", ["oops-a-string", 42, 3.5, True])
+def test_scalar_payloads_become_coverage_gaps(
+    parser: OpenApiParser, scalar: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A scalar endpoint body is a malformed response: a bare string
+    must not expand per-character into garbage records, and a bare
+    number must not raise and abort the whole discovery run. Both are
+    recorded like unreadable endpoints — a visible coverage gap."""
+    from meraki2tf.models import UNREADABLE_MARKER
+
+    vlans = _get_op(parser, "/networks/{networkId}/appliance/vlans")
+    with caplog.at_level("WARNING"):
+        (gap,) = expand_endpoint_payload(parser, vlans, "N_1", scalar)
+    assert gap.api_path == vlans.path
+    assert gap.path_values == ("N_1",)
+    assert UNREADABLE_MARKER in gap.payload
+    assert type(scalar).__name__ in gap.payload[UNREADABLE_MARKER]
+    assert any("non-collection" in r.message for r in caplog.records)
+
+
 def _envelope_spec(tmp_path: Path) -> OpenApiParser:
     """An org-scoped collection using the paginated {items, meta} envelope."""
     envelope_schema = {
