@@ -184,19 +184,30 @@ def secret_attribute_union(
     runs, which never plan) it goes quiet. The payload scan keeps the
     list stable across runs, so the coverage manifest, notifications,
     and runbook always carry the full "restore after a rebuild" set.
+
+    A true per-address union: a plan that flags ``psk`` must not erase
+    the scan's nested finding (``radius_servers.secret``) for the same
+    resource — that pointer is the operator's only trail back to the
+    snapshot value. Attributes are sorted so the output is
+    deterministic regardless of which side contributed them.
     """
-    merged: dict[str, tuple[str, ...]] = {
-        asset.address: tuple(
+    merged: dict[str, set[str]] = {}
+    for asset in captured:
+        attrs = {
             snake_case(key)
             for key in secret_payload_keys(
                 payloads.get((asset.api_path, asset.identifiers), {})
             )
-        )
-        for asset in captured
+        }
+        if attrs:
+            merged[asset.address] = attrs
+    for address, plan_attrs in plan_derived.items():
+        merged.setdefault(address, set()).update(plan_attrs)
+    return {
+        address: tuple(sorted(attrs))
+        for address, attrs in sorted(merged.items())
+        if attrs
     }
-    merged = {address: attrs for address, attrs in merged.items() if attrs}
-    merged.update(plan_derived)
-    return dict(sorted(merged.items()))
 
 
 def _secret_sources(

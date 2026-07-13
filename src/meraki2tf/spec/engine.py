@@ -7,7 +7,9 @@ candidates. No endpoint, tag, or resource name is hard-coded — a new
 spec release is picked up without code changes.
 
 The Terraform mapping/translation layer built on top of this registry
-lands in a later iteration; this module fixes the discovery contract.
+lives in :mod:`~meraki2tf.openapi_parser` and
+:mod:`~meraki2tf.resource_matcher`; this module fixes the discovery
+contract.
 """
 
 from __future__ import annotations
@@ -28,6 +30,38 @@ _PATH_PARAM_PATTERN = re.compile(r"\{([^{}]+)\}")
 
 class MalformedSpecError(ValueError):
     """The document does not carry the OpenAPI structure the engine needs."""
+
+
+def _json_pointer(document: Mapping[str, Any], ref: str) -> Any:
+    """Resolve an internal ``#/...`` JSON pointer against ``document``.
+
+    Returns ``None`` for external references (any that do not start
+    with ``#/``) and for pointers that do not resolve, so the caller
+    can surface the gap instead of crashing on a malformed document.
+    """
+    if not ref.startswith("#/"):
+        return None
+    node: Any = document
+    for token in ref[2:].split("/"):
+        # RFC 6901 escaping: ``~1`` → ``/`` first, then ``~0`` → ``~``.
+        token = token.replace("~1", "/").replace("~0", "~")
+        if not isinstance(node, Mapping) or token not in node:
+            return None
+        node = node[token]
+    return node
+
+
+def _fallback_operation_id(method: str, path: str) -> str:
+    """Deterministic id for operations the spec left anonymous.
+
+    ``operationId`` is optional per OpenAPI; skipping such operations
+    would make their entity invisible to discovery and coverage — a
+    silent DR hole. The slug never collides with a real Meraki SDK
+    method name, so live dispatch reports the operation loudly as
+    undispatchable instead of dropping it before discovery.
+    """
+    slug = re.sub(r"[^a-z0-9]+", "_", path.lower()).strip("_")
+    return f"{method}_{slug}"
 
 
 @dataclass(frozen=True)
@@ -94,6 +128,8 @@ class SpecIngestionEngine:
     def operations(self) -> Iterator[OperationSpec]:
         """Walk every path/method pair in the document, in spec order."""
         for path, methods in self._paths.items():
+            if isinstance(methods, Mapping) and "$ref" in methods:
+                methods = self._resolve_path_item_ref(methods["$ref"], path)
             if not isinstance(methods, Mapping):
                 continue
             for method, operation in methods.items():
@@ -101,8 +137,14 @@ class SpecIngestionEngine:
                     continue
                 operation_id = operation.get("operationId")
                 if not isinstance(operation_id, str):
-                    logger.warning("Skipping %s %s: missing operationId", method, path)
-                    continue
+                    operation_id = _fallback_operation_id(method, path)
+                    logger.warning(
+                        "Operation %s %s carries no operationId; using "
+                        "synthesized id %r so its assets still reach "
+                        "discovery and coverage (live SDK dispatch will "
+                        "report it as undispatchable).",
+                        method, path, operation_id,
+                    )
                 # `tags` may be null or a bare string in hand-trimmed
                 # specs; only a real sequence yields tags (a string
                 # would decompose into single characters).
@@ -117,6 +159,26 @@ class SpecIngestionEngine:
                     tags=tuple(tag for tag in raw_tags if isinstance(tag, str)),
                     raw=operation,
                 )
+
+    def _resolve_path_item_ref(self, ref: Any, path: str) -> Mapping[str, Any] | None:
+        """Resolve a ``$ref`` path item (valid OpenAPI 3.x) in-document.
+
+        External or dangling references cannot be followed with a local
+        document alone; that is a discovery/coverage hole, so it is
+        logged loudly by path instead of skipped silently.
+        """
+        resolved = (
+            _json_pointer(self._spec, ref) if isinstance(ref, str) else None
+        )
+        if not isinstance(resolved, Mapping):
+            logger.warning(
+                "Path %s is a $ref (%r) that does not resolve inside the "
+                "document (external or dangling); its operations cannot "
+                "be discovered and will be missing from coverage.",
+                path, ref,
+            )
+            return None
+        return resolved
 
     def resource_groups(self) -> dict[str, ResourceGroup]:
         """Cluster operations by shared path template.
@@ -133,15 +195,3 @@ class SpecIngestionEngine:
             path: ResourceGroup(path=path, operations=tuple(ops))
             for path, ops in buckets.items()
         }
-
-    def build_registry(self) -> Any:
-        """Derive the API-to-Terraform resource registry.
-
-        Later iteration: correlates resource groups with the Terraform
-        provider schema, maps parameters, derives compound import ID
-        formats from ``path_params``, and flags unsupported attributes
-        for the exception auditing engine.
-        """
-        raise NotImplementedError(
-            "Terraform registry mapping lands with the translation-engine iteration."
-        )

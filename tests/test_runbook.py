@@ -92,6 +92,20 @@ def test_redact_payload_masks_secret_keyed_string_lists() -> None:
     assert clean["ports"] == [161, 162]
 
 
+def test_secret_payload_keys_handles_bool_and_object_valued_secrets() -> None:
+    """Booleans are flags, never secret values, even under secret-shaped
+    keys; a secret-keyed object counts when anything inside it does."""
+    keys = secret_payload_keys(
+        {
+            "passwordEnabled": True,  # flag, not a value to restore
+            "credentials": {"token": "t0k3n"},  # object carrying a value
+            "secrets": {"placeholder": ""},  # object carrying nothing
+            "apiKey": None,  # null carries nothing to restore
+        }
+    )
+    assert keys == ("credentials",)
+
+
 def test_secret_payload_keys_detects_list_valued_secrets() -> None:
     """A secret key whose value is a (possibly nested) list of strings
     must reach the secrets-to-restore table like a bare string does."""
@@ -130,7 +144,7 @@ def test_payload_index_keys_by_path_and_values() -> None:
     assert index[(VLAN_PATH, ("N_1", "10"))] == {"name": "Data"}
 
 
-def test_secret_attribute_union_scans_payloads_and_prefers_plan() -> None:
+def test_secret_attribute_union_merges_plan_and_scan_per_address() -> None:
     captured = (
         CapturedAsset(
             address="meraki_wireless_ssid.n_1_0",
@@ -159,7 +173,7 @@ def test_secret_attribute_union_scans_payloads_and_prefers_plan() -> None:
     assert secret_attribute_union(captured, {}, payloads) == {
         "meraki_wireless_ssid.n_1_0": ("psk",)
     }
-    # plan-derived findings win for their address and merge in extras
+    # plan-derived findings merge with the scan's, per address
     union = secret_attribute_union(
         captured,
         {
@@ -171,6 +185,41 @@ def test_secret_attribute_union_scans_payloads_and_prefers_plan() -> None:
     assert union == {
         "meraki_networks.n_1": ("snmp_auth_pass",),
         "meraki_wireless_ssid.n_1_0": ("psk", "radius_secret"),
+    }
+
+
+def test_secret_attribute_union_keeps_scan_only_attributes_on_overlap() -> None:
+    """A plan mentioning one secret of a resource must not erase the
+    payload scan's other findings for the same address: the plan flags
+    ``psk`` while the scan also found the nested
+    ``radius_servers.secret`` — the operator's only pointer back to the
+    snapshot value. True union, deterministically sorted."""
+    captured = (
+        CapturedAsset(
+            address="meraki_wireless_ssid.n_1_0",
+            api_path=SSID_PATH,
+            import_id="N_1,0",
+            already_in_state=True,
+            identifiers=("N_1", "0"),
+        ),
+    )
+    payloads = payload_index(
+        _graph(
+            FeatureConfiguration(
+                SSID_PATH,
+                ("N_1", "0"),
+                {
+                    "psk": "wifi-secret",
+                    "radiusServers": [{"host": "192.0.2.1", "secret": "r1"}],
+                },
+            ),
+        )
+    )
+    union = secret_attribute_union(
+        captured, {"meraki_wireless_ssid.n_1_0": ("psk",)}, payloads
+    )
+    assert union == {
+        "meraki_wireless_ssid.n_1_0": ("psk", "radius_servers.secret"),
     }
 
 

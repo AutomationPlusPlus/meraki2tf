@@ -3,11 +3,13 @@
 Resolution rules for ``--spec``:
 
 * The spec file exists → compare its ``info.version`` against the
-  latest release published in the ``meraki/openapi`` GitHub repository;
-  when the versions differ (or either is unknown) the local file is
-  refreshed with the latest release. If GitHub is unreachable the local
-  copy is used as-is with a warning, keeping air-gapped and offline
-  runs functional.
+  latest release published in the ``meraki/openapi`` GitHub repository.
+  For the tool-managed default (``--spec`` omitted), a version
+  difference (or an unknown version on either side) refreshes the file
+  with the latest release; an explicitly user-supplied ``--spec`` file
+  is never overwritten — the difference is only warned about. If
+  GitHub is unreachable the local copy is used as-is with a warning,
+  keeping air-gapped and offline runs functional.
 * The file does not exist (or ``--spec`` was omitted, defaulting to
   ``spec3.json`` in the current directory) → the latest release is
   downloaded from GitHub directly.
@@ -49,7 +51,7 @@ def _download(url: str) -> str:
         with urllib.request.urlopen(url, timeout=_DOWNLOAD_TIMEOUT_SECONDS) as response:
             # Read one byte past the ceiling so an oversized body is
             # detected rather than silently truncated.
-            raw = response.read(_MAX_SPEC_BYTES + 1)
+            raw: bytes = response.read(_MAX_SPEC_BYTES + 1)
     except Exception as exc:
         raise SpecResolutionError(
             f"Could not download the Meraki OpenAPI spec from {url}: {exc}"
@@ -59,7 +61,15 @@ def _download(url: str) -> str:
             f"Spec download from {url} exceeds the {_MAX_SPEC_BYTES}-byte "
             "ceiling; refusing to load a suspiciously large document."
         )
-    return str(raw.decode("utf-8"))
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        # A garbled body must translate like every other download
+        # failure so callers with a local copy can fall back to it
+        # instead of crashing the run.
+        raise SpecResolutionError(
+            f"Spec download from {url} is not valid UTF-8: {exc}"
+        ) from exc
 
 
 def _parse_spec(text: str, source: str) -> dict[str, Any]:
@@ -98,7 +108,17 @@ def fetch_latest_spec(url: str = SPEC_REMOTE_URL) -> dict[str, Any]:
 
 
 def resolve_spec(spec_path: Path | None, remote_url: str = SPEC_REMOTE_URL) -> Path:
-    """Materialize the OpenAPI spec to run against and return its path."""
+    """Materialize the OpenAPI spec to run against and return its path.
+
+    ``spec_path`` is ``None`` when ``--spec`` was omitted: the tool then
+    owns the default ``./spec3.json`` and refreshes it whenever GitHub
+    publishes a different release. An explicitly supplied file belongs
+    to the user — a hand-curated or deliberately pinned spec (including
+    a downgrade) is never overwritten; a version difference against the
+    latest release only logs a warning and the run continues on the
+    user's file. A missing file is downloaded fresh in either mode.
+    """
+    user_supplied = spec_path is not None
     path = spec_path if spec_path is not None else Path(DEFAULT_SPEC_FILENAME)
 
     if path.exists():
@@ -115,6 +135,16 @@ def resolve_spec(spec_path: Path | None, remote_url: str = SPEC_REMOTE_URL) -> P
             return path
         if local_version is not None and local_version == remote_version:
             logger.info("Spec %s is already the latest release (%s).", path, local_version)
+            return path
+        if user_supplied:
+            # An explicit --spec file is the user's, not the tool's
+            # cache: never clobber it (versions differing includes
+            # deliberate downgrades and hand-curated documents).
+            logger.warning(
+                "Spec %s (version %s) differs from the latest published "
+                "release (%s); keeping the user-supplied file as-is.",
+                path, local_version or "unknown", remote_version or "unknown",
+            )
             return path
         if not _has_paths(remote_document):
             # Never clobber a known-good local spec with a document

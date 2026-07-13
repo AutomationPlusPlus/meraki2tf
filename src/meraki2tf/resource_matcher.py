@@ -43,15 +43,18 @@ import logging
 import re
 from dataclasses import dataclass
 
-from meraki2tf.openapi_parser import OpenApiParser, is_item_path
+from meraki2tf.openapi_parser import OpenApiParser, is_item_path, snake_case
 from meraki2tf.provider_catalog import ProviderCatalog
 from meraki2tf.providers.discovery import mutable_entity_keys
 
 logger = logging.getLogger(__name__)
 
-#: camelCase boundaries: ``aB``, ``ACRONYMWord``, and letter-pair→digit
-#: (``hotspot20`` → ``hotspot 20``; single-letter prefixes like ``l3``
-#: stay intact, matching the provider's own tokenization).
+#: camelCase boundaries for *name/word matching only*: ``aB``,
+#: ``ACRONYMWord``, and letter-pair→digit (``hotspot20`` →
+#: ``hotspot 20``; single-letter prefixes like ``l3`` stay intact,
+#: matching the provider's own tokenization). Path *parameters* are
+#: snake_cased with the parser's ``snake_case`` instead — see
+#: :func:`_path_params`.
 _CAMEL_BOUNDARY = re.compile(
     r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])|(?<=[a-z][a-z])(?=[0-9])"
 )
@@ -127,8 +130,17 @@ def _path_words(path: str) -> list[str]:
 
 
 def _path_params(path: str) -> tuple[str, ...]:
+    """Ordered path parameters, snake_cased with the parser's tokenizer.
+
+    The generator's import-ID guard compares these ``expected``
+    components against ``provided`` ones it derives with
+    :func:`~meraki2tf.openapi_parser.snake_case`; both sides must use
+    the one implementation or a digit-boundary parameter (e.g.
+    ``{hotspot20RuleId}``) would tokenize differently and falsely mark
+    every asset of its entity unsupported.
+    """
     return tuple(
-        "_".join(_split_words(segment[1:-1]))
+        snake_case(segment[1:-1])
         for segment in path.split("/")
         if segment and _PARAM_SEGMENT.match(segment)
     )
