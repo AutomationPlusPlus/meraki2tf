@@ -2717,3 +2717,192 @@ def test_wipe_execution_fault_alerts_and_exits_1(
     assert event["event_type"] == "PROCESSING_FAULT"
     assert "--wipe-org --confirm" in event["details"]["stage"]
     assert "api unreachable mid-wipe" in event["details"]["error"]
+
+
+def _heal_dump(tmp_path: Path, sanitized: bool = False) -> Path:
+    dump = tmp_path / "heal-snapshot.json"
+    document = {
+        "organizationId": "org-123",
+        "networks": [
+            {"id": "N_1", "organizationId": "org-123", "name": "HQ",
+             "productTypes": ["wireless"], "timeZone": "UTC"}
+        ],
+        "devices": [],
+        "features": [
+            {
+                "apiPath": "/networks/{networkId}/wireless/ssids/{number}",
+                "pathValues": ["N_1", "0"],
+                "payload": {"number": 0, "name": "Corp"},
+            }
+        ],
+    }
+    if sanitized:
+        document["sanitized"] = True
+    dump.write_text(json.dumps(document), encoding="utf-8")
+    return dump
+
+
+class _StubLiveProvider:
+    """Injectable stand-in for LiveApiDataProvider in heal tests."""
+
+    graph: Any = None
+
+    def __init__(self, parser: Any = None) -> None:
+        pass
+
+    def __enter__(self) -> "_StubLiveProvider":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        return None
+
+    def fetch_network_graph(self, organization_id: str | None = None) -> Any:
+        return type(self).graph
+
+
+def test_heal_requires_snapshot_and_org(spec_file: Path) -> None:
+    with pytest.raises(SystemExit):
+        main(["--spec", str(spec_file), "--heal"])
+    with pytest.raises(SystemExit):
+        main(["--spec", str(spec_file), "--heal", "--from-dump", "x.json"])
+
+
+def test_heal_rejects_pipeline_flags(spec_file: Path, tmp_path: Path) -> None:
+    dump = _heal_dump(tmp_path)
+    with pytest.raises(SystemExit):
+        main(
+            ["--spec", str(spec_file), "--heal", "--from-dump", str(dump),
+             "--org-id", "org-123", "--sync"]
+        )
+
+
+def test_heal_refuses_sanitized_snapshots(
+    spec_file: Path, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    dump = _heal_dump(tmp_path, sanitized=True)
+    exit_code = main(
+        ["--spec", str(spec_file), "--heal", "--from-dump", str(dump),
+         "--org-id", "org-123", "--workdir", str(tmp_path / "ws")]
+    )
+    assert exit_code == 2
+
+
+def test_heal_refuses_a_foreign_org(
+    spec_file: Path, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The inverse of --restore's interlock: heal writes only into the
+    snapshot's own source organization."""
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    dump = _heal_dump(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--heal", "--from-dump", str(dump),
+         "--org-id", "org-999", "--workdir", str(tmp_path / "ws")]
+    )
+    assert exit_code == 2
+
+
+def test_heal_requires_api_key_even_for_preview(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _no_network(monkeypatch)
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    dump = _heal_dump(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--heal", "--from-dump", str(dump),
+         "--org-id", "org-123", "--workdir", str(tmp_path / "ws")]
+    )
+    assert exit_code == 1
+
+
+def test_heal_preview_lists_missing_and_writes_nothing(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import sys as _sys
+    import types as _types
+
+    from meraki2tf import cli as cli_module
+    from meraki2tf.models import MerakiNetwork, NetworkGraph
+
+    _no_network(monkeypatch)
+
+    def forbidden(**kwargs: Any) -> None:
+        raise AssertionError("preview must not construct an SDK client")
+
+    stub = _types.ModuleType("meraki")
+    stub.DashboardAPI = forbidden  # type: ignore[attr-defined]
+    monkeypatch.setitem(_sys.modules, "meraki", stub)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    # Live discovery sees an org with the network but WITHOUT the SSID
+    # feature key — the SSID counts as missing.
+    _StubLiveProvider.graph = NetworkGraph(
+        organization_id="org-123",
+        networks=(
+            MerakiNetwork.from_payload(
+                {"id": "N_1", "organizationId": "org-123", "name": "HQ",
+                 "productTypes": ["wireless"], "timeZone": "UTC"}
+            ),
+        ),
+        devices=(),
+        features=(),
+    )
+    monkeypatch.setattr(cli_module, "LiveApiDataProvider", _StubLiveProvider)
+    dump = _heal_dump(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--heal", "--from-dump", str(dump),
+         "--org-id", "org-123", "--workdir", str(tmp_path / "ws")]
+    )
+    console = capsys.readouterr().err
+    assert exit_code == 0
+    assert "Preview only" in console
+    assert "1 missing" in console or "missing and planned" in console
+
+
+def test_heal_with_nothing_missing_exits_zero(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from meraki2tf import cli as cli_module
+    from meraki2tf.models import (
+        FeatureConfiguration,
+        MerakiNetwork,
+        NetworkGraph,
+    )
+
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    _StubLiveProvider.graph = NetworkGraph(
+        organization_id="org-123",
+        networks=(
+            MerakiNetwork.from_payload(
+                {"id": "N_1", "organizationId": "org-123", "name": "HQ",
+                 "productTypes": ["wireless"], "timeZone": "UTC"}
+            ),
+        ),
+        devices=(),
+        features=(
+            FeatureConfiguration(
+                "/networks/{networkId}/wireless/ssids/{number}",
+                ("N_1", "0"),
+                {"number": 0, "name": "Corp"},
+            ),
+        ),
+    )
+    monkeypatch.setattr(cli_module, "LiveApiDataProvider", _StubLiveProvider)
+    dump = _heal_dump(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--heal", "--confirm", "--from-dump",
+         str(dump), "--org-id", "org-123", "--workdir", str(tmp_path / "ws")]
+    )
+    console = capsys.readouterr().err
+    assert exit_code == 0
+    assert "Nothing to heal" in console
