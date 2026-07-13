@@ -1184,3 +1184,23 @@ def test_call_raises_on_missing_sdk_method(
     )
     with pytest.raises(ReplayDispatchError, match="no method"):
         GapReplayer()._call(op, {}, {})
+
+
+def test_strip_nulls_prunes_emptied_mappings() -> None:
+    """An object emptied by null-stripping carries no data but trips
+    strict write validators (SSID VPN rejects a bare concentrator: {});
+    empty lists stay — 'rules: []' is an instruction, not an artifact."""
+    from meraki2tf.replayer import _strip_nulls
+
+    body = {
+        "concentrator": {"networkId": None},
+        "failover": {"requestIp": None, "heartbeatInterval": 10},
+        "splitTunnel": {},
+        "rules": [],
+        "name": "keep",
+    }
+    assert _strip_nulls(body) == {
+        "failover": {"heartbeatInterval": 10},
+        "rules": [],
+        "name": "keep",
+    }

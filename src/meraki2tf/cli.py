@@ -871,6 +871,13 @@ def _restore(config: RuntimeConfig) -> int:
         logger.error("Restore FAILED for %s: %s", key, reason)
     for entry in result.skipped:
         logger.warning("Restore skipped %s: %s", entry["target"], entry["reason"])
+    for key, paths in result.drill_placeholders:
+        logger.warning(
+            "Drill placeholder secret(s) written for %s (%s); the real "
+            "values are redacted in the sanitized snapshot — re-enter "
+            "them per the runbook if this organization is ever kept.",
+            key, paths,
+        )
     logger.info(
         "Restore into %s complete: %d executed, %d failed, %d skipped "
         "(journal: %s).",
