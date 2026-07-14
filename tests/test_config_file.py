@@ -138,6 +138,14 @@ def test_unknown_state_backend_value_is_refused(tmp_path: Path) -> None:
         load_config_file(path)
 
 
+@pytest.mark.parametrize("backend", ["local", "azurerm", "s3", "gcs"])
+def test_every_supported_state_backend_is_accepted(
+    tmp_path: Path, backend: str
+) -> None:
+    path = _write(tmp_path, f'state-backend = "{backend}"\n')
+    assert load_config_file(path) == {"state_backend": backend}
+
+
 @pytest.mark.parametrize(
     "line, match",
     [

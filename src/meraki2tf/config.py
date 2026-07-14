@@ -38,29 +38,52 @@ class StateBackend(enum.Enum):
     LOCAL = "local"
     #: Azure Blob Storage via Terraform's built-in ``azurerm`` backend.
     AZURERM = "azurerm"
+    #: Amazon S3 via Terraform's built-in ``s3`` backend.
+    S3 = "s3"
+    #: Google Cloud Storage via Terraform's built-in ``gcs`` backend.
+    GCS = "gcs"
 
 
-#: ``--backend-config`` keys whose values are credentials. Terraform's
-#: backends read these from the environment instead (``ARM_ACCESS_KEY``,
-#: ``ARM_SAS_TOKEN``, ``ARM_CLIENT_SECRET`` — or a managed identity), so
-#: meraki2tf refuses them on the command line: argv, process listings,
-#: and debug logs must never carry a secret (see CLAUDE.md).
+#: ``--backend-config`` keys whose values are credentials, across every
+#: supported remote backend (a union — refusing another backend's
+#: credential key can never hurt). Terraform reads these from the
+#: environment instead (``ARM_*`` for azurerm, ``AWS_*`` for s3,
+#: ``GOOGLE_APPLICATION_CREDENTIALS``/ADC for gcs — or an ambient
+#: managed identity), so meraki2tf refuses them on the command line:
+#: argv, process listings, and debug logs must never carry a secret
+#: (see CLAUDE.md).
 SECRET_BACKEND_KEYS = frozenset(
     {
+        # azurerm
         "access_key",
         "sas_token",
         "client_secret",
         "client_certificate_password",
-        "secret_key",
         "password",
         "oidc_token",
         "oidc_request_token",
+        # s3 (secret_key doubles as a generic credential name)
+        "secret_key",
+        "token",
+        "sse_customer_key",
+        # gcs ('credentials' may hold the service-account key JSON inline)
+        "credentials",
+        "access_token",
+        "encryption_key",
     }
 )
 
-#: Settings azurerm always needs to address a state blob. Enforced only
-#: when they are not supplied out-of-band via ``--backend-config-file``.
-_AZURERM_REQUIRED_KEYS = ("storage_account_name", "container_name", "key")
+#: Per-backend settings that address the state object itself (the
+#: analogue of ``--state-file`` for a remote backend). Enforced only
+#: when they are not supplied out-of-band via ``--backend-config-file``;
+#: connection settings with environment fallbacks (azurerm
+#: ``resource_group_name``, s3 ``region``, …) are deliberately not
+#: required here — terraform init fails loudly on those itself.
+_REQUIRED_STATE_ADDRESS_KEYS: dict[StateBackend, tuple[str, ...]] = {
+    StateBackend.AZURERM: ("storage_account_name", "container_name", "key"),
+    StateBackend.S3: ("bucket", "key"),
+    StateBackend.GCS: ("bucket",),
+}
 
 
 class BackendConfigError(ValueError):
@@ -92,8 +115,9 @@ def _refuse_credential_keys_in_file(path: Path) -> None:
             raise BackendConfigError(
                 f"--backend-config-file {path} sets {key!r}, which is a "
                 "credential and must not be written to a config file; "
-                "terraform reads it from the environment instead (e.g. "
-                "ARM_ACCESS_KEY / ARM_SAS_TOKEN, or use a managed identity)."
+                "terraform reads it from the environment instead (ARM_* "
+                "for azurerm, AWS_* for s3, GOOGLE_APPLICATION_CREDENTIALS "
+                "for gcs — or use an ambient managed identity)."
             )
 
 
@@ -161,8 +185,9 @@ class BackendConfig:
                 raise BackendConfigError(
                     f"--backend-config {key!r} is a credential and must not be "
                     "passed on the command line; terraform reads it from the "
-                    "environment instead (e.g. ARM_ACCESS_KEY / ARM_SAS_TOKEN, "
-                    "or use a managed identity)."
+                    "environment instead (ARM_* for azurerm, AWS_* for s3, "
+                    "GOOGLE_APPLICATION_CREDENTIALS for gcs — or use an "
+                    "ambient managed identity)."
                 )
             settings.append((key, value))
 
@@ -178,13 +203,15 @@ class BackendConfig:
 
         resolved = cls(backend=backend, settings=tuple(settings), config_file=file_path)
 
-        if backend is StateBackend.AZURERM and file_path is None:
+        required = _REQUIRED_STATE_ADDRESS_KEYS.get(backend, ())
+        if required and file_path is None:
             supplied = {key.lower() for key, _ in settings}
-            missing = [key for key in _AZURERM_REQUIRED_KEYS if key not in supplied]
+            missing = [key for key in required if key not in supplied]
             if missing:
                 raise BackendConfigError(
-                    "--state-backend azurerm requires --backend-config settings: "
-                    f"{', '.join(missing)} (or supply them via --backend-config-file)."
+                    f"--state-backend {backend.value} requires "
+                    f"--backend-config settings: {', '.join(missing)} "
+                    "(or supply them via --backend-config-file)."
                 )
         return resolved
 

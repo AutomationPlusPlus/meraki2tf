@@ -707,7 +707,7 @@ Quick reference (each flag is described in detail below):
 | `--fail-on-gaps` | off | Exit 3 when unsupported (uncoverable) objects exist — CI coverage gate |
 | `--workdir DIR` | `generated` | Terraform execution workspace |
 | `--state-file PATH` | `<workdir>/meraki2tf.tfstate` | Terraform state to aggregate into across runs (local backend only) |
-| `--state-backend {local,azurerm}` | `local` | Where Terraform keeps state; `azurerm` stores it in Azure Blob Storage |
+| `--state-backend {local,azurerm,s3,gcs}` | `local` | Where Terraform keeps state; the remote backends store it in Azure Blob Storage / Amazon S3 / Google Cloud Storage |
 | `--backend-config KEY=VALUE` | — | Remote-backend setting (repeatable); e.g. azurerm `storage_account_name`, `container_name`, `key` |
 | `--backend-config-file PATH` | — | File of remote-backend settings (composes with `--backend-config`) |
 | `--webhook-url URL` | — | Webhook alert endpoint (repeatable) |
@@ -873,22 +873,25 @@ local backend; see [Terraform state management](#terraform-state-management).
 Ignored/refused with a remote `--state-backend` (the remote backend
 addresses its own state, e.g. the azurerm `key` setting).
 
-**`--state-backend {local,azurerm}`** — the Terraform state backend.
-`local` (default) keeps state on disk in `--workdir`/`--state-file`,
-exactly as before. `azurerm` stores state in Azure Blob Storage —
-durable, locked, and off-box, which is what a scheduled DR job wants (a
-local state file lives on the very machine the DR job protects). Remote
-backends take their settings from `--backend-config` /
-`--backend-config-file`; see
+**`--state-backend {local,azurerm,s3,gcs}`** — the Terraform state
+backend. `local` (default) keeps state on disk in
+`--workdir`/`--state-file`, exactly as before. `azurerm` (Azure Blob
+Storage), `s3` (Amazon S3), and `gcs` (Google Cloud Storage) store
+state durably, locked, and off-box, which is what a scheduled DR job
+wants (a local state file lives on the very machine the DR job
+protects). Remote backends take their settings from `--backend-config`
+/ `--backend-config-file`; see
 [Remote state backends](#remote-state-backends).
 
 **`--backend-config KEY=VALUE`** *(repeatable)* — a setting passed to
 `terraform init -backend-config` for a remote `--state-backend`. For
 azurerm: `resource_group_name`, `storage_account_name`, `container_name`,
-`key`. **Credential-shaped keys are refused** (`access_key`, `sas_token`,
-`client_secret`, …): terraform reads those from the environment
-(`ARM_ACCESS_KEY`, `ARM_SAS_TOKEN`) or a managed identity, so a secret
-never lands in a flag, a process listing, or a log.
+`key`; for s3: `bucket`, `key`, `region`; for gcs: `bucket`, `prefix`.
+**Credential-shaped keys are refused** (`access_key`, `sas_token`,
+`secret_key`, `token`, `credentials`, …): terraform reads those from the
+environment (`ARM_*`, `AWS_*`, `GOOGLE_APPLICATION_CREDENTIALS`) or an
+ambient identity, so a secret never lands in a flag, a process listing,
+or a log.
 
 **`--backend-config-file PATH`** — a file of remote-backend settings
 passed to `terraform init -backend-config=PATH` (composes with repeated
@@ -972,14 +975,14 @@ The default local backend keeps state on the same host that runs the
 job — fine for ad-hoc use, but the weakest link for a DR tool: the state
 sits on the very machine you are protecting against losing. Point
 `--state-backend` at a remote backend to store state durably off-box
-instead. `azurerm` (Azure Blob Storage) is the supported and recommended
-target for scheduled DR; it gives you geo-redundancy, RBAC, encryption at
-rest, and native state locking:
+instead — `azurerm` (Azure Blob Storage), `s3` (Amazon S3), or `gcs`
+(Google Cloud Storage). Each gives you redundancy, access control,
+encryption at rest, and state locking:
 
 ```bash
 export MERAKI_DASHBOARD_API_KEY="<your-dashboard-api-key>"
-# terraform reads the storage credential from the environment (or a
-# managed identity) — never from a flag:
+# terraform reads the storage credential from the environment (or an
+# ambient identity) — never from a flag:
 export ARM_ACCESS_KEY="<storage-account-key>"   # or use MSI / az login
 
 meraki2tf --org-id 123456 --sync \
@@ -990,21 +993,46 @@ meraki2tf --org-id 123456 --sync \
   --backend-config key=org-123456.tfstate
 ```
 
+```bash
+# Amazon S3 — credentials from AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY,
+# a shared credentials profile, or an instance/task role:
+meraki2tf --org-id 123456 --sync \
+  --state-backend s3 \
+  --backend-config bucket=meraki-dr-state \
+  --backend-config key=org-123456.tfstate \
+  --backend-config region=us-east-1
+
+# Google Cloud Storage — credentials from
+# GOOGLE_APPLICATION_CREDENTIALS or Application Default Credentials:
+meraki2tf --org-id 123456 --sync \
+  --state-backend gcs \
+  --backend-config bucket=meraki-dr-state \
+  --backend-config prefix=org-123456
+```
+
 Notes:
 
 - **Credentials stay in the environment.** meraki2tf refuses
   credential-shaped `--backend-config` keys (`access_key`, `sas_token`,
-  `client_secret`, …); terraform's azurerm backend reads them from
-  `ARM_ACCESS_KEY` / `ARM_SAS_TOKEN` or a managed identity. Nothing
-  secret touches a flag, a process listing, or a log.
+  `client_secret`, `secret_key`, `token`, `credentials`,
+  `access_token`, …); terraform reads them from the environment
+  (`ARM_*`, `AWS_*`, `GOOGLE_APPLICATION_CREDENTIALS`) or an ambient
+  identity (managed identity, instance role, ADC). Nothing secret
+  touches a flag, a process listing, or a log.
 - **At-rest protection moves to the backend.** The owner-only (0600)
   guarantee applies to the *local* state file; with a remote backend,
-  encryption and access control are the Storage Account's responsibility
-  (RBAC + service-side encryption). The unsanitized snapshot remains
-  0600 either way.
+  encryption and access control are the storage service's
+  responsibility (RBAC/IAM + service-side encryption). The unsanitized
+  snapshot remains 0600 either way.
 - `--state-file` is a local-backend concept and is refused alongside a
   remote `--state-backend`; the remote backend addresses its state via
-  its own settings (the azurerm `key`).
+  its own settings (the azurerm/s3 `key`, the gcs `prefix`).
+- The state-address settings are validated eagerly (azurerm:
+  `storage_account_name`, `container_name`, `key`; s3: `bucket`, `key`;
+  gcs: `bucket`) so a misconfigured scheduled job fails at argument
+  parsing, not hours into a run. Connection settings with environment
+  fallbacks (s3 `region`, azurerm `resource_group_name`, …) are left to
+  `terraform init` to enforce.
 - Prefer keeping the backend settings in a file? Pass
   `--backend-config-file org-123456.tfbackend` instead of (or alongside)
   the individual `--backend-config` flags.
