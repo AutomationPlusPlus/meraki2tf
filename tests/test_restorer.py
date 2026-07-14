@@ -2445,3 +2445,98 @@ def test_capability_400_is_drill_skipped_under_skip_claims(
     result = restorer.execute(graph, plan)
     assert result.failed == ()
     assert any("drill:" in entry["reason"] for entry in result.skipped)
+
+
+def test_create_ids_extracted_via_the_item_placeholder(tmp_path: Path) -> None:
+    """Create responses key their identity per collection ('groupId',
+    'payloadTemplateId', …); the mapping must still be recorded or every
+    child referencing the object fails on dead snapshot IDs."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(
+            GP_ITEM, ("N_1", "100"), {"groupPolicyId": "100", "name": "gp"}
+        ),
+        FeatureConfiguration(
+            SNMP_PATH, ("N_1",),
+            {"access": "none", "groupPolicyId": "100"},
+        ),
+    )
+    plan = plan_restore(graph, parser)
+    calls: list = []
+    section = _RecordingSection(
+        calls,
+        responses={"createNetworkGroupPolicy": {"groupPolicyId": "955"}},
+    )
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "j.jsonl"), skip_claims=True
+    )
+    restorer._client = SimpleNamespace(
+        organizations=section, networks=section, wireless=section
+    )
+    result = restorer.execute(graph, plan)
+    assert result.failed == ()
+    snmp = next(c for c in calls if c[0] == "updateNetworkSnmp")
+    assert snmp[2]["groupPolicyId"] == "955"  # remapped via 'groupPolicyId' key
+
+
+def test_bare_disabled_payload_refusal_skips(tmp_path: Path) -> None:
+    """A payload that already IS the bare disabled bit has nothing to
+    trim; if the dashboard refuses it, disabled is the rebuilt default."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    ami_path = "/networks/{networkId}/switch/alternateManagementInterface"
+    spec = {
+        "openapi": "3.0.0", "info": {"title": "a2", "version": "1"},
+        "paths": {
+            "/organizations/{organizationId}/networks": {
+                "get": _op("getOrganizationNetworks", "organizations"),
+                "post": _op("createOrganizationNetwork", "organizations"),
+            },
+            "/networks/{networkId}/devices/claim": {
+                "post": _op("claimNetworkDevices", "networks"),
+            },
+            ami_path: {
+                "get": _op(
+                    "getNetworkSwitchAlternateManagementInterface", "switch"
+                ),
+                "put": _op(
+                    "updateNetworkSwitchAlternateManagementInterface",
+                    "switch",
+                ),
+            },
+        },
+    }
+    path = tmp_path / "ami2-spec.json"
+    path.write_text(json.dumps(spec), encoding="utf-8")
+    parser = OpenApiParser(path)
+    graph = _graph(FeatureConfiguration(ami_path, ("N_1",), {"enabled": False}))
+    plan = plan_restore(graph, parser)
+    calls: list = []
+
+    class Section(_RecordingSection):
+        def updateNetworkSwitchAlternateManagementInterface(
+            self, *args, **kwargs
+        ) -> dict:
+            self._calls.append(("ami", args, kwargs))
+            raise _conflict_error("Vlan can't be blank")
+
+    section = Section(calls)
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "j.jsonl"), skip_claims=True
+    )
+    restorer._client = SimpleNamespace(
+        organizations=section, networks=section, switch=section
+    )
+    result = restorer.execute(graph, plan)
+    assert result.failed == ()
+    assert any(
+        "already disabled by default" in entry["reason"]
+        for entry in result.skipped
+    )
+    assert len([c for c in calls if c[0] == "ami"]) == 1  # no pointless retry
