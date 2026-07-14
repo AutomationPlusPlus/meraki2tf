@@ -480,6 +480,24 @@ class ReferenceResolver:
         self._entries.setdefault((stem, old), []).append(entry)
         self._by_old.setdefault(old, []).append(entry)
 
+    def forget(self, stem: str, old: str, new: str) -> None:
+        """Drop every mapping of ``(stem, old)`` onto ``new``.
+
+        Adoption of a freshly provisioned default records a provisional
+        mapping onto the dashboard's ``-1`` sentinel alias so the
+        content-alignment PUT can address the item; once the real
+        identifier is known, the sentinel entry must go — two surviving
+        entries make every reference to the object ambiguous, and the
+        resolver (correctly) refuses to guess.
+        """
+        for entries in (
+            self._entries.get((stem, old)), self._by_old.get(old),
+        ):
+            if entries is not None:
+                entries[:] = [
+                    entry for entry in entries if entry[1] != new
+                ]
+
     def sibling_mapping(self, stem: str, old: str) -> str | None:
         """The single new ID recorded for ``(stem, old)`` anywhere.
 
@@ -1797,6 +1815,12 @@ class OrgRestorer:
                 else None
             )
             if refreshed is not None and refreshed != "-1":
+                # The alignment follow-up recorded a provisional
+                # mapping onto the sentinel; leaving both entries
+                # standing makes every reference to this object
+                # ambiguous ("refusing to guess").
+                own_stem, own_old = _own_identity(action)
+                resolver.forget(own_stem, own_old, "-1")
                 adopted = refreshed
         return adopted
 
