@@ -95,6 +95,28 @@ from meraki2tf.terraform_runner import (
 logger = logging.getLogger(__name__)
 
 
+_HELP_EPILOG = """\
+examples:
+  # One-shot read-only export of an organization to Terraform:
+  export MERAKI_DASHBOARD_API_KEY="<key>"
+  meraki2tf --org-id 123456
+
+  # Capture an offline snapshot and diff it against last week's:
+  meraki2tf --org-id 123456 --dump-to snapshots/this-week.jsonl.gz \\
+    --drift-baseline snapshots/last-week.jsonl.gz
+
+  # Scheduled DR job: also materialize state via the guarded
+  # import-only apply, alerting to a webhook:
+  meraki2tf --org-id 123456 --sync --webhook-url https://hooks.example.com/m2t
+
+  # Disaster recovery, always preview-first (add --confirm to execute):
+  meraki2tf --rebuild --workdir ./generated
+
+The default invocation is strictly read-only toward Meraki. See the
+README for the full guide: https://github.com/AutomationPlusPlus/meraki2tf
+"""
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="meraki2tf",
@@ -102,8 +124,14 @@ def build_parser() -> argparse.ArgumentParser:
             "Extract Cisco Meraki configurations and translate them into "
             "Terraform structures with drift detection and alerting."
         ),
+        epilog=_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument(
+    core = parser.add_argument_group(
+        "core options",
+        "Everything a plain read-only export needs.",
+    )
+    core.add_argument(
         "--org-id",
         default=None,
         help=(
@@ -111,117 +139,180 @@ def build_parser() -> argparse.ArgumentParser:
             "dump mode falls back to the organization recorded in the snapshot."
         ),
     )
-    parser.add_argument(
+    core.add_argument(
         "--spec",
         metavar="PATH",
         default=None,
         help=(
-            "Meraki OpenAPI JSON document driving the dynamic resource registry. "
-            "If the file exists it is version-checked against the latest GitHub "
-            "release and refreshed when outdated; if missing (or the flag is "
-            "omitted, defaulting to ./spec3.json) the latest release is "
-            "downloaded from GitHub."
+            "Meraki OpenAPI JSON document driving the dynamic resource "
+            "registry (default: ./spec3.json). Auto-downloaded and "
+            "version-refreshed from GitHub; see README 'OpenAPI spec "
+            "resolution'."
         ),
     )
-    parser.add_argument(
+    core.add_argument(
+        "--workdir",
+        metavar="DIR",
+        default="generated",
+        help="Terraform execution workspace directory (default: %(default)s).",
+    )
+    core.add_argument(
+        "--terraform-bin",
+        default="terraform",
+        help="Terraform executable to invoke (default: %(default)s).",
+    )
+    core.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable verbose debug logging; credentials are redacted at every level.",
+    )
+    snapshots = parser.add_argument_group(
+        "snapshots & offline",
+        "Produce and consume offline snapshots; no API key needed to read one.",
+    )
+    snapshots.add_argument(
         "--from-dump",
         metavar="PATH",
         default=None,
         help="Run offline against a local JSON snapshot instead of the live cloud API.",
     )
-    parser.add_argument(
+    snapshots.add_argument(
         "--dump-to",
         metavar="PATH",
         default=None,
         help=(
-            "Write the discovered configuration to PATH as an offline snapshot "
-            "(the --from-dump format) instead of running the Terraform pipeline. "
-            "Combine with --org-id for a live export, or with --from-dump to "
-            "normalize an existing nested export into the canonical format."
+            "Write the discovered configuration to PATH as an offline "
+            "snapshot (the --from-dump format) instead of running the "
+            "Terraform pipeline."
         ),
     )
-    parser.add_argument(
+    snapshots.add_argument(
+        "--sanitize",
+        action="store_true",
+        help=(
+            "Redact secrets and pseudonymize identifying details in the "
+            "snapshot written by --dump-to, keeping it structurally "
+            "processable — for tests, demos, and bug reports."
+        ),
+    )
+    snapshots.add_argument(
         "--drift-baseline",
         metavar="PATH",
         default=None,
         help=(
-            "A previous snapshot (any --dump-to format) to compare the fresh "
-            "discovery against: attribute-level, spec-normalized drift "
-            "detection in seconds, without a terraform read pass. Real "
-            "differences dispatch a DRIFT_DETECTED alert. Typical scheduled "
-            "use: --dump-to snapshots/this-week.jsonl.gz --drift-baseline "
-            "snapshots/last-week.jsonl.gz."
+            "A previous snapshot to compare the fresh discovery against: "
+            "attribute-level drift detection without a terraform read pass. "
+            "Real differences dispatch a DRIFT_DETECTED alert."
         ),
     )
-    parser.add_argument(
-        "--sanitize",
+    pipeline = parser.add_argument_group(
+        "pipeline options",
+        "Tune the default read-only pipeline and the scheduled DR job.",
+    )
+    pipeline.add_argument(
+        "--sync",
         action="store_true",
         help=(
-            "Redact secrets and pseudonymize identifying details (IDs, names, "
-            "serials, MACs, URLs, …) in the snapshot written by --dump-to — for "
-            "sharing in tests, demos, or bug reports. Structural IDs stay "
-            "consistent so the sanitized snapshot remains fully processable."
+            "Opt-in DR automation for the scheduled job: auto-apply the "
+            "plan ONLY when it is 100%% imports (0 add / 0 change / "
+            "0 destroy) and regenerate the HCL baseline of modified "
+            "objects. Meraki itself is never touched. Requires "
+            f"{API_KEY_ENV_VAR}."
         ),
     )
-    parser.add_argument(
+    pipeline.add_argument(
+        "--rebaseline",
+        action="store_true",
+        help=(
+            "Accept the currently discovered configuration as the new "
+            "baseline: discard the accumulated resources.tf so this run "
+            "regenerates it. Refused while the state file tracks resources."
+        ),
+    )
+    pipeline.add_argument(
+        "--confirm-deletions",
+        action="store_true",
+        help=(
+            "Human confirmation to remove resources deleted in Meraki from "
+            "the DR kit and the Terraform state; without it deletions stay "
+            "alert-only so they cannot silently poison the rebuild baseline."
+        ),
+    )
+    pipeline.add_argument(
+        "--fail-on-gaps",
+        action="store_true",
+        help=(
+            "Exit with code 3 when the run discovers objects Terraform "
+            "cannot rebuild (coverage gaps), so schedulers and CI can gate "
+            "on full coverage."
+        ),
+    )
+    actions = parser.add_argument_group(
+        "disaster-recovery actions",
+        "Mutually exclusive, human-invoked actions — the ONLY paths that "
+        "can write to Meraki. Each is a read-only preview until --confirm "
+        "is added; none may run from a scheduler. See the README's "
+        "'Disaster Recovery' section.",
+    )
+    actions.add_argument(
         "--rebuild",
         action="store_true",
         help=(
-            "Disaster recovery: preview what 'terraform apply' would do with "
-            "the artifacts already generated in --workdir. Add --confirm to "
-            "actually execute the apply. This explicit action is the only way "
-            "meraki2tf ever applies anything — normal pipeline runs are "
-            "strictly read-only toward your Meraki organization."
+            "Preview what 'terraform apply' would do with the artifacts "
+            "already generated in --workdir; --confirm executes the apply."
         ),
     )
-    parser.add_argument(
-        "--confirm",
-        action="store_true",
-        help=(
-            "Escalate --rebuild or --replay-gaps from a read-only preview "
-            "to a real write against the Meraki organization."
-        ),
-    )
-    parser.add_argument(
-        "--replay-gaps",
-        action="store_true",
-        help=(
-            "Disaster recovery: preview replaying the objects Terraform "
-            "cannot rebuild (and the secret attributes the kit cannot "
-            "carry) from an unsanitized --from-dump snapshot back into the "
-            "organization. Add --confirm to actually write. Runs after "
-            "'--rebuild --confirm' has restored the Terraform-covered "
-            "resources; network IDs are remapped to the rebuilt tenant "
-            "by name."
-        ),
-    )
-    parser.add_argument(
-        "--restore",
-        action="store_true",
-        help=(
-            "Disaster recovery: preview rebuilding an ENTIRE organization "
-            "from a --from-dump snapshot into --target-org, directly via "
-            "the API (networks created, devices claimed, every restorable "
-            "feature written in dependency order with ID remapping). Add "
-            "--confirm to execute. Refuses to target the snapshot's own "
-            "source organization."
-        ),
-    )
-    parser.add_argument(
+    actions.add_argument(
         "--heal",
         action="store_true",
         help=(
-            "Partial recovery: preview recreating snapshot objects that "
-            "are missing from the live organization (accidental "
-            "deletions) — the SAME organization the --from-dump snapshot "
-            "was captured from. Additive-only: objects still present are "
-            "never modified. A deleted parent's children are rewired to "
-            "its new ID. Requires --org-id (must match the snapshot's "
-            "source org) and an unsanitized snapshot. Add --confirm to "
-            "execute."
+            "Partial recovery: recreate snapshot objects missing from the "
+            "SAME organization the --from-dump snapshot was captured from "
+            "(accidental deletions). Additive-only — surviving objects are "
+            "never modified. Requires a matching --org-id and an "
+            "unsanitized snapshot."
         ),
     )
-    parser.add_argument(
+    actions.add_argument(
+        "--replay-gaps",
+        action="store_true",
+        help=(
+            "Replay the objects Terraform cannot rebuild (and the secret "
+            "attributes the kit cannot carry) from an unsanitized "
+            "--from-dump snapshot back into the organization. Run after "
+            "'--rebuild --confirm'."
+        ),
+    )
+    actions.add_argument(
+        "--restore",
+        action="store_true",
+        help=(
+            "Rebuild an ENTIRE organization from a --from-dump snapshot "
+            "into --target-org, directly via the API in dependency order "
+            "with ID remapping. Refuses the snapshot's own source org."
+        ),
+    )
+    actions.add_argument(
+        "--wipe-org",
+        metavar="ORG_ID",
+        default=None,
+        help=(
+            "Drill teardown: delete every network and then the organization "
+            "itself. Refused outright for any organization holding claimed "
+            "devices; requires --wipe-org-name as a second factor."
+        ),
+    )
+    actions.add_argument(
+        "--confirm",
+        action="store_true",
+        help=(
+            "Escalate --rebuild, --heal, --replay-gaps, --restore, or "
+            "--wipe-org from a read-only preview to a real write against "
+            "the Meraki organization."
+        ),
+    )
+    actions.add_argument(
         "--target-org",
         metavar="ORG_ID",
         default=None,
@@ -231,39 +322,7 @@ def build_parser() -> argparse.ArgumentParser:
             "snapshot's source organization."
         ),
     )
-    parser.add_argument(
-        "--skip-claims",
-        action="store_true",
-        help=(
-            "Drill mode for --restore: skip device claiming and "
-            "device-scoped features (the hardware is attached to the "
-            "production organization, so a drill cannot claim it). They "
-            "are reported as drill-skipped, never as failures."
-        ),
-    )
-    parser.add_argument(
-        "--wipe-org",
-        metavar="ORG_ID",
-        default=None,
-        help=(
-            "Disaster-recovery drill teardown: preview (or, with "
-            "--confirm, execute) deleting every network and then the "
-            "organization itself. Refused outright for any organization "
-            "holding claimed devices — production always has hardware, a "
-            "drill org never does. Requires --wipe-org-name as a second "
-            "factor."
-        ),
-    )
-    parser.add_argument(
-        "--wipe-org-name",
-        metavar="NAME",
-        default=None,
-        help=(
-            "The exact name of the organization --wipe-org targets; a "
-            "mismatch refuses the wipe."
-        ),
-    )
-    parser.add_argument(
+    actions.add_argument(
         "--serial-map",
         metavar="PATH",
         default=None,
@@ -273,92 +332,61 @@ def build_parser() -> argparse.ArgumentParser:
             "serials are claimed as-is."
         ),
     )
-    parser.add_argument(
-        "--sync",
+    actions.add_argument(
+        "--skip-claims",
         action="store_true",
         help=(
-            "Opt-in disaster-recovery mode for the scheduled job: after the "
-            "speculative plan, auto-apply it ONLY when it is 100%% imports "
-            "(0 to add, 0 to change, 0 to destroy) to grow the Terraform "
-            "state, and regenerate the HCL baseline of modified objects to "
-            "mirror current Meraki. Any mutating plan aborts with a drift "
-            "alert. Meraki itself is never touched. Requires "
-            f"{API_KEY_ENV_VAR}."
+            "Drill mode for --restore: device claiming and device-scoped "
+            "features become drill-skipped verdicts, never failures (the "
+            "hardware is attached to the production organization)."
         ),
     )
-    parser.add_argument(
-        "--confirm-deletions",
-        action="store_true",
+    actions.add_argument(
+        "--wipe-org-name",
+        metavar="NAME",
+        default=None,
         help=(
-            "Human confirmation to remove resources that were deleted in "
-            "Meraki from the DR kit and the Terraform state. Without this "
-            "flag deletions are alert-only and the kit keeps them, so an "
-            "accidental clickops deletion cannot silently poison the "
-            "rebuild baseline."
+            "The exact name of the organization --wipe-org targets; a "
+            "mismatch refuses the wipe."
         ),
     )
-    parser.add_argument(
-        "--fail-on-gaps",
-        action="store_true",
-        help=(
-            "Exit with code 3 when the run discovers objects Terraform "
-            "cannot rebuild (coverage gaps), so schedulers and CI can gate "
-            "on full coverage."
-        ),
+    state = parser.add_argument_group(
+        "terraform state",
+        "Where the materialized Terraform state lives.",
     )
-    parser.add_argument(
-        "--rebaseline",
-        action="store_true",
-        help=(
-            "Accept the currently discovered configuration as the new "
-            "baseline: discard the accumulated resources.tf so this run "
-            "regenerates it from live data. Use after reviewing a "
-            "DRIFT_DETECTED alert. Refused while the state file tracks "
-            "resources (their configuration cannot be regenerated)."
-        ),
-    )
-    parser.add_argument(
-        "--workdir",
-        metavar="DIR",
-        default="generated",
-        help="Terraform execution workspace directory (default: %(default)s).",
-    )
-    parser.add_argument(
+    state.add_argument(
         "--state-file",
         metavar="PATH",
         default=None,
         help=(
-            "Terraform state file to aggregate into. An existing state is "
-            "reused so consecutive runs only import the delta; if the file "
-            "does not exist it is created on the first apply "
-            "(default: meraki2tf.tfstate inside --workdir)."
+            "Terraform state file to aggregate into; consecutive runs only "
+            "import the delta (default: meraki2tf.tfstate inside --workdir; "
+            "local backend only)."
         ),
     )
-    parser.add_argument(
+    state.add_argument(
         "--state-backend",
         choices=[member.value for member in StateBackend],
         default=StateBackend.LOCAL.value,
         help=(
             "Terraform state backend (default: %(default)s). 'local' keeps "
-            "state on disk in --workdir/--state-file; 'azurerm' stores it in "
-            "Azure Blob Storage for durable, locked, off-box state (recommended "
-            "for scheduled DR). Remote backends take their settings from "
-            "--backend-config / --backend-config-file."
+            "state on disk in --workdir/--state-file; 'azurerm' stores it "
+            "in Azure Blob Storage — durable, locked, off-box (recommended "
+            "for scheduled DR)."
         ),
     )
-    parser.add_argument(
+    state.add_argument(
         "--backend-config",
         action="append",
         metavar="KEY=VALUE",
         help=(
-            "Remote backend setting passed to 'terraform init -backend-config'; "
-            "repeat for several. For azurerm: resource_group_name, "
-            "storage_account_name, container_name, key. Credentials are refused "
-            "here — terraform reads them from the environment (ARM_ACCESS_KEY, "
-            "ARM_SAS_TOKEN, or a managed identity)."
+            "Remote backend setting passed to 'terraform init "
+            "-backend-config'; repeat for several. Credentials are refused "
+            "here — terraform reads them from the environment or a managed "
+            "identity."
         ),
     )
-    parser.add_argument(
+    state.add_argument(
         "--backend-config-file",
         metavar="PATH",
         default=None,
@@ -368,7 +396,11 @@ def build_parser() -> argparse.ArgumentParser:
             "--backend-config)."
         ),
     )
-    parser.add_argument(
+    alerting = parser.add_argument_group(
+        "alerting",
+        "Webhook and email channels for drift, success, and fault events.",
+    )
+    alerting.add_argument(
         "--webhook-url",
         action="append",
         metavar="URL",
@@ -379,38 +411,27 @@ def build_parser() -> argparse.ArgumentParser:
             "secret stays out of argv and process listings."
         ),
     )
-    parser.add_argument(
+    alerting.add_argument(
         "--alert-email",
         action="append",
         metavar="ADDR",
         help="Email alert recipient; repeat the flag for multiple recipients.",
     )
-    parser.add_argument(
+    alerting.add_argument(
         "--smtp-host",
         default="localhost",
         help="SMTP relay host for email alerts (default: %(default)s).",
     )
-    parser.add_argument(
+    alerting.add_argument(
         "--smtp-port",
         type=int,
         default=25,
         help="SMTP relay port for email alerts (default: %(default)s).",
     )
-    parser.add_argument(
+    alerting.add_argument(
         "--email-from",
         default="meraki2tf@localhost",
         help="Sender address for email alerts (default: %(default)s).",
-    )
-    parser.add_argument(
-        "--terraform-bin",
-        default="terraform",
-        help="Terraform executable to invoke (default: %(default)s).",
-    )
-    parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Enable verbose debug logging; credentials are redacted at every level.",
     )
     return parser
 
