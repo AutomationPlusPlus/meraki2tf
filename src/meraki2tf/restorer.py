@@ -1432,24 +1432,26 @@ class OrgRestorer:
         if (
             action.kind == "configure"
             and action.payload.get("enabled") is False
-            and len(action.payload) > 1
         ):
             # GET echoes of disabled features carry attribute skeletons
             # their PUT refuses while disabled (OSPF demands areas, the
             # alternate management interface demands a VLAN). The
             # disabled bit alone restores the actual state; if even
-            # that is refused, disabled is a rebuilt network's default
+            # that is refused — or the payload already WAS the bare
+            # disabled bit — disabled is a rebuilt network's default
             # state already.
+            skip_reason = (
+                "disabled in the snapshot and the dashboard refuses "
+                "the disabled-state write; a rebuilt network is "
+                "already disabled by default"
+            )
+            if len(action.payload) == 1:
+                return ("skip", skip_reason)
             minimal = replace(action, payload={"enabled": False})
             try:
                 self._dispatch(dashboard, minimal, resolver, source_org)
             except Exception:  # noqa: BLE001 - degrade to the default
-                return (
-                    "skip",
-                    "disabled in the snapshot and the dashboard refuses "
-                    "the disabled-state write; a rebuilt network is "
-                    "already disabled by default",
-                )
+                return ("skip", skip_reason)
             logger.warning(
                 "Restored %s as disabled-only: the dashboard rejected "
                 "the full disabled-state payload; its attributes apply "
@@ -1669,6 +1671,15 @@ class OrgRestorer:
         self._bucket.on_success()
         if action.kind in ("create", "claim") and isinstance(response, Mapping):
             new_id = response.get("id")
+            if new_id is None:
+                # Create responses key their identity differently per
+                # collection ('groupId', 'payloadTemplateId', …); the
+                # item path's own placeholder names the field. Without
+                # this, the mapping is never recorded and every child
+                # referencing the object fails on dead snapshot IDs.
+                placeholders = _PATH_PARAM_RE.findall(action.api_path)
+                if placeholders:
+                    new_id = response.get(placeholders[-1])
             if new_id is not None:
                 return str(new_id)
         return None
