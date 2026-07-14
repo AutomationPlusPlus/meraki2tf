@@ -163,3 +163,97 @@ def test_from_cli_rejects_unknown_backend() -> None:
     # argparse's choices normally guards this; from_cli is defensive too.
     with pytest.raises(BackendConfigError, match="unknown"):
         BackendConfig.from_cli("consul", None, None)
+
+
+def test_s3_backend_parses_settings_into_init_args() -> None:
+    backend = _config(
+        ["--state-backend", "s3",
+         "--backend-config", "bucket=meraki-dr-state",
+         "--backend-config", "key=org.tfstate",
+         "--backend-config", "region=us-east-1"]
+    ).backend
+    assert backend.backend is StateBackend.S3
+    assert backend.is_remote
+    assert backend.init_args() == (
+        "-backend-config=bucket=meraki-dr-state",
+        "-backend-config=key=org.tfstate",
+        "-backend-config=region=us-east-1",
+    )
+
+
+def test_gcs_backend_parses_settings_into_init_args() -> None:
+    backend = _config(
+        ["--state-backend", "gcs",
+         "--backend-config", "bucket=meraki-dr-state",
+         "--backend-config", "prefix=org"]
+    ).backend
+    assert backend.backend is StateBackend.GCS
+    assert backend.is_remote
+    assert backend.init_args() == (
+        "-backend-config=bucket=meraki-dr-state",
+        "-backend-config=prefix=org",
+    )
+
+
+def test_s3_backend_requires_state_address_settings() -> None:
+    with pytest.raises(BackendConfigError, match="bucket, key"):
+        _config(["--state-backend", "s3"])
+    with pytest.raises(BackendConfigError, match="key"):
+        _config(
+            ["--state-backend", "s3", "--backend-config", "bucket=meraki-dr"]
+        )
+
+
+def test_gcs_backend_requires_bucket() -> None:
+    with pytest.raises(BackendConfigError, match="bucket"):
+        _config(["--state-backend", "gcs"])
+
+
+@pytest.mark.parametrize(
+    "argv_backend, secret_key",
+    [
+        ("s3", "access_key"),
+        ("s3", "secret_key"),
+        ("s3", "token"),
+        ("s3", "sse_customer_key"),
+        ("gcs", "credentials"),
+        ("gcs", "access_token"),
+        ("gcs", "encryption_key"),
+    ],
+)
+def test_s3_and_gcs_credential_keys_are_refused(
+    argv_backend: str, secret_key: str
+) -> None:
+    with pytest.raises(BackendConfigError, match="credential") as excinfo:
+        _config(
+            ["--state-backend", argv_backend,
+             "--backend-config", "bucket=meraki-dr-state",
+             "--backend-config", "key=org.tfstate",
+             "--backend-config", f"{secret_key}=SUPERSECRET"]
+        )
+    assert "SUPERSECRET" not in str(excinfo.value)
+
+
+def test_s3_backend_config_file_skips_required_check() -> None:
+    backend = _config(
+        ["--state-backend", "s3", "--backend-config-file", "aws.tfbackend"]
+    ).backend
+    assert backend.is_remote
+    assert backend.init_args()[0] == "-backend-config=aws.tfbackend"
+
+
+def test_gcs_credential_key_in_backend_file_is_refused(
+    tmp_path: Path,
+) -> None:
+    backend_file = tmp_path / "gcs.tfbackend"
+    backend_file.write_text(
+        'bucket      = "meraki-dr-state"\n'
+        'credentials = "{\\"type\\": \\"service_account\\"}"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(BackendConfigError, match="credential") as excinfo:
+        _config(
+            ["--state-backend", "gcs",
+             "--backend-config-file", str(backend_file)]
+        )
+    assert "service_account" not in str(excinfo.value)

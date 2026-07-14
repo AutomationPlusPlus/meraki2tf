@@ -383,9 +383,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=StateBackend.LOCAL.value,
         help=(
             "Terraform state backend (default: %(default)s). 'local' keeps "
-            "state on disk in --workdir/--state-file; 'azurerm' stores it "
-            "in Azure Blob Storage — durable, locked, off-box (recommended "
-            "for scheduled DR)."
+            "state on disk in --workdir/--state-file; 'azurerm' (Azure "
+            "Blob Storage), 's3' (Amazon S3), and 'gcs' (Google Cloud "
+            "Storage) keep it durable, locked, and off-box — recommended "
+            "for scheduled DR."
         ),
     )
     state.add_argument(
@@ -1243,7 +1244,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "--state-file names a local state path and cannot be combined with "
             f"a remote --state-backend ({config.backend.backend.value}); the "
             "remote backend's state location comes from --backend-config "
-            "(e.g. the azurerm 'key' setting)."
+            "(the azurerm/s3 'key' or gcs 'prefix' setting)."
         )
 
     if config.confirm and not (

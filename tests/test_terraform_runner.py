@@ -433,6 +433,43 @@ def test_backend_config_file_is_passed_to_init(
     assert "-backend-config=azure.tfbackend" in fake.calls[0]["command"]
 
 
+@pytest.mark.parametrize(
+    "state_backend, settings",
+    [
+        (
+            StateBackend.S3,
+            (
+                ("bucket", "meraki-dr-state"),
+                ("key", "org.tfstate"),
+                ("region", "us-east-1"),
+            ),
+        ),
+        (StateBackend.GCS, (("bucket", "meraki-dr-state"), ("prefix", "org"))),
+    ],
+)
+def test_s3_and_gcs_render_partial_backend_and_init_args(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    state_backend: StateBackend,
+    settings: tuple[tuple[str, str], ...],
+) -> None:
+    """The remote-backend path is backend-agnostic: s3 and gcs get the
+    same partial block + -backend-config treatment as azurerm."""
+    backend = BackendConfig(backend=state_backend, settings=settings)
+    runner = TerraformRunner(
+        tmp_path / "ws", executable="terraform", backend=backend
+    )
+    content = runner.prepare_workspace().read_text(encoding="utf-8")
+    assert f'backend "{state_backend.value}" {{' in content
+    assert "path =" not in content
+    assert not (runner.workdir / DEFAULT_STATE_FILENAME).exists()
+    fake = FakeSubprocess(stdout="Initialized")
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    runner.init()
+    expected = tuple(f"-backend-config={key}={value}" for key, value in settings)
+    assert fake.calls[0]["command"][-len(expected):] == expected
+
+
 def test_init_is_cached_and_runs_once_per_runner(
     runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
