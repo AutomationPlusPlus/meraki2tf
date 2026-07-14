@@ -2129,3 +2129,319 @@ def test_disabled_features_retry_with_minimal_payload(tmp_path: Path) -> None:
     assert ospf_calls[1][2] == {"enabled": False}
     assert result.failed == ()
     assert f"{ospf_path}::N_1" in result.executed
+
+
+def _conflict_error(message: str) -> Exception:
+    class Conflict400(Exception):
+        status = 400
+
+    return Conflict400(message)
+
+
+def test_conflicted_create_adopts_client_assigned_slot(tmp_path: Path) -> None:
+    """VLAN 1 exists in every new appliance network; the captured
+    VLAN's create collides ('Vlan has already been taken') and must
+    adopt the slot by its client-assigned ID, then align content."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    vlan_collection = "/networks/{networkId}/appliance/vlans"
+    vlan_item = "/networks/{networkId}/appliance/vlans/{vlanId}"
+    create_op = dict(_op("createNetworkApplianceVlan", "appliance"))
+    create_op["requestBody"] = {
+        "content": {"application/json": {"schema": {
+            "type": "object",
+            "properties": {"id": {}, "name": {}, "subnet": {}},
+        }}}
+    }
+    spec = {
+        "openapi": "3.0.0", "info": {"title": "v", "version": "1"},
+        "paths": {
+            "/organizations/{organizationId}/networks": {
+                "get": _op("getOrganizationNetworks", "organizations"),
+                "post": _op("createOrganizationNetwork", "organizations"),
+            },
+            "/networks/{networkId}/devices/claim": {
+                "post": _op("claimNetworkDevices", "networks"),
+            },
+            vlan_collection: {
+                "get": _op("getNetworkApplianceVlans", "appliance"),
+                "post": create_op,
+            },
+            vlan_item: {
+                "get": _op("getNetworkApplianceVlan", "appliance"),
+                "put": _op("updateNetworkApplianceVlan", "appliance"),
+            },
+        },
+    }
+    path = tmp_path / "vlan-spec.json"
+    path.write_text(json.dumps(spec), encoding="utf-8")
+    parser = OpenApiParser(path)
+    graph = _graph(
+        FeatureConfiguration(
+            vlan_item, ("N_1", "1"),
+            {"id": "1", "name": "Default", "subnet": "10.0.0.0/24"},
+        )
+    )
+    plan = plan_restore(graph, parser)
+    calls: list = []
+
+    class Section(_RecordingSection):
+        def createNetworkApplianceVlan(self, *args, **kwargs) -> dict:
+            self._calls.append(("createNetworkApplianceVlan", args, kwargs))
+            raise _conflict_error("Vlan has already been taken")
+
+    section = Section(calls)
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "j.jsonl"), skip_claims=True
+    )
+    restorer._client = SimpleNamespace(
+        organizations=section, networks=section, appliance=section
+    )
+    result = restorer.execute(graph, plan)
+    assert result.failed == ()
+    assert f"{vlan_item}::N_1,1" in result.executed
+    # The adopted slot's content was aligned via the item PUT.
+    aligned = next(c for c in calls if c[0] == "updateNetworkApplianceVlan")
+    assert aligned[2]["subnet"] == "10.0.0.0/24"
+
+
+def test_conflicted_create_adopts_reserved_default_by_name(
+    tmp_path: Path,
+) -> None:
+    """Meraki-provisioned defaults (payload templates, RF profiles)
+    reject the captured copy's create by name; adopt by name and align."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(
+            GP_ITEM, ("N_1", "100"), {"groupPolicyId": "100", "name": "gp"}
+        )
+    )
+    plan = plan_restore(graph, parser)
+    calls: list = []
+
+    class Section(_RecordingSection):
+        def createNetworkGroupPolicy(self, *args, **kwargs) -> dict:
+            self._calls.append(("createNetworkGroupPolicy", args, kwargs))
+            raise _conflict_error("'gp' is a reserved name and cannot be used")
+
+        def getNetworkGroupPolicies(self, networkId: str) -> list[dict]:
+            self._calls.append(("getNetworkGroupPolicies", (networkId,), {}))
+            return [{"groupPolicyId": "901", "name": "gp"}]
+
+    section = Section(calls)
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "j.jsonl"), skip_claims=True
+    )
+    restorer._client = SimpleNamespace(
+        organizations=section, networks=section, wireless=section
+    )
+    result = restorer.execute(graph, plan)
+    assert result.failed == ()
+    aligned = next(c for c in calls if c[0] == "updateNetworkGroupPolicy")
+    assert aligned[1][1] == "901"  # PUT targets the adopted counterpart
+
+
+def test_mutual_reference_deadlock_converges_by_dropping_one_side(
+    tmp_path: Path,
+) -> None:
+    """A policy object referencing its group while the group references
+    the object deadlocks the wave loop; the drop-retry round must
+    settle both, re-establishing the link from the surviving side."""
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    po_collection = "/organizations/{organizationId}/policyObjects"
+    po_item = "/organizations/{organizationId}/policyObjects/{policyObjectId}"
+    grp_collection = "/organizations/{organizationId}/policyObjects/groups"
+    grp_item = (
+        "/organizations/{organizationId}/policyObjects/groups"
+        "/{policyObjectGroupId}"
+    )
+    spec = {
+        "openapi": "3.0.0", "info": {"title": "p", "version": "1"},
+        "paths": {
+            "/organizations/{organizationId}/networks": {
+                "get": _op("getOrganizationNetworks", "organizations"),
+                "post": _op("createOrganizationNetwork", "organizations"),
+            },
+            "/networks/{networkId}/devices/claim": {
+                "post": _op("claimNetworkDevices", "networks"),
+            },
+            po_collection: {
+                "get": _op("getOrganizationPolicyObjects", "organizations"),
+                "post": _op("createOrganizationPolicyObject", "organizations"),
+            },
+            po_item: {
+                "get": _op("getOrganizationPolicyObject", "organizations"),
+                "put": _op("updateOrganizationPolicyObject", "organizations"),
+            },
+            grp_collection: {
+                "get": _op(
+                    "getOrganizationPolicyObjectsGroups", "organizations"
+                ),
+                "post": _op(
+                    "createOrganizationPolicyObjectsGroup", "organizations"
+                ),
+            },
+            grp_item: {
+                "get": _op(
+                    "getOrganizationPolicyObjectsGroup", "organizations"
+                ),
+                "put": _op(
+                    "updateOrganizationPolicyObjectsGroup", "organizations"
+                ),
+            },
+        },
+    }
+    path = tmp_path / "po-spec.json"
+    path.write_text(json.dumps(spec), encoding="utf-8")
+    parser = OpenApiParser(path)
+    graph = NetworkGraph(
+        organization_id="org-123",
+        networks=(),
+        devices=(),
+        features=(
+            FeatureConfiguration(
+                po_item, ("org-123", "5001"),
+                {"id": "5001", "name": "po-a", "groupIds": ["6001"]},
+            ),
+            FeatureConfiguration(
+                grp_item, ("org-123", "6001"),
+                {"id": "6001", "name": "grp-a", "objectIds": ["5001"]},
+            ),
+        ),
+    )
+    plan = plan_restore(graph, parser)
+    calls: list = []
+    section = _RecordingSection(
+        calls,
+        responses={
+            "createOrganizationPolicyObject": {"id": "9001"},
+            "createOrganizationPolicyObjectsGroup": {"id": "9002"},
+        },
+    )
+    from types import SimpleNamespace as NS
+
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "j.jsonl")
+    )
+    restorer._client = NS(organizations=section, networks=section)
+    result = restorer.execute(graph, plan)
+    assert result.failed == ()
+    assert len(result.executed) == 2
+    po = next(c for c in calls if c[0] == "createOrganizationPolicyObject")
+    grp = next(
+        c for c in calls if c[0] == "createOrganizationPolicyObjectsGroup"
+    )
+    # One side dropped its membership list to break the deadlock; the
+    # other carries the remapped reference, restoring the link.
+    po_refs = po[2].get("groupIds")
+    grp_refs = grp[2].get("objectIds")
+    assert (po_refs is None and grp_refs == ["9001"]) or (
+        grp_refs is None and po_refs == ["9002"]
+    )
+
+
+def test_refused_disabled_state_downgrades_to_skip(tmp_path: Path) -> None:
+    """When even {enabled: false} is refused (alternate management
+    interface), the feature's disabled state is a fresh network's
+    default — a skip verdict, not a failure."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    ami_path = "/networks/{networkId}/switch/alternateManagementInterface"
+    spec = {
+        "openapi": "3.0.0", "info": {"title": "a", "version": "1"},
+        "paths": {
+            "/organizations/{organizationId}/networks": {
+                "get": _op("getOrganizationNetworks", "organizations"),
+                "post": _op("createOrganizationNetwork", "organizations"),
+            },
+            "/networks/{networkId}/devices/claim": {
+                "post": _op("claimNetworkDevices", "networks"),
+            },
+            ami_path: {
+                "get": _op(
+                    "getNetworkSwitchAlternateManagementInterface", "switch"
+                ),
+                "put": _op(
+                    "updateNetworkSwitchAlternateManagementInterface",
+                    "switch",
+                ),
+            },
+        },
+    }
+    path = tmp_path / "ami-spec.json"
+    path.write_text(json.dumps(spec), encoding="utf-8")
+    parser = OpenApiParser(path)
+    graph = _graph(
+        FeatureConfiguration(
+            ami_path, ("N_1",),
+            {"enabled": False, "protocols": [], "switches": []},
+        )
+    )
+    plan = plan_restore(graph, parser)
+    calls: list = []
+
+    class Section(_RecordingSection):
+        def updateNetworkSwitchAlternateManagementInterface(
+            self, *args, **kwargs
+        ) -> dict:
+            self._calls.append(("ami", args, kwargs))
+            raise _conflict_error("Vlan can't be blank")
+
+    section = Section(calls)
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "j.jsonl"), skip_claims=True
+    )
+    restorer._client = SimpleNamespace(
+        organizations=section, networks=section, switch=section
+    )
+    result = restorer.execute(graph, plan)
+    assert result.failed == ()
+    assert any(
+        "already disabled by default" in entry["reason"]
+        for entry in result.skipped
+    )
+    assert len([c for c in calls if c[0] == "ami"]) == 2  # full + minimal
+
+
+def test_capability_400_is_drill_skipped_under_skip_claims(
+    tmp_path: Path,
+) -> None:
+    """'This endpoint only supports organizations with MX networks' is
+    inevitable on a device-free drill org: drill-skip, not failure."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(SNMP_PATH, ("N_1",), {"access": "none"})
+    )
+    plan = plan_restore(graph, parser)
+    calls: list = []
+
+    class Section(_RecordingSection):
+        def updateNetworkSnmp(self, *args, **kwargs) -> dict:
+            self._calls.append(("updateNetworkSnmp", args, kwargs))
+            raise _conflict_error(
+                "This endpoint only supports organizations with MX networks"
+            )
+
+    section = Section(calls)
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "j.jsonl"), skip_claims=True
+    )
+    restorer._client = SimpleNamespace(
+        organizations=section, networks=section, wireless=section
+    )
+    result = restorer.execute(graph, plan)
+    assert result.failed == ()
+    assert any("drill:" in entry["reason"] for entry in result.skipped)

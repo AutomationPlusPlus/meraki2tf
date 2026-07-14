@@ -169,6 +169,11 @@ def _is_structural_number(value: str) -> bool:
 
 def _is_path_keyword(placeholder: str, value: str) -> bool:
     """Whether a path value is a protocol/service keyword, not identity."""
+    if value.lower() == "default":
+        # The literal fixed-slot selector (vlanProfiles/{iname} names
+        # its built-in profile "default"): identity-free, and a
+        # pseudonym makes the slot unaddressable on restore.
+        return True
     return bool(
         not _KEYWORD_EXCLUDED_PLACEHOLDER.search(placeholder)
         and _KEYWORD_PATH_VALUE.fullmatch(value)
@@ -281,6 +286,18 @@ class _GraphSanitizer:
         # placeholder makes the sanitized snapshot fail restore drills.
         # RFC 2606 reserves `.invalid` — the address can never route.
         return f"user-{self._digest_bytes(value).hex()[:16]}@drill.invalid"
+
+    def _fake_host(self, value: str) -> str:
+        # Hostname pseudonyms must stay hostname-shaped: firewall rule
+        # destinations accept FQDNs, and a dotless `host-<digest>`
+        # token fails their validation on restore ("Destination address
+        # must be an IP address or a subnet in CIDR form…").
+        return f"host-{self._digest_bytes(value).hex()[:16]}.invalid"
+
+    def _fake_url(self, value: str) -> str:
+        # URL pseudonyms must stay URLs: webhook receivers and syslog
+        # forwarders validate scheme and host shape on write.
+        return f"https://url-{self._digest_bytes(value).hex()[:16]}.invalid/"
 
     @staticmethod
     def _masked(fake: str, prefix: str) -> str:
@@ -437,8 +454,21 @@ class _GraphSanitizer:
         if key.lower() in _COORDINATE_KEYS:
             return 0.0
         if _IDENTITY_KEY.search(key) and isinstance(value, str) and value:
+            if key.lower() == "shortname":
+                # Early-access feature slugs (`has_beta_api`): API
+                # keywords the opt-in POST validates against a fixed
+                # list, not identity.
+                return value
+            if value.lower() == "default":
+                # The fixed-slot selector again, echoed in payloads
+                # (a vlan profile's own `iname`).
+                return value
             if "email" in key.lower() or _EMAIL_VALUE.fullmatch(value):
                 return self._fake_email(value)
+            if key.lower().rstrip("s").endswith("url"):
+                # Same shape rule as the value-based URL rewrite:
+                # receivers validate scheme and host on write.
+                return self._fake_url(value)
             return self._pseudonym(key, value)
         if isinstance(value, str):
             return self._clean_identity_shaped(value)
@@ -466,9 +496,9 @@ class _GraphSanitizer:
                 for index, part in enumerate(re.split(r"(\s*,\s*)", value))
             )
         if _URL_VALUE.search(value):
-            return self._pseudonym("url", value)
+            return self._fake_url(value)
         if _FQDN_VALUE.fullmatch(value):
-            return self._pseudonym("host", value)
+            return self._fake_host(value)
         # Known structural IDs, FQDNs, IPs, and MACs are rewritten even
         # when embedded in free text (rule comments name networks and
         # hosts; DHCP option strings carry `MCIPADD=10.0.0.1,MCPORT=…`).
@@ -487,7 +517,7 @@ class _GraphSanitizer:
             return f"\x00{len(fake_emails) - 1}\x00"
         value = _EMAIL_VALUE.sub(_email_sentinel, value)
         value = _FQDN_VALUE.sub(
-            lambda m: self._pseudonym("host", m.group(0)), value
+            lambda m: self._fake_host(m.group(0)), value
         )
         value = _IPV4_VALUE.sub(
             lambda m: self._fake_ip(m.group(0), m.group("prefix") or ""), value

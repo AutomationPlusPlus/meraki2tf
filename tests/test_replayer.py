@@ -1204,3 +1204,39 @@ def test_strip_nulls_prunes_emptied_mappings() -> None:
         "rules": [],
         "name": "keep",
     }
+
+
+def test_shape_rules_strips_synthetic_rows() -> None:
+    """GET-echo rules carry Meraki's synthetic rows (trailing default
+    rule; the wireless LAN-access row) that the PUT rejects."""
+    from meraki2tf.replayer import shape_rules
+
+    ssid_path = "/networks/{networkId}/wireless/ssids/{number}/firewall/l3FirewallRules"
+    body = {
+        "rules": [
+            {"comment": "block telnet", "policy": "deny", "destCidr": "any"},
+            {"comment": "Wireless clients accessing LAN", "policy": "deny",
+             "destCidr": "Local LAN"},
+            {"comment": "Default rule", "policy": "allow", "destCidr": "Any"},
+        ]
+    }
+    shaped = shape_rules(ssid_path, body)
+    comments = [r["comment"] for r in shaped["rules"]]
+    assert comments == ["block telnet"]
+    assert shaped["allowLanAccess"] is False
+    # Non-SSID rules lists only lose the trailing default row.
+    generic = shape_rules(
+        "/networks/{networkId}/appliance/firewall/l3FirewallRules",
+        {"rules": [{"comment": "a", "policy": "allow"},
+                   {"comment": "Default rule", "policy": "allow"}]},
+    )
+    assert [r["comment"] for r in generic["rules"]] == ["a"]
+    # A default-comment row that is NOT trailing stays (operator-made).
+    keep = shape_rules(
+        "/networks/{networkId}/appliance/firewall/l3FirewallRules",
+        {"rules": [{"comment": "Default rule", "policy": "deny"},
+                   {"comment": "b", "policy": "allow"}]},
+    )
+    assert len(keep["rules"]) == 2
+    # Bodies without a rules list pass through untouched.
+    assert shape_rules(ssid_path, {"enabled": True}) == {"enabled": True}

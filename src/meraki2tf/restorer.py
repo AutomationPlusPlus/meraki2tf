@@ -62,6 +62,7 @@ from meraki2tf.replayer import (
     _single_array_body_field,
     _strip_nulls,
     is_action_log,
+    shape_rules,
     split_redacted as _split_redacted,
 )
 from meraki2tf.runbook import write_operations
@@ -94,6 +95,12 @@ class RestoreAction:
     #: executor reads it back to adopt (by name) an object a crashed
     #: run created but never journaled, instead of duplicating it.
     lookup: OperationSpec | None = field(
+        hash=False, compare=False, default=None
+    )
+    #: The item's PUT, when the spec has one: after adopting an
+    #: already-existing counterpart (a Meraki-provisioned default), the
+    #: executor aligns its content with the captured payload.
+    aligner: OperationSpec | None = field(
         hash=False, compare=False, default=None
     )
 
@@ -242,6 +249,7 @@ def _classify_feature(
             # The collection GET (same path as the collection POST),
             # for crash-recovery adoption by name.
             lookup=lookups.get(creates[0].path),
+            aligner=updates[0] if updates else None,
         )
     operation = updates[0] if updates else creates[0]
     return RestoreAction(
@@ -600,6 +608,7 @@ def rewrite_references(
     resolver: ReferenceResolver,
     context: tuple[str, ...],
     exclude: str | None = None,
+    dropped: list[str] | None = None,
 ) -> Any:
     """Rewrite snapshot-tenant identifiers to their rebuilt counterparts.
 
@@ -608,21 +617,40 @@ def rewrite_references(
     reference to a *known* old identifier with no rebuilt counterpart
     raises :class:`UnmappedReferenceError`; unknown strings pass
     through untouched (they are data, not references).
+
+    With ``dropped`` (a collector list), unresolvable *list-valued*
+    reference fields are omitted instead of raising, and their key
+    names are appended — the executor's deadlock breaker for mutually-
+    referencing pairs (a policy object's ``groupIds`` vs the group's
+    ``objectIds``: one side must yield so the other can create and
+    record its mapping; the surviving side re-establishes the link).
+    Scalar references (``configTemplateId``, ``groupPolicyId``) are
+    structural dependencies, not memberships — dropping one restores a
+    silently-miswired object, so they raise even then, as do
+    rule-grammar strings (dropping a whole firewall rule, or passing
+    the source tenant's ID through, are both worse than failing the
+    object loudly).
     """
     if isinstance(value, Mapping):
-        return {
-            key: (
-                _rewrite_reference_value(
-                    key, inner, resolver, context, exclude
+        out: dict[Any, Any] = {}
+        for key, inner in value.items():
+            if isinstance(key, str) and _REFERENCE_KEY_RE.search(key):
+                try:
+                    out[key] = _rewrite_reference_value(
+                        key, inner, resolver, context, exclude
+                    )
+                except UnmappedReferenceError:
+                    if dropped is None or not isinstance(inner, list):
+                        raise
+                    dropped.append(key)
+            else:
+                out[key] = rewrite_references(
+                    inner, resolver, context, exclude, dropped
                 )
-                if isinstance(key, str) and _REFERENCE_KEY_RE.search(key)
-                else rewrite_references(inner, resolver, context, exclude)
-            )
-            for key, inner in value.items()
-        }
+        return out
     if isinstance(value, list):
         return [
-            rewrite_references(item, resolver, context, exclude)
+            rewrite_references(item, resolver, context, exclude, dropped)
             for item in value
         ]
     if isinstance(value, str):
@@ -725,6 +753,20 @@ def _remap_serial_fields(
 
 #: Body property names that bind a write to specific hardware.
 _SERIAL_PROPERTY = re.compile(r"(?i)serial")
+
+#: Dashboard 400 texts meaning "an object with this name/slot already
+#: exists" — Meraki provisions defaults (payload templates, RF
+#: profiles, staged upgrade groups, VLAN 1) into new networks, so a
+#: snapshot's captured copy collides with the built-in on restore.
+_NAME_CONFLICT_RE = re.compile(
+    r"(?i)already (?:exists|been taken)|reserved name"
+    r"|with this name (?:exists|already)"
+)
+#: Dashboard 400 texts meaning "the organization lacks the hardware
+#: class this feature needs" — inevitable on device-free drill orgs.
+_CAPABILITY_RE = re.compile(
+    r"(?i)only supports organizations with .+ networks"
+)
 
 
 def _body_serial_properties(op: OperationSpec) -> frozenset[str]:
@@ -1071,6 +1113,11 @@ class OrgRestorer:
         # the next round instead of failing; a round that maps or
         # settles nothing means the references are genuinely dead.
         pending: list[RestoreAction] = list(plan.actions)
+        #: Keys granted one drop-unresolvable-references retry after a
+        #: deadlocked (no-progress) round — mutually-referencing pairs
+        #: (policy object groupIds ↔ group objectIds) otherwise starve
+        #: each other forever.
+        drop_retry: set[str] = set()
         while pending:
             deferred: list[tuple[RestoreAction, str]] = []
             for action in pending:
@@ -1226,21 +1273,41 @@ class OrgRestorer:
                         new_id = self._dispatch(
                             dashboard, dispatch_action, resolver,
                             graph.organization_id,
+                            drop_unresolvable=action.key in drop_retry,
                         )
                 except UnmappedReferenceError as exc:
+                    if action.key in drop_retry:
+                        # Even dropping unresolvable fields could not
+                        # dispatch it (rule-grammar references never
+                        # drop): the references are genuinely dead.
+                        failed.append((action.key, str(exc)))
+                        if action.kind in ("create", "claim"):
+                            failed_parents.add(_own_identity(action))
+                        continue
                     deferred.append((action, str(exc)))
                     continue
                 except Exception as exc:  # noqa: BLE001 - per-object isolation
-                    if self._retry_disabled_minimal(
+                    verdict, salvage = self._salvage_failure(
                         dashboard, dispatch_action, resolver,
                         graph.organization_id, exc,
-                    ):
+                    )
+                    if verdict == "healed":
                         # The disabled state was restored; the extra
                         # attributes the dashboard rejected only matter
-                        # once the feature is enabled (and configured)
-                        # for real.
+                        # once the feature is enabled for real.
                         new_id = None
                         injected_paths = ()
+                    elif verdict == "adopted":
+                        # The target already provisions this object (a
+                        # Meraki default); its content was aligned and
+                        # the mapping flows through the normal path.
+                        new_id = salvage
+                        injected_paths = ()
+                    elif verdict == "skip":
+                        skipped.append(
+                            {"target": action.key, "reason": salvage or ""}
+                        )
+                        continue
                     else:
                         message = str(exc)
                         if _secret_paths(dispatch_action.payload):
@@ -1308,10 +1375,23 @@ class OrgRestorer:
                 break
             if len(deferred) == len(pending):
                 # Nothing settled this round, so no new mapping can
-                # appear — the remaining references are unresolvable.
-                for action, reason in deferred:
-                    failed.append((action.key, reason))
-                break
+                # appear on its own. Grant every deferred action one
+                # retry that omits unresolvable reference fields — a
+                # mutual pair then converges (the first to settle
+                # records the mapping the other needs, and the
+                # surviving side of the pair re-establishes the link).
+                # An action already granted that retry is out of moves;
+                # the UnmappedReferenceError handler fails it.
+                fresh = [
+                    action
+                    for action, _ in deferred
+                    if action.key not in drop_retry
+                ]
+                if not fresh:
+                    for action, reason in deferred:
+                        failed.append((action.key, reason))
+                    break
+                drop_retry.update(action.key for action in fresh)
             pending = [action for action, _ in deferred]
         if drill_placeholders:
             logger.warning(
@@ -1329,40 +1409,146 @@ class OrgRestorer:
             drill_placeholders=tuple(drill_placeholders),
         )
 
-    def _retry_disabled_minimal(
+    def _salvage_failure(
         self,
         dashboard: Any,
         action: RestoreAction,
         resolver: ReferenceResolver,
         source_org: str,
         exc: Exception,
-    ) -> bool:
-        """Retry a rejected disabled-state configure with only the flag.
+    ) -> tuple[str, str | None]:
+        """Classify a dispatch failure into a salvageable outcome.
 
-        GET echoes of disabled features carry attribute skeletons their
-        PUT refuses to accept while disabled (OSPF demands areas, the
-        alternate management interface demands a VLAN). The disabled
-        bit alone restores the feature's actual state; the rejected
-        attributes only exist once an operator enables the feature.
+        Returns one of ``("healed", None)`` — the disabled state was
+        restored with a minimal retry; ``("adopted", new_id)`` — the
+        target already provisions the object (a Meraki default) and it
+        was adopted + content-aligned; ``("skip", reason)`` — an
+        expected drill/default condition, not a failure;
+        ``("failed", None)`` — the original error stands.
         """
+        if getattr(exc, "status", None) != 400:
+            return ("failed", None)
+        text = str(exc)
         if (
-            action.kind != "configure"
-            or getattr(exc, "status", None) != 400
-            or action.payload.get("enabled") is not False
-            or len(action.payload) <= 1
+            action.kind == "configure"
+            and action.payload.get("enabled") is False
+            and len(action.payload) > 1
         ):
-            return False
-        minimal = replace(action, payload={"enabled": False})
-        try:
-            self._dispatch(dashboard, minimal, resolver, source_org)
-        except Exception:  # noqa: BLE001 - the original error stands
-            return False
-        logger.warning(
-            "Restored %s as disabled-only: the dashboard rejected the "
-            "full disabled-state payload; its attributes apply only "
-            "when the feature is enabled.", action.key,
+            # GET echoes of disabled features carry attribute skeletons
+            # their PUT refuses while disabled (OSPF demands areas, the
+            # alternate management interface demands a VLAN). The
+            # disabled bit alone restores the actual state; if even
+            # that is refused, disabled is a rebuilt network's default
+            # state already.
+            minimal = replace(action, payload={"enabled": False})
+            try:
+                self._dispatch(dashboard, minimal, resolver, source_org)
+            except Exception:  # noqa: BLE001 - degrade to the default
+                return (
+                    "skip",
+                    "disabled in the snapshot and the dashboard refuses "
+                    "the disabled-state write; a rebuilt network is "
+                    "already disabled by default",
+                )
+            logger.warning(
+                "Restored %s as disabled-only: the dashboard rejected "
+                "the full disabled-state payload; its attributes apply "
+                "only when the feature is enabled.", action.key,
+            )
+            return ("healed", None)
+        if action.kind == "create" and _NAME_CONFLICT_RE.search(text):
+            adopted = self._adopt_existing(
+                dashboard, action, resolver, source_org
+            )
+            if adopted is not None:
+                return ("adopted", adopted)
+        if self._skip_claims and _CAPABILITY_RE.search(text):
+            return (
+                "skip",
+                "drill: the dashboard refuses this feature because the "
+                "drill organization has no claimed hardware of the "
+                "required class; it only restores in a real disaster "
+                "recovery",
+            )
+        return ("failed", None)
+
+    def _adopt_existing(
+        self,
+        dashboard: Any,
+        action: RestoreAction,
+        resolver: ReferenceResolver,
+        source_org: str,
+    ) -> str | None:
+        """Adopt the already-existing counterpart of a conflicted create.
+
+        Meraki provisions defaults into new networks/organizations
+        (payload templates, RF profiles, staged upgrade groups, VLAN 1,
+        the default adaptive-policy group), so the snapshot's captured
+        copy collides on create. Fixed slots with a client-assigned ID
+        adopt by that ID; everything else adopts by name (the crash-
+        recovery lookup). The adopted object's content is then aligned
+        with the captured payload via the item's PUT, when one exists.
+        """
+        _, own_old = _own_identity(action)
+        accepted = _body_property_names(action.operation)
+        client_assigned = any(
+            key in accepted and value == own_old
+            for key, value in action.payload.items()
         )
-        return True
+        adopted = (
+            own_old
+            if client_assigned
+            else self._reconcile_existing(
+                dashboard, action, resolver, source_org
+            )
+        )
+        if adopted is None:
+            return None
+        logger.warning(
+            "Adopted %s: the target already provisions this object (a "
+            "Meraki default or an earlier restore); aligning its "
+            "content with the snapshot.", action.key,
+        )
+        self._align_adopted(dashboard, action, resolver, source_org, adopted)
+        return adopted
+
+    def _align_adopted(
+        self,
+        dashboard: Any,
+        action: RestoreAction,
+        resolver: ReferenceResolver,
+        source_org: str,
+        adopted: str,
+    ) -> None:
+        """Push the captured payload onto an adopted object via its PUT.
+
+        Adoption alone leaves the built-in's factory content in place;
+        the drill/recovery intent is the snapshot's content. Alignment
+        failures downgrade to a warning — the object exists and is
+        mapped, which is what the rest of the restore depends on.
+        """
+        if action.aligner is None:
+            return
+        own_stem, own_old = _own_identity(action)
+        context = tuple(
+            value
+            for value in action.path_values[:-1]
+            if value != source_org
+        )
+        # Recorded ahead of the caller's bookkeeping so the follow-up
+        # PUT can resolve its own path scope; the duplicate row the
+        # caller records is harmless (same mapping).
+        resolver.record(own_stem, own_old, adopted, context)
+        follow_up = replace(action, kind="configure", operation=action.aligner)
+        try:
+            self._dispatch(dashboard, follow_up, resolver, source_org)
+        except Exception as exc:  # noqa: BLE001 - adoption stands
+            logger.warning(
+                "Adopted %s but could not align its content with the "
+                "snapshot (%s, status %s); review it in the dashboard.",
+                action.key, type(exc).__name__,
+                getattr(exc, "status", "n/a"),
+            )
 
     def _dispatch(
         self,
@@ -1370,6 +1556,7 @@ class OrgRestorer:
         action: RestoreAction,
         resolver: ReferenceResolver,
         source_org: str,
+        drop_unresolvable: bool = False,
     ) -> str | None:
         """One write; returns the server-assigned ID for creates."""
         op = action.operation
@@ -1434,9 +1621,18 @@ class OrgRestorer:
                     if v != own_old or k in accepted
                 }
                 exclude = own_old
+            dropped: list[str] | None = [] if drop_unresolvable else None
             body = rewrite_references(
-                body, resolver, action.path_values, exclude
+                body, resolver, action.path_values, exclude, dropped
             )
+            if dropped:
+                logger.warning(
+                    "Restored %s without its unresolvable reference "
+                    "field(s) %s: their referents have no rebuilt "
+                    "counterpart (mutual-reference deadlock); the "
+                    "surviving side of each pair re-establishes the "
+                    "link.", action.key, ", ".join(sorted(set(dropped))),
+                )
             if self._serial_map:
                 body = _remap_serial_fields(body, self._serial_map)
         items = _collection_items(body)
@@ -1448,6 +1644,7 @@ class OrgRestorer:
             if field is not None:
                 body = {field: items}
         body = _strip_nulls(body)
+        body = shape_rules(action.api_path, body)
         section = getattr(dashboard, op.tags[0], None) if op.tags else None
         method = (
             getattr(section, op.operation_id, None)
@@ -1535,6 +1732,13 @@ class OrgRestorer:
         if len(matches) != 1:
             return None
         found = matches[0].get("id")
+        if found is None:
+            # Collections key their items differently ('groupPolicyId',
+            # 'payloadTemplateId', …); the item path's own placeholder
+            # names the field.
+            placeholders = _PATH_PARAM_RE.findall(action.api_path)
+            if placeholders:
+                found = matches[0].get(placeholders[-1])
         return str(found) if found is not None else None
 
 
