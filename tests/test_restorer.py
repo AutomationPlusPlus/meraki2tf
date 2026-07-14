@@ -2826,6 +2826,12 @@ def _staged_spec(tmp_path: Path) -> OpenApiParser:
                 "get": _op(
                     "getNetworkFirmwareUpgradesStagedGroup", "networks"
                 ),
+                # The item PUT makes adoption run its content-alignment
+                # follow-up, which records a PROVISIONAL mapping for the
+                # adopted ID — the live-observed ambiguity bug needs it.
+                "put": _op(
+                    "updateNetworkFirmwareUpgradesStagedGroup", "networks"
+                ),
             },
             STAGED_STAGES: {
                 "get": _op(
