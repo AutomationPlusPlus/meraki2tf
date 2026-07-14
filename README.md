@@ -684,6 +684,7 @@ Quick reference (each flag is described in detail below):
 
 | Flag | Default | Purpose |
 | --- | --- | --- |
+| `--config PATH` | — | TOML file of recurring settings (CLI > file > default); DR actions, confirmations, and credentials refused |
 | `--org-id` | — | Organization to discover (required in live mode) |
 | `--spec PATH` | `./spec3.json` | Meraki OpenAPI JSON document; auto-downloaded/refreshed from GitHub |
 | `--from-dump PATH` | — | Offline snapshot; switches to dump mode |
@@ -716,7 +717,53 @@ Quick reference (each flag is described in detail below):
 | `--terraform-bin` | `terraform` | Terraform executable to invoke |
 | `-v`, `--verbose` | off | Debug logging (secrets always redacted) |
 
+### Config file (`--config`)
+
+Recurring settings — everything a scheduled job would otherwise pass as
+flags — can live in a TOML file, so the weekly DR invocation shrinks to
+one flag:
+
+```toml
+# /etc/meraki2tf/meraki2tf.toml
+org-id = "123456"
+workdir = "/var/lib/meraki2tf/dr-kit"
+sync = true
+fail-on-gaps = true
+state-backend = "azurerm"
+
+[backend-config]
+storage_account_name = "storacct"
+container_name = "tfstate"
+key = "org.tfstate"
+```
+
+```bash
+meraki2tf --config /etc/meraki2tf/meraki2tf.toml
+```
+
+Keys mirror the long flag names (`org-id`, `state-backend`,
+`webhook-url` — repeatable flags take a string or an array of strings;
+`backend-config` is a table). Precedence is strictly **command line >
+config file > built-in default**: a file value applies only where the
+flag was not typed.
+
+Two classes of keys are refused in the file, by design:
+
+- **Disaster-recovery actions and confirmations** (`--rebuild`,
+  `--heal`, `--replay-gaps`, `--restore`, `--wipe-org`, `--confirm`,
+  `--confirm-deletions`, `--rebaseline`, and their scoped companions).
+  A write to Meraki — or a baseline-destroying acceptance — must be
+  typed by a human for that specific invocation, never inherited from a
+  long-lived file.
+- **Credentials**, exactly as on the command line: credential-shaped
+  `backend-config` keys are rejected, and the API key is only ever read
+  from `MERAKI_DASHBOARD_API_KEY`. The config file never holds a
+  secret, so it needs no special file permissions.
+
 ### Parameters in detail
+
+**`--config PATH`** — TOML file of recurring settings; see
+[Config file](#config-file---config) above.
 
 **`--org-id ID`** — the Meraki organization to discover. Required in
 live mode. In dump mode it may be omitted (the organization recorded in

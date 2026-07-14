@@ -12,6 +12,7 @@ import argparse
 import enum
 import os
 import re
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -186,6 +187,181 @@ class BackendConfig:
                     f"{', '.join(missing)} (or supply them via --backend-config-file)."
                 )
         return resolved
+
+
+class ConfigFileError(ValueError):
+    """A ``--config`` file is unreadable, malformed, or sets a refused key."""
+
+
+#: Config-file keys that must stay human-typed on the command line.
+#: Disaster-recovery actions, their targets, and every confirmation flag
+#: are refused: a write to Meraki (or a baseline-destroying acceptance)
+#: must never happen because a long-lived config file says so.
+CONFIG_FILE_REFUSED_KEYS = frozenset(
+    {
+        "rebuild",
+        "heal",
+        "replay-gaps",
+        "restore",
+        "wipe-org",
+        "wipe-org-name",
+        "confirm",
+        "confirm-deletions",
+        "rebaseline",
+        "target-org",
+        "serial-map",
+        "skip-claims",
+    }
+)
+
+#: TOML key → argparse dest for string-valued settings.
+_CONFIG_STR_KEYS = {
+    "org-id": "org_id",
+    "spec": "spec",
+    "workdir": "workdir",
+    "terraform-bin": "terraform_bin",
+    "from-dump": "from_dump",
+    "dump-to": "dump_to",
+    "drift-baseline": "drift_baseline",
+    "state-file": "state_file",
+    "state-backend": "state_backend",
+    "backend-config-file": "backend_config_file",
+    "smtp-host": "smtp_host",
+    "email-from": "email_from",
+}
+_CONFIG_BOOL_KEYS = {
+    "verbose": "verbose",
+    "sanitize": "sanitize",
+    "sync": "sync",
+    "fail-on-gaps": "fail_on_gaps",
+}
+_CONFIG_INT_KEYS = {"smtp-port": "smtp_port"}
+#: Accept a single string or an array of strings (repeatable flags).
+_CONFIG_LIST_KEYS = {"webhook-url": "webhook_url", "alert-email": "alert_email"}
+
+
+def _config_file_allowed_keys() -> str:
+    allowed = (
+        set(_CONFIG_STR_KEYS)
+        | set(_CONFIG_BOOL_KEYS)
+        | set(_CONFIG_INT_KEYS)
+        | set(_CONFIG_LIST_KEYS)
+        | {"backend-config"}
+    )
+    return ", ".join(sorted(allowed))
+
+
+def _backend_settings_from_table(path: Path, value: object) -> list[str]:
+    """Convert a ``[backend-config]`` TOML table into KEY=VALUE items.
+
+    Credential-shaped keys are refused here with a file-specific message;
+    :meth:`BackendConfig.from_cli` re-validates the produced items, so the
+    argv guard stays authoritative (belt-and-suspenders).
+    """
+    if not isinstance(value, dict):
+        raise ConfigFileError(
+            f"--config {path}: 'backend-config' must be a TOML table of "
+            "KEY = \"VALUE\" settings."
+        )
+    items: list[str] = []
+    for key, setting in value.items():
+        if key.lower() in SECRET_BACKEND_KEYS:
+            raise ConfigFileError(
+                f"--config {path} sets backend-config.{key}, which is a "
+                "credential and must not be written to a config file; "
+                "terraform reads it from the environment or a managed "
+                "identity instead."
+            )
+        if isinstance(setting, bool):
+            rendered = "true" if setting else "false"
+        elif isinstance(setting, (str, int)):
+            rendered = str(setting)
+        else:
+            raise ConfigFileError(
+                f"--config {path}: backend-config.{key} must be a string, "
+                "integer, or boolean."
+            )
+        items.append(f"{key}={rendered}")
+    return items
+
+
+def load_config_file(path: Path) -> dict[str, object]:
+    """Parse a ``--config`` TOML file into argparse destination overrides.
+
+    Returns a mapping of argparse ``dest`` names to values, applied only
+    where the command line did not supply the flag (CLI > file > default).
+    Only schedule-safe settings are accepted: DR actions, their targets,
+    and confirmation flags are refused (see ``CONFIG_FILE_REFUSED_KEYS``),
+    and credential-shaped values are refused everywhere — the file must
+    never hold a secret (the API key only ever comes from the
+    ``MERAKI_DASHBOARD_API_KEY`` environment variable).
+    """
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise ConfigFileError(f"--config {path}: cannot read the file ({exc}).") from exc
+    try:
+        data = tomllib.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise ConfigFileError(f"--config {path} is not valid TOML: {exc}") from exc
+
+    overrides: dict[str, object] = {}
+    for key, value in data.items():
+        if key in CONFIG_FILE_REFUSED_KEYS:
+            raise ConfigFileError(
+                f"--config {path} sets {key!r}, which must be typed on the "
+                "command line for every invocation: disaster-recovery "
+                "actions and confirmations never run because a config "
+                "file says so."
+            )
+        if key == "backend-config":
+            overrides["backend_config"] = _backend_settings_from_table(path, value)
+        elif key in _CONFIG_LIST_KEYS:
+            if isinstance(value, str):
+                values = [value]
+            elif isinstance(value, list) and all(
+                isinstance(item, str) for item in value
+            ):
+                values = list(value)
+            else:
+                raise ConfigFileError(
+                    f"--config {path}: {key!r} must be a string or an "
+                    "array of strings."
+                )
+            overrides[_CONFIG_LIST_KEYS[key]] = values
+        elif key in _CONFIG_BOOL_KEYS:
+            if not isinstance(value, bool):
+                raise ConfigFileError(
+                    f"--config {path}: {key!r} must be a boolean."
+                )
+            overrides[_CONFIG_BOOL_KEYS[key]] = value
+        elif key in _CONFIG_INT_KEYS:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ConfigFileError(
+                    f"--config {path}: {key!r} must be an integer."
+                )
+            overrides[_CONFIG_INT_KEYS[key]] = value
+        elif key in _CONFIG_STR_KEYS:
+            if not isinstance(value, str):
+                raise ConfigFileError(
+                    f"--config {path}: {key!r} must be a string."
+                )
+            if key == "state-backend":
+                try:
+                    StateBackend(value)
+                except ValueError:
+                    choices = ", ".join(member.value for member in StateBackend)
+                    raise ConfigFileError(
+                        f"--config {path}: unknown state-backend {value!r}; "
+                        f"choose one of: {choices}."
+                    ) from None
+            overrides[_CONFIG_STR_KEYS[key]] = value
+        else:
+            raise ConfigFileError(
+                f"--config {path}: unknown key {key!r}. Valid keys: "
+                f"{_config_file_allowed_keys()}."
+            )
+    return overrides
 
 
 class MissingApiKeyError(RuntimeError):
