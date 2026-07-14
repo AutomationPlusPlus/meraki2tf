@@ -26,16 +26,22 @@ alerts to your configured webhook/email channels.
 never mutates your Meraki organization. Its job is to continuously
 convert your org into runnable Terraform artifacts; in the event of a
 major incident you use those artifacts to rebuild — see
-[Disaster Recovery](#disaster-recovery). Only three explicit,
+[Disaster Recovery](#disaster-recovery). Only five explicit,
 human-invoked disaster-recovery actions ever write anything, and each is
 a read-only preview until you add `--confirm`:
 [`--rebuild --confirm`](#restoring-an-existing-organization-primary-dr-path)
-(a `terraform apply` of the kit) and
+(a `terraform apply` of the kit),
+[`--heal --confirm`](#healing-accidental-deletions---heal)
+(recreates snapshot objects missing from the same organization —
+additive-only, survivors untouched),
 [`--replay-gaps --confirm`](#restoring-what-terraform-cant-rebuild---replay-gaps)
-(restores objects and secrets Terraform cannot carry, via the SDK), and
+(restores objects and secrets Terraform cannot carry, via the SDK),
 [`--restore --confirm`](#rebuilding-an-entire-organization---restore)
 (rebuilds an entire organization from a snapshot — only ever into a
-separate `--target-org`, never the source).
+separate `--target-org`, never the source), and
+[`--wipe-org --confirm`](#restore-drills-and-cleaning-up-after-them)
+(drill-org teardown — refused outright for any organization holding
+claimed devices, so it physically cannot target production).
 Every scheduled/automated run stays strictly read-only toward Meraki.
 
 **Why dynamic OpenAPI spec parsing?** The Meraki API surface changes
@@ -423,6 +429,46 @@ Terraform cannot import something that is gone. Adjust the kit first:
 > *same* organization avoids all of this, which is why it is the
 > primary DR path.
 
+### Healing accidental deletions (`--heal`)
+
+`--rebuild` reverts *modified* settings, but when objects were
+**deleted** from a still-healthy organization (the classic clickops
+accident), their `import {}` blocks fail — Terraform cannot import
+something that is gone. `--heal` covers exactly this case: it diffs
+your snapshot against a fresh live discovery of the **same**
+organization and recreates only what is missing, directly through the
+API:
+
+```bash
+export MERAKI_DASHBOARD_API_KEY="<your-dashboard-api-key>"
+
+# 1. Preview — shows every missing object and what would be recreated:
+meraki2tf --heal --from-dump vault/latest.jsonl.gz --org-id 123456
+
+# 2. Execute — recreates the missing objects; survivors are untouched:
+meraki2tf --heal --confirm --from-dump vault/latest.jsonl.gz --org-id 123456
+```
+
+Notes:
+
+- **Additive-only.** Objects still present in the organization are
+  never modified or dispatched — heal only creates what is missing. A
+  deleted parent's children are rewired to the parent's new ID.
+- **Same-org interlock** (the inverse of `--restore`): `--org-id` must
+  match the snapshot's source organization, or the run is refused. To
+  rebuild a *different* organization, use `--restore --target-org`.
+- **Unsanitized snapshot required.** A sanitized snapshot's
+  identifiers are pseudonyms and cannot be matched against the live
+  organization.
+- **API key required even for preview** — deciding what is "missing"
+  takes a live discovery of the organization as it is right now.
+- **Crash-resumable.** Executed writes are journaled
+  (`<workdir>/heal-journal.jsonl`); re-running `--heal --confirm`
+  resumes instead of duplicating creates.
+- Execution dispatches a `HEAL_EXECUTED` alert with the recreated,
+  failed, skipped, and surviving counts; objects the API cannot
+  recreate are reported with reasons, never silently dropped.
+
 ### Restoring what Terraform can't rebuild (`--replay-gaps`)
 
 `--rebuild` restores everything the Terraform provider can express. Two
@@ -444,7 +490,7 @@ export MERAKI_DASHBOARD_API_KEY="<your-dashboard-api-key>"
 # 1. Preview — read-only, prints exactly what would be written:
 meraki2tf --replay-gaps --from-dump ./snapshots/org-123456.json
 
-# 2. Execute — the second (and last) way meraki2tf writes to Meraki:
+# 2. Execute — writes the gap objects and secrets back via the SDK:
 meraki2tf --replay-gaps --confirm --from-dump ./snapshots/org-123456.json
 ```
 
@@ -582,6 +628,7 @@ Quick reference (each flag is described in detail below):
 | `--sanitize` | off | Redact secrets/identity in the `--dump-to` snapshot |
 | `--drift-baseline PATH` | — | Prior snapshot to diff the fresh discovery against — attribute-level drift in seconds, no terraform read pass |
 | `--rebuild` | off | Disaster recovery: preview a rebuild apply of the workdir artifacts |
+| `--heal` | off | Disaster recovery: preview recreating snapshot objects missing from the same live org (additive-only) |
 | `--replay-gaps` | off | Disaster recovery: preview restoring objects/secrets Terraform can't rebuild, from an unsanitized snapshot |
 | `--restore` | off | Disaster recovery: preview a full-organization rebuild from a snapshot into `--target-org` |
 | `--target-org ORG_ID` | — | The (fresh/scratch) organization `--restore` writes into; never the snapshot's source org |
@@ -589,7 +636,7 @@ Quick reference (each flag is described in detail below):
 | `--skip-claims` | off | Drill mode for `--restore`: device claiming + device-scoped features become drill-skipped verdicts |
 | `--wipe-org ORG_ID` | — | Drill teardown: delete every network then the org; refused for any org with claimed devices |
 | `--wipe-org-name NAME` | — | Second factor for `--wipe-org`: must match the organization's exact name |
-| `--confirm` | off | Escalate `--rebuild`, `--replay-gaps`, or `--restore` from preview to a real write against Meraki |
+| `--confirm` | off | Escalate `--rebuild`, `--heal`, `--replay-gaps`, `--restore`, or `--wipe-org` from preview to a real write against Meraki |
 | `--rebaseline` | off | Accept current reality: discard `resources.tf` so this run regenerates the baseline |
 | `--sync` | off | DR automation: guarded import-only auto-apply + modified-object baseline regeneration |
 | `--confirm-deletions` | off | Human confirmation to remove Meraki-deleted resources from the kit and state |
@@ -644,6 +691,17 @@ what an apply would do. Read-only on its own; requires
 Cannot be combined with `--from-dump`/`--dump-to`. See
 [Disaster Recovery](#disaster-recovery).
 
+**`--heal`** — disaster-recovery action: recreate snapshot objects that
+are missing from the live organization (accidental deletions) — the
+**same** organization the `--from-dump` snapshot was captured from
+(`--org-id` must match its source org). Additive-only: surviving
+objects are never modified; a deleted parent's children are rewired to
+its new ID. Requires an unsanitized snapshot and
+`MERAKI_DASHBOARD_API_KEY` (even the preview performs a live discovery
+to decide what is missing). Read-only preview on its own; `--confirm`
+executes with a crash-resumable journal. See
+[Healing accidental deletions](#healing-accidental-deletions---heal).
+
 **`--replay-gaps`** — disaster-recovery action: restore the pieces
 Terraform cannot rebuild — objects the provider can't express, plus the
 secret attributes the kit deliberately never carries (SSID PSKs, SNMP
@@ -656,11 +714,14 @@ network IDs are remapped to the rebuilt tenant by name. Secrets are read
 from the snapshot at execution time and held only in memory. See
 [Restoring what Terraform can't rebuild](#restoring-what-terraform-cant-rebuild---replay-gaps).
 
-**`--confirm`** — escalates `--rebuild` (a `terraform apply` of the kit)
-or `--replay-gaps` (SDK writes from the snapshot) from a read-only
-preview to a real write. These two disaster-recovery actions are the
-*only* ways meraki2tf ever changes Meraki; every other invocation —
-including every scheduled run — is read-only toward your organization.
+**`--confirm`** — escalates a disaster-recovery action — `--rebuild`
+(a `terraform apply` of the kit), `--heal` (recreates deleted objects
+in the same org), `--replay-gaps` (SDK writes from the snapshot),
+`--restore` (full-organization rebuild into `--target-org`), or
+`--wipe-org` (drill-org teardown) — from a read-only preview to a real
+write. These five disaster-recovery actions are the *only* ways
+meraki2tf ever changes Meraki; every other invocation — including every
+scheduled run — is read-only toward your organization.
 
 **`--rebaseline`** — discard the accumulated `resources.tf`
 configuration baseline so this run regenerates it from currently
@@ -872,6 +933,7 @@ environment itself.
 | `UNSUPPORTED_FEATURE_FLAGGED` | A discovered asset cannot be mapped to a Terraform resource |
 | `DELETION_PENDING_CONFIRMATION` | Resources tracked in the DR kit were not found in Meraki (deleted?); they stay in the kit until a human confirms with `--confirm-deletions` |
 | `RESTORE_EXECUTED` | A human-invoked `--restore --confirm` rebuilt a target organization from a snapshot. Payload carries executed/failed/skipped action labels (identifiers and endpoints only — never values) |
+| `HEAL_EXECUTED` | A human-invoked `--heal --confirm` recreated snapshot objects missing from the same live organization. Payload carries the executed/failed/skipped actions plus the surviving (untouched) count — identifiers and endpoints only, never values |
 | `ORG_WIPE_EXECUTED` | A human-invoked `--wipe-org --confirm` tore down a hardware-free drill organization (networks deleted + org deleted, with any failures) |
 | `GAP_REPLAY_EXECUTED` | A human-invoked `--replay-gaps --confirm` wrote unsupported objects and/or secret attributes back to Meraki from a snapshot. Payload carries the executed, skipped, and failed operations (identifiers/endpoints only — never secret values) |
 | `PROCESSING_FAULT` | A critical pipeline failure (payload carries the failing stage) |
@@ -880,8 +942,9 @@ environment itself.
 
 The CLI is non-interactive end to end and reports outcome via exit code
 (0 clean, 1 fault, 2 usage error, 3 coverage gaps with `--fail-on-gaps`,
-4 sync auto-apply aborted for human review), so a weekly headless run is
-one crontab line:
+4 sync auto-apply aborted for human review, 5 run succeeded but at
+least one alert reached no configured channel), so a weekly headless
+run is one crontab line:
 
 ```cron
 # Every Monday 06:00 — stream live, materialize state, alert to the NetOps webhook.
