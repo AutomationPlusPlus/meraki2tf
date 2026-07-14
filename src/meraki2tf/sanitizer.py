@@ -55,7 +55,7 @@ import logging
 import os
 import re
 import secrets
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -226,6 +226,17 @@ def load_or_create_salt(path: Path) -> bytes:
     return salt
 
 
+def _walk_mappings(node: Any) -> Iterator[Mapping[str, Any]]:
+    """Every mapping in a payload tree, depth-first."""
+    if isinstance(node, Mapping):
+        yield node
+        for value in node.values():
+            yield from _walk_mappings(value)
+    elif isinstance(node, (list, tuple)):
+        for item in node:
+            yield from _walk_mappings(item)
+
+
 class _GraphSanitizer:
     """One sanitization pass; holds the consistent structural-ID map."""
 
@@ -233,6 +244,21 @@ class _GraphSanitizer:
         self._salt = salt
         self._id_map: dict[str, str] = {}
         self._counters: dict[str, int] = {}
+        # Meraki built-in payload templates ("type": "included") carry
+        # vendor names, not customer identity, and those names must
+        # survive verbatim EVERYWHERE — on the template object itself
+        # and inside references to it (a webhook receiver's
+        # payloadTemplate carries id + name, and the dashboard rejects
+        # the pair when they disagree). Collect the built-ins' IDs up
+        # front so reference nodes (which lack the "type" marker) are
+        # recognized too.
+        self._included_template_ids: frozenset[str] = frozenset(
+            str(payload.get("payloadTemplateId"))
+            for feature in graph.features
+            for payload in _walk_mappings(feature.payload)
+            if payload.get("type") == "included"
+            and payload.get("payloadTemplateId")
+        )
         self._assign(graph.organization_id, "org")
         for network in graph.networks:
             self._assign(network.organization_id, "org")
@@ -387,8 +413,15 @@ class _GraphSanitizer:
             # names ("Slack (included)"), not customer identity — and a
             # pseudonymized name breaks adopt-by-name on restore, so
             # the org-shared built-in gets duplicated in every network.
+            # Reference nodes (a webhook receiver's payloadTemplate)
+            # carry the ID without the "type" marker, and the dashboard
+            # rejects an id/name pair that disagrees — hence the
+            # prescanned ID set.
             included = (
                 node.get("type") == "included" and "payloadTemplateId" in node
+            ) or (
+                str(node.get("payloadTemplateId"))
+                in self._included_template_ids
             )
             # Keys are data too: fixed-IP assignments key on MACs,
             # per-device maps key on serials.

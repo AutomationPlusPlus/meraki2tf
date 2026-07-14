@@ -2901,6 +2901,75 @@ def test_default_flagged_creates_adopt_the_provisioned_default(
     assert "901" in sent and "3510" not in sent
 
 
+def test_adopted_default_sentinel_id_is_refreshed_after_align(
+    tmp_path: Path,
+) -> None:
+    """A freshly provisioned default can list under the sentinel ID -1
+    until the dashboard materializes it; item PUTs accept the alias but
+    sibling references (the stages PUT) reject it ("Invalid Staged
+    Upgrade Group: -1"), so adoption re-reads the collection after
+    alignment and records the real identifier."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    parser = _staged_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(
+            STAGED_GROUP_ITEM, ("N_1", "3510"),
+            {"groupId": "3510", "name": "Default group", "isDefault": True},
+        ),
+        FeatureConfiguration(
+            STAGED_STAGES, ("N_1",),
+            {"items": [{"group": {"id": "3510"}}]},
+        ),
+    )
+    plan = plan_restore(graph, parser)
+    calls: list = []
+
+    class Section(_RecordingSection):
+        def __init__(self, record: list) -> None:
+            super().__init__(record)
+            self._listed = 0
+
+        def getNetworkFirmwareUpgradesStagedGroups(
+            self, networkId: str
+        ) -> list[dict]:
+            self._calls.append(
+                ("getNetworkFirmwareUpgradesStagedGroups", (networkId,), {})
+            )
+            self._listed += 1
+            if self._listed == 1:
+                return [
+                    {"groupId": "-1", "name": "Auto default",
+                     "isDefault": True}
+                ]
+            return [
+                {"groupId": "901", "name": "Default group",
+                 "isDefault": True}
+            ]
+
+    section = Section(calls)
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "j.jsonl"), skip_claims=True
+    )
+    restorer._client = SimpleNamespace(
+        organizations=section, networks=section
+    )
+    result = restorer.execute(graph, plan)
+
+    assert result.failed == ()
+    # The collection was re-read after alignment…
+    assert section._listed == 2
+    # …and the stages PUT references the materialized ID, never -1.
+    stages = next(
+        c for c in calls
+        if c[0] == "updateNetworkFirmwareUpgradesStagedStages"
+    )
+    sent = json.dumps(stages[2])
+    assert "901" in sent and "-1" not in sent
+
+
 PT_COLLECTION = "/networks/{networkId}/webhooks/payloadTemplates"
 PT_ITEM = PT_COLLECTION + "/{payloadTemplateId}"
 
