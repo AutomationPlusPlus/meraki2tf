@@ -382,7 +382,12 @@ _OBJ_GRP_RE = re.compile(r"\b(GRP|OBJ)\((\d+)\)")
 _GRAMMAR_KEYS = {"GRP": "policyObjectGroupId", "OBJ": "policyObjectId"}
 
 #: Payload keys whose values are cross-references to other objects.
-_REFERENCE_KEY_RE = re.compile(r"Ids?$")
+#: Bare ``id``/``ids`` count too (mirroring the sanitizer's rule): a
+#: nested sub-object reference (staged stages' ``group.id``) carries
+#: exactly that key, and skipping it dispatches dead snapshot IDs. An
+#: object's own root-level ``id`` echo stays safe — creates exclude it
+#: and configures resolve it through the already-recorded mapping.
+_REFERENCE_KEY_RE = re.compile(r"^ids?$|Ids?$")
 
 _PATH_PARAM_RE = re.compile(r"\{([^}]+)\}")
 
@@ -1623,6 +1628,13 @@ class OrgRestorer:
                     if v != own_old or k in accepted
                 }
                 exclude = own_old
+            elif action.api_path.endswith("}"):
+                # An item configure's payload echoes its own identity
+                # (a recreated VLAN carries id: "10") — with bare id
+                # keys treated as references, that echo must count as
+                # identity, exactly like on creates. Singletons keep no
+                # exclude: their last path value is a parent scope.
+                _, exclude = _own_identity(action)
             dropped: list[str] | None = [] if drop_unresolvable else None
             body = rewrite_references(
                 body, resolver, action.path_values, exclude, dropped
