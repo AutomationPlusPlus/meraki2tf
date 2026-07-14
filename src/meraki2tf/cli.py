@@ -55,10 +55,12 @@ from meraki2tf.config import (
     API_KEY_ENV_VAR,
     WEBHOOK_URL_ENV_VAR,
     BackendConfigError,
+    ConfigFileError,
     ExecutionMode,
     RuntimeConfig,
     StateBackend,
     api_key_present,
+    load_config_file,
 )
 from meraki2tf.coverage import build_manifest, unsupported_payload, write_manifest
 from meraki2tf.hcl_generator import HclImportGenerator
@@ -130,6 +132,17 @@ def build_parser() -> argparse.ArgumentParser:
     core = parser.add_argument_group(
         "core options",
         "Everything a plain read-only export needs.",
+    )
+    core.add_argument(
+        "--config",
+        metavar="PATH",
+        default=None,
+        help=(
+            "TOML file of recurring settings (keys mirror the long flag "
+            "names). Precedence: command line > config file > built-in "
+            "default. Disaster-recovery actions, confirmations, and "
+            "credentials are refused in the file."
+        ),
     )
     core.add_argument(
         "--org-id",
@@ -1193,9 +1206,32 @@ def _replay_gaps(config: RuntimeConfig) -> int:
     return 0
 
 
+def _apply_config_file(
+    arg_parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    """Fill flags the command line left at their default from --config.
+
+    Precedence is strictly CLI > file > built-in default: a file value
+    is applied only where the parsed value still equals the parser's
+    default (i.e. the operator did not type the flag). The loader has
+    already refused every DR action, confirmation, and credential key,
+    so nothing applied here can widen a run's write surface.
+    """
+    if args.config is None:
+        return
+    try:
+        overrides = load_config_file(Path(args.config))
+    except ConfigFileError as exc:
+        arg_parser.error(str(exc))
+    for dest, value in overrides.items():
+        if getattr(args, dest) == arg_parser.get_default(dest):
+            setattr(args, dest, value)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     arg_parser = build_parser()
     args = arg_parser.parse_args(argv)
+    _apply_config_file(arg_parser, args)
     try:
         config = RuntimeConfig.from_args(args)
     except BackendConfigError as exc:
