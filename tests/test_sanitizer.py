@@ -243,7 +243,9 @@ def test_identity_fields_are_pseudonymized() -> None:
     assert sanitized.devices[0].name.startswith("device-")
     payload = sanitized.features[0].payload
     assert payload["name"].startswith("name-")
-    assert payload["adminSplashUrl"].startswith("adminsplashurl-")
+    assert re.fullmatch(
+        r"https://url-[0-9a-f]{16}\.invalid/", payload["adminSplashUrl"]
+    )
     assert payload["tags"][0].startswith("tags-")
     # Unknown serials under a structural key get a consistent dev-NNNN
     # pseudonym (not a one-off digest), keeping references coherent.
@@ -290,9 +292,13 @@ def test_identity_shaped_values_are_scrubbed_regardless_of_key() -> None:
     assert rule["srcCidr"] == "Any"  # semantic literal, not an address
     assert rule["comment"] == "allow radius"
     assert payload["host"].startswith("10.") and payload["host"] != "1.2.3.4"
-    assert payload["fqdn"].startswith("host-")
-    assert payload["patterns"][0].startswith("host-")
-    assert payload["patterns"][1].startswith("url-")
+    # Hostname/URL pseudonyms keep their shape (firewall destinations
+    # and webhook receivers validate them on restore).
+    assert re.fullmatch(r"host-[0-9a-f]{16}\.invalid", payload["fqdn"])
+    assert re.fullmatch(r"host-[0-9a-f]{16}\.invalid", payload["patterns"][0])
+    assert re.fullmatch(
+        r"https://url-[0-9a-f]{16}\.invalid/", payload["patterns"][1]
+    )
     assert payload["bssid"].startswith("02:")
     # IPs embedded in free text (DHCP option strings) are rewritten.
     dhcp = sanitize_graph(
