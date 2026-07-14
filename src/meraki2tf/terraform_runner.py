@@ -141,9 +141,17 @@ _REMOTE_BACKEND_BLOCK = """\
   backend "{backend_type}" {{
     # Partial backend — settings come from `terraform init -backend-config`
     # (meraki2tf --backend-config) and credentials from the environment
-    # (e.g. ARM_ACCESS_KEY / managed identity); nothing is written here.
+    # ({credential_hint} or a managed identity); nothing is written here.
   }}
 """
+
+#: Per-backend environment-credential examples for the partial-block
+#: comment (mirrors the --backend-config refusal message).
+_BACKEND_CREDENTIAL_HINTS = {
+    "azurerm": "e.g. ARM_ACCESS_KEY",
+    "s3": "e.g. AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY",
+    "gcs": "e.g. GOOGLE_APPLICATION_CREDENTIALS",
+}
 
 #: ``terraform plan -detailed-exitcode`` contract.
 _PLAN_NO_CHANGES = 0
@@ -439,8 +447,12 @@ class TerraformRunner:
     def _backend_block(self) -> str:
         """Render the ``terraform { backend … }`` block for this run."""
         if self._backend.is_remote:
+            backend_type = self._backend.backend.value
             return _REMOTE_BACKEND_BLOCK.format(
-                backend_type=self._backend.backend.value
+                backend_type=backend_type,
+                credential_hint=_BACKEND_CREDENTIAL_HINTS.get(
+                    backend_type, "the backend's own credential variables"
+                ),
             )
         return _LOCAL_BACKEND_BLOCK.format(
             state_path=_hcl_quote(str(self._state_path))

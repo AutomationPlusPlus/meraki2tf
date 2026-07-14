@@ -1,6 +1,7 @@
 """Lifecycle coordinator: alert triggers, failure semantics, read-only contract."""
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -480,6 +481,39 @@ def test_fault_dispatches_processing_fault_and_raises(
     assert not runner.applied
     # even a faulted run must not leave the secret-bearing saved plan
     assert runner.saved_plan_discarded
+
+
+def test_fault_logs_one_error_line_without_a_traceback(
+    tmp_path: Path, api_key: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A gracefully-handled fault (an unreachable backend) must not
+    spray a stack trace over every scheduled-run log: one plain ERROR
+    line for the operator, the traceback only on the DEBUG record."""
+    orchestrator, _, _, _ = _orchestrator(tmp_path, fail_stage="init")
+    with caplog.at_level(logging.DEBUG, logger="meraki2tf.orchestrator"):
+        with pytest.raises(PipelineError, match="terraform init"):
+            orchestrator.run("org-123")
+
+    errors = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.ERROR
+        and "Pipeline fault" in record.getMessage()
+    ]
+    assert len(errors) == 1
+    (error,) = errors
+    assert "terraform init" in error.getMessage()
+    assert error.exc_info is None  # no traceback at operator level
+    assert "Traceback" not in logging.Formatter().format(error)
+    debugs = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.DEBUG
+        and "Pipeline fault traceback" in record.getMessage()
+    ]
+    assert len(debugs) == 1
+    assert debugs[0].exc_info is not None  # debugging detail preserved
+    assert "Traceback" in logging.Formatter().format(debugs[0])
 
 
 def test_every_run_discards_the_saved_sync_plan(

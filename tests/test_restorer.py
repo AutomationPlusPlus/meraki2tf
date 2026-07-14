@@ -1,7 +1,10 @@
 """Restore planner: waves, create-vs-configure classification, audit."""
 
 import json
+import re
 from pathlib import Path
+
+import pytest
 
 from conftest import _op
 
@@ -2618,3 +2621,906 @@ def test_nested_bare_id_references_are_remapped(tmp_path: Path) -> None:
     )
     sent = json.dumps(stages[2])
     assert "3530" in sent and "3510" not in sent
+
+
+# --------------------------------------- drill-fix helpers and adoption
+
+
+def test_name_conflict_pattern_matches_early_access_opt_ins() -> None:
+    """Re-opting a network into an already-enabled early-access feature
+    400s with 'has already opted in' — a name-conflict-shaped condition
+    the adopter must recognize, not a failure."""
+    from meraki2tf.restorer import _NAME_CONFLICT_RE
+
+    assert _NAME_CONFLICT_RE.search(
+        "Organization has already opted in to early access feature "
+        "has_vlan_db"
+    )
+    # The pre-existing conflict shapes still match.
+    assert _NAME_CONFLICT_RE.search("Name has already been taken")
+    assert _NAME_CONFLICT_RE.search("A vlan with this name exists")
+    assert _NAME_CONFLICT_RE.search("'gp' is a reserved name")
+    assert not _NAME_CONFLICT_RE.search("Something else went wrong")
+
+
+def test_sibling_mapping_returns_the_single_distinct_new_id() -> None:
+    from meraki2tf.models import NetworkGraph as _NetworkGraph
+    from meraki2tf.restorer import ReferenceResolver
+
+    resolver = ReferenceResolver(_NetworkGraph("org-123", (), (), ()))
+    # Nothing recorded for the identity yet: no sibling to adopt.
+    assert resolver.sibling_mapping("payloadtemplate", "wpt_1") is None
+    # The same old ID recorded across two network contexts with ONE
+    # distinct new ID is the org-shared object.
+    resolver.record("payloadtemplate", "wpt_1", "wpt_A", ("N_1",))
+    resolver.record("payloadtemplate", "wpt_1", "wpt_A", ("N_2",))
+    assert resolver.sibling_mapping("payloadtemplate", "wpt_1") == "wpt_A"
+    # Colliding per-network IDs map to DIFFERENT new IDs: never adopt.
+    resolver.record("grouppolicy", "100", "900", ("N_1",))
+    resolver.record("grouppolicy", "100", "901", ("N_2",))
+    assert resolver.sibling_mapping("grouppolicy", "100") is None
+
+
+def test_default_flag_key_detects_truthy_isdefault_variants() -> None:
+    from meraki2tf.restorer import _default_flag_key
+
+    assert _default_flag_key({"isDefault": True}) == "isDefault"
+    assert _default_flag_key(
+        {"name": "x", "isDefaultGroup": True}
+    ) == "isDefaultGroup"
+    assert _default_flag_key({"isDefault": False}) is None
+    assert _default_flag_key({}) is None
+    assert _default_flag_key({"isDefault": "true"}) is None  # literal True only
+
+
+def test_match_collection_item_falls_back_through_natural_keys() -> None:
+    from meraki2tf.restorer import _match_collection_item
+
+    listing = [
+        {"name": "Employee Group", "sgt": 5, "groupId": "1"},
+        {"name": "Guest Group", "sgt": 10, "groupId": "2"},
+    ]
+    # A unique name match wins outright.
+    match = _match_collection_item(listing, {"name": "Guest Group"})
+    assert match is not None and match["groupId"] == "2"
+    # Sanitized snapshots pseudonymize names; the org-unique sgt breaks
+    # the tie when no name matches.
+    match = _match_collection_item(
+        listing, {"name": "name-0a1b2c3d4e5f6071", "sgt": 5}
+    )
+    assert match is not None and match["groupId"] == "1"
+    # shortName (an API keyword the sanitizer preserves) is the last key.
+    opt_ins = [{"shortName": "has_vlan_db", "id": "9"}]
+    match = _match_collection_item(
+        opt_ins, {"name": "name-ffff", "shortName": "has_vlan_db"}
+    )
+    assert match is not None and match["id"] == "9"
+    # Two items sharing the key are ambiguous: never guess.
+    dup = [{"name": "dup"}, {"name": "dup"}]
+    assert _match_collection_item(dup, {"name": "dup"}) is None
+    # No key matches anything: fall through to the create.
+    assert _match_collection_item(listing, {"name": "nothing"}) is None
+    # Dict/list-valued payload keys are structure, not identity values.
+    match = _match_collection_item(
+        listing, {"name": {"nested": True}, "shortName": ["x"], "sgt": 10}
+    )
+    assert match is not None and match["groupId"] == "2"
+
+
+def test_item_identifier_covers_per_collection_id_conventions() -> None:
+    from meraki2tf.restorer import RestoreAction, _item_identifier
+    from meraki2tf.spec.engine import OperationSpec
+
+    def action(api_path: str) -> RestoreAction:
+        op = OperationSpec(
+            operation_id="op", method="post", path=api_path,
+            path_params=("networkId",), tags=("networks",),
+        )
+        return RestoreAction(
+            kind="create", wave=4, api_path=api_path,
+            path_values=("N_1", "x"), operation=op,
+        )
+
+    gp = action(GP_ITEM)
+    # A generic id wins first (and stringifies).
+    assert _item_identifier(gp, {"id": 7}) == "7"
+    # The item path's own placeholder names the field.
+    assert _item_identifier(gp, {"groupPolicyId": "7"}) == "7"
+    # A bare {id} placeholder falls back to the collection-derived
+    # <singular>Id convention (adaptive policy groups carry groupId).
+    apg = action("/organizations/{organizationId}/adaptivePolicy/groups/{id}")
+    assert _item_identifier(apg, {"groupId": "7"}) == "7"
+    # -ies plurals singularize (policies -> policyId).
+    pol = action("/organizations/{organizationId}/policies/{id}")
+    assert _item_identifier(pol, {"policyId": "9"}) == "9"
+    # Nothing matches: None, never a guess.
+    assert _item_identifier(apg, {"unrelated": "7"}) is None
+    # Singleton paths (no trailing placeholder) have no item convention.
+    assert _item_identifier(action(SNMP_PATH), {"snmpId": "3"}) is None
+    # A placeholder-only collection segment derives no convention.
+    two = action("/networks/{networkId}/{id}")
+    assert _item_identifier(two, {"networkId": "N_9"}) is None
+
+
+def test_drill_secrets_respect_declared_numeric_schema_types() -> None:
+    """A numeric secret slot (a PIN) rejects string placeholders; the
+    schema-declared type routes the injection."""
+    from meraki2tf.restorer import _inject_drill_secrets, _schema_type_at
+    from meraki2tf.spec.engine import OperationSpec
+
+    op = OperationSpec(
+        operation_id="updateThing", method="put",
+        path="/networks/{networkId}/thing", path_params=("networkId",),
+        tags=("networks",),
+        raw={"requestBody": {"content": {"application/json": {"schema": {
+            "type": "object",
+            "properties": {
+                "pin": {"type": "integer"},
+                "cost": {"type": "number"},
+                "communityString": {"type": "string"},
+                "radius": {
+                    "type": "object",
+                    "properties": {"secret": {"type": "string"}},
+                },
+            },
+        }}}}},
+    )
+    assert _schema_type_at(op, ["pin"]) == "integer"
+    assert _schema_type_at(op, ["radius", "secret"]) == "string"
+    assert _schema_type_at(op, ["undeclared"]) is None
+    assert _schema_type_at(None, ["pin"]) is None
+    bare = OperationSpec(
+        operation_id="bare", method="put",
+        path="/networks/{networkId}/thing", path_params=("networkId",),
+        tags=("networks",),
+    )
+    assert _schema_type_at(bare, ["pin"]) is None
+
+    filled, injected = _inject_drill_secrets(
+        {"radius": {"host": "10.0.0.1"}},
+        ("pin", "cost", "communityString", "radius.secret", "undeclared"),
+        "seed", op=op,
+    )
+    assert injected == (
+        "pin", "cost", "communityString", "radius.secret", "undeclared"
+    )
+    assert isinstance(filled["pin"], int)
+    assert 10000000 <= filled["pin"] <= 99999999  # 8 digits, always
+    assert isinstance(filled["cost"], int)
+    assert re.fullmatch(r"drill-[0-9a-f]{12}", filled["communityString"])
+    assert re.fullmatch(r"drill-[0-9a-f]{12}", filled["radius"]["secret"])
+    # Paths the schema does not declare stay string placeholders.
+    assert re.fullmatch(r"drill-[0-9a-f]{12}", filled["undeclared"])
+    # Deterministic per (seed, path): resumed drills stay idempotent.
+    again, _ = _inject_drill_secrets(
+        {"radius": {"host": "10.0.0.1"}}, ("pin",), "seed", op=op
+    )
+    assert again["pin"] == filled["pin"]
+
+
+STAGED_GROUPS = "/networks/{networkId}/firmwareUpgrades/staged/groups"
+STAGED_GROUP_ITEM = STAGED_GROUPS + "/{groupId}"
+STAGED_STAGES = "/networks/{networkId}/firmwareUpgrades/staged/stages"
+
+
+def _staged_spec(tmp_path: Path) -> OpenApiParser:
+    spec = {
+        "openapi": "3.0.0", "info": {"title": "staged", "version": "1"},
+        "paths": {
+            "/organizations/{organizationId}/networks": {
+                "get": _op("getOrganizationNetworks", "organizations"),
+                "post": _op("createOrganizationNetwork", "organizations"),
+            },
+            "/networks/{networkId}/devices/claim": {
+                "post": _op("claimNetworkDevices", "networks"),
+            },
+            STAGED_GROUPS: {
+                "get": _op(
+                    "getNetworkFirmwareUpgradesStagedGroups", "networks"
+                ),
+                "post": _op(
+                    "createNetworkFirmwareUpgradesStagedGroup", "networks"
+                ),
+            },
+            STAGED_GROUP_ITEM: {
+                "get": _op(
+                    "getNetworkFirmwareUpgradesStagedGroup", "networks"
+                ),
+            },
+            STAGED_STAGES: {
+                "get": _op(
+                    "getNetworkFirmwareUpgradesStagedStages", "networks"
+                ),
+                "put": _op(
+                    "updateNetworkFirmwareUpgradesStagedStages", "networks"
+                ),
+            },
+        },
+    }
+    path = tmp_path / "staged-adopt-spec.json"
+    path.write_text(json.dumps(spec), encoding="utf-8")
+    return OpenApiParser(path)
+
+
+def test_default_flagged_creates_adopt_the_provisioned_default(
+    tmp_path: Path,
+) -> None:
+    """A create of an isDefault-true object can SUCCEED and still be
+    wrong (the dashboard provisions its own default alongside); the
+    target's flagged default is adopted BEFORE any POST, and children
+    resolve to the adopted ID."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    parser = _staged_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(
+            STAGED_GROUP_ITEM, ("N_1", "3510"),
+            {"groupId": "3510", "name": "Default group", "isDefault": True},
+        ),
+        FeatureConfiguration(
+            STAGED_STAGES, ("N_1",),
+            {"items": [{"group": {"id": "3510"}}]},
+        ),
+    )
+    plan = plan_restore(graph, parser)
+    calls: list = []
+
+    class Section(_RecordingSection):
+        def getNetworkFirmwareUpgradesStagedGroups(
+            self, networkId: str
+        ) -> list[dict]:
+            self._calls.append(
+                ("getNetworkFirmwareUpgradesStagedGroups", (networkId,), {})
+            )
+            return [
+                {"groupId": "901", "name": "Auto default", "isDefault": True}
+            ]
+
+    section = Section(calls)
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "j.jsonl"), skip_claims=True
+    )
+    restorer._client = SimpleNamespace(
+        organizations=section, networks=section
+    )
+    result = restorer.execute(graph, plan)
+
+    assert result.failed == ()
+    ops = [c[0] for c in calls]
+    assert "createNetworkFirmwareUpgradesStagedGroup" not in ops  # adopted
+    assert "getNetworkFirmwareUpgradesStagedGroups" in ops
+    assert f"{STAGED_GROUP_ITEM}::N_1,3510" in result.executed
+    # The follow-up stages PUT references the ADOPTED default's ID.
+    stages = next(
+        c for c in calls
+        if c[0] == "updateNetworkFirmwareUpgradesStagedStages"
+    )
+    sent = json.dumps(stages[2])
+    assert "901" in sent and "3510" not in sent
+
+
+PT_COLLECTION = "/networks/{networkId}/webhooks/payloadTemplates"
+PT_ITEM = PT_COLLECTION + "/{payloadTemplateId}"
+
+
+def _template_pair_spec(tmp_path: Path) -> OpenApiParser:
+    spec = {
+        "openapi": "3.0.0", "info": {"title": "pt", "version": "1"},
+        "paths": {
+            "/organizations/{organizationId}/networks": {
+                "get": _op("getOrganizationNetworks", "organizations"),
+                "post": _op("createOrganizationNetwork", "organizations"),
+            },
+            "/networks/{networkId}/devices/claim": {
+                "post": _op("claimNetworkDevices", "networks"),
+            },
+            PT_COLLECTION: {
+                "get": _op("getNetworkWebhooksPayloadTemplates", "networks"),
+                "post": _op(
+                    "createNetworkWebhooksPayloadTemplate", "networks"
+                ),
+            },
+            PT_ITEM: {
+                "get": _op("getNetworkWebhooksPayloadTemplate", "networks"),
+            },
+        },
+    }
+    path = tmp_path / "pt-spec.json"
+    path.write_text(json.dumps(spec), encoding="utf-8")
+    return OpenApiParser(path)
+
+
+def _two_network_template_graph() -> NetworkGraph:
+    """The same org-shared built-in template discovered in two networks
+    under the SAME old ID (URL-derived IDs repeat across networks)."""
+    payload = {
+        "payloadTemplateId": "wpt_shared",
+        "name": "Slack (included)",
+        "type": "included",
+    }
+    return NetworkGraph(
+        organization_id="org-123",
+        networks=(
+            MerakiNetwork.from_payload(
+                {"id": "N_1", "organizationId": "org-123", "name": "HQ",
+                 "productTypes": ["appliance"], "timeZone": "UTC"}
+            ),
+            MerakiNetwork.from_payload(
+                {"id": "N_2", "organizationId": "org-123", "name": "Lab",
+                 "productTypes": ["appliance"], "timeZone": "UTC"}
+            ),
+        ),
+        devices=(),
+        features=(
+            FeatureConfiguration(PT_ITEM, ("N_1", "wpt_shared"), dict(payload)),
+            FeatureConfiguration(PT_ITEM, ("N_2", "wpt_shared"), dict(payload)),
+        ),
+    )
+
+
+class _TemplateSection(_RecordingSection):
+    """Sequential network IDs plus a scriptable template create."""
+
+    def __init__(self, calls: list, template_results: list) -> None:
+        super().__init__(calls)
+        self._network_count = 0
+        #: One entry per create call: a dict response or an Exception.
+        self._template_results = template_results
+
+    def createOrganizationNetwork(self, *args: object, **kwargs: object) -> dict:
+        self._calls.append(("createOrganizationNetwork", args, kwargs))
+        self._network_count += 1
+        return {"id": f"L_{self._network_count}"}
+
+    def createNetworkWebhooksPayloadTemplate(
+        self, *args: object, **kwargs: object
+    ) -> dict:
+        self._calls.append(
+            ("createNetworkWebhooksPayloadTemplate", args, kwargs)
+        )
+        outcome = self._template_results.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    def getNetworkWebhooksPayloadTemplates(self, networkId: str) -> list:
+        self._calls.append(
+            ("getNetworkWebhooksPayloadTemplates", (networkId,), {})
+        )
+        return []  # the built-in lives outside this network's collection
+
+
+def test_org_shared_conflicts_adopt_the_sibling_networks_mapping(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The second network's copy of an org-shared template conflicts on
+    create and is absent from its own collection; the sibling network's
+    mapping for the same old ID IS the shared target object."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    parser = _template_pair_spec(tmp_path)
+    graph = _two_network_template_graph()
+    plan = plan_restore(graph, parser)
+    calls: list = []
+    section = _TemplateSection(
+        calls,
+        [
+            {"payloadTemplateId": "wpt_NEW"},
+            _conflict_error("Name has already been taken"),
+        ],
+    )
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "j.jsonl")
+    )
+    restorer._client = SimpleNamespace(
+        organizations=section, networks=section
+    )
+    with caplog.at_level("WARNING", logger="meraki2tf.restorer"):
+        result = restorer.execute(graph, plan)
+
+    assert result.failed == ()
+    assert f"{PT_ITEM}::N_1,wpt_shared" in result.executed
+    assert f"{PT_ITEM}::N_2,wpt_shared" in result.executed
+    creates = [
+        c for c in calls if c[0] == "createNetworkWebhooksPayloadTemplate"
+    ]
+    assert len(creates) == 2  # the second was attempted, then adopted
+    # Both copies map to the one shared target object.
+    assert restorer._journal.id_map["wpt_shared"] == "wpt_NEW"
+    assert "org-shared" in caplog.text
+
+
+def test_failed_same_old_id_in_a_sibling_network_is_still_attempted(
+    tmp_path: Path,
+) -> None:
+    """A create's own last path value is its identity-to-be-minted, not
+    an addressed parent: the same old ID failing in network A must not
+    dead-parent the sibling copy in network B."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    parser = _template_pair_spec(tmp_path)
+    graph = _two_network_template_graph()
+    plan = plan_restore(graph, parser)
+    calls: list = []
+    section = _TemplateSection(
+        calls,
+        [
+            RuntimeError("boom"),  # N_1's copy fails for real (non-400)
+            {"payloadTemplateId": "wpt_B"},
+        ],
+    )
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "j.jsonl")
+    )
+    restorer._client = SimpleNamespace(
+        organizations=section, networks=section
+    )
+    result = restorer.execute(graph, plan)
+
+    assert [key for key, _ in result.failed] == [
+        f"{PT_ITEM}::N_1,wpt_shared"
+    ]
+    assert f"{PT_ITEM}::N_2,wpt_shared" in result.executed
+    creates = [
+        c for c in calls if c[0] == "createNetworkWebhooksPayloadTemplate"
+    ]
+    assert len(creates) == 2  # B was attempted, not skipped as dead
+    assert not any(
+        "parent object wpt_shared failed" in entry["reason"]
+        for entry in result.skipped
+    )
+
+
+SR_COLLECTION = "/networks/{networkId}/appliance/staticRoutes"
+SR_ITEM = SR_COLLECTION + "/{staticRouteId}"
+
+
+def test_end_of_run_salvage_retries_same_wave_dependency_400s(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A 400 caused by a same-wave sibling (a static route whose next
+    hop lives on a VLAN that sorts after it) succeeds once the plan
+    settles: one end-of-run retry salvages it; a genuine 400 keeps its
+    original failure record."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    spec = {
+        "openapi": "3.0.0", "info": {"title": "sr", "version": "1"},
+        "paths": {
+            "/organizations/{organizationId}/networks": {
+                "get": _op("getOrganizationNetworks", "organizations"),
+                "post": _op("createOrganizationNetwork", "organizations"),
+            },
+            "/networks/{networkId}/devices/claim": {
+                "post": _op("claimNetworkDevices", "networks"),
+            },
+            SR_COLLECTION: {
+                "get": _op("getNetworkApplianceStaticRoutes", "appliance"),
+                "post": _op("createNetworkApplianceStaticRoute", "appliance"),
+            },
+            SR_ITEM: {
+                "get": _op("getNetworkApplianceStaticRoute", "appliance"),
+                "put": _op("updateNetworkApplianceStaticRoute", "appliance"),
+            },
+        },
+    }
+    path = tmp_path / "sr-spec.json"
+    path.write_text(json.dumps(spec), encoding="utf-8")
+    parser = OpenApiParser(path)
+    graph = _graph(
+        FeatureConfiguration(
+            SR_ITEM, ("N_1", "r1"),
+            {"id": "r1", "name": "salvageable", "subnet": "10.1.0.0/24"},
+        ),
+        FeatureConfiguration(
+            SR_ITEM, ("N_1", "r2"),
+            {"id": "r2", "name": "hopeless", "subnet": "10.2.0.0/24"},
+        ),
+    )
+    plan = plan_restore(graph, parser)
+    calls: list = []
+    attempts: dict[str, int] = {"salvageable": 0, "hopeless": 0}
+
+    class Section(_RecordingSection):
+        def createNetworkApplianceStaticRoute(
+            self, *args: object, **kwargs: object
+        ) -> dict:
+            self._calls.append(
+                ("createNetworkApplianceStaticRoute", args, kwargs)
+            )
+            name = str(kwargs.get("name"))
+            attempts[name] += 1
+            if name == "hopeless":
+                raise _conflict_error("hopeless is genuinely invalid")
+            if attempts[name] == 1:
+                raise _conflict_error(
+                    "The next hop must be on a configured subnet"
+                )
+            return {"id": "sr_900"}
+
+    section = Section(calls)
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "j.jsonl"), skip_claims=True
+    )
+    restorer._client = SimpleNamespace(
+        organizations=section, networks=section, appliance=section
+    )
+    with caplog.at_level("WARNING", logger="meraki2tf.restorer"):
+        result = restorer.execute(graph, plan)
+
+    assert f"{SR_ITEM}::N_1,r1" in result.executed
+    assert attempts == {"salvageable": 2, "hopeless": 2}  # one retry each
+    # The salvaged route left the failure list; the hopeless one kept
+    # its ORIGINAL message.
+    assert [key for key, _ in result.failed] == [f"{SR_ITEM}::N_1,r2"]
+    assert "hopeless is genuinely invalid" in dict(result.failed)[
+        f"{SR_ITEM}::N_1,r2"
+    ]
+    assert "End-of-run salvage restored 1 object(s)" in caplog.text
+    assert f"{SR_ITEM}::N_1,r1" in caplog.text
+
+
+def test_withheld_detail_names_the_fields_sent(tmp_path: Path) -> None:
+    """Secret-bearing failures withhold the SDK echo but list the
+    top-level field NAMES sent — diagnosable, never sensitive."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(
+            SNMP_PATH, ("N_1",),
+            {"access": "community", "communityString": "real-secret-value"},
+        ),
+    )
+    plan = plan_restore(graph, parser)
+    calls: list = []
+
+    class Section(_RecordingSection):
+        def updateNetworkSnmp(self, *args: object, **kwargs: object) -> dict:
+            self._calls.append(("updateNetworkSnmp", args, kwargs))
+            raise _conflict_error(
+                "communityString rejected: real-secret-value"
+            )
+
+    section = Section(calls)
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "j.jsonl")
+    )
+    restorer._client = SimpleNamespace(
+        organizations=section, networks=section, wireless=section
+    )
+    result = restorer.execute(graph, plan)
+
+    reason = dict(result.failed)[f"{SNMP_PATH}::N_1"]
+    assert "detail withheld" in reason
+    assert "fields sent: access, communityString" in reason
+    assert "real-secret-value" not in reason
+
+
+# ------------------------------------------------------ wipe: drill admins
+
+
+def _admin_wipe_dashboard(
+    networks: int = 1,
+    name: str = "Drill Org",
+    me: object = None,
+    admins: object = None,
+    with_identity: bool = True,
+    admins_error: bool = False,
+    admin_delete_error: bool = False,
+):
+    from types import SimpleNamespace
+
+    deleted: dict[str, list] = {"networks": [], "orgs": [], "admins": []}
+
+    class Organizations:
+        def getOrganization(self, organizationId: str) -> dict:
+            return {"id": organizationId, "name": name}
+
+        def getOrganizationDevices(
+            self, organizationId: str, total_pages: str = "all"
+        ) -> list:
+            return []
+
+        def getOrganizationInventoryDevices(
+            self, organizationId: str, total_pages: str = "all"
+        ) -> list:
+            return []
+
+        def getOrganizationNetworks(
+            self, organizationId: str, total_pages: str = "all"
+        ) -> list:
+            return [{"id": f"L_{i}"} for i in range(networks)]
+
+        def getOrganizationAdmins(self, organizationId: str) -> object:
+            if admins_error:
+                raise RuntimeError("admins endpoint down")
+            return admins if admins is not None else []
+
+        def deleteOrganizationAdmin(
+            self, organizationId: str, adminId: str
+        ) -> dict:
+            if admin_delete_error:
+                raise RuntimeError("admin is protected")
+            deleted["admins"].append(adminId)
+            return {}
+
+        def deleteOrganization(self, organizationId: str) -> dict:
+            deleted["orgs"].append(organizationId)
+            return {}
+
+    class Networks:
+        def deleteNetwork(self, networkId: str) -> dict:
+            deleted["networks"].append(networkId)
+            return {}
+
+    class Administered:
+        def getAdministeredIdentitiesMe(self) -> object:
+            return me if me is not None else {"email": "caller@drill.invalid"}
+
+    sections: dict[str, object] = {
+        "organizations": Organizations(), "networks": Networks(),
+    }
+    if with_identity:
+        sections["administered"] = Administered()
+    return SimpleNamespace(**sections), deleted
+
+
+_DRILL_ADMINS = [
+    {"id": "1", "email": "caller@drill.invalid"},
+    {"id": "2", "email": "user-4f6a@drill.invalid"},
+    {"email": "no-id@drill.invalid"},  # id-less rows never qualify
+]
+
+
+def test_wipe_preview_counts_admins_other_than_the_caller() -> None:
+    from meraki2tf.restorer import OrgWiper
+
+    wiper = OrgWiper()
+    wiper._client, _ = _admin_wipe_dashboard(admins=list(_DRILL_ADMINS))
+    preview = wiper.preview("org-drill", "Drill Org")
+    assert preview.other_admin_count == 1
+
+
+def test_wipe_removes_drill_admins_before_the_org() -> None:
+    """The dashboard refuses to delete an org 'with multiple users';
+    drill-restored admins (never the caller) are removed first."""
+    from meraki2tf.restorer import OrgWiper
+
+    wiper = OrgWiper()
+    wiper._client, deleted = _admin_wipe_dashboard(admins=list(_DRILL_ADMINS))
+    result = wiper.execute("org-drill", "Drill Org")
+    assert deleted["admins"] == ["2"]  # only the non-caller admin
+    assert result.organization_deleted is True
+    assert deleted["orgs"] == ["org-drill"]
+    assert result.failed == ()
+
+
+def test_wipe_without_identity_endpoint_never_deletes_admins() -> None:
+    """If the caller's own identity cannot be established, NO admin is
+    ever deleted — the org deletion may then fail on its own."""
+    from meraki2tf.restorer import OrgWiper
+
+    wiper = OrgWiper()
+    wiper._client, deleted = _admin_wipe_dashboard(
+        admins=list(_DRILL_ADMINS), with_identity=False
+    )
+    preview = wiper.preview("org-drill", "Drill Org")
+    assert preview.other_admin_count == 0
+    result = wiper.execute("org-drill", "Drill Org")
+    assert deleted["admins"] == []
+    assert result.organization_deleted is True  # the fake org allows it
+
+
+def test_wipe_admin_deletion_failure_blocks_the_org_deletion() -> None:
+    """A failed admin removal is recorded and stops the organization
+    deletion — the operator investigates first."""
+    from meraki2tf.restorer import OrgWiper
+
+    wiper = OrgWiper()
+    wiper._client, deleted = _admin_wipe_dashboard(
+        admins=list(_DRILL_ADMINS), admin_delete_error=True
+    )
+    result = wiper.execute("org-drill", "Drill Org")
+    assert result.organization_deleted is False
+    assert deleted["orgs"] == []
+    assert [target for target, _ in result.failed] == ["admin:2"]
+    assert "admin is protected" in result.failed[0][1]
+
+
+def test_wipe_admin_enumeration_failures_degrade_to_no_deletion() -> None:
+    """An unreadable admin list — or an identity without an email —
+    means no admin is deleted, never a crash or a guess."""
+    from meraki2tf.restorer import OrgWiper
+
+    wiper = OrgWiper()
+    wiper._client, deleted = _admin_wipe_dashboard(
+        admins=list(_DRILL_ADMINS), admins_error=True
+    )
+    assert wiper.preview("org-drill", "Drill Org").other_admin_count == 0
+
+    wiper = OrgWiper()
+    wiper._client, deleted = _admin_wipe_dashboard(
+        admins=list(_DRILL_ADMINS), me={}
+    )
+    result = wiper.execute("org-drill", "Drill Org")
+    assert deleted["admins"] == []
+    assert result.organization_deleted is True
+
+
+def test_salvaged_actions_keep_their_drill_placeholder_record(
+    tmp_path: Path,
+) -> None:
+    """An end-of-run salvage of a drill write that received placeholder
+    secrets must still report those placeholders — the operator's
+    re-entry list may not lose entries to the retry."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(
+            SNMP_PATH, ("N_1",),
+            {"access": "community", "communityString": REDACTED},
+        ),
+    )
+    plan = plan_restore(graph, parser)
+    calls: list = []
+    attempts = {"count": 0}
+
+    class Section(_RecordingSection):
+        def updateNetworkSnmp(self, *args: object, **kwargs: object) -> dict:
+            self._calls.append(("updateNetworkSnmp", args, kwargs))
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise _conflict_error("Community string is not usable yet")
+            return {}
+
+    section = Section(calls)
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "j.jsonl"), skip_claims=True
+    )
+    restorer._client = SimpleNamespace(
+        organizations=section, networks=section, wireless=section
+    )
+    result = restorer.execute(graph, plan)
+
+    assert result.failed == ()
+    assert f"{SNMP_PATH}::N_1" in result.executed
+    assert result.drill_placeholders == (
+        (f"{SNMP_PATH}::N_1", "communityString"),
+    )
+    assert attempts["count"] == 2  # original 400, then the salvage retry
+
+
+def test_unadoptable_name_conflicts_stay_failed(tmp_path: Path) -> None:
+    """A name-conflict 400 with no reconcilable counterpart, no
+    client-assigned slot, and no sibling mapping keeps its failure."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    parser = _template_pair_spec(tmp_path)
+    graph = NetworkGraph(
+        organization_id="org-123",
+        networks=(
+            MerakiNetwork.from_payload(
+                {"id": "N_1", "organizationId": "org-123", "name": "HQ",
+                 "productTypes": ["appliance"], "timeZone": "UTC"}
+            ),
+        ),
+        devices=(),
+        features=(
+            FeatureConfiguration(
+                PT_ITEM, ("N_1", "wpt_lone"),
+                {"payloadTemplateId": "wpt_lone", "name": "Custom",
+                 "type": "custom"},
+            ),
+        ),
+    )
+    plan = plan_restore(graph, parser)
+    calls: list = []
+    section = _TemplateSection(
+        calls, [_conflict_error("Name has already been taken")]
+    )
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "j.jsonl")
+    )
+    restorer._client = SimpleNamespace(
+        organizations=section, networks=section
+    )
+    result = restorer.execute(graph, plan)
+
+    reasons = dict(result.failed)
+    assert "already been taken" in reasons[f"{PT_ITEM}::N_1,wpt_lone"]
+
+
+def test_adopt_default_falls_through_on_every_non_match(
+    tmp_path: Path,
+) -> None:
+    """Anything short of one identifiable flagged default falls through
+    to the normal create — never a guess."""
+    from types import SimpleNamespace
+
+    from meraki2tf.models import NetworkGraph as _NetworkGraph
+    from meraki2tf.restorer import (
+        OrgRestorer,
+        ReferenceResolver,
+        RestoreAction,
+        RestoreJournal,
+    )
+    from meraki2tf.spec.engine import OperationSpec
+
+    resolver = ReferenceResolver(_NetworkGraph("org-123", (), (), ()))
+    resolver.record("network", "N_1", "N_LIVE", ())
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "adopt.jsonl")
+    )
+    lookup = OperationSpec(
+        operation_id="getNetworkFirmwareUpgradesStagedGroups",
+        method="get", path=STAGED_GROUPS, path_params=("networkId",),
+        tags=("networks",),
+    )
+
+    def action(**overrides: object) -> RestoreAction:
+        values = dict(
+            kind="create", wave=4, api_path=STAGED_GROUP_ITEM,
+            path_values=("N_1", "3510"), operation=lookup,
+            payload={"name": "Default", "isDefault": True}, lookup=lookup,
+        )
+        values.update(overrides)
+        return RestoreAction(**values)  # type: ignore[arg-type]
+
+    class Sections:
+        def __init__(self, listing: list) -> None:
+            self._listing = listing
+
+        def getNetworkFirmwareUpgradesStagedGroups(
+            self, networkId: str
+        ) -> list:
+            return self._listing
+
+    def dashboard(listing: list) -> object:
+        return SimpleNamespace(networks=Sections(listing))
+
+    # No collection GET in the spec: nothing to adopt from.
+    assert restorer._adopt_default(
+        dashboard([]), action(lookup=None), resolver, "org-123", "isDefault"
+    ) is None
+    # The target provisions no flagged default.
+    assert restorer._adopt_default(
+        dashboard([{"groupId": "9", "isDefault": False}]),
+        action(), resolver, "org-123", "isDefault",
+    ) is None
+    # Several flagged items and no natural key breaks the tie.
+    assert restorer._adopt_default(
+        dashboard([
+            {"groupId": "8", "isDefault": True, "name": "a"},
+            {"groupId": "9", "isDefault": True, "name": "b"},
+        ]),
+        action(), resolver, "org-123", "isDefault",
+    ) is None
+    # The flagged item carries no recognizable identifier.
+    assert restorer._adopt_default(
+        dashboard([{"isDefault": True, "name": "Only"}]),
+        action(), resolver, "org-123", "isDefault",
+    ) is None
+    # Several flagged items DO disambiguate on a natural key.
+    assert restorer._adopt_default(
+        dashboard([
+            {"groupId": "8", "isDefault": True, "name": "other"},
+            {"groupId": "9", "isDefault": True, "name": "Default"},
+        ]),
+        action(), resolver, "org-123", "isDefault",
+    ) == "9"

@@ -470,6 +470,29 @@ def test_s3_and_gcs_render_partial_backend_and_init_args(
     assert fake.calls[0]["command"][-len(expected):] == expected
 
 
+@pytest.mark.parametrize(
+    "state_backend, hint",
+    [
+        (StateBackend.AZURERM, "ARM_ACCESS_KEY"),
+        (StateBackend.S3, "AWS_ACCESS_KEY_ID"),
+        (StateBackend.GCS, "GOOGLE_APPLICATION_CREDENTIALS"),
+    ],
+)
+def test_backend_block_comment_names_the_backends_credential_env(
+    tmp_path: Path, state_backend: StateBackend, hint: str
+) -> None:
+    """The partial-block comment names each backend's own credential
+    environment variables (mirroring the --backend-config refusal
+    message), so an operator reading provider.tf knows what to export."""
+    backend = BackendConfig(backend=state_backend)
+    runner = TerraformRunner(
+        tmp_path / "ws", executable="terraform", backend=backend
+    )
+    content = runner.prepare_workspace().read_text(encoding="utf-8")
+    assert f'backend "{state_backend.value}" {{' in content
+    assert hint in content
+
+
 def test_init_is_cached_and_runs_once_per_runner(
     runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
