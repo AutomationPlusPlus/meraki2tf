@@ -2540,3 +2540,81 @@ def test_bare_disabled_payload_refusal_skips(tmp_path: Path) -> None:
         for entry in result.skipped
     )
     assert len([c for c in calls if c[0] == "ami"]) == 1  # no pointless retry
+
+
+def test_nested_bare_id_references_are_remapped(tmp_path: Path) -> None:
+    """Staged-upgrade stages reference their groups as {'group': {'id':
+    ...}} — a bare nested 'id' key that must remap or the write fires
+    at dead snapshot IDs ('Invalid Staged Upgrade Group')."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    groups_collection = "/networks/{networkId}/firmwareUpgrades/staged/groups"
+    group_item = groups_collection + "/{groupId}"
+    stages_path = "/networks/{networkId}/firmwareUpgrades/staged/stages"
+    spec = {
+        "openapi": "3.0.0", "info": {"title": "s", "version": "1"},
+        "paths": {
+            "/organizations/{organizationId}/networks": {
+                "get": _op("getOrganizationNetworks", "organizations"),
+                "post": _op("createOrganizationNetwork", "organizations"),
+            },
+            "/networks/{networkId}/devices/claim": {
+                "post": _op("claimNetworkDevices", "networks"),
+            },
+            groups_collection: {
+                "get": _op(
+                    "getNetworkFirmwareUpgradesStagedGroups", "networks"
+                ),
+                "post": _op(
+                    "createNetworkFirmwareUpgradesStagedGroup", "networks"
+                ),
+            },
+            group_item: {
+                "get": _op(
+                    "getNetworkFirmwareUpgradesStagedGroup", "networks"
+                ),
+            },
+            stages_path: {
+                "get": _op("getNetworkFirmwareUpgradesStagedStages", "networks"),
+                "put": _op(
+                    "updateNetworkFirmwareUpgradesStagedStages", "networks"
+                ),
+            },
+        },
+    }
+    path = tmp_path / "staged-spec.json"
+    path.write_text(json.dumps(spec), encoding="utf-8")
+    parser = OpenApiParser(path)
+    graph = _graph(
+        FeatureConfiguration(
+            group_item, ("N_1", "3510"),
+            {"groupId": "3510", "name": "ring-a", "isDefault": False},
+        ),
+        FeatureConfiguration(
+            stages_path, ("N_1",),
+            {"items": [{"group": {"id": "3510", "name": "ring-a"}}]},
+        ),
+    )
+    plan = plan_restore(graph, parser)
+    calls: list = []
+    section = _RecordingSection(
+        calls,
+        responses={
+            "createNetworkFirmwareUpgradesStagedGroup": {"groupId": "3530"}
+        },
+    )
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "j.jsonl"), skip_claims=True
+    )
+    restorer._client = SimpleNamespace(
+        organizations=section, networks=section
+    )
+    result = restorer.execute(graph, plan)
+    assert result.failed == ()
+    stages = next(
+        c for c in calls if c[0] == "updateNetworkFirmwareUpgradesStagedStages"
+    )
+    sent = json.dumps(stages[2])
+    assert "3530" in sent and "3510" not in sent
