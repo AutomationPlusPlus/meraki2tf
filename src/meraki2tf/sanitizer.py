@@ -75,7 +75,8 @@ REDACTED = "**REDACTED**"
 #: DR runbook and gap replayer must agree with the sanitizer on what
 #: counts as a secret (redact in artifacts, restore from the dump).
 SECRET_KEY_PATTERN = re.compile(
-    r"secret|psk|passphrase|password|community|token|api_?key|auth_?key"
+    r"secret|psk|passphrase|password(?!expiration|length|s$|count)"
+    r"|community|token|api_?key|auth_?key"
     r"|shared_?key|auth_?pass|priv_?pass|passcode|pin$|private_?key"
     r"|credential|license_?key",
     re.IGNORECASE,
@@ -295,9 +296,12 @@ class _GraphSanitizer:
         return f"host-{self._digest_bytes(value).hex()[:16]}.invalid"
 
     def _fake_url(self, value: str) -> str:
-        # URL pseudonyms must stay URLs: webhook receivers and syslog
-        # forwarders validate scheme and host shape on write.
-        return f"https://url-{self._digest_bytes(value).hex()[:16]}.invalid/"
+        # URL pseudonyms must stay URLs, and their host must publicly
+        # resolve: Meraki DNS-checks webhook receiver hostnames on
+        # write, so a `.invalid` host fails restore drills. The apex
+        # example.com (IANA, RFC 2606) has public A/AAAA records —
+        # subdomains of it do NOT — so the digest rides in the path.
+        return f"https://example.com/url-{self._digest_bytes(value).hex()[:16]}"
 
     @staticmethod
     def _masked(fake: str, prefix: str) -> str:
@@ -379,10 +383,21 @@ class _GraphSanitizer:
         # not look secret-shaped themselves.
         secret = secret or bool(key and _SECRET_KEY.search(key))
         if isinstance(node, Mapping):
+            # Meraki's built-in webhook payload templates carry vendor
+            # names ("Slack (included)"), not customer identity — and a
+            # pseudonymized name breaks adopt-by-name on restore, so
+            # the org-shared built-in gets duplicated in every network.
+            included = (
+                node.get("type") == "included" and "payloadTemplateId" in node
+            )
             # Keys are data too: fixed-IP assignments key on MACs,
             # per-device maps key on serials.
             return {
-                self._clean_key(child): self._clean(value, child, secret)
+                self._clean_key(child): (
+                    value
+                    if included and child == "name" and isinstance(value, str)
+                    else self._clean(value, child, secret)
+                )
                 for child, value in node.items()
             }
         if isinstance(node, (list, tuple)):

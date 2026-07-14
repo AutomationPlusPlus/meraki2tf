@@ -244,7 +244,7 @@ def test_identity_fields_are_pseudonymized() -> None:
     payload = sanitized.features[0].payload
     assert payload["name"].startswith("name-")
     assert re.fullmatch(
-        r"https://url-[0-9a-f]{16}\.invalid/", payload["adminSplashUrl"]
+        r"https://example\.com/url-[0-9a-f]{16}", payload["adminSplashUrl"]
     )
     assert payload["tags"][0].startswith("tags-")
     # Unknown serials under a structural key get a consistent dev-NNNN
@@ -297,7 +297,7 @@ def test_identity_shaped_values_are_scrubbed_regardless_of_key() -> None:
     assert re.fullmatch(r"host-[0-9a-f]{16}\.invalid", payload["fqdn"])
     assert re.fullmatch(r"host-[0-9a-f]{16}\.invalid", payload["patterns"][0])
     assert re.fullmatch(
-        r"https://url-[0-9a-f]{16}\.invalid/", payload["patterns"][1]
+        r"https://example\.com/url-[0-9a-f]{16}", payload["patterns"][1]
     )
     assert payload["bssid"].startswith("02:")
     # IPs embedded in free text (DHCP option strings) are rewritten.
@@ -883,3 +883,81 @@ def test_fake_ips_keep_subnet_membership() -> None:
     assert ipaddress.ip_address(vlan["applianceIp"]) in network
     assert ipaddress.ip_address(route["gatewayIp"]) in network
     assert "192.168.128" not in str(vlan) and "192.168.128" not in str(route)
+
+
+def test_password_policy_keys_are_not_secrets() -> None:
+    """Password *policy* settings (login security) are configuration,
+    not credentials: redacting them makes the whole loginSecurity write
+    unrestorable, while actual password fields must still vanish."""
+    graph = NetworkGraph(
+        "org-123", (), (),
+        (
+            FeatureConfiguration(
+                "/organizations/{organizationId}/loginSecurity",
+                ("org-123",),
+                {
+                    "numDifferentPasswords": 5,
+                    "minimumPasswordLength": 12,
+                    "passwordExpirationDays": 90,
+                    "enforcePasswordExpiration": True,
+                    "password": "hunter2",
+                    "radiusPassword": "radpass1",
+                    "psk": "wifikey99",
+                    "passphrase": "opensesame",
+                },
+            ),
+        ),
+    )
+    payload = sanitize_graph(graph, salt=b"fixed").features[0].payload
+    assert payload["numDifferentPasswords"] == 5
+    assert payload["minimumPasswordLength"] == 12
+    assert payload["passwordExpirationDays"] == 90
+    assert payload["enforcePasswordExpiration"] is True
+    for key in ("password", "radiusPassword", "psk", "passphrase"):
+        assert payload[key] == REDACTED, key
+
+
+def test_fake_urls_are_deterministic_and_distinct() -> None:
+    """URL pseudonyms ride the digest in the path of the resolvable
+    example.com apex (Meraki DNS-checks webhook hosts on write), stay
+    stable per input, and never collide across inputs."""
+    sanitizer = _GraphSanitizer(_graph(), salt=b"fixed")
+    first = sanitizer._fake_url("https://hooks.example/services/T0/A")
+    assert re.fullmatch(r"https://example\.com/url-[0-9a-f]{16}", first)
+    assert sanitizer._fake_url("https://hooks.example/services/T0/A") == first
+    assert sanitizer._fake_url("https://hooks.example/services/T0/B") != first
+
+
+def test_included_payload_template_names_survive_verbatim() -> None:
+    """Meraki's built-in webhook payload templates carry vendor names,
+    not customer identity; pseudonymizing them breaks adopt-by-name on
+    restore. Custom templates and unrelated included-typed objects still
+    get their names pseudonymized."""
+    template_path = (
+        "/networks/{networkId}/webhooks/payloadTemplates/{payloadTemplateId}"
+    )
+    graph = NetworkGraph(
+        "org-123", (), (),
+        (
+            FeatureConfiguration(
+                template_path, ("N_1", "wpt_00001"),
+                {"payloadTemplateId": "wpt_00001", "type": "included",
+                 "name": "Slack (included)"},
+            ),
+            FeatureConfiguration(
+                template_path, ("N_1", "wpt_9"),
+                {"payloadTemplateId": "wpt_9", "type": "custom",
+                 "name": "Corp Custom Template"},
+            ),
+            FeatureConfiguration(
+                "/networks/{networkId}/somethingElse", ("N_1",),
+                {"type": "included", "name": "Branch Office"},
+            ),
+        ),
+    )
+    features = sanitize_graph(graph, salt=b"fixed").features
+    assert features[0].payload["name"] == "Slack (included)"
+    assert features[1].payload["name"].startswith("name-")
+    assert features[2].payload["name"].startswith("name-")
+    # The exemption is name-only: the template's own ID still maps.
+    assert features[0].payload["payloadTemplateId"].startswith("id-")

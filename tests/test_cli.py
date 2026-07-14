@@ -2392,6 +2392,195 @@ def test_restore_drill_preview_notes_skip_claims(
     assert "Drill mode" in console
 
 
+def _sanitized_restore_dump(tmp_path: Path) -> Path:
+    dump = _restore_dump(tmp_path)
+    document = json.loads(dump.read_text(encoding="utf-8"))
+    document["sanitized"] = True
+    dump.write_text(json.dumps(document), encoding="utf-8")
+    return dump
+
+
+def test_sanitized_restore_refuses_a_populated_target(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A sanitized snapshot's org ID is a pseudonym, so the source-org
+    interlock is blind; a populated --target-org is refused outright —
+    it could BE the source organization."""
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    counted: list[str] = []
+
+    def fake_count(target_org: str) -> int:
+        counted.append(target_org)
+        return 3
+
+    monkeypatch.setattr("meraki2tf.cli._target_network_count", fake_count)
+    dump = _sanitized_restore_dump(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--restore", "--from-dump", str(dump),
+         "--target-org", "org-999", "--workdir", str(tmp_path / "ws"),
+         "--confirm"]
+    )
+    console = capsys.readouterr().err
+    assert exit_code == 2
+    assert counted == ["org-999"]
+    assert "only writes it into an EMPTY organization" in console
+
+
+def test_sanitized_restore_proceeds_into_an_empty_target(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys as _sys
+    import types as _types
+
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    monkeypatch.setattr(
+        "meraki2tf.cli._target_network_count", lambda target_org: 0
+    )
+    calls: list[tuple[str, tuple, dict]] = []
+
+    class Section:
+        def __getattr__(self, operation_id: str):  # noqa: ANN204
+            def _dispatch(*args: Any, **kwargs: Any) -> dict:
+                calls.append((operation_id, args, kwargs))
+                if operation_id == "createOrganizationNetwork":
+                    return {"id": "L_NEW"}
+                return {}
+
+            return _dispatch
+
+    section = Section()
+    dashboard = SimpleNamespace(
+        organizations=section, networks=section, wireless=section
+    )
+    stub = _types.ModuleType("meraki")
+    stub.DashboardAPI = lambda **kwargs: dashboard  # type: ignore[attr-defined]
+    monkeypatch.setitem(_sys.modules, "meraki", stub)
+    dump = _sanitized_restore_dump(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--restore", "--from-dump", str(dump),
+         "--target-org", "org-999", "--workdir", str(tmp_path / "ws"),
+         "--confirm"]
+    )
+    assert exit_code == 0
+    assert "createOrganizationNetwork" in [c[0] for c in calls]
+
+
+def test_sanitized_restore_resume_skips_the_empty_target_check(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A journaled resume's earlier waves populated the target; the
+    empty-target interlock must not even consult the network count."""
+    import sys as _sys
+    import types as _types
+
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+
+    def forbidden(target_org: str) -> int:
+        raise AssertionError("a journaled resume must not count networks")
+
+    monkeypatch.setattr("meraki2tf.cli._target_network_count", forbidden)
+    stub = _types.ModuleType("meraki")
+    stub.DashboardAPI = (  # type: ignore[attr-defined]
+        lambda **kwargs: SimpleNamespace()
+    )
+    monkeypatch.setitem(_sys.modules, "meraki", stub)
+    workdir = tmp_path / "ws"
+    workdir.mkdir()
+    (workdir / "restore-journal.jsonl").write_text(
+        json.dumps({"kind": "meta", "target": "org-999", "source": "org-123"})
+        + "\n"
+        + json.dumps(
+            {"kind": "done",
+             "key": "/organizations/{organizationId}/networks::N_1"}
+        )
+        + "\n"
+        + json.dumps(
+            {"kind": "done",
+             "key": "/networks/{networkId}/wireless/ssids/{number}::N_1,0"}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    dump = _sanitized_restore_dump(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--restore", "--from-dump", str(dump),
+         "--target-org", "org-999", "--workdir", str(workdir), "--confirm"]
+    )
+    assert exit_code == 0
+
+
+def test_target_network_count_reads_the_live_network_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys as _sys
+    import types as _types
+
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    constructed: list[dict[str, Any]] = []
+
+    class Organizations:
+        def __init__(self, networks: Any) -> None:
+            self._networks = networks
+
+        def getOrganizationNetworks(
+            self, organizationId: str, total_pages: str = "all"
+        ) -> Any:
+            assert organizationId == "org-999"
+            assert total_pages == "all"
+            return self._networks
+
+    def install(networks: Any) -> None:
+        def factory(**kwargs: Any) -> SimpleNamespace:
+            constructed.append(kwargs)
+            return SimpleNamespace(organizations=Organizations(networks))
+
+        stub = _types.ModuleType("meraki")
+        stub.DashboardAPI = factory  # type: ignore[attr-defined]
+        monkeypatch.setitem(_sys.modules, "meraki", stub)
+
+    from meraki2tf.cli import _target_network_count
+
+    install([{"id": "L_1"}, {"id": "L_2"}])
+    assert _target_network_count("org-999") == 2
+    # A non-list response counts as empty rather than crashing.
+    install({"unexpected": "shape"})
+    assert _target_network_count("org-999") == 0
+    # The throwaway client is quiet and keyed from the environment.
+    assert constructed[0]["api_key"] == "test-token"
+    assert constructed[0]["suppress_logging"] is True
+
+
+def test_sanitized_restore_count_failure_fails_closed(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+
+    def exploding(target_org: str) -> int:
+        raise RuntimeError("dashboard unreachable")
+
+    monkeypatch.setattr("meraki2tf.cli._target_network_count", exploding)
+    dump = _sanitized_restore_dump(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--restore", "--from-dump", str(dump),
+         "--target-org", "org-999", "--workdir", str(tmp_path / "ws"),
+         "--confirm"]
+    )
+    console = capsys.readouterr().err
+    assert exit_code == 1
+    assert "Cannot verify that target organization org-999 is empty" in console
+    assert "dashboard unreachable" in console
+
+
 # ------------------------------------------------------------- --wipe-org
 
 

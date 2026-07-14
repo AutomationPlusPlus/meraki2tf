@@ -732,9 +732,11 @@ def _wipe_org(config: RuntimeConfig) -> int:
         return 1
     logger.warning(
         "Wipe target verified: organization %s (%r), %d network(s), "
-        "0 claimed devices.",
+        "0 claimed devices, %d admin(s) besides the caller%s.",
         preview.organization_id, preview.organization_name,
-        preview.network_count,
+        preview.network_count, preview.other_admin_count,
+        " (they will be removed before the organization is deleted)"
+        if preview.other_admin_count else "",
     )
     if not config.confirm:
         logger.warning(
@@ -894,6 +896,33 @@ def _restore(config: RuntimeConfig) -> int:
     except ValueError as exc:
         logger.critical("Restore journal is unreadable: %s", exc)
         return 2
+    if provider.snapshot_sanitized and not journal.completed:
+        # A sanitized snapshot's recorded org ID is a pseudonym, so the
+        # never-restore-into-the-source-org interlock above cannot
+        # recognize the source org. A fresh restore only ever targets a
+        # fresh (empty) organization — a populated target is either the
+        # source org itself or an org someone cares about. A journaled
+        # resume is exempt: its earlier waves populated the target.
+        try:
+            existing = _target_network_count(config.target_org)
+        except Exception as exc:  # noqa: BLE001 - fail closed
+            logger.critical(
+                "Cannot verify that target organization %s is empty "
+                "(%s); a sanitized-snapshot restore only writes into a "
+                "fresh organization.", config.target_org, exc,
+            )
+            return 1
+        if existing:
+            logger.critical(
+                "Target organization %s already contains %d network(s). "
+                "A sanitized snapshot cannot prove it is not this "
+                "restore's own source organization, so --restore only "
+                "writes it into an EMPTY organization. Create a fresh "
+                "scratch org and target that (or resume the original "
+                "restore from its workdir journal).",
+                config.target_org, existing,
+            )
+            return 2
     restorer = OrgRestorer(
         config.target_org, journal, serial_map=serial_map,
         skip_claims=config.skip_claims,
@@ -946,6 +975,24 @@ def _restore(config: RuntimeConfig) -> int:
         )
     )
     return 0 if not result.failed else 1
+
+
+def _target_network_count(target_org: str) -> int:
+    """How many networks the restore target organization holds now."""
+    import meraki
+
+    from meraki2tf.config import read_api_key
+
+    dashboard = meraki.DashboardAPI(
+        api_key=read_api_key(),
+        suppress_logging=True,
+        print_console=False,
+        output_log=False,
+    )
+    networks = dashboard.organizations.getOrganizationNetworks(
+        target_org, total_pages="all"
+    )
+    return len(networks) if isinstance(networks, list) else 0
 
 
 def _heal(config: RuntimeConfig) -> int:

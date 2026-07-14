@@ -41,7 +41,7 @@ import hashlib
 import logging
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -480,6 +480,19 @@ class ReferenceResolver:
         self._entries.setdefault((stem, old), []).append(entry)
         self._by_old.setdefault(old, []).append(entry)
 
+    def sibling_mapping(self, stem: str, old: str) -> str | None:
+        """The single new ID recorded for ``(stem, old)`` anywhere.
+
+        Org-shared objects (Meraki's built-in payload templates) are
+        discovered once per network under the *same* old ID; once one
+        network's copy is created or adopted, every sibling copy is the
+        same target object. Anything other than exactly one distinct
+        new ID returns ``None`` — colliding per-network IDs (group
+        policy "100") map to different new IDs and never qualify.
+        """
+        new_ids = {new for _, new in self._entries.get((stem, old), [])}
+        return next(iter(new_ids)) if len(new_ids) == 1 else None
+
     def expect_remap(self, stem: str, old: str) -> None:
         """Declare an identity that only exists after its create runs.
 
@@ -764,7 +777,7 @@ _SERIAL_PROPERTY = re.compile(r"(?i)serial")
 #: profiles, staged upgrade groups, VLAN 1) into new networks, so a
 #: snapshot's captured copy collides with the built-in on restore.
 _NAME_CONFLICT_RE = re.compile(
-    r"(?i)already (?:exists|been taken)|reserved name"
+    r"(?i)already (?:exists|been taken|opted in)|reserved name"
     r"|with this name (?:exists|already)"
 )
 #: Dashboard 400 texts meaning "the organization lacks the hardware
@@ -772,6 +785,72 @@ _NAME_CONFLICT_RE = re.compile(
 _CAPABILITY_RE = re.compile(
     r"(?i)only supports organizations with .+ networks"
 )
+
+#: Payload keys that identify an object as the Meraki-provisioned
+#: default of its collection (staged upgrade groups carry `isDefault`,
+#: adaptive-policy groups `isDefaultGroup`).
+_DEFAULT_FLAG_RE = re.compile(r"(?i)^isdefault")
+
+#: Natural identity keys tried, in order, when adopt-by-name finds no
+#: counterpart. Each is unique within its collection per the dashboard
+#: ("SGT has already been taken"); `shortName` is an API keyword the
+#: sanitizer preserves verbatim, so both work from sanitized snapshots.
+_NATURAL_MATCH_KEYS = ("name", "sgt", "shortName")
+
+
+def _default_flag_key(payload: Mapping[str, Any]) -> str | None:
+    """The truthy ``isDefault``-shaped key of the payload, if any."""
+    for key, value in payload.items():
+        if _DEFAULT_FLAG_RE.match(key) and value is True:
+            return key
+    return None
+
+
+def _match_collection_item(
+    listing: list[Any], payload: Mapping[str, Any]
+) -> Mapping[str, Any] | None:
+    """The single listing item sharing a natural key with ``payload``."""
+    for key in _NATURAL_MATCH_KEYS:
+        wanted = payload.get(key)
+        if wanted is None or isinstance(wanted, (Mapping, list)):
+            continue
+        matches = [
+            item
+            for item in listing
+            if isinstance(item, Mapping) and item.get(key) == wanted
+        ]
+        if len(matches) == 1:
+            return matches[0]
+    return None
+
+
+def _item_identifier(
+    action: RestoreAction, item: Mapping[str, Any]
+) -> str | None:
+    """One collection element's ID under the action's own convention.
+
+    Collections key their items differently: a generic ``id``, the item
+    path's own placeholder (``groupPolicyId``), or the conventional
+    ``<singular>Id`` named after the collection segment — adaptive
+    policy ``groups/{id}`` elements carry ``groupId``, not ``id``.
+    """
+    found = item.get("id")
+    if found is None:
+        placeholders = _PATH_PARAM_RE.findall(action.api_path)
+        if placeholders:
+            found = item.get(placeholders[-1])
+    if found is None:
+        segments = [s for s in action.api_path.split("/") if s]
+        if len(segments) >= 2 and segments[-1].startswith("{"):
+            collection = segments[-2]
+            if not collection.startswith("{"):
+                singular = (
+                    collection[:-3] + "y"
+                    if collection.endswith("ies")
+                    else collection.removesuffix("s")
+                )
+                found = item.get(f"{singular}Id")
+    return str(found) if found is not None else None
 
 
 def _body_serial_properties(op: OperationSpec) -> frozenset[str]:
@@ -789,10 +868,24 @@ def _body_serial_properties(op: OperationSpec) -> frozenset[str]:
     )
 
 
+def _schema_type_at(
+    op: OperationSpec | None, parts: Sequence[str]
+) -> str | None:
+    """The JSON-schema ``type`` of a dotted body path, if declared."""
+    node: Any = op.raw.get("requestBody") if op is not None and op.raw else None
+    for key in ("content", "application/json", "schema"):
+        node = node.get(key) if isinstance(node, Mapping) else None
+    for part in parts:
+        props = node.get("properties") if isinstance(node, Mapping) else None
+        node = props.get(part) if isinstance(props, Mapping) else None
+    return node.get("type") if isinstance(node, Mapping) else None
+
+
 def _inject_drill_secrets(
     payload: Mapping[str, Any],
     paths: tuple[str, ...],
     seed: str,
+    op: OperationSpec | None = None,
 ) -> tuple[dict[str, Any], tuple[str, ...]]:
     """Fill redacted secret slots with deterministic drill placeholders.
 
@@ -823,7 +916,13 @@ def _inject_drill_secrets(
         if not isinstance(node, dict):
             continue
         digest = hashlib.sha256(f"{seed}:{path}".encode()).hexdigest()[:12]
-        node[parts[-1]] = f"drill-{digest}"
+        if _schema_type_at(op, parts) in ("integer", "number"):
+            # A numeric secret slot (a PIN, a passcode) rejects string
+            # placeholders outright; a deterministic 8-digit number
+            # satisfies the widest live validators.
+            node[parts[-1]] = int(digest[:6], 16) % 90000000 + 10000000
+        else:
+            node[parts[-1]] = f"drill-{digest}"
         injected.append(path)
     return filled, tuple(injected)
 
@@ -1118,6 +1217,11 @@ class OrgRestorer:
         # the next round instead of failing; a round that maps or
         # settles nothing means the references are genuinely dead.
         pending: list[RestoreAction] = list(plan.actions)
+        #: 400-failed create/configure actions eligible for one
+        #: end-of-run retry (same-wave sibling dependencies).
+        salvage_round: dict[
+            str, tuple[RestoreAction, RestoreAction, tuple[str, ...]]
+        ] = {}
         #: Keys granted one drop-unresolvable-references retry after a
         #: deadlocked (no-progress) round — mutually-referencing pairs
         #: (policy object groupIds ↔ group objectIds) otherwise starve
@@ -1187,7 +1291,16 @@ class OrgRestorer:
                     continue
                 # Parents are matched by (type stem, value): a bare
                 # value match would let e.g. a failed group policy
-                # "100" poison the unrelated VLAN 100.
+                # "100" poison the unrelated VLAN 100. A create's own
+                # last path value is its identity-to-be-minted, not an
+                # addressed parent — the same old ID failing in a
+                # sibling network (URL-derived webhook-receiver IDs
+                # repeat across networks) must not hold this one back.
+                own = (
+                    _own_identity(action)
+                    if action.kind in ("create", "claim")
+                    else None
+                )
                 dead = [
                     value
                     for name, value in zip(
@@ -1195,6 +1308,7 @@ class OrgRestorer:
                         action.path_values,
                     )
                     if (_scope_stem(name), value) in failed_parents
+                    and (_scope_stem(name), value) != own
                 ]
                 if dead:
                     skipped.append(
@@ -1209,6 +1323,7 @@ class OrgRestorer:
                         action.path_values,
                     )
                     if (_scope_stem(name), value) in skipped_parents
+                    and (_scope_stem(name), value) != own
                 ]
                 if held:
                     # Propagate the drill verdict down the tree: a
@@ -1247,7 +1362,8 @@ class OrgRestorer:
                     # same shape a real restore would ("Password is
                     # required to enable WPA encryption" otherwise).
                     filled, injected_paths = _inject_drill_secrets(
-                        action.payload, action.secret_reentry, action.key
+                        action.payload, action.secret_reentry, action.key,
+                        op=action.operation,
                     )
                     if injected_paths:
                         dispatch_action = replace(action, payload=filled)
@@ -1267,12 +1383,21 @@ class OrgRestorer:
                             dashboard, action, resolver,
                             graph.organization_id,
                         )
+                        if recovered is not None:
+                            logger.warning(
+                                "Adopted %s: an interrupted run created "
+                                "it without journaling; matched in the "
+                                "target instead of re-creating.",
+                                action.key,
+                            )
+                    if recovered is None and action.kind == "create":
+                        default_key = _default_flag_key(action.payload)
+                        if default_key is not None:
+                            recovered = self._adopt_default(
+                                dashboard, action, resolver,
+                                graph.organization_id, default_key,
+                            )
                     if recovered is not None:
-                        logger.warning(
-                            "Adopted %s: an interrupted run created it "
-                            "without journaling; matched by name in the "
-                            "target instead of re-creating.", action.key,
-                        )
                         new_id = recovered
                     else:
                         new_id = self._dispatch(
@@ -1320,11 +1445,27 @@ class OrgRestorer:
                             # back; this payload carries live secret
                             # values (or drill placeholders standing in
                             # for them), so the echo must not reach logs
-                            # or alerts.
+                            # or alerts. Field NAMES are diagnosable and
+                            # never sensitive — the runbook already
+                            # publishes them.
                             message = (
                                 f"{type(exc).__name__} (status "
                                 f"{getattr(exc, 'status', 'n/a')}); detail "
-                                "withheld — the request carried secret values"
+                                "withheld — the request carried secret "
+                                "values (fields sent: "
+                                f"{', '.join(sorted(dispatch_action.payload))})"
+                            )
+                        if (
+                            getattr(exc, "status", None) == 400
+                            and action.kind in ("create", "configure")
+                        ):
+                            # Same-wave sibling dependencies (a static
+                            # route whose next hop lives on a VLAN that
+                            # sorts after it) produce 400s that resolve
+                            # once the wave settles: eligible for one
+                            # end-of-run salvage retry.
+                            salvage_round[action.key] = (
+                                action, dispatch_action, injected_paths,
                             )
                         failed.append((action.key, message))
                         if action.kind in ("create", "claim"):
@@ -1336,41 +1477,9 @@ class OrgRestorer:
                         continue
                 if action.kind == "claim":
                     unclaimed.discard(action.path_values[-1])
-                if new_id is None and action.kind == "create":
-                    # The API accepted the create but returned no
-                    # usable ID, so no old→new mapping can be recorded:
-                    # children referencing the snapshot ID will fail
-                    # loudly on this and every resumed run. Surface the
-                    # remediation instead of leaving a silent strand.
-                    logger.error(
-                        "Create %s returned no object ID; its old "
-                        "identifier cannot be remapped and any children "
-                        "referencing it will fail. Verify the object in "
-                        "the target organization and restore its "
-                        "children manually.", action.key,
-                    )
-                if new_id is not None:
-                    own_stem, own_old = _own_identity(action)
-                    # The organization is a global singleton scope, so
-                    # it never disambiguates anything — and keeping it
-                    # would make org-scoped objects (policy objects,
-                    # config templates) unresolvable from network scope,
-                    # whose referrer path values never carry the org ID.
-                    mapping_context = (
-                        ()
-                        if action.wave == WAVE_NETWORKS
-                        else tuple(
-                            value
-                            for value in action.path_values[:-1]
-                            if value != graph.organization_id
-                        )
-                    )
-                    resolver.record(own_stem, own_old, new_id, mapping_context)
-                    self._journal.record_mapping(
-                        own_old, new_id,
-                        scope=own_stem, context=mapping_context,
-                    )
-                self._journal.record_done(action.key)
+                self._bookkeep_success(
+                    action, new_id, resolver, graph.organization_id
+                )
                 executed.append(action.key)
                 if injected_paths:
                     drill_placeholders.append(
@@ -1398,6 +1507,47 @@ class OrgRestorer:
                     break
                 drop_retry.update(action.key for action in fresh)
             pending = [action for action, _ in deferred]
+        if salvage_round:
+            # One bounded retry after the whole plan settles: same-wave
+            # sibling dependencies (a static route rejected because its
+            # next-hop VLAN sorted after it) resolve once the siblings
+            # exist. Anything that fails again keeps its original
+            # failure record.
+            salvaged: list[str] = []
+            for key, (action, dispatch_action, injected) in (
+                salvage_round.items()
+            ):
+                try:
+                    new_id = self._dispatch(
+                        dashboard, dispatch_action, resolver,
+                        graph.organization_id,
+                    )
+                except Exception as exc:  # noqa: BLE001 - original stands
+                    logger.debug(
+                        "End-of-run salvage retry for %s failed (%s); "
+                        "the original failure stands.", key, exc,
+                    )
+                    continue
+                self._bookkeep_success(
+                    action, new_id, resolver, graph.organization_id
+                )
+                executed.append(key)
+                salvaged.append(key)
+                if injected:
+                    drill_placeholders.append((key, ",".join(injected)))
+                if action.kind in ("create", "claim"):
+                    failed_parents.discard(_own_identity(action))
+            if salvaged:
+                recovered_keys = set(salvaged)
+                failed = [
+                    entry for entry in failed
+                    if entry[0] not in recovered_keys
+                ]
+                logger.warning(
+                    "End-of-run salvage restored %d object(s) whose "
+                    "first attempt failed on a same-wave sibling "
+                    "dependency: %s", len(salvaged), ", ".join(salvaged),
+                )
         if drill_placeholders:
             logger.warning(
                 "%d object(s) received drill placeholder secrets (their "
@@ -1413,6 +1563,50 @@ class OrgRestorer:
             skipped=tuple(skipped),
             drill_placeholders=tuple(drill_placeholders),
         )
+
+    def _bookkeep_success(
+        self,
+        action: RestoreAction,
+        new_id: str | None,
+        resolver: ReferenceResolver,
+        source_org: str,
+    ) -> None:
+        """Record a dispatched action's mapping and journal completion."""
+        if new_id is None and action.kind == "create":
+            # The API accepted the create but returned no
+            # usable ID, so no old→new mapping can be recorded:
+            # children referencing the snapshot ID will fail
+            # loudly on this and every resumed run. Surface the
+            # remediation instead of leaving a silent strand.
+            logger.error(
+                "Create %s returned no object ID; its old "
+                "identifier cannot be remapped and any children "
+                "referencing it will fail. Verify the object in "
+                "the target organization and restore its "
+                "children manually.", action.key,
+            )
+        if new_id is not None:
+            own_stem, own_old = _own_identity(action)
+            # The organization is a global singleton scope, so
+            # it never disambiguates anything — and keeping it
+            # would make org-scoped objects (policy objects,
+            # config templates) unresolvable from network scope,
+            # whose referrer path values never carry the org ID.
+            mapping_context = (
+                ()
+                if action.wave == WAVE_NETWORKS
+                else tuple(
+                    value
+                    for value in action.path_values[:-1]
+                    if value != source_org
+                )
+            )
+            resolver.record(own_stem, own_old, new_id, mapping_context)
+            self._journal.record_mapping(
+                own_old, new_id,
+                scope=own_stem, context=mapping_context,
+            )
+        self._journal.record_done(action.key)
 
     def _salvage_failure(
         self,
@@ -1510,11 +1704,76 @@ class OrgRestorer:
             )
         )
         if adopted is None:
+            # An org-wide-unique object (a built-in payload template)
+            # discovered once per network conflicts from the second
+            # network on, but lives outside that network's collection —
+            # the sibling network's mapping for the same old ID IS the
+            # shared target object.
+            own_stem, _ = _own_identity(action)
+            adopted = resolver.sibling_mapping(own_stem, own_old)
+            if adopted is not None:
+                logger.warning(
+                    "Adopted %s: the conflicting object is org-shared "
+                    "and was already restored via a sibling network; "
+                    "reusing its mapping.", action.key,
+                )
+                return adopted
+        if adopted is None:
             return None
         logger.warning(
             "Adopted %s: the target already provisions this object (a "
             "Meraki default or an earlier restore); aligning its "
             "content with the snapshot.", action.key,
+        )
+        self._align_adopted(dashboard, action, resolver, source_org, adopted)
+        return adopted
+
+    def _adopt_default(
+        self,
+        dashboard: Any,
+        action: RestoreAction,
+        resolver: ReferenceResolver,
+        source_org: str,
+        flag_key: str,
+    ) -> str | None:
+        """Adopt the target's own default instead of duplicating it.
+
+        A create of a snapshot object flagged ``isDefault``-true can
+        SUCCEED and still be wrong: the dashboard provisions its own
+        default alongside (staged upgrade groups), leaving a duplicate
+        the follow-up stages PUT then rejects ("Missing Staged Upgrade
+        Group: …", naming the unassigned auto-default). So defaults are
+        adopted *before* the POST: the collection's existing
+        flag-matching item is taken over and content-aligned. More than
+        one flagged item disambiguates by natural key; no match falls
+        through to the normal create.
+        """
+        listing = self._list_collection(dashboard, action, resolver,
+                                        source_org)
+        if listing is None:
+            return None
+        flagged = [
+            item
+            for item in listing
+            if isinstance(item, Mapping) and item.get(flag_key) is True
+        ]
+        if not flagged:
+            return None
+        match = (
+            flagged[0]
+            if len(flagged) == 1
+            else _match_collection_item(flagged, action.payload)
+        )
+        if match is None:
+            return None
+        adopted = _item_identifier(action, match)
+        if adopted is None:
+            return None
+        logger.warning(
+            "Adopted %s: the snapshot object is its collection's "
+            "default and the target organization already provisions "
+            "one; aligning the existing default instead of creating a "
+            "duplicate.", action.key,
         )
         self._align_adopted(dashboard, action, resolver, source_org, adopted)
         return adopted
@@ -1703,18 +1962,38 @@ class OrgRestorer:
         resolver: ReferenceResolver,
         source_org: str,
     ) -> str | None:
-        """The ID of an already-existing, name-matching counterpart.
+        """The ID of an already-existing counterpart of this create.
 
         Reads the create's collection back from the target and matches
-        by name; anything short of exactly one match (no name in the
+        by name first, then by a natural key (``sgt`` is org-unique for
+        adaptive-policy groups, ``shortName`` for early-access opt-ins)
+        when name matching fails — sanitized snapshots pseudonymize
+        names, so the target's real-named defaults never match by name.
+        Anything short of exactly one match (no matchable key in the
         payload, no collection GET in the spec, unreadable collection,
         zero or several matches) returns ``None`` and the normal create
         proceeds — worst case the API rejects a duplicate per object,
         exactly as before.
         """
+        listing = self._list_collection(dashboard, action, resolver,
+                                        source_org)
+        if listing is None:
+            return None
+        match = _match_collection_item(listing, action.payload)
+        if match is None:
+            return None
+        return _item_identifier(action, match)
+
+    def _list_collection(
+        self,
+        dashboard: Any,
+        action: RestoreAction,
+        resolver: ReferenceResolver,
+        source_org: str,
+    ) -> list[Any] | None:
+        """The create's target collection, or ``None`` if unreadable."""
         op = action.lookup
-        name = action.payload.get("name")
-        if op is None or not isinstance(name, str) or not name:
+        if op is None:
             return None
         scope_values = action.path_values
         if action.wave == WAVE_NETWORKS:
@@ -1740,29 +2019,14 @@ class OrgRestorer:
             )
         except Exception as exc:  # noqa: BLE001 - fall back to the POST
             logger.debug(
-                "Crash-recovery lookup for %s failed (%s); proceeding "
+                "Adoption lookup for %s failed (%s); proceeding "
                 "with the create.", action.key, exc,
             )
             return None
         self._bucket.on_success()
         if isinstance(listing, Mapping):
             listing = listing.get("items")
-        matches = [
-            item
-            for item in (listing if isinstance(listing, list) else [])
-            if isinstance(item, Mapping) and item.get("name") == name
-        ]
-        if len(matches) != 1:
-            return None
-        found = matches[0].get("id")
-        if found is None:
-            # Collections key their items differently ('groupPolicyId',
-            # 'payloadTemplateId', …); the item path's own placeholder
-            # names the field.
-            placeholders = _PATH_PARAM_RE.findall(action.api_path)
-            if placeholders:
-                found = matches[0].get(placeholders[-1])
-        return str(found) if found is not None else None
+        return listing if isinstance(listing, list) else None
 
 
 @dataclass(frozen=True)
@@ -1773,6 +2037,11 @@ class WipePreview:
     organization_name: str
     network_count: int
     claimed_device_count: int
+    #: Admins other than the caller. A restore drill from a snapshot
+    #: recreates the source org's admins (as pseudonyms in sanitized
+    #: drills), and the dashboard refuses to delete an organization
+    #: "with multiple users" — so the wipe must remove them first.
+    other_admin_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -1874,7 +2143,54 @@ class OrgWiper:
             organization_name=name,
             network_count=len(networks),
             claimed_device_count=0,
+            other_admin_count=len(self._other_admins(organization_id)),
         )
+
+    def _other_admins(self, organization_id: str) -> list[tuple[str, str]]:
+        """``(admin_id, email)`` of every admin who is not the caller.
+
+        Restore drills recreate the source org's admins, and the
+        dashboard refuses to delete an organization "with multiple
+        users" — the wipe removes them first. The caller is identified
+        by the API key's own identity; if that cannot be established,
+        NO admin is ever deleted (the org deletion may then fail with
+        the dashboard's own clear message rather than risk removing
+        the operator's account).
+        """
+        dashboard = self._dashboard()
+        identity_reader = getattr(
+            getattr(dashboard, "administered", None),
+            "getAdministeredIdentitiesMe", None,
+        )
+        if identity_reader is None:
+            return []
+        try:
+            self._bucket.acquire()
+            me = identity_reader()
+            self._bucket.on_success()
+            own_email = str(me.get("email", "")) if isinstance(
+                me, Mapping
+            ) else ""
+            self._bucket.acquire()
+            admins = dashboard.organizations.getOrganizationAdmins(
+                organization_id
+            )
+            self._bucket.on_success()
+        except Exception as exc:  # noqa: BLE001 - degrade to no deletion
+            logger.debug(
+                "Could not enumerate admins for %s (%s); the wipe will "
+                "not remove any admin.", organization_id, exc,
+            )
+            return []
+        if not own_email:
+            return []
+        return [
+            (str(admin.get("id", "")), str(admin.get("email", "")))
+            for admin in (admins if isinstance(admins, list) else [])
+            if isinstance(admin, Mapping)
+            and str(admin.get("email", "")) != own_email
+            and admin.get("id")
+        ]
 
     def execute(self, organization_id: str, expected_name: str) -> WipeResult:
         """Re-verify the interlocks immediately before destroying."""
@@ -1895,6 +2211,26 @@ class OrgWiper:
             except Exception as exc:  # noqa: BLE001 - per-object isolation
                 failed.append((network_id, str(exc)))
         org_deleted = False
+        if not failed:
+            # Drill-restored admins block the organization deletion
+            # ("Cannot delete organization - it still has multiple
+            # users"); remove every admin except the caller. The caller
+            # itself is never deleted — _other_admins guarantees that.
+            for admin_id, admin_email in self._other_admins(
+                organization_id
+            ):
+                try:
+                    self._bucket.acquire()
+                    dashboard.organizations.deleteOrganizationAdmin(
+                        organization_id, admin_id
+                    )
+                    self._bucket.on_success()
+                    logger.warning(
+                        "Wipe removed admin %s from organization %s.",
+                        admin_email, organization_id,
+                    )
+                except Exception as exc:  # noqa: BLE001 - isolate
+                    failed.append((f"admin:{admin_id}", str(exc)))
         if not failed:
             try:
                 # The network loop above can run for a long time on a

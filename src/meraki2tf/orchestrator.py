@@ -492,7 +492,12 @@ class PipelineOrchestrator:
         except PreflightRefusalError:
             raise  # an expected refusal, not a fault — no alert, no traceback
         except Exception as exc:
-            logger.exception("Pipeline fault during %s.", stage)
+            # The one-line ERROR is the operator-facing record; the
+            # traceback is debugging detail — a gracefully-handled
+            # fault (an unreachable backend, a dead endpoint) must not
+            # spray a stack trace over every scheduled-run log.
+            logger.error("Pipeline fault during %s: %s", stage, exc)
+            logger.debug("Pipeline fault traceback:", exc_info=True)
             self._dispatcher.dispatch(processing_fault(stage=stage, error=str(exc)))
             raise PipelineError(f"Pipeline failed during {stage}: {exc}") from exc
         finally:
