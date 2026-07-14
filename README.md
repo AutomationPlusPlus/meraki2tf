@@ -12,6 +12,69 @@ structures for the [`CiscoDevNet/meraki`](https://registry.terraform.io/provider
 provider, detect state drift, and alert on every outcome — from one
 schedulable CLI built as a **disaster-recovery snapshotting tool**.
 
+## 60-second quickstart
+
+Turn your Meraki organization into runnable Terraform with one flag.
+The run is **strictly read-only** — nothing in your organization is
+ever touched, and nothing is applied:
+
+```bash
+# Install (needs Python ≥ 3.11 and terraform ≥ 1.5 on PATH; not on PyPI yet)
+git clone git@github.com:AutomationPlusPlus/meraki2tf.git && cd meraki2tf
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt && pip install -e .
+
+# Run — the API key only ever comes from the environment, never a flag
+export MERAKI_DASHBOARD_API_KEY="<your-dashboard-api-key>"
+meraki2tf --org-id 123456
+```
+
+Everything lands in `./generated/` — a plain Terraform root module with
+one `import {}` block per discovered asset plus the generated HCL:
+
+```terraform
+# generated/imports.tf
+import {
+  to = meraki_networks.n_111222333444555666
+  id = "123456,N_111222333444555666"
+}
+
+import {
+  to = meraki_appliance_vlan.vlan_10
+  id = "N_111222333444555666,10"
+}
+```
+
+…and a coverage report that answers "what is and isn't in Terraform?"
+for every object it found:
+
+```text
+# generated/coverage.txt
+meraki2tf coverage report — organization 123456
+
+Discovered objects : 412
+  imported         : 0   (tracked in Terraform state)
+  pending-import   : 406 (in the kit, not yet in state)
+  unsupported      : 6   (MANUAL rebuild required)
+Coverage           : 98.5%
+```
+
+From there, `cd generated && terraform init && terraform plan` — or let
+the tool keep running on a schedule as a DR safety net. Full install
+notes: [Prerequisites & Installation](#prerequisites--installation).
+
+## Which mode do I want?
+
+| Your goal | Invocation | Where it's documented |
+| --- | --- | --- |
+| One-shot export of my org to Terraform | `meraki2tf --org-id <id>` | [Live Mode](#live-mode-cloud-streaming) |
+| Scheduled DR job that also materializes Terraform state | add `--sync` | [Scheduled DR automation](#scheduled-dr-automation---sync) |
+| Capture a snapshot for offline / air-gapped use | `--dump-to <path>` (add `--sanitize` to share it) | [Producing a snapshot](#producing-a-snapshot---dump-to) |
+| Run entirely offline from a snapshot | `--from-dump <path>` | [Dump Mode](#dump-mode-offline--air-gapped) |
+| Fast drift check between two snapshots (no terraform) | `--drift-baseline <prev>` | [Snapshot-diff drift detection](#snapshot-diff-drift-detection---drift-baseline) |
+| Rebuild after an incident | `--rebuild` / `--heal` / `--replay-gaps` / `--restore` (each previews; add `--confirm`) | [Disaster Recovery](#disaster-recovery) |
+| Stop clickops and manage Meraki as code | one `--sync` run, then own the HCL | [Transitioning to IaC](#transitioning-to-infrastructure-as-code) |
+
 ## Project Overview
 
 meraki2tf discovers your Meraki organization (networks, devices, and
@@ -1000,6 +1063,58 @@ second (terraform) read pass entirely, so a weekly
 discovery sweep. Prefer `.jsonl.gz` snapshots at this scale, and give
 schedulers a generous timeout — completeness matters more than speed
 for a DR safety net.
+
+## Troubleshooting & FAQ
+
+**The run finished but no plan/drift comparison happened.**
+`MERAKI_DASHBOARD_API_KEY` was not set. Without it the pipeline still
+generates the full kit (imports, HCL, coverage manifest) but skips the
+speculative `terraform plan` comparison and exits 0 — by design, so
+air-gapped and dump-mode runs stay useful. Export the key to get the
+drift comparison.
+
+**`terraform executable 'terraform' was not found`.**
+Install Terraform (≥ 1.5) and make sure it is on `PATH`, or point at a
+specific binary with `--terraform-bin /path/to/terraform` (OpenTofu
+works too).
+
+**`meraki2tf could not start: …` right after launch.**
+Usually a bad `--org-id` or an API key without access to that
+organization. Find your organization ID in the dashboard URL or via
+`GET /organizations`; the run exits 1 and dispatches a
+`PROCESSING_FAULT` alert.
+
+**Resource names look right but import IDs seem off / resources are
+missing.**
+meraki2tf reads resource identity schemas from the *installed*
+`CiscoDevNet/meraki` provider and needs **≥ v1.12.0**. With an older
+provider (or no `terraform init` yet) it falls back to a bundled
+v1.12.2 catalog, which can drift from what your workdir actually runs.
+Upgrade the provider and re-run.
+
+**Discovery is slow on a big organization.**
+That's the design trade-off: completeness over speed. Every object ×
+surface costs a GET, paced under Meraki's 10 req/s org budget (which is
+shared with your other integrations — the pool caps itself at 6 req/s).
+Tune the worker pool with `MERAKI2TF_DISCOVERY_WORKERS` (default 8) and
+see [Performance & Scale](#performance--scale). A DR kit missing
+objects is worse than a slow one.
+
+**Will this ever change my Meraki org?**
+Not unless you explicitly ask it to. Every pipeline invocation —
+scheduled or ad-hoc, live or dump — is read-only toward Meraki. Only
+the five human-invoked DR actions gated behind `--confirm` can write;
+each is a read-only preview without it. See the
+[read-only guarantee](#project-overview).
+
+**Is it on PyPI?**
+Not yet — install from a clone (`pip install -e .` puts the
+`meraki2tf` command on your PATH, as shown in the quickstart).
+
+**What does the AGPL v3 license mean for me?**
+Running meraki2tf internally against your own organizations carries no
+obligations. The copyleft terms apply when you distribute modified
+versions or offer the tool itself as a network service.
 
 ## Contributor Architecture
 
