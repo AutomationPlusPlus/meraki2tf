@@ -18,9 +18,12 @@ alerts), safe for anyone to run against any org. ``--sync`` opts into
 DR automation: guarded import-only state materialization and
 modified-object baseline regeneration. Meraki itself is never mutated
 by either mode; only the explicit, human-invoked DR actions —
-``--rebuild --confirm`` (terraform apply of the kit) and
+``--rebuild --confirm`` (terraform apply of the kit), ``--heal
+--confirm`` (same-org additive recreation of deleted objects),
 ``--replay-gaps --confirm`` (snapshot replay of what Terraform cannot
-carry) — ever change the organization.
+carry), ``--restore --confirm`` (full-org rebuild into a separate
+``--target-org``), and ``--wipe-org --confirm`` (drill-org teardown) —
+ever change the organization.
 """
 
 from __future__ import annotations
@@ -1050,9 +1053,10 @@ def _heal(config: RuntimeConfig) -> int:
 def _replay_gaps(config: RuntimeConfig) -> int:
     """Explicit DR action: preview or execute a snapshot gap replay.
 
-    Together with ``_rebuild`` these are the only two places meraki2tf
-    can write to Meraki, and both demand an explicit --confirm;
-    --replay-gaps alone is a read-only preview of the planned writes.
+    One of the five explicit DR write paths (with ``_rebuild``,
+    ``_heal``, ``_restore``, and ``_wipe_org``), each demanding an
+    explicit --confirm; --replay-gaps alone is a read-only preview of
+    the planned writes.
     """
     assert config.dump_path is not None  # guarded by the caller
     try:
