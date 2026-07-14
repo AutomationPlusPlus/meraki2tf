@@ -619,6 +619,7 @@ class GapReplayer:
         # GET echoes unset fields as null; the write endpoints reject
         # them ("'description' must be a string") — unset stays unset.
         body = _strip_nulls(body)
+        body = shape_rules(op.path, body)
         accepted = inspect.signature(method).parameters
         if not any(
             p.kind is inspect.Parameter.VAR_KEYWORD for p in accepted.values()
@@ -754,6 +755,50 @@ def _single_array_body_field(op: OperationSpec) -> str | None:
     if isinstance(sub, Mapping) and sub.get("type") == "array":
         return str(name)
     return None
+
+
+#: Synthetic rule rows Meraki appends to GET responses. The trailing
+#: default rule exists on every firewall-style list; the wireless "LAN
+#: access" row is the GET rendering of the SSID's allowLanAccess flag.
+#: Neither is accepted back by the PUT (invalid destination / duplicate
+#: rule), so GET-echo payloads must shed them before dispatch.
+_DEFAULT_RULE_COMMENT = "Default rule"
+_WIRELESS_LAN_ROW_COMMENT = "Wireless clients accessing LAN"
+_SSID_L3_PATH_SUFFIX = "/wireless/ssids/{number}/firewall/l3FirewallRules"
+
+
+def shape_rules(api_path: str, body: Any) -> Any:
+    """Strip Meraki's synthetic rows from a rules-list payload.
+
+    Drops a trailing "Default rule" row (the dashboard re-appends its
+    own), and for wireless SSID L3 rules converts the synthetic
+    "Wireless clients accessing LAN" row back into the
+    ``allowLanAccess`` flag the PUT actually accepts.
+    """
+    if not isinstance(body, Mapping) or not isinstance(
+        body.get("rules"), list
+    ):
+        return body
+    rows = list(body["rules"])
+    if (
+        rows
+        and isinstance(rows[-1], Mapping)
+        and rows[-1].get("comment") == _DEFAULT_RULE_COMMENT
+    ):
+        rows = rows[:-1]
+    shaped = dict(body)
+    if api_path.endswith(_SSID_L3_PATH_SUFFIX):
+        lan_rows = [
+            row
+            for row in rows
+            if isinstance(row, Mapping)
+            and row.get("comment") == _WIRELESS_LAN_ROW_COMMENT
+        ]
+        if lan_rows:
+            rows = [row for row in rows if row not in lan_rows]
+            shaped["allowLanAccess"] = lan_rows[0].get("policy") == "allow"
+    shaped["rules"] = rows
+    return shaped
 
 
 def _strip_nulls(value: Any) -> Any:
