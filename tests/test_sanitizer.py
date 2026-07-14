@@ -961,3 +961,55 @@ def test_included_payload_template_names_survive_verbatim() -> None:
     assert features[2].payload["name"].startswith("name-")
     # The exemption is name-only: the template's own ID still maps.
     assert features[0].payload["payloadTemplateId"].startswith("id-")
+
+
+def test_included_template_reference_names_survive_verbatim() -> None:
+    """A webhook receiver references its payload template by id + name
+    WITHOUT the "type" marker; the dashboard rejects the pair when they
+    disagree, so references to built-ins keep the vendor name verbatim
+    too. References to custom templates stay pseudonymized (coherently
+    with the pseudonymized template object)."""
+    template_path = (
+        "/networks/{networkId}/webhooks/payloadTemplates/{payloadTemplateId}"
+    )
+    graph = NetworkGraph(
+        "org-123", (), (),
+        (
+            FeatureConfiguration(
+                template_path, ("N_1", "wpt_00001"),
+                {"payloadTemplateId": "wpt_00001", "type": "included",
+                 "name": "Meraki (included)"},
+            ),
+            FeatureConfiguration(
+                template_path, ("N_1", "wpt_9"),
+                {"payloadTemplateId": "wpt_9", "type": "custom",
+                 "name": "Corp Custom Template"},
+            ),
+            FeatureConfiguration(
+                "/networks/{networkId}/webhooks/httpServers/{httpServerId}",
+                ("N_1", "WH_1"),
+                {"name": "receiver", "url": "https://hooks.corp.example/x",
+                 "payloadTemplate": {"payloadTemplateId": "wpt_00001",
+                                     "name": "Meraki (included)"}},
+            ),
+            FeatureConfiguration(
+                "/networks/{networkId}/webhooks/httpServers/{httpServerId}",
+                ("N_1", "WH_2"),
+                {"name": "receiver2", "url": "https://hooks.corp.example/y",
+                 "payloadTemplate": {"payloadTemplateId": "wpt_9",
+                                     "name": "Corp Custom Template"}},
+            ),
+        ),
+    )
+    features = sanitize_graph(graph, salt=b"fixed").features
+    included_ref = features[2].payload["payloadTemplate"]
+    assert included_ref["name"] == "Meraki (included)"
+    # The reference ID maps identically to the template object's own ID,
+    # keeping the pair coherent after restore remapping.
+    assert included_ref["payloadTemplateId"] == (
+        features[0].payload["payloadTemplateId"]
+    )
+    custom_ref = features[3].payload["payloadTemplate"]
+    assert custom_ref["name"].startswith("name-")
+    # Coherent with the custom template object's pseudonymized name.
+    assert custom_ref["name"] == features[1].payload["name"]

@@ -1776,6 +1776,28 @@ class OrgRestorer:
             "duplicate.", action.key,
         )
         self._align_adopted(dashboard, action, resolver, source_org, adopted)
+        if adopted == "-1":
+            # A freshly provisioned default can list under the sentinel
+            # ID -1 until the dashboard materializes it. Item PUTs
+            # accept the sentinel as a default alias, but references
+            # from sibling endpoints (the staged-stages PUT) reject it
+            # ("Invalid Staged Upgrade Group: -1") — re-read the
+            # collection after alignment for the real identifier.
+            relisted = self._list_collection(
+                dashboard, action, resolver, source_org
+            )
+            rematch = (
+                _match_collection_item(relisted, action.payload)
+                if relisted
+                else None
+            )
+            refreshed = (
+                _item_identifier(action, rematch)
+                if rematch is not None
+                else None
+            )
+            if refreshed is not None and refreshed != "-1":
+                adopted = refreshed
         return adopted
 
     def _align_adopted(
