@@ -152,16 +152,36 @@ def _collection_id_key(item_op: OperationSpec) -> str | None:
     return f"{singular}Id"
 
 
+def _parent_scope_id_key(item_op: OperationSpec) -> str | None:
+    """Conventional ``<parentSegment>Id`` for family-nested collections.
+
+    Adaptive policy ``adaptivePolicy/policies/{id}`` elements carry
+    ``adaptivePolicyId`` — named after the FAMILY segment, not the
+    collection. Without this candidate the element ID is unknowable,
+    the item is captured at its collection path, and restore cannot
+    address it.
+    """
+    segments = [s for s in item_op.path.split("/") if s]
+    if len(segments) < 3 or not segments[-1].startswith("{"):
+        return None
+    parent = segments[-3]
+    if parent.startswith("{"):
+        return None
+    return f"{parent}Id"
+
+
 def element_id(item_op: OperationSpec, element: Any) -> str | None:
     """Identify one collection element by the item endpoint's own
     parameter name, falling back to conventional ID fields."""
     if not isinstance(element, Mapping):
         return None
     derived = _collection_id_key(item_op)
+    family = _parent_scope_id_key(item_op)
     candidates = (
         item_op.path_params[-1],
         *_ITEM_ID_FALLBACK_KEYS,
         *((derived,) if derived else ()),
+        *((family,) if family else ()),
     )
     for key in candidates:
         value = element.get(key)
