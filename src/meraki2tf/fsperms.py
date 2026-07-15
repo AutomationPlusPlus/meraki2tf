@@ -24,7 +24,20 @@ def restrict_to_owner(path: Path) -> bool:
 
     Returns True when owner-only permissions are verified in effect.
     """
-    path.chmod(_OWNER_ONLY)
+    try:
+        path.chmod(_OWNER_ONLY)
+    except OSError as exc:
+        # A refused chmod (foreign-owned file after a one-off sudo run,
+        # a mount that EPERMs mode changes) is the same degraded state
+        # as a chmod that silently did not stick: warn and report
+        # False — never crash a completed run over the lock.
+        logger.warning(
+            "chmod(0600) failed for %s: %s. The file may contain secrets; "
+            "restrict access via filesystem or share ACLs.",
+            path,
+            exc,
+        )
+        return False
     if os.name != "posix":
         logger.warning(
             "Owner-only (0600) permissions cannot be guaranteed for %s: "

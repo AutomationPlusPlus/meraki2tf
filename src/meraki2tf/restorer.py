@@ -1831,9 +1831,19 @@ class OrgRestorer:
                         graph.organization_id,
                     )
                 except Exception as exc:  # noqa: BLE001 - original stands
+                    # Same withholding rule as the main handler: the SDK
+                    # error text can echo the rejected request fields,
+                    # and this action's payload may carry live secrets.
+                    detail = (
+                        f"{type(exc).__name__} (status "
+                        f"{getattr(exc, 'status', 'n/a')}); detail "
+                        "withheld — the request carried secret values"
+                        if _secret_paths(dispatch_action.payload)
+                        else str(exc)
+                    )
                     logger.debug(
                         "End-of-run salvage retry for %s failed (%s); "
-                        "the original failure stands.", key, exc,
+                        "the original failure stands.", key, detail,
                     )
                     continue
                 self._bookkeep_success(

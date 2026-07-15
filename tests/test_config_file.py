@@ -175,8 +175,9 @@ def _parse_with_config(tmp_path: Path, text: str, argv: list[str]) -> RuntimeCon
 
     path = _write(tmp_path, text)
     parser = build_parser()
-    args = parser.parse_args(["--config", str(path), *argv])
-    _apply_config_file(parser, args)
+    full_argv = ["--config", str(path), *argv]
+    args = parser.parse_args(full_argv)
+    _apply_config_file(parser, args, full_argv)
     return RuntimeConfig.from_args(args)
 
 
@@ -248,7 +249,7 @@ def test_no_config_flag_leaves_args_untouched(tmp_path: Path) -> None:
     args = parser.parse_args([])
     from meraki2tf.cli import _apply_config_file
 
-    _apply_config_file(parser, args)
+    _apply_config_file(parser, args, [])
     assert args.org_id is None
     assert args.workdir == "generated"
 

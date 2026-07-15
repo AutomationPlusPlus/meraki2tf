@@ -78,7 +78,7 @@ SECRET_KEY_PATTERN = re.compile(
     r"secret|psk|passphrase|password(?!expiration|length|s$|count)"
     r"|community|token|api_?key|auth_?key"
     r"|shared_?key|auth_?pass|priv_?pass|passcode|pin$|private_?key"
-    r"|credential|license_?key",
+    r"|credential|license_?key|encryption_?key|wep_?key|wpa_?key",
     re.IGNORECASE,
 )
 _SECRET_KEY = SECRET_KEY_PATTERN

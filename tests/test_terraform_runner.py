@@ -1025,12 +1025,17 @@ def test_apply_import_plan_verifies_then_applies_the_saved_plan(
 
     show_command, apply_command = scripted.calls
     assert show_command[1] == "show"
-    # The verified plan file is applied verbatim — no TOCTOU window.
+    # Verification and apply are bound to the same run-private COPY of
+    # the plan file, so a concurrent run rewriting the shared filename
+    # cannot swap in a mutating plan between the two steps.
+    verified_name = show_command[-1]
+    assert verified_name.startswith(f"{SYNC_PLAN_FILENAME}.verified-")
     assert apply_command == (
-        "terraform", "apply", "-input=false", "-no-color", SYNC_PLAN_FILENAME,
+        "terraform", "apply", "-input=false", "-no-color", verified_name,
     )
     assert added == ("meraki_devices.q2ab", "meraki_networks.n_1")
     assert not (runner.workdir / SYNC_PLAN_FILENAME).exists()
+    assert not (runner.workdir / verified_name).exists()
 
 
 def test_apply_import_plan_noop_when_state_is_current(

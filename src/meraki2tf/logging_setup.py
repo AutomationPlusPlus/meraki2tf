@@ -35,7 +35,16 @@ class SecretRedactionFilter(logging.Filter):
     """Strip credential material from every record before it is emitted."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        message = record.getMessage()
+        try:
+            message = record.getMessage()
+        except Exception:
+            # A malformed log call (mismatched %-args) raises here —
+            # and logging does NOT catch exceptions from filters, so it
+            # would crash the caller instead of landing in
+            # Handler.handleError like every other formatting fault.
+            # Degrade to the unformatted template (still redacted).
+            message = str(record.msg)
+            record.args = None
         redacted = self._redact(message)
         if redacted != message:
             record.msg = redacted
@@ -55,9 +64,13 @@ class SecretRedactionFilter(logging.Filter):
     @staticmethod
     def _redact(text: str) -> str:
         redacted = _HEADER_PATTERN.sub(rf"\g<1>{_REDACTED}", text)
-        token = os.environ.get(API_KEY_ENV_VAR, "").strip()
-        if token:
-            redacted = redacted.replace(token, _REDACTED)
+        # Both credential variables: the dashboard key and the provider
+        # convention's MERAKI_API_KEY, which an operator may set to a
+        # *different* token (the runner respects it and never overrides).
+        for env_var in (API_KEY_ENV_VAR, "MERAKI_API_KEY"):
+            token = os.environ.get(env_var, "").strip()
+            if token:
+                redacted = redacted.replace(token, _REDACTED)
         return redacted
 
 

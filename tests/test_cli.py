@@ -192,7 +192,7 @@ def test_dump_to_failure_dispatches_processing_fault(
         delivered.append(json.loads(request.data.decode("utf-8")))
         return FakeResponse()
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr("meraki2tf.alerts.webhook._open", fake_urlopen)
     _no_network(monkeypatch)
     out = tmp_path / "already-a-directory"
     out.mkdir()  # write_snapshot cannot write text over a directory
@@ -289,7 +289,7 @@ def test_dump_mode_end_to_end(
         return FakeResponse()
 
     monkeypatch.setattr(terraform_runner.subprocess, "run", fake_run)
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr("meraki2tf.alerts.webhook._open", fake_urlopen)
     _no_network(monkeypatch)
     workdir = tmp_path / "workspace"
 
@@ -351,7 +351,7 @@ def test_pipeline_fault_exits_one_and_alerts(
         return FakeResponse()
 
     monkeypatch.setattr(terraform_runner.subprocess, "run", failing_run)
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr("meraki2tf.alerts.webhook._open", fake_urlopen)
     _no_network(monkeypatch)
 
     exit_code = main(
@@ -891,7 +891,7 @@ def test_sync_end_to_end_applies_import_only_plan(
         return FakeResponse()
 
     monkeypatch.setattr(terraform_runner.subprocess, "run", fake_run)
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr("meraki2tf.alerts.webhook._open", fake_urlopen)
 
     exit_code = main(
         ["--spec", str(spec_file), "--from-dump", str(dump_file),
@@ -908,7 +908,8 @@ def test_sync_end_to_end_applies_import_only_plan(
     assert [call[1] for call in terraform_calls] == [
         "init", "providers", "plan", "show", "apply",
     ]
-    assert terraform_calls[-1][-1] == "meraki2tf-sync.tfplan"
+    # The apply consumes the run-private verified copy of the plan.
+    assert terraform_calls[-1][-1].startswith("meraki2tf-sync.tfplan.verified-")
     assert [event["event_type"] for event in delivered] == ["RUN_SUCCESS"]
     success = delivered[0]["details"]
     assert success["resources_added_to_state"] == [
@@ -962,7 +963,7 @@ def test_sync_end_to_end_aborts_mutating_plan(
         return FakeResponse()
 
     monkeypatch.setattr(terraform_runner.subprocess, "run", fake_run)
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr("meraki2tf.alerts.webhook._open", fake_urlopen)
 
     exit_code = main(
         ["--spec", str(spec_file), "--from-dump", str(dump_file),
@@ -1110,7 +1111,7 @@ def test_startup_failure_dispatches_processing_fault(
         delivered.append(json.loads(request.data.decode("utf-8")))
         return FakeResponse()
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr("meraki2tf.alerts.webhook._open", fake_urlopen)
     exit_code = main(
         [
             "--spec", str(tmp_path / "missing-spec.json"),
@@ -1135,7 +1136,7 @@ def test_sync_without_api_key_alerts_the_scheduler(
         delivered.append(json.loads(request.data.decode("utf-8")))
         return FakeResponse()
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr("meraki2tf.alerts.webhook._open", fake_urlopen)
     exit_code = main(
         ["--from-dump", str(dump_file), "--sync",
          "--webhook-url", "https://hooks.example/alerts"]
@@ -1297,7 +1298,7 @@ def test_export_flags_unsupported_and_notifies_success(
         delivered.append(json.loads(request.data.decode("utf-8")))
         return FakeResponse()
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr("meraki2tf.alerts.webhook._open", fake_urlopen)
     from conftest import DUMP_DOCUMENT
 
     document = json.loads(json.dumps(DUMP_DOCUMENT))
@@ -1831,7 +1832,7 @@ def test_export_with_drift_baseline_reports_snapshot_drift(
         delivered.append(json.loads(request.data.decode("utf-8")))
         return FakeResponse()
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr("meraki2tf.alerts.webhook._open", fake_urlopen)
     baseline = tmp_path / "baseline.json"
     baseline.write_text(
         json.dumps(
@@ -1875,7 +1876,7 @@ def test_export_with_identical_drift_baseline_is_quiet(
         delivered.append(json.loads(request.data.decode("utf-8")))
         return FakeResponse()
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr("meraki2tf.alerts.webhook._open", fake_urlopen)
     first = tmp_path / "first.json"
     assert main(
         ["--spec", str(spec_file), "--from-dump", str(dump_file),
@@ -2009,7 +2010,7 @@ def test_restore_execution_fault_alerts_and_exits_1(
         delivered.append(json.loads(request.data.decode("utf-8")))
         return FakeResponse()
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr("meraki2tf.alerts.webhook._open", fake_urlopen)
     dump = _restore_dump(tmp_path)
     exit_code = main(
         ["--spec", str(spec_file), "--restore", "--from-dump", str(dump),
@@ -2219,7 +2220,7 @@ def test_restore_confirm_executes_and_alerts(
         delivered.append(json.loads(request.data.decode("utf-8")))
         return FakeResponse()
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr("meraki2tf.alerts.webhook._open", fake_urlopen)
     dump = _restore_dump(tmp_path)
     workdir = tmp_path / "ws"
     exit_code = main(
@@ -2695,7 +2696,7 @@ def test_wipe_confirm_executes_and_alerts(
         delivered.append(json.loads(request.data.decode("utf-8")))
         return FakeResponse()
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr("meraki2tf.alerts.webhook._open", fake_urlopen)
     exit_code = main(
         ["--spec", str(spec_file), "--wipe-org", "org-drill",
          "--wipe-org-name", "Drill Org", "--confirm",
@@ -2895,7 +2896,7 @@ def test_wipe_execution_fault_alerts_and_exits_1(
         delivered.append(json.loads(request.data.decode("utf-8")))
         return FakeResponse()
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr("meraki2tf.alerts.webhook._open", fake_urlopen)
     exit_code = main(
         ["--spec", str(spec_file), "--wipe-org", "org-drill",
          "--wipe-org-name", "Drill Org", "--confirm",

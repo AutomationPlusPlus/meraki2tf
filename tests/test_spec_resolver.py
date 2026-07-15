@@ -245,7 +245,14 @@ def test_download_uses_urllib_and_wraps_failures(
         def __exit__(self, *exc_info: object) -> None:
             return None
 
+        def __init__(self) -> None:
+            self._sent = False
+
         def read(self, amount: int | None = None) -> bytes:
+            # File-object contract: the body once, then EOF (b"").
+            if self._sent:
+                return b""
+            self._sent = True
             return json.dumps(_spec("1.56.0")).encode("utf-8")
 
     captured = SimpleNamespace(url=None, timeout=None)
@@ -299,6 +306,9 @@ def test_download_refuses_an_oversized_response(
 class _GarbledResponse:
     """A body that is not valid UTF-8 (a truncated CDN error, say)."""
 
+    def __init__(self) -> None:
+        self._sent = False
+
     def __enter__(self) -> "_GarbledResponse":
         return self
 
@@ -306,6 +316,10 @@ class _GarbledResponse:
         return None
 
     def read(self, amount: int | None = None) -> bytes:
+        # File-object contract: the body once, then EOF (b"").
+        if self._sent:
+            return b""
+        self._sent = True
         return b"\xff\xfe{}"
 
 

@@ -50,7 +50,7 @@ _BUNDLED_RESOURCE = "provider_catalog.json"
 #: interpolated raw into generated HCL — so it is validated at
 #: ingestion (a tampered cache carrying HCL metacharacters cannot
 #: reach the kit; only the import ID is quote-escaped downstream).
-_RESOURCE_NAME_RE = re.compile(r"^meraki_[a-z0-9_]+$")
+_RESOURCE_NAME_RE = re.compile(r"^meraki_[a-z0-9_]+\Z")
 
 
 class CatalogError(RuntimeError):

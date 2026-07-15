@@ -169,7 +169,17 @@ class StaticJsonDataProvider(MerakiDataProvider):
         self._get_ops: dict[str, OperationSpec] | None = None
         try:
             document = _load_snapshot_document(dump_path)
-        except (OSError, json.JSONDecodeError) as exc:
+        except (
+            OSError,
+            json.JSONDecodeError,
+            # A hand-edited/corrupted snapshot: non-UTF-8 bytes, a gzip
+            # stream truncated mid-write (EOFError), or pathological
+            # nesting must all land on the contract's "unreadable
+            # snapshot" path, not crash the run raw.
+            UnicodeDecodeError,
+            EOFError,
+            RecursionError,
+        ) as exc:
             raise MalformedDumpError(f"Cannot read snapshot {dump_path}: {exc}") from exc
         if not isinstance(document, dict):
             raise MalformedDumpError(f"Snapshot {dump_path} must be a JSON object.")
@@ -301,10 +311,20 @@ class StaticJsonDataProvider(MerakiDataProvider):
                 f"Snapshot {self._path}: feature 'pathValues' must be an "
                 f"array of ID components, got {type(raw_values).__name__}."
             )
+        raw_payload = item.get("payload") or {}
+        if not isinstance(raw_payload, dict):
+            # FeatureConfiguration.payload is a Mapping by contract; a
+            # scalar or array here (tampered/corrupted snapshot) would
+            # crash restore/heal/diff planning with a raw TypeError far
+            # from the snapshot-load error path.
+            raise MalformedDumpError(
+                f"Snapshot {self._path}: feature 'payload' must be an "
+                f"object, got {type(raw_payload).__name__}."
+            )
         return FeatureConfiguration(
             api_path=str(item["apiPath"]),
             path_values=tuple(str(v) for v in raw_values),
-            payload=item.get("payload") or {},
+            payload=raw_payload,
         )
 
     # ------------------------------------------------------------------

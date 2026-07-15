@@ -23,6 +23,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from meraki2tf.fileio import atomic_write_text
 from meraki2tf.hcl_generator import CapturedAsset, UnsupportedAsset
 
 logger = logging.getLogger(__name__)
@@ -117,11 +118,11 @@ def build_manifest(
 def write_manifest(manifest: dict[str, Any], workdir: Path) -> tuple[Path, Path]:
     """Write coverage.json and its human-readable twin into the workdir."""
     json_path = workdir / COVERAGE_JSON_FILENAME
-    json_path.write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    atomic_write_text(
+        json_path, json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     )
     summary_path = workdir / COVERAGE_SUMMARY_FILENAME
-    summary_path.write_text(_render_summary(manifest), encoding="utf-8")
+    atomic_write_text(summary_path, _render_summary(manifest))
     logger.info(
         "Coverage manifest written: %s and %s (%.2f%% of %d discovered "
         "object(s) covered by Terraform).",
@@ -151,7 +152,10 @@ def _render_summary(manifest: dict[str, Any]) -> str:
         lines += ["", "Objects Terraform cannot rebuild (manual DR runbook):"]
         lines += [
             f"  - {entry['api_path']} "
-            f"(ids={','.join(entry['identifiers']) or '<none>'}): {entry['reason']}"
+            f"(ids={','.join(entry['identifiers']) or '<none>'}): "
+            # Provider diagnostics can be multi-line; one entry must
+            # stay one line so nothing reads as a separate report item.
+            + " ".join(str(entry["reason"]).split())
             for entry in unsupported
         ]
     if manifest["deletions_pending_confirmation"]:

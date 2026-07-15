@@ -58,23 +58,24 @@ class HealPlan:
         )
 
 
-def live_asset_keys(live: NetworkGraph) -> frozenset[str]:
+def live_asset_keys(live: NetworkGraph, parser: OpenApiParser) -> frozenset[str]:
     """Every asset identity discoverable in the live organization.
 
-    Key shapes mirror :func:`plan_restore` exactly — networks and
-    device claims use the synthetic collection paths their actions
-    carry, features use their own ``api_path::path_values``.
+    Keys come from running the SAME classification (:func:`plan_restore`)
+    over the live graph, so shapes match the snapshot plan's action keys
+    by construction — including features the classifier rewrites onto a
+    synthesized item path (adaptive-policy-style elements). A hand-built
+    mirror of the key shapes once missed those rewrites, so a surviving
+    object's key never matched, it classified as "missing", and heal
+    would re-create — or adopt-and-align, i.e. MODIFY — a survivor,
+    violating additive-only. Unrestorable live assets contribute their
+    raw keys so the unrestorable filter matches the same way.
     """
-    keys = {
-        f"/organizations/{{organizationId}}/networks::{n.network_id}"
-        for n in live.networks
-    }
+    live_plan = plan_restore(live, parser)
+    keys = {action.key for action in live_plan.actions}
     keys |= {
-        f"/networks/{{networkId}}/devices/claim::{d.network_id},{d.serial}"
-        for d in live.devices
-    }
-    keys |= {
-        f"{f.api_path}::{','.join(f.path_values)}" for f in live.features
+        f"{item.api_path}::{','.join(item.path_values)}"
+        for item in live_plan.unrestorable
     }
     return frozenset(keys)
 
@@ -90,7 +91,7 @@ def plan_heal(
     subtree into the heal plan without any tree walking here.
     """
     full = plan_restore(snapshot, parser)
-    alive = live_asset_keys(live)
+    alive = live_asset_keys(live, parser)
     missing = tuple(a for a in full.actions if a.key not in alive)
     surviving = tuple(a for a in full.actions if a.key in alive)
     mappings: list[IdentityMapping] = []

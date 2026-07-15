@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -36,10 +37,15 @@ SPEC_REMOTE_URL = (
 DEFAULT_SPEC_FILENAME = "spec3.json"
 
 _DOWNLOAD_TIMEOUT_SECONDS = 60.0
+#: Wall-clock ceiling on the whole transfer. The socket timeout above
+#: is per read operation, so a server dripping one byte per minute
+#: would otherwise keep the unattended DR job "alive" forever.
+_DOWNLOAD_DEADLINE_SECONDS = 600.0
 #: The published Meraki spec is a few MB; cap the download so a
 #: poisoned or wrong endpoint cannot OOM the unattended DR job with an
 #: unbounded response body.
 _MAX_SPEC_BYTES = 128 * 1024 * 1024
+_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 
 
 class SpecResolutionError(RuntimeError):
@@ -47,11 +53,32 @@ class SpecResolutionError(RuntimeError):
 
 
 def _download(url: str) -> str:
+    deadline = time.monotonic() + _DOWNLOAD_DEADLINE_SECONDS
     try:
         with urllib.request.urlopen(url, timeout=_DOWNLOAD_TIMEOUT_SECONDS) as response:
             # Read one byte past the ceiling so an oversized body is
-            # detected rather than silently truncated.
-            raw: bytes = response.read(_MAX_SPEC_BYTES + 1)
+            # detected rather than silently truncated. Chunked with a
+            # wall-clock deadline: the socket timeout only bounds each
+            # read, so a byte-dripping server would otherwise stall the
+            # unattended run indefinitely.
+            chunks: list[bytes] = []
+            received = 0
+            while received <= _MAX_SPEC_BYTES:
+                if time.monotonic() > deadline:
+                    raise SpecResolutionError(
+                        f"Spec download from {url} did not complete within "
+                        f"{_DOWNLOAD_DEADLINE_SECONDS:.0f}s; giving up."
+                    )
+                chunk = response.read(
+                    min(_DOWNLOAD_CHUNK_BYTES, _MAX_SPEC_BYTES + 1 - received)
+                )
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                received += len(chunk)
+            raw = b"".join(chunks)
+    except SpecResolutionError:
+        raise
     except Exception as exc:
         raise SpecResolutionError(
             f"Could not download the Meraki OpenAPI spec from {url}: {exc}"
@@ -75,7 +102,9 @@ def _download(url: str) -> str:
 def _parse_spec(text: str, source: str) -> dict[str, Any]:
     try:
         document = json.loads(text)
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, RecursionError) as exc:
+        # RecursionError: pathologically nested JSON must degrade like
+        # any other malformed document so the local-copy fallback runs.
         raise SpecResolutionError(f"Spec from {source} is not valid JSON: {exc}") from exc
     if not isinstance(document, dict):
         raise SpecResolutionError(f"Spec from {source} is not a JSON object.")
