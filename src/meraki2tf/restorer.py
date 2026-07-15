@@ -66,6 +66,7 @@ from meraki2tf.replayer import (
     split_redacted as _split_redacted,
 )
 from meraki2tf.runbook import write_operations
+from meraki2tf.sanitizer import SECRET_KEY_PATTERN
 from meraki2tf.spec.engine import OperationSpec
 
 logger = logging.getLogger(__name__)
@@ -501,6 +502,10 @@ class ReferenceResolver:
                 entries[:] = [
                     entry for entry in entries if entry[1] != new
                 ]
+
+    def has_mapping(self, stem: str, old: str) -> bool:
+        """Is any mapping recorded for ``(stem, old)``?"""
+        return bool(self._entries.get((stem, old)))
 
     def sibling_mapping(self, stem: str, old: str) -> str | None:
         """The single new ID recorded for ``(stem, old)`` anywhere.
@@ -1057,6 +1062,86 @@ def _fill_secret_slots(
     return True
 
 
+def _inject_absent_list_secrets(
+    payload: Mapping[str, Any],
+    seed: str,
+    op: OperationSpec | None,
+) -> tuple[dict[str, Any], tuple[str, ...]]:
+    """Fill schema-declared secret slots Meraki never returned.
+
+    Write-only secrets (a RADIUS server's ``secret``) are absent from
+    GET echoes entirely — redaction never saw them, so
+    ``secret_reentry`` is empty and the PUT fails ("Secret can't be
+    blank"). For every list of objects PRESENT in the payload whose
+    item schema declares secret-shaped properties, absent slots get
+    deterministic drill placeholders. Only list elements qualify: a
+    present element is in use and needs its secret, while a top-level
+    absent secret (an open SSID's ``psk``) may be genuinely
+    inapplicable and must stay absent.
+    """
+    schema: Any = op.raw.get("requestBody") if op is not None and op.raw else None
+    for key in ("content", "application/json", "schema"):
+        schema = schema.get(key) if isinstance(schema, Mapping) else None
+    if not isinstance(schema, Mapping):
+        return dict(payload), ()
+    filled = _json_copy(dict(payload))
+    injected: set[str] = set()
+    _fill_absent_schema_secrets(filled, schema, seed, "", injected)
+    return filled, tuple(sorted(injected))
+
+
+def _fill_absent_schema_secrets(
+    node: Any,
+    schema: Mapping[str, Any],
+    seed: str,
+    base: str,
+    injected: set[str],
+) -> None:
+    props = schema.get("properties")
+    if not isinstance(node, dict) or not isinstance(props, Mapping):
+        return
+    for key, value in node.items():
+        sub = props.get(key)
+        if not isinstance(sub, Mapping):
+            continue
+        path = f"{base}.{key}" if base else key
+        if isinstance(value, dict):
+            _fill_absent_schema_secrets(value, sub, seed, path, injected)
+            continue
+        if not isinstance(value, list):
+            continue
+        items = sub.get("items")
+        if not isinstance(items, Mapping):
+            continue
+        item_props = items.get("properties")
+        if not isinstance(item_props, Mapping):
+            continue
+        secret_props = [
+            (name, prop)
+            for name, prop in item_props.items()
+            if isinstance(prop, Mapping) and SECRET_KEY_PATTERN.search(name)
+        ]
+        for i, element in enumerate(value):
+            if not isinstance(element, dict):
+                continue
+            for name, prop in secret_props:
+                if name in element:
+                    continue
+                digest = hashlib.sha256(
+                    f"{seed}:{path}[].{name}[{i}]".encode()
+                ).hexdigest()[:12]
+                if prop.get("type") in ("integer", "number"):
+                    element[name] = (
+                        int(digest[:6], 16) % 90000000 + 10000000
+                    )
+                else:
+                    element[name] = f"drill-{digest}"
+                injected.add(f"{path}[].{name}")
+            _fill_absent_schema_secrets(
+                element, items, seed, f"{path}[]", injected
+            )
+
+
 def _own_identity(action: RestoreAction) -> tuple[str, str]:
     """(type stem, old ID) of the object an action creates or claims."""
     if action.wave == WAVE_NETWORKS:
@@ -1398,6 +1483,31 @@ class OrgRestorer:
                     )
                     continue
                 if action.key in self._journal.completed:
+                    if (
+                        action.kind == "create"
+                        and not resolver.has_mapping(*_own_identity(action))
+                    ):
+                        # A completed create with no journaled mapping:
+                        # the run that created it could not extract the
+                        # response ID, so every reference to it is dead
+                        # on this and all future resumes. Recover the
+                        # mapping by matching the existing object in
+                        # the target.
+                        remembered = self._reconcile_existing(
+                            dashboard, action, resolver,
+                            graph.organization_id,
+                        )
+                        if remembered is not None:
+                            self._bookkeep_success(
+                                action, remembered, resolver,
+                                graph.organization_id,
+                            )
+                            logger.warning(
+                                "Recovered the missing ID mapping for "
+                                "%s by matching the already-restored "
+                                "object in the target organization.",
+                                action.key,
+                            )
                     skipped.append(
                         {"target": action.key, "reason": "already restored "
                          "(journal); resume skips completed actions"}
@@ -1486,14 +1596,23 @@ class OrgRestorer:
                         continue
                 dispatch_action = action
                 injected_paths: tuple[str, ...] = ()
-                if self._skip_claims and action.secret_reentry:
+                if self._skip_claims:
                     # A sanitized-snapshot drill: redacted secret slots
                     # get valid placeholders so the write exercises the
                     # same shape a real restore would ("Password is
-                    # required to enable WPA encryption" otherwise).
+                    # required to enable WPA encryption" otherwise) —
+                    # and write-only secrets the API never echoed
+                    # (RADIUS server secrets) are filled from the
+                    # write schema ("Secret can't be blank").
                     filled, injected_paths = _inject_drill_secrets(
                         action.payload, action.secret_reentry, action.key,
                         op=action.operation,
+                    )
+                    filled, absent = _inject_absent_list_secrets(
+                        filled, action.key, action.operation
+                    )
+                    injected_paths = tuple(
+                        sorted({*injected_paths, *absent})
                     )
                     if injected_paths:
                         dispatch_action = replace(action, payload=filled)
