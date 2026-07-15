@@ -732,11 +732,15 @@ def _wipe_org(config: RuntimeConfig) -> int:
         return 1
     logger.warning(
         "Wipe target verified: organization %s (%r), %d network(s), "
-        "0 claimed devices, %d admin(s) besides the caller%s.",
+        "%d config template(s), 0 claimed devices, %d admin(s) besides "
+        "the caller%s.",
         preview.organization_id, preview.organization_name,
-        preview.network_count, preview.other_admin_count,
-        " (they will be removed before the organization is deleted)"
-        if preview.other_admin_count else "",
+        preview.network_count, preview.config_template_count,
+        preview.other_admin_count,
+        " (templates/admins are removed before the organization is "
+        "deleted)"
+        if preview.other_admin_count or preview.config_template_count
+        else "",
     )
     if not config.confirm:
         logger.warning(
