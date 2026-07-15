@@ -378,7 +378,11 @@ class ForeignScopeError(RuntimeError):
 
 #: Policy-object grammar embedded in firewall rule strings, and the
 #: reference-key stems its two verbs resolve through.
-_OBJ_GRP_RE = re.compile(r"\b(GRP|OBJ)\((\d+)\)")
+#: Sanitized snapshots carry pseudonymized IDs inside the grammar
+#: (``OBJ(id-0012)``), so the ID part must admit more than digits — a
+#: digits-only pattern silently skips the rewrite and dead pseudonyms
+#: reach the dashboard ("Source address must be an IP address …").
+_OBJ_GRP_RE = re.compile(r"\b(GRP|OBJ)\(([\w-]+)\)")
 _GRAMMAR_KEYS = {"GRP": "policyObjectGroupId", "OBJ": "policyObjectId"}
 
 #: Payload keys whose values are cross-references to other objects.
@@ -802,7 +806,19 @@ _NAME_CONFLICT_RE = re.compile(
 #: class this feature needs" — inevitable on device-free drill orgs.
 _CAPABILITY_RE = re.compile(
     r"(?i)only supports organizations with .+ networks"
+    r"|is not supported for this network"
+    r"|consider upgrading your devices"
 )
+
+#: Dashboard 400 texts meaning "this setting is governed by the
+#: network's config template" — a bound network refuses the write for
+#: everyone, drill or not; the template's own copy restores separately.
+_TEMPLATE_BOUND_RE = re.compile(r"(?i)on a template network")
+
+
+class _EmptyConfigureSkip(Exception):
+    """A configure payload stripped to nothing — nothing to write."""
+
 
 #: Payload keys that identify an object as the Meraki-provisioned
 #: default of its collection (staged upgrade groups carry `isDefault`,
@@ -842,6 +858,27 @@ def _match_collection_item(
     return None
 
 
+def _derived_collection_id_key(api_path: str) -> str | None:
+    """Conventional ``<singular>Id`` named after the collection segment.
+
+    Some collections key their elements this way while the item path's
+    own placeholder is a generic ``{id}`` — adaptive policy
+    ``groups/{id}`` elements (and create responses) carry ``groupId``.
+    """
+    segments = [s for s in api_path.split("/") if s]
+    if len(segments) < 2 or not segments[-1].startswith("{"):
+        return None
+    collection = segments[-2]
+    if collection.startswith("{"):
+        return None
+    singular = (
+        collection[:-3] + "y"
+        if collection.endswith("ies")
+        else collection.removesuffix("s")
+    )
+    return f"{singular}Id"
+
+
 def _item_identifier(
     action: RestoreAction, item: Mapping[str, Any]
 ) -> str | None:
@@ -858,17 +895,26 @@ def _item_identifier(
         if placeholders:
             found = item.get(placeholders[-1])
     if found is None:
-        segments = [s for s in action.api_path.split("/") if s]
-        if len(segments) >= 2 and segments[-1].startswith("{"):
-            collection = segments[-2]
-            if not collection.startswith("{"):
-                singular = (
-                    collection[:-3] + "y"
-                    if collection.endswith("ies")
-                    else collection.removesuffix("s")
-                )
-                found = item.get(f"{singular}Id")
+        derived = _derived_collection_id_key(action.api_path)
+        if derived:
+            found = item.get(derived)
     return str(found) if found is not None else None
+
+
+def _effectively_empty(value: Any) -> bool:
+    """Is a write body nothing but null leaves and empty containers?
+
+    A GET echo can strip to this after null pruning (a config
+    template's cellular uplink reads back ``{"bandwidthLimits":
+    {"limitUp": null, "limitDown": null}}``), and the dashboard rejects
+    the resulting PUT with "None of the fields were specified" — there
+    is simply nothing to restore.
+    """
+    if isinstance(value, Mapping):
+        return all(_effectively_empty(inner) for inner in value.values())
+    if isinstance(value, list):
+        return all(_effectively_empty(inner) for inner in value)
+    return value is None
 
 
 def _body_serial_properties(op: OperationSpec) -> frozenset[str]:
@@ -889,13 +935,21 @@ def _body_serial_properties(op: OperationSpec) -> frozenset[str]:
 def _schema_type_at(
     op: OperationSpec | None, parts: Sequence[str]
 ) -> str | None:
-    """The JSON-schema ``type`` of a dotted body path, if declared."""
+    """The JSON-schema ``type`` of a dotted body path, if declared.
+
+    A ``name[]`` segment descends through the array property's
+    ``items`` schema (``radiusServers[].port`` → integer).
+    """
     node: Any = op.raw.get("requestBody") if op is not None and op.raw else None
     for key in ("content", "application/json", "schema"):
         node = node.get(key) if isinstance(node, Mapping) else None
     for part in parts:
+        is_list = part.endswith("[]")
+        name = part[:-2] if is_list else part
         props = node.get("properties") if isinstance(node, Mapping) else None
-        node = props.get(part) if isinstance(props, Mapping) else None
+        node = props.get(name) if isinstance(props, Mapping) else None
+        if is_list and isinstance(node, Mapping):
+            node = node.get("items")
     return node.get("type") if isinstance(node, Mapping) else None
 
 
@@ -908,41 +962,99 @@ def _inject_drill_secrets(
     """Fill redacted secret slots with deterministic drill placeholders.
 
     A sanitized snapshot strips secret values, but some writes are
-    invalid without one (a WPA SSID needs a psk, SNMP needs a community
-    string) — a drill would fail exactly the objects it is supposed to
-    rehearse. The placeholder shape satisfies the strictest validators
-    seen live (8+ chars, letters/digits/hyphens only) and is derived
-    from the action key + path, so resumed drills stay idempotent.
-    Only mapping paths are reconstructable; list slots (``a[]``) stay
-    omitted. Returns the filled payload and the paths actually filled.
+    invalid without one (a WPA SSID needs a psk, a RADIUS server needs
+    a secret) — a drill would fail exactly the objects it is supposed
+    to rehearse. The placeholder shape satisfies the strictest
+    validators seen live (8+ chars, letters/digits/hyphens only) and is
+    derived from the action key + path (+ element index inside lists),
+    so resumed drills stay idempotent. Returns the filled payload and
+    the paths actually filled.
     """
-    filled = {key: value for key, value in payload.items()}
+    filled = _json_copy(dict(payload))
     injected: list[str] = []
     for path in paths:
-        if "[]" in path:
-            continue
         parts = path.split(".")
-        node: Any = filled
-        for part in parts[:-1]:
-            child = node.get(part) if isinstance(node, Mapping) else None
-            if not isinstance(child, Mapping):
-                node = None
-                break
-            child = dict(child)
-            node[part] = child
-            node = child
-        if not isinstance(node, dict):
-            continue
-        digest = hashlib.sha256(f"{seed}:{path}".encode()).hexdigest()[:12]
-        if _schema_type_at(op, parts) in ("integer", "number"):
-            # A numeric secret slot (a PIN, a passcode) rejects string
-            # placeholders outright; a deterministic 8-digit number
-            # satisfies the widest live validators.
-            node[parts[-1]] = int(digest[:6], 16) % 90000000 + 10000000
-        else:
-            node[parts[-1]] = f"drill-{digest}"
-        injected.append(path)
+        if _fill_secret_slots(filled, parts, seed, path, op, ""):
+            injected.append(path)
     return filled, tuple(injected)
+
+
+def _json_copy(value: Any) -> Any:
+    """Deep copy of a plain-JSON payload tree."""
+    if isinstance(value, Mapping):
+        return {key: _json_copy(inner) for key, inner in value.items()}
+    if isinstance(value, list):
+        return [_json_copy(inner) for inner in value]
+    return value
+
+
+def _drill_placeholder(
+    op: OperationSpec | None, parts: Sequence[str], digest: str
+) -> Any:
+    if _schema_type_at(op, parts) in ("integer", "number"):
+        # A numeric secret slot (a PIN, a passcode) rejects string
+        # placeholders outright; a deterministic 8-digit number
+        # satisfies the widest live validators.
+        return int(digest[:6], 16) % 90000000 + 10000000
+    return f"drill-{digest}"
+
+
+def _fill_secret_slots(
+    node: Any,
+    parts: Sequence[str],
+    seed: str,
+    path: str,
+    op: OperationSpec | None,
+    index: str,
+) -> bool:
+    """Fill every slot addressed by ``parts`` under ``node``.
+
+    ``name[]`` segments fan out over list elements (a RADIUS SSID
+    carries ``radiusServers[].secret`` — one redacted secret per
+    server), with the element index folded into the digest so each
+    element gets a distinct, deterministic placeholder.
+    """
+    if not isinstance(node, dict) or not parts:
+        return False
+    head, rest = parts[0], parts[1:]
+    is_list = head.endswith("[]")
+    key = head[:-2] if is_list else head
+    if is_list:
+        # List and container hops need the structure present; a LEAF
+        # slot is assigned unconditionally — the sanitizer STRIPS
+        # secret slots rather than nulling them, so the key is absent.
+        elements = node.get(key)
+        if not isinstance(elements, list):
+            return False
+        hit = False
+        for i, element in enumerate(elements):
+            if rest:
+                if _fill_secret_slots(
+                    element, rest, seed, path, op, f"{index}[{i}]"
+                ):
+                    hit = True
+            else:
+                digest = hashlib.sha256(
+                    f"{seed}:{path}{index}[{i}]".encode()
+                ).hexdigest()[:12]
+                # Type lookup needs the FULL dotted path (this frame's
+                # ``parts`` is truncated by the recursion).
+                elements[i] = _drill_placeholder(
+                    op, path.split("."), digest
+                )
+                hit = True
+        return hit
+    if rest:
+        return _fill_secret_slots(
+            node.get(key), rest, seed, path, op, index
+        )
+    digest = hashlib.sha256(
+        f"{seed}:{path}{index}".encode()
+    ).hexdigest()[:12]
+    # Type lookup needs the FULL dotted path (this frame's ``parts``
+    # is truncated by the recursion).
+    node[key] = _drill_placeholder(op, path.split("."), digest)
+    return True
 
 
 def _own_identity(action: RestoreAction) -> tuple[str, str]:
@@ -1423,6 +1535,11 @@ class OrgRestorer:
                             graph.organization_id,
                             drop_unresolvable=action.key in drop_retry,
                         )
+                except _EmptyConfigureSkip as exc:
+                    skipped.append(
+                        {"target": action.key, "reason": str(exc)}
+                    )
+                    continue
                 except UnmappedReferenceError as exc:
                     if action.key in drop_retry:
                         # Even dropping unresolvable fields could not
@@ -1688,6 +1805,16 @@ class OrgRestorer:
                 "drill organization has no claimed hardware of the "
                 "required class; it only restores in a real disaster "
                 "recovery",
+            )
+        if _TEMPLATE_BOUND_RE.search(text):
+            # Not drill-specific: a template-bound network refuses this
+            # write for everyone; the config template's own copy of the
+            # setting restores separately and governs the network.
+            return (
+                "skip",
+                "the dashboard refuses this write on a template-bound "
+                "network; the setting is governed by its config "
+                "template (restored separately)",
             )
         return ("failed", None)
 
@@ -1964,6 +2091,11 @@ class OrgRestorer:
                 body = {field: items}
         body = _strip_nulls(body)
         body = shape_rules(action.api_path, body)
+        if action.kind == "configure" and _effectively_empty(body):
+            raise _EmptyConfigureSkip(
+                "the captured payload holds no writable values (null "
+                "leaves only); nothing to restore"
+            )
         section = getattr(dashboard, op.tags[0], None) if op.tags else None
         method = (
             getattr(section, op.operation_id, None)
@@ -1987,18 +2119,15 @@ class OrgRestorer:
             response = method(*params.values(), _json=body)
         self._bucket.on_success()
         if action.kind in ("create", "claim") and isinstance(response, Mapping):
-            new_id = response.get("id")
-            if new_id is None:
-                # Create responses key their identity differently per
-                # collection ('groupId', 'payloadTemplateId', …); the
-                # item path's own placeholder names the field. Without
-                # this, the mapping is never recorded and every child
-                # referencing the object fails on dead snapshot IDs.
-                placeholders = _PATH_PARAM_RE.findall(action.api_path)
-                if placeholders:
-                    new_id = response.get(placeholders[-1])
+            # Create responses key their identity differently per
+            # collection ('groupId', 'payloadTemplateId', …): a generic
+            # 'id', the item path's own placeholder, or the
+            # '<singular>Id' convention. Without this, the mapping is
+            # never recorded and every child referencing the object
+            # fails on dead snapshot IDs.
+            new_id = _item_identifier(action, response)
             if new_id is not None:
-                return str(new_id)
+                return new_id
         return None
 
     def _reconcile_existing(

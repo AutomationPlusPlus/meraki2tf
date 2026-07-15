@@ -2004,16 +2004,30 @@ def test_real_restores_never_inject_placeholders(tmp_path: Path) -> None:
 def test_inject_drill_secrets_handles_nesting_and_list_slots() -> None:
     from meraki2tf.restorer import _inject_drill_secrets
 
-    payload = {"radius": {"host": "10.0.0.1"}, "servers": [{"a": 1}]}
+    payload = {
+        "radius": {"host": "10.0.0.1"},
+        "servers": [{"a": 1}, {"a": 2}],
+    }
     filled, injected = _inject_drill_secrets(
         payload,
         ("radius.secret", "servers[].secret", "missing.parent.secret"),
         "seed",
     )
-    assert injected == ("radius.secret",)
+    assert injected == ("radius.secret", "servers[].secret")
     assert filled["radius"]["secret"].startswith("drill-")
     assert payload["radius"] == {"host": "10.0.0.1"}  # input untouched
-    assert filled["servers"] == [{"a": 1}]  # list slots stay omitted
+    assert payload["servers"] == [{"a": 1}, {"a": 2}]  # input untouched
+    # List slots fan out: every element gets a DISTINCT deterministic
+    # placeholder (a RADIUS SSID carries one secret per server).
+    first, second = (server["secret"] for server in filled["servers"])
+    assert first.startswith("drill-") and second.startswith("drill-")
+    assert first != second
+    refill, _ = _inject_drill_secrets(
+        payload,
+        ("radius.secret", "servers[].secret", "missing.parent.secret"),
+        "seed",
+    )
+    assert refill == filled  # deterministic across resumed drills
 
 
 def test_serial_schema_configures_are_drill_skipped(tmp_path: Path) -> None:
@@ -3599,3 +3613,309 @@ def test_adopt_default_falls_through_on_every_non_match(
         ]),
         action(), resolver, "org-123", "isDefault",
     ) == "9"
+
+
+# ------------------------------------ enriched-drill regression fixes
+
+
+def test_grammar_rewrites_pseudonymized_policy_object_ids() -> None:
+    """Sanitized snapshots pseudonymize policy-object IDs inside the
+    GRP()/OBJ() firewall grammar (``OBJ(id-0012)``); the digits-only
+    pattern silently skipped the rewrite and dead pseudonyms reached
+    the dashboard ('Source address must be an IP address ...').
+    Numeric IDs must keep rewriting."""
+    from meraki2tf.restorer import ReferenceResolver, rewrite_references
+
+    graph = _graph(
+        FeatureConfiguration(PO_ITEM, ("org-123", "id-0012"), {"name": "web"}),
+    )
+    resolver = ReferenceResolver(graph)
+    resolver.record("policyobject", "id-0012", "9012")
+    resolver.record("policyobjectgroup", "id-0015", "9015")
+    resolver.record("policyobject", "42", "9042")
+    payload = {
+        "rules": [
+            {"policy": "deny", "srcCidr": "OBJ(id-0012)",
+             "destCidr": "GRP(id-0015)"},
+            {"policy": "allow", "srcCidr": "OBJ(42)"},
+        ]
+    }
+    rewritten = rewrite_references(payload, resolver, ("N_1",))
+    assert rewritten["rules"][0]["srcCidr"] == "OBJ(9012)"
+    assert rewritten["rules"][0]["destCidr"] == "GRP(9015)"
+    assert rewritten["rules"][1]["srcCidr"] == "OBJ(9042)"
+
+
+def test_derived_collection_id_key_singularizes_the_collection() -> None:
+    from meraki2tf.restorer import _derived_collection_id_key
+
+    assert _derived_collection_id_key(
+        "/organizations/{organizationId}/adaptivePolicy/groups/{id}"
+    ) == "groupId"
+    # -ies plurals singularize (policies -> policyId).
+    assert _derived_collection_id_key(
+        "/organizations/{organizationId}/policies/{id}"
+    ) == "policyId"
+    # Non-item paths (no trailing placeholder) carry no convention.
+    assert _derived_collection_id_key(SNMP_PATH) is None
+    # A placeholder-only collection segment derives no convention.
+    assert _derived_collection_id_key("/networks/{networkId}/{id}") is None
+    # A bare item placeholder has no collection segment at all.
+    assert _derived_collection_id_key("/{id}") is None
+
+
+def test_create_response_id_extracted_via_the_collection_convention(
+    tmp_path: Path,
+) -> None:
+    """An adaptive-policy-group create answers with ONLY ``groupId``
+    (no ``id``, and the item path's own placeholder is a generic
+    ``{id}``): the mapping must still be recorded or every child
+    referencing the group fails on dead snapshot IDs (the live 'Create
+    returned no object ID' -> 'no rebuilt counterpart' failure)."""
+    apg_collection = "/organizations/{organizationId}/adaptivePolicy/groups"
+    apg_item = apg_collection + "/{id}"
+    spec = {
+        "openapi": "3.0.0", "info": {"title": "apg", "version": "1"},
+        "paths": {
+            "/organizations/{organizationId}/networks": {
+                "get": _op("getOrganizationNetworks", "organizations"),
+                "post": _op("createOrganizationNetwork", "organizations"),
+            },
+            "/networks/{networkId}/devices/claim": {
+                "post": _op("claimNetworkDevices", "networks"),
+            },
+            apg_collection: {
+                "get": _op(
+                    "getOrganizationAdaptivePolicyGroups", "organizations"
+                ),
+                "post": _op(
+                    "createOrganizationAdaptivePolicyGroup", "organizations"
+                ),
+            },
+            apg_item: {
+                "get": _op(
+                    "getOrganizationAdaptivePolicyGroup", "organizations"
+                ),
+            },
+            SNMP_PATH: {
+                "get": _op("getNetworkSnmp", "networks"),
+                "put": _op("updateNetworkSnmp", "networks"),
+            },
+        },
+    }
+    path = tmp_path / "apg-spec.json"
+    path.write_text(json.dumps(spec), encoding="utf-8")
+    parser = OpenApiParser(path)
+    graph = _graph(
+        FeatureConfiguration(
+            apg_item, ("org-123", "APG_9"),
+            {"name": "Employee Group", "sgt": 5},
+        ),
+        FeatureConfiguration(
+            SNMP_PATH, ("N_1",), {"access": "none", "groupId": "APG_9"},
+        ),
+    )
+    plan = plan_restore(graph, parser)
+    restorer, calls = _executor(
+        tmp_path,
+        responses={
+            "createOrganizationAdaptivePolicyGroup": {"groupId": "955"}
+        },
+    )
+    result = restorer.execute(graph, plan)
+
+    assert result.failed == ()
+    assert f"{apg_item}::org-123,APG_9" in result.executed
+    # The dependent child resolves to the NEW server-assigned ID.
+    snmp = next(c for c in calls if c[0] == "updateNetworkSnmp")
+    assert snmp[2]["groupId"] == "955"
+
+
+def test_effectively_empty_detects_null_only_bodies() -> None:
+    from meraki2tf.restorer import _effectively_empty
+
+    assert _effectively_empty({"a": {"b": None}}) is True
+    assert _effectively_empty({}) is True
+    assert _effectively_empty({"a": []}) is True
+    assert _effectively_empty({"a": [None]}) is True
+    assert _effectively_empty({"a": 0}) is False
+    assert _effectively_empty({"a": ["x"]}) is False
+
+
+def test_null_only_configure_payload_is_skipped_not_dispatched(
+    tmp_path: Path,
+) -> None:
+    """A GET echo can strip to nothing but null leaves (a config
+    template's cellular uplink reads back ``{"bandwidthLimits":
+    {"limitUp": null, "limitDown": null}}``); the dashboard 400s the
+    resulting PUT with 'None of the fields were specified' — there is
+    nothing to restore, so the action skips without any API call."""
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(
+            SNMP_PATH, ("N_1",),
+            {"bandwidthLimits": {"limitUp": None, "limitDown": None}},
+        ),
+    )
+    plan = plan_restore(graph, parser)
+    restorer, calls = _executor(tmp_path)
+    result = restorer.execute(graph, plan)
+
+    assert result.failed == ()
+    assert all(c[0] != "updateNetworkSnmp" for c in calls)  # never sent
+    (entry,) = [
+        e for e in result.skipped if e["target"] == f"{SNMP_PATH}::N_1"
+    ]
+    assert "no writable values" in entry["reason"]
+    assert f"{SNMP_PATH}::N_1" not in result.executed
+
+
+def test_device_class_capability_400_is_drill_skipped(
+    tmp_path: Path,
+) -> None:
+    """"'wan2' is not supported for this network. Consider upgrading
+    your devices" is the device-class refusal a hardware-free drill org
+    produces: drill-skip under --skip-claims, not failure."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import _CAPABILITY_RE, OrgRestorer, RestoreJournal
+
+    # Both new alternatives match independently.
+    assert _CAPABILITY_RE.search("'wan2' is not supported for this network")
+    assert _CAPABILITY_RE.search("Consider upgrading your devices")
+
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(SNMP_PATH, ("N_1",), {"access": "none"})
+    )
+    plan = plan_restore(graph, parser)
+    calls: list = []
+
+    class Section(_RecordingSection):
+        def updateNetworkSnmp(self, *args, **kwargs) -> dict:
+            self._calls.append(("updateNetworkSnmp", args, kwargs))
+            raise _conflict_error(
+                "'wan2' is not supported for this network. Consider "
+                "upgrading your devices"
+            )
+
+    section = Section(calls)
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "j.jsonl"), skip_claims=True
+    )
+    restorer._client = SimpleNamespace(
+        organizations=section, networks=section, wireless=section
+    )
+    result = restorer.execute(graph, plan)
+    assert result.failed == ()
+    assert any("drill:" in entry["reason"] for entry in result.skipped)
+
+
+def test_template_bound_400_skips_even_outside_drills(
+    tmp_path: Path,
+) -> None:
+    """'Cannot configure sensor alerts on a template network' is NOT
+    drill-gated: a template-bound network refuses the write for
+    everyone; the config template's own copy restores separately."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(SNMP_PATH, ("N_1",), {"access": "none"})
+    )
+    plan = plan_restore(graph, parser)
+    calls: list = []
+
+    class Section(_RecordingSection):
+        def updateNetworkSnmp(self, *args, **kwargs) -> dict:
+            self._calls.append(("updateNetworkSnmp", args, kwargs))
+            raise _conflict_error(
+                "Cannot configure sensor alerts on a template network"
+            )
+
+    section = Section(calls)
+    restorer = OrgRestorer(  # a REAL restore: skip_claims stays False
+        "org-TARGET", RestoreJournal(tmp_path / "j.jsonl")
+    )
+    restorer._client = SimpleNamespace(
+        organizations=section, networks=section, wireless=section
+    )
+    result = restorer.execute(graph, plan)
+
+    assert result.failed == ()
+    (entry,) = [
+        e for e in result.skipped if e["target"] == f"{SNMP_PATH}::N_1"
+    ]
+    assert "governed by its config template" in entry["reason"]
+    assert not entry["reason"].startswith("drill:")
+    # No pointless retry: the refusal is classified on the first 400.
+    assert len([c for c in calls if c[0] == "updateNetworkSnmp"]) == 1
+
+
+def test_schema_type_at_descends_array_hops(tmp_path: Path) -> None:
+    """A ``name[]`` path segment descends through the array property's
+    ``items`` schema, so per-element numeric slots keep their declared
+    type (``radiusServers[].port`` -> integer placeholder)."""
+    from meraki2tf.restorer import _inject_drill_secrets, _schema_type_at
+    from meraki2tf.spec.engine import OperationSpec
+
+    op = OperationSpec(
+        operation_id="updateNetworkWirelessSsid", method="put",
+        path=SSID_ITEM, path_params=("networkId", "number"),
+        tags=("wireless",),
+        raw={"requestBody": {"content": {"application/json": {"schema": {
+            "type": "object",
+            "properties": {
+                "radiusServers": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "port": {"type": "integer"},
+                            "secret": {"type": "string"},
+                        },
+                    },
+                },
+            },
+        }}}}},
+    )
+    assert _schema_type_at(op, ["radiusServers[]", "port"]) == "integer"
+    assert _schema_type_at(op, ["radiusServers[]", "secret"]) == "string"
+
+    payload = {"radiusServers": [{"host": "10.0.0.1"}, {"host": "10.0.0.2"}]}
+    filled, injected = _inject_drill_secrets(
+        payload,
+        ("radiusServers[].port", "radiusServers[].secret"),
+        "seed", op=op,
+    )
+    assert injected == ("radiusServers[].port", "radiusServers[].secret")
+    ports = [server["port"] for server in filled["radiusServers"]]
+    assert all(
+        isinstance(port, int) and 10000000 <= port <= 99999999
+        for port in ports
+    )
+    secrets = [server["secret"] for server in filled["radiusServers"]]
+    assert all(re.fullmatch(r"drill-[0-9a-f]{12}", s) for s in secrets)
+    assert secrets[0] != secrets[1]  # per-element digests, never shared
+    assert payload["radiusServers"] == [
+        {"host": "10.0.0.1"}, {"host": "10.0.0.2"}
+    ]  # input untouched
+
+
+def test_list_leaf_secret_slots_fan_out_with_distinct_placeholders() -> None:
+    """A list-leaf slot (``secrets[]`` over scalar elements) replaces
+    every element; a path whose container is not a list stays omitted."""
+    from meraki2tf.restorer import _inject_drill_secrets
+
+    filled, injected = _inject_drill_secrets(
+        {"secrets": ["gone", "gone"], "psks": {"not": "a list"}},
+        ("secrets[]", "psks[]"),
+        "seed",
+    )
+    assert injected == ("secrets[]",)  # psks is no list: no slot to fill
+    first, second = filled["secrets"]
+    assert first.startswith("drill-") and second.startswith("drill-")
+    assert first != second
+    assert filled["psks"] == {"not": "a list"}
