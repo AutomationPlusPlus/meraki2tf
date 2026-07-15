@@ -24,6 +24,7 @@ import inspect
 import itertools
 import logging
 import os
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -99,6 +100,46 @@ _SCOPE_REFUSAL_HTTP_STATUSES = frozenset({400, 404})
 def _scope_label(params: dict[str, str]) -> str:
     """Human-readable scope for log/error messages, any parameter depth."""
     return ", ".join(f"{name} {value}" for name, value in params.items())
+
+
+#: Session verbs a generated SDK method may call and still be
+#: dispatchable by discovery. Discovery filters operations by the
+#: *spec-declared* method, but dispatch resolves purely by
+#: operationId/tag strings from that same spec — so a stale or
+#: tampered spec could label a mutating SDK method as a GET. The
+#: resolved method's own source is the ground truth for what it does.
+_READ_ONLY_SESSION_VERBS = frozenset({"get", "get_pages"})
+_SESSION_VERB_PATTERN = re.compile(r"self\._session\.([A-Za-z_]+)\(")
+#: Underlying SDK function → verified-read-only verdict (memoized; the
+#: SDK surface is a few hundred functions and source parsing is not free).
+_read_only_verdicts: dict[Any, bool] = {}
+
+
+def _method_is_read_only(method: Any) -> bool:
+    """True when the resolved SDK method verifiably only reads.
+
+    Only real ``meraki``-package methods carry the generated
+    ``self._session.<verb>(`` fingerprint; anything else (a test double,
+    a wrapper) is outside the spec-poisoning threat model and passes.
+    Real SDK methods whose source cannot be read or whose verbs are not
+    exclusively read-only are refused — fail closed on Cardinal Rule 1.
+    """
+    func = getattr(method, "__func__", method)
+    module = getattr(func, "__module__", "") or ""
+    if module.split(".", 1)[0] != "meraki":
+        return True
+    cached = _read_only_verdicts.get(func)
+    if cached is not None:
+        return cached
+    try:
+        source = inspect.getsource(func)
+    except (OSError, TypeError):
+        verdict = False
+    else:
+        verbs = set(_SESSION_VERB_PATTERN.findall(source))
+        verdict = bool(verbs) and verbs <= _READ_ONLY_SESSION_VERBS
+    _read_only_verdicts[func] = verdict
+    return verdict
 
 
 #: Per-call throttle budget: every attempt is paced by the shared AIMD
@@ -541,6 +582,13 @@ class LiveApiDataProvider(MerakiDataProvider):
             raise LiveDispatchError(
                 f"Meraki SDK exposes no method for operation {op.operation_id!r} "
                 f"(tags={op.tags!r})."
+            )
+        if not _method_is_read_only(method):
+            raise LiveDispatchError(
+                f"Refusing to dispatch operation {op.operation_id!r}: the "
+                "resolved SDK method is not verifiably read-only. Discovery "
+                "never mutates Meraki, and a stale or tampered spec can "
+                "mislabel a mutating operation as a GET."
             )
         # Paginated SDK methods default to total_pages=1; without "all"
         # a large collection would be silently truncated to its first page.

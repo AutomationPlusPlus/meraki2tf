@@ -31,6 +31,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from meraki2tf.fileio import atomic_write_text
 from meraki2tf.hcl_generator import CapturedAsset, UnsupportedAsset
 from meraki2tf.models import NetworkGraph
 from meraki2tf.openapi_parser import OpenApiParser, entity_key, snake_case
@@ -210,6 +211,22 @@ def secret_attribute_union(
     }
 
 
+def _inline(text: object) -> str:
+    """Meraki-/provider-controlled free text, flattened to one line.
+
+    Unsupported-asset reasons carry raw provider diagnostics, and object
+    identifiers echo dashboard names: a newline in either would render
+    as its own markdown construct — e.g. an injected numbered step in
+    the rebuild instructions an operator follows verbatim mid-disaster.
+    """
+    return " ".join(str(text).split())
+
+
+def _code_span(text: object) -> str:
+    """Free text destined for a backtick code span or a table cell."""
+    return _inline(text).replace("`", "'").replace("|", "/")
+
+
 def _secret_sources(
     captured: tuple[CapturedAsset, ...],
     unmanaged_secret_attributes: Mapping[str, tuple[str, ...]],
@@ -238,8 +255,14 @@ def _secret_sources(
         keys = tuple(
             key for key in secret_payload_keys(payload) if snake_case(key) in wanted
         ) or tuple(attrs)
-        locator = f"`{asset.api_path}` ids=`{','.join(asset.identifiers)}`"
-        rows.append((address, attrs, locator, ", ".join(f"`{k}`" for k in keys)))
+        locator = (
+            f"`{_code_span(asset.api_path)}` "
+            f"ids=`{_code_span(','.join(asset.identifiers))}`"
+        )
+        rows.append(
+            (address, attrs, locator,
+             ", ".join(f"`{_code_span(k)}`" for k in keys))
+        )
     return rows
 
 
@@ -282,9 +305,9 @@ def build_runbook(
     if not unsupported:
         lines += ["None — every discovered object is covered by Terraform.", ""]
     for asset in sorted(unsupported, key=lambda a: (a.api_path, a.identifiers)):
-        ids = ",".join(asset.identifiers) or "<none>"
-        lines += [f"### `{asset.api_path}` — ids `{ids}`", ""]
-        lines += [f"- **Why Terraform can't carry it:** {asset.reason}"]
+        ids = _code_span(",".join(asset.identifiers)) or "<none>"
+        lines += [f"### `{_code_span(asset.api_path)}` — ids `{ids}`", ""]
+        lines += [f"- **Why Terraform can't carry it:** {_inline(asset.reason)}"]
         writes = ops.get(asset.api_path, ())
         if writes:
             best = writes[0]
@@ -351,7 +374,8 @@ def write_runbook(
 ) -> Path:
     """Write ``runbook.md`` into the workdir and return its path."""
     path = workdir / RUNBOOK_FILENAME
-    path.write_text(
+    atomic_write_text(
+        path,
         build_runbook(
             organization_id=organization_id,
             graph=graph,
@@ -360,7 +384,6 @@ def write_runbook(
             unmanaged_secret_attributes=unmanaged_secret_attributes,
             parser=parser,
         ),
-        encoding="utf-8",
     )
     secret_rows = _secret_sources(
         captured, unmanaged_secret_attributes, payload_index(graph)

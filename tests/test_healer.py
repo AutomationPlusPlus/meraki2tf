@@ -18,6 +18,11 @@ from meraki2tf.openapi_parser import OpenApiParser
 GP_ITEM = "/networks/{networkId}/groupPolicies/{groupPolicyId}"
 VLAN_ITEM = "/networks/{networkId}/appliance/vlans/{vlanId}"
 SNMP_PATH = "/networks/{networkId}/snmp"
+#: Adaptive-policy-style class: captured at its collection, but the
+#: only update writer lives on the item path — plan_restore synthesizes
+#: the item-path action key for it.
+APG_COLLECTION = "/networks/{networkId}/adaptivePolicy/groups"
+APG_ITEM = "/networks/{networkId}/adaptivePolicy/groups/{groupId}"
 
 
 def _heal_spec(tmp_path: Path) -> OpenApiParser:
@@ -47,6 +52,13 @@ def _heal_spec(tmp_path: Path) -> OpenApiParser:
             SNMP_PATH: {
                 "get": _op("getNetworkSnmp", "networks"),
                 "put": _op("updateNetworkSnmp", "networks"),
+            },
+            APG_COLLECTION: {
+                "get": _op("getNetworkAdaptivePolicyGroups", "networks"),
+                "post": _op("createNetworkAdaptivePolicyGroup", "networks"),
+            },
+            APG_ITEM: {
+                "put": _op("updateNetworkAdaptivePolicyGroup", "networks"),
             },
         },
     }
@@ -117,7 +129,7 @@ def test_plan_heal_classifies_missing_vs_surviving(tmp_path: Path) -> None:
     assert "untouched" in plan.summary()
 
 
-def test_live_asset_keys_mirror_plan_key_shapes() -> None:
+def test_live_asset_keys_mirror_plan_key_shapes(tmp_path: Path) -> None:
     live = NetworkGraph(
         organization_id="org-123",
         networks=(_network("N_1", "HQ"),),
@@ -131,10 +143,42 @@ def test_live_asset_keys_mirror_plan_key_shapes() -> None:
             FeatureConfiguration(SNMP_PATH, ("N_1",), {"access": "none"}),
         ),
     )
-    keys = live_asset_keys(live)
+    keys = live_asset_keys(live, _heal_spec(tmp_path))
     assert "/organizations/{organizationId}/networks::N_1" in keys
     assert "/networks/{networkId}/devices/claim::N_1,Q2AB-CDEF-GHIJ" in keys
     assert f"{SNMP_PATH}::N_1" in keys
+
+
+def test_surviving_synthesized_item_path_asset_is_never_missing(
+    tmp_path: Path,
+) -> None:
+    """Additive-only regression guard for the item-path rewrite.
+
+    plan_restore rewrites adaptive-policy-style features onto a
+    synthesized ITEM path (key ``.../groups/{groupId}::N_1,7``) while
+    live discovery captures them at their COLLECTION path. A hand-built
+    live-key mirror missed that rewrite, so the surviving object's key
+    never matched, it classified as missing, and heal would re-create —
+    or adopt-and-align, i.e. modify — a survivor."""
+    parser = _heal_spec(tmp_path)
+    apg = FeatureConfiguration(
+        APG_COLLECTION, ("N_1",), {"groupId": "7", "name": "employees"}
+    )
+    snapshot = NetworkGraph(
+        organization_id="org-123",
+        networks=(_network("N_1", "HQ"),),
+        devices=(),
+        features=(apg,),
+    )
+    live = NetworkGraph(
+        organization_id="org-123",
+        networks=(_network("N_1", "HQ"),),
+        devices=(),
+        features=(apg,),
+    )
+    plan = plan_heal(snapshot, live, parser)
+    assert plan.missing.actions == ()
+    assert plan.surviving_count == plan.snapshot_asset_count
 
 
 def test_heal_executor_recreates_only_missing_with_identity_refs(

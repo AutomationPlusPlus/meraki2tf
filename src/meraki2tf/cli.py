@@ -42,6 +42,7 @@ from meraki2tf.alerts import (
     heal_executed,
     org_wipe_executed,
     processing_fault,
+    rebuild_executed,
     restore_executed,
     run_success,
     AlertDispatcher,
@@ -689,13 +690,26 @@ def _rebuild(config: RuntimeConfig) -> int:
             "the organization from the generated artifacts."
         )
         return 0
+    # Built before the write, like every other guarded DR path: a
+    # misconfigured channel must refuse the action up front, and a
+    # mid-incident half-applied rebuild must reach the on-call channel,
+    # not just the local terminal.
+    dispatcher = build_dispatcher(config)
     try:
         runner.rebuild_apply()
     except (TerraformError, OSError) as exc:
         logger.critical("Rebuild apply failed: %s", exc)
+        dispatcher.dispatch(
+            rebuild_executed(
+                workspace=str(config.workdir), succeeded=False, error=str(exc)
+            )
+        )
         return 1
     logger.info(
         "Rebuild complete: the organization now matches the generated artifacts."
+    )
+    dispatcher.dispatch(
+        rebuild_executed(workspace=str(config.workdir), succeeded=True)
     )
     return 0
 
@@ -1258,16 +1272,29 @@ def _replay_gaps(config: RuntimeConfig) -> int:
     return 0
 
 
+#: Config-file keys that steer where a confirmed DR action WRITES.
+#: A long-lived file must never pick a write target: when a DR action
+#: is invoked, these must be typed on the command line.
+_DR_TARGET_DESTS = frozenset({"org_id", "from_dump"})
+
+
 def _apply_config_file(
-    arg_parser: argparse.ArgumentParser, args: argparse.Namespace
+    arg_parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    argv: Sequence[str],
 ) -> None:
     """Fill flags the command line left at their default from --config.
 
-    Precedence is strictly CLI > file > built-in default: a file value
-    is applied only where the parsed value still equals the parser's
-    default (i.e. the operator did not type the flag). The loader has
-    already refused every DR action, confirmation, and credential key,
-    so nothing applied here can widen a run's write surface.
+    Precedence is strictly CLI > file > built-in default: a flag the
+    operator actually typed (detected from ``argv``, so an explicitly
+    typed default value still wins) is never overridden, and a file
+    value is otherwise applied only where the parsed value still equals
+    the parser's default. The loader has already refused every DR
+    action, confirmation, and credential key; additionally, when this
+    invocation carries a DR write action, the file may not supply the
+    action's target (``org-id``/``from-dump``) — the org a confirmed
+    write lands in must be human-typed, never inherited from a
+    scheduled job's config file.
     """
     if args.config is None:
         return
@@ -1275,7 +1302,27 @@ def _apply_config_file(
         overrides = load_config_file(Path(args.config))
     except ConfigFileError as exc:
         arg_parser.error(str(exc))
+    tokens = list(argv)
+    explicit = {
+        action.dest
+        for action in arg_parser._actions
+        for option in action.option_strings
+        if any(token == option or token.startswith(f"{option}=") for token in tokens)
+    }
+    dr_action = any(
+        getattr(args, dest, False)
+        for dest in ("rebuild", "replay_gaps", "restore", "heal", "wipe_org")
+    )
     for dest, value in overrides.items():
+        if dr_action and dest in _DR_TARGET_DESTS and dest not in explicit:
+            arg_parser.error(
+                f"--config {args.config} supplies '{dest.replace('_', '-')}' "
+                "while a disaster-recovery action is invoked; the target of "
+                "a DR action must be typed on the command line (pass "
+                f"--{dest.replace('_', '-')} explicitly)."
+            )
+        if dest in explicit:
+            continue
         if getattr(args, dest) == arg_parser.get_default(dest):
             setattr(args, dest, value)
 
@@ -1283,7 +1330,9 @@ def _apply_config_file(
 def main(argv: Sequence[str] | None = None) -> int:
     arg_parser = build_parser()
     args = arg_parser.parse_args(argv)
-    _apply_config_file(arg_parser, args)
+    _apply_config_file(
+        arg_parser, args, sys.argv[1:] if argv is None else list(argv)
+    )
     try:
         config = RuntimeConfig.from_args(args)
     except BackendConfigError as exc:

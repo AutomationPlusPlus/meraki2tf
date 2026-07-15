@@ -83,23 +83,23 @@ class EmailNotifier(Notifier):
             # limits: relays that never advertise STARTTLS still get
             # plaintext (the contract designates email a placeholder),
             # and relays whose certificate fails validation (e.g.
-            # self-signed internal relays) now fail the handshake — the
-            # failure lands in the warning below and delivery over the
-            # broken connection then typically fails too.
-            try:
-                # EHLO first: has_extn() reads esmtp_features, which is
-                # only populated by ehlo() — connect() does not send it,
-                # so without this has_extn("starttls") is always False
-                # and the hop is never encrypted.
+            # self-signed internal relays) fail the handshake and the
+            # delivery with it. Once STARTTLS is advertised, a failed
+            # negotiation must fail the send: an active MITM can answer
+            # the STARTTLS command with a 454 while keeping the
+            # plaintext session usable, so "warn and send anyway" would
+            # hand the full drift diff to exactly the attacker TLS is
+            # for. The dispatcher logs the failure and isolates the
+            # channel.
+            #
+            # EHLO first: has_extn() reads esmtp_features, which is
+            # only populated by ehlo() — connect() does not send it,
+            # so without this has_extn("starttls") is always False
+            # and the hop is never encrypted.
+            smtp.ehlo()
+            if smtp.has_extn("starttls"):
+                smtp.starttls(context=ssl.create_default_context())
                 smtp.ehlo()
-                if smtp.has_extn("starttls"):
-                    smtp.starttls(context=ssl.create_default_context())
-                    smtp.ehlo()
-            except (smtplib.SMTPException, OSError) as exc:
-                logger.warning(
-                    "STARTTLS negotiation failed for event %s; sending over "
-                    "an unencrypted connection: %s", event.event_type.value, exc,
-                )
             refused = smtp.send_message(message)
         if refused:
             logger.error(

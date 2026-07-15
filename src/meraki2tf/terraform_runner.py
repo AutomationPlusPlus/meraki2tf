@@ -414,7 +414,13 @@ class TerraformRunner:
 
     def prepare_workspace(self) -> Path:
         """Create the execution directory and anchor provider + state backend."""
-        self._workdir.mkdir(parents=True, exist_ok=True)
+        # Owner-only container: the kit is secret-free by contract, but
+        # it still describes the whole org (firewall rules, VLANs,
+        # admins) and the directory holds the 0600 state/plan files —
+        # other local users have no business listing it. Only newly
+        # created directories get the mode; an operator's existing
+        # workdir keeps whatever they chose for it.
+        self._workdir.mkdir(mode=0o700, parents=True, exist_ok=True)
         provider_file = self._workdir / PROVIDER_FILENAME
         provider_file.write_text(
             _PROVIDER_TF_TEMPLATE.format(backend_block=self._backend_block()),
@@ -829,6 +835,12 @@ class TerraformRunner:
         as import-only by :meth:`apply_import_plan` exactly like a full
         plan. Read-only toward Meraki, like every plan.
         """
+        targets = list(addresses)
+        if not targets:
+            # An empty -target set silently degenerates into a full
+            # untargeted multi-hour plan — reopening exactly the race
+            # window this method exists to close.
+            raise ValueError("plan_targeted requires at least one address.")
         self._absorb_generated_config()
         args = [
             "plan",
@@ -838,11 +850,16 @@ class TerraformRunner:
             f"-generate-config-out={GENERATED_CONFIG_FILENAME}",
             f"-out={SYNC_PLAN_FILENAME}",
         ]
-        args.extend(f"-target={address}" for address in addresses)
+        args.extend(f"-target={address}" for address in targets)
         result = self._run(
             *args,
             allowed=(_PLAN_NO_CHANGES, _PLAN_ERROR, _PLAN_CHANGES_PRESENT),
         )
+        if result.returncode == _PLAN_ERROR:
+            # An errored plan writes no (or a partial) plan file; drop
+            # whatever is on disk so a previous window's saved plan
+            # cannot be mistaken for this one downstream.
+            (self._workdir / SYNC_PLAN_FILENAME).unlink(missing_ok=True)
         self._restrict_plan_file_permissions()
         self._absorb_generated_config()
         return result
@@ -926,13 +943,13 @@ class TerraformRunner:
         """
         return _document_resource_actions(self._show_plan_document())
 
-    def _show_plan_document(self) -> Any:
-        """The saved sync plan rendered as a JSON document.
+    def _show_plan_document(self, filename: str = SYNC_PLAN_FILENAME) -> Any:
+        """A saved plan file rendered as a JSON document.
 
         Consumers guard the document shape themselves (an unexpected
         non-object tolerantly classifies as "nothing to act on").
         """
-        result = self._run("show", "-json", SYNC_PLAN_FILENAME)
+        result = self._run("show", "-json", filename)
         try:
             return json.loads(result.stdout)
         except json.JSONDecodeError as exc:
@@ -954,8 +971,10 @@ class TerraformRunner:
         planned action is harmless (no-op/read — imports render as
         no-op). Applying a saved plan executes only the actions recorded
         in it — terraform never recomputes a diff at apply time, and
-        refuses the plan wholesale if the state changed underneath — so
-        nothing mutating can slip between verification and execution.
+        refuses the plan wholesale if the state changed underneath.
+        Verification and apply both run against a run-private copy of
+        the plan file, so a concurrent run rewriting the shared plan
+        filename cannot swap in a mutating plan between the two steps.
         Deliberately NOT a fresh re-plan: a full-kit re-plan is a
         multi-hour read window that a busy organization races with new
         clickops edits, starving the apply forever.
@@ -970,9 +989,24 @@ class TerraformRunner:
                 "Refusing to apply: no saved plan file exists to verify.",
                 plan_output="",
             )
+        # Verification and execution must be bound to one immutable
+        # artifact: a concurrent run sharing the workdir (e.g. an
+        # overlapping cron firing) rewrites the fixed plan filename, and
+        # terraform only refuses a swapped plan when the state serial
+        # moved — a mutating plan made against the same state would
+        # apply unverified. Snapshot the plan into a run-private,
+        # exclusively created owner-only copy; verify and apply THAT.
+        verified_name = f"{SYNC_PLAN_FILENAME}.verified-{os.getpid()}"
+        verified_file = self._workdir / verified_name
+        plan_bytes = plan_file.read_bytes()
+        descriptor = os.open(
+            verified_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+        )
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(plan_bytes)
         try:
             try:
-                document = self._show_plan_document()
+                document = self._show_plan_document(verified_name)
             except TerraformError as exc:
                 raise ImportGuardViolation(
                     "Refusing to apply: the saved plan could not be "
@@ -1020,9 +1054,10 @@ class TerraformRunner:
                 "(%d import(s), 0 mutations); applying to materialize state.",
                 imports,
             )
-            self._run("apply", "-input=false", "-no-color", SYNC_PLAN_FILENAME)
+            self._run("apply", "-input=false", "-no-color", verified_name)
             self._restrict_state_permissions()
         finally:
+            verified_file.unlink(missing_ok=True)
             plan_file.unlink(missing_ok=True)
         added = tuple(sorted(self.existing_addresses() - before))
         logger.info("State materialized: %d resource(s) added.", len(added))
@@ -1312,9 +1347,11 @@ class TerraformRunner:
                 # saved plan files itself; an 0o077 umask makes them
                 # owner-only from the first byte instead of leaving a
                 # world-readable window until the post-run chmod.
-                preexec_fn=(
-                    (lambda: os.umask(0o077)) if os.name == "posix" else None
-                ),
+                # subprocess's own umask parameter, not preexec_fn: a
+                # Python-level preexec_fn can deadlock the forked child
+                # when other threads (discovery pool) are live. -1 is
+                # the "leave unset" sentinel for non-POSIX platforms.
+                umask=0o077 if os.name == "posix" else -1,
             )
         except FileNotFoundError as exc:
             raise TerraformNotFoundError(

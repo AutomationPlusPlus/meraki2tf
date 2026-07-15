@@ -56,6 +56,21 @@ def condense_diff(text: str) -> str:
     return "\n".join(kept)
 
 
+#: Quoted HCL string (escapes included) — stripped before counting
+#: brackets so a bracket *inside* a rendered value cannot open or close
+#: a masked block.
+_QUOTED_STRING_RE = re.compile(r'"(?:\\.|[^"\\])*"')
+_HEREDOC_OPENER_RE = re.compile(r"<<[-~]?\s*(\w+)")
+
+
+def _bracket_delta(fragment: str) -> int:
+    cleaned = _QUOTED_STRING_RE.sub('""', fragment)
+    return sum(
+        cleaned.count(opener) - cleaned.count(closer)
+        for opener, closer in (("[", "]"), ("{", "}"), ("(", ")"))
+    )
+
+
 def redact_diff(text: str) -> str:
     """Mask attribute *values* on secret-named lines of a plan diff.
 
@@ -63,14 +78,31 @@ def redact_diff(text: str) -> str:
     the alert contract ("names and locators, never values") must not
     depend on the provider's schema being complete: any diff line whose
     attribute name is secret-shaped loses everything after the ``=``
-    (or ``:``) before the diff leaves the process.
+    (or ``:``) before the diff leaves the process. Values terraform
+    renders across multiple lines (lists, maps, heredocs) are masked to
+    their closing delimiter — a line-local redactor would strip only
+    the name line and pass every continuation line through raw.
     """
     redacted: list[str] = []
+    depth = 0
+    heredoc_tag: str | None = None
     for line in text.splitlines():
+        if heredoc_tag is not None:
+            if line.strip() == heredoc_tag:
+                heredoc_tag = None
+            continue
+        if depth > 0:
+            depth += _bracket_delta(line)
+            continue
         for separator in ("=", ":"):
-            head, sep, _ = line.partition(separator)
+            head, sep, value = line.partition(separator)
             tokens = head.split()
             if sep and tokens and SECRET_KEY_PATTERN.search(tokens[-1]):
+                opener = _HEREDOC_OPENER_RE.search(value)
+                if opener is not None:
+                    heredoc_tag = opener.group(1)
+                else:
+                    depth = max(0, _bracket_delta(value))
                 line = f"{head}{separator} (value redacted)"
                 break
         redacted.append(line)
@@ -97,6 +129,9 @@ class EventType(enum.Enum):
     #: A human-invoked --wipe-org --confirm tore down a hardware-free
     #: drill organization after a restore rehearsal.
     ORG_WIPE_EXECUTED = "ORG_WIPE_EXECUTED"
+    #: A human-invoked --rebuild --confirm ran terraform apply of the
+    #: generated DR kit against the organization.
+    REBUILD_EXECUTED = "REBUILD_EXECUTED"
 
 
 class EventSeverity(enum.Enum):
@@ -351,6 +386,31 @@ def org_wipe_executed(
             "deleted_networks": deleted_networks,
             "organization_deleted": organization_deleted,
             "failed": [list(item) for item in failed],
+        },
+    )
+
+
+def rebuild_executed(workspace: str, succeeded: bool, error: str = "") -> AlertEvent:
+    """Contract payload for a human-invoked terraform rebuild apply.
+
+    The largest write path of all (a full ``terraform apply``) must
+    reach the notification channels like every other DR action — a
+    mid-incident half-applied rebuild that only the local terminal saw
+    would leave the on-call channel blind. ``error`` carries the
+    (already value-free) failure text when ``succeeded`` is False.
+    """
+    return AlertEvent(
+        event_type=EventType.REBUILD_EXECUTED,
+        severity=EventSeverity.INFO if succeeded else EventSeverity.CRITICAL,
+        summary=(
+            f"Terraform rebuild apply from workspace {workspace} "
+            + ("completed." if succeeded else "FAILED — the organization "
+               "may be partially rebuilt.")
+        ),
+        details={
+            "workspace": workspace,
+            "succeeded": succeeded,
+            "error": error,
         },
     )
 

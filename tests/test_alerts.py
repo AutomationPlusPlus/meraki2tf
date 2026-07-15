@@ -23,6 +23,7 @@ from meraki2tf.alerts import (
     run_success,
     unsupported_feature_flagged,
 )
+from meraki2tf.alerts import webhook as webhook_module
 from meraki2tf.alerts.email import _default_smtp_factory
 
 
@@ -179,7 +180,7 @@ def test_webhook_posts_structured_json(monkeypatch: pytest.MonkeyPatch) -> None:
         captured["timeout"] = timeout
         return FakeResponse(200)
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(webhook_module, "_open", fake_urlopen)
     event = run_success(
         imports_written=1,
         drift_was_detected=False,
@@ -202,7 +203,7 @@ def test_webhook_posts_structured_json(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_webhook_raises_on_non_success_status(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        urllib.request, "urlopen", lambda request, timeout: FakeResponse(302)
+        webhook_module, "_open", lambda request, timeout: FakeResponse(302)
     )
     with pytest.raises(WebhookDeliveryError):
         WebhookNotifier("https://hooks.example/abc").send(
@@ -214,7 +215,7 @@ def test_webhook_wraps_transport_failures(monkeypatch: pytest.MonkeyPatch) -> No
     def fake_urlopen(request: urllib.request.Request, timeout: float) -> FakeResponse:
         raise OSError("connection refused")
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(webhook_module, "_open", fake_urlopen)
     with pytest.raises(WebhookDeliveryError):
         WebhookNotifier("https://hooks.example/abc").send(
             processing_fault(stage="x", error="y")
@@ -243,7 +244,7 @@ def test_webhook_https_failure_never_leaks_the_url(
     def fake_urlopen(request: urllib.request.Request, timeout: float) -> FakeResponse:
         raise OSError(f"connection to {url} refused")
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(webhook_module, "_open", fake_urlopen)
     with pytest.raises(WebhookDeliveryError) as excinfo:
         WebhookNotifier(url).send(processing_fault(stage="x", error="y"))
     assert "SECRETTOKEN" not in str(excinfo.value)

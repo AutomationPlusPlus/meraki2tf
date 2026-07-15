@@ -112,7 +112,7 @@ class SpecIngestionEngine:
         """Load a local OpenAPI JSON document (``--spec path/to/spec.json``)."""
         try:
             document = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
             raise MalformedSpecError(f"Cannot read OpenAPI spec {path}: {exc}") from exc
         if not isinstance(document, Mapping):
             raise MalformedSpecError(f"OpenAPI spec {path} is not a JSON object.")

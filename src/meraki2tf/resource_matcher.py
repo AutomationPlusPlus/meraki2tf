@@ -58,7 +58,7 @@ logger = logging.getLogger(__name__)
 _CAMEL_BOUNDARY = re.compile(
     r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])|(?<=[a-z][a-z])(?=[0-9])"
 )
-_PARAM_SEGMENT = re.compile(r"^\{.+\}$")
+_PARAM_SEGMENT = re.compile(r"^\{.+\}\Z")
 
 #: Identity attributes that scope a resource rather than identify one
 #: item of it.

@@ -43,7 +43,7 @@ from meraki2tf.spec.engine import OperationSpec, SpecIngestionEngine
 logger = logging.getLogger(__name__)
 
 _CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
-_PARAM_SEGMENT = re.compile(r"^\{.+\}$")
+_PARAM_SEGMENT = re.compile(r"^\{.+\}\Z")
 
 TERRAFORM_PROVIDER_PREFIX = "meraki"
 

@@ -38,11 +38,16 @@ class MerakiNetwork:
         network_id = str(payload.get("id", "")).strip()
         if not network_id:
             raise MalformedPayloadError(f"Network payload has no 'id': {sorted(payload)}")
+        # A bare-string productTypes (hand-edited dump) would decompose
+        # into single characters and silently skip product surfaces.
+        raw_types = payload.get("productTypes")
+        if not isinstance(raw_types, (list, tuple)):
+            raw_types = ()
         return cls(
             network_id=network_id,
             organization_id=str(payload.get("organizationId", "")),
             name=str(payload.get("name", "")),
-            product_types=tuple(str(p) for p in payload.get("productTypes") or ()),
+            product_types=tuple(str(p) for p in raw_types),
             payload=dict(payload),
         )
 
