@@ -2390,6 +2390,10 @@ class WipePreview:
     #: drills), and the dashboard refuses to delete an organization
     #: "with multiple users" — so the wipe must remove them first.
     other_admin_count: int = 0
+    #: Config templates are backed by hidden networks the network loop
+    #: never sees; the dashboard then refuses the org deletion with
+    #: "Cannot delete organization: it still has networks".
+    config_template_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -2492,7 +2496,31 @@ class OrgWiper:
             network_count=len(networks),
             claimed_device_count=0,
             other_admin_count=len(self._other_admins(organization_id)),
+            config_template_count=len(
+                self._config_templates(organization_id)
+            ),
         )
+
+    def _config_templates(self, organization_id: str) -> list[str]:
+        """IDs of the organization's config templates (may be empty)."""
+        dashboard = self._dashboard()
+        try:
+            self._bucket.acquire()
+            templates = dashboard.organizations.getOrganizationConfigTemplates(
+                organization_id
+            )
+            self._bucket.on_success()
+        except Exception as exc:  # noqa: BLE001 - degrade to none found
+            logger.debug(
+                "Could not enumerate config templates for %s (%s).",
+                organization_id, exc,
+            )
+            return []
+        return [
+            str(template.get("id", ""))
+            for template in (templates if isinstance(templates, list) else [])
+            if isinstance(template, Mapping) and template.get("id")
+        ]
 
     def _other_admins(self, organization_id: str) -> list[tuple[str, str]]:
         """``(admin_id, email)`` of every admin who is not the caller.
@@ -2558,6 +2586,23 @@ class OrgWiper:
                 deleted.append(network_id)
             except Exception as exc:  # noqa: BLE001 - per-object isolation
                 failed.append((network_id, str(exc)))
+        if not failed:
+            # Config templates are backed by hidden networks the loop
+            # above never lists; the dashboard refuses the organization
+            # deletion while any remain ("it still has networks").
+            for template_id in self._config_templates(organization_id):
+                try:
+                    self._bucket.acquire()
+                    dashboard.organizations.deleteOrganizationConfigTemplate(
+                        organization_id, template_id
+                    )
+                    self._bucket.on_success()
+                    logger.warning(
+                        "Wipe removed config template %s from "
+                        "organization %s.", template_id, organization_id,
+                    )
+                except Exception as exc:  # noqa: BLE001 - isolate
+                    failed.append((f"configTemplate:{template_id}", str(exc)))
         org_deleted = False
         if not failed:
             # Drill-restored admins block the organization deletion

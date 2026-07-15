@@ -3307,10 +3307,14 @@ def _admin_wipe_dashboard(
     with_identity: bool = True,
     admins_error: bool = False,
     admin_delete_error: bool = False,
+    templates: object = None,
+    template_delete_error: bool = False,
 ):
     from types import SimpleNamespace
 
-    deleted: dict[str, list] = {"networks": [], "orgs": [], "admins": []}
+    deleted: dict[str, list] = {
+        "networks": [], "orgs": [], "admins": [], "templates": [],
+    }
 
     class Organizations:
         def getOrganization(self, organizationId: str) -> dict:
@@ -3346,6 +3350,19 @@ def _admin_wipe_dashboard(
 
         def deleteOrganization(self, organizationId: str) -> dict:
             deleted["orgs"].append(organizationId)
+            return {}
+
+        def getOrganizationConfigTemplates(
+            self, organizationId: str
+        ) -> object:
+            return templates if templates is not None else []
+
+        def deleteOrganizationConfigTemplate(
+            self, organizationId: str, configTemplateId: str
+        ) -> dict:
+            if template_delete_error:
+                raise RuntimeError("template is protected")
+            deleted["templates"].append(configTemplateId)
             return {}
 
     class Networks:
@@ -4109,3 +4126,34 @@ def test_discovery_element_id_knows_the_family_convention() -> None:
         raw={},
     )
     assert element_id(op, {"adaptivePolicyId": "AP_9"}) == "AP_9"
+
+
+def test_wipe_removes_config_templates_before_the_org() -> None:
+    """Config templates are backed by hidden networks the network loop
+    never lists; the dashboard then refuses the org deletion with
+    'Cannot delete organization: it still has networks'."""
+    from meraki2tf.restorer import OrgWiper
+
+    wiper = OrgWiper()
+    wiper._client, deleted = _admin_wipe_dashboard(
+        templates=[{"id": "L_T1", "name": "tmpl"}]
+    )
+    preview = wiper.preview("org-drill", "Drill Org")
+    assert preview.config_template_count == 1
+    result = wiper.execute("org-drill", "Drill Org")
+    assert deleted["templates"] == ["L_T1"]
+    assert result.organization_deleted is True
+    assert result.failed == ()
+
+
+def test_wipe_template_failure_blocks_the_org_deletion() -> None:
+    from meraki2tf.restorer import OrgWiper
+
+    wiper = OrgWiper()
+    wiper._client, deleted = _admin_wipe_dashboard(
+        templates=[{"id": "L_T1"}], template_delete_error=True,
+    )
+    result = wiper.execute("org-drill", "Drill Org")
+    assert result.organization_deleted is False
+    assert deleted["orgs"] == []
+    assert any(key == "configTemplate:L_T1" for key, _ in result.failed)
