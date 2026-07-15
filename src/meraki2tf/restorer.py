@@ -252,9 +252,37 @@ def _classify_feature(
             lookup=lookups.get(creates[0].path),
             aligner=updates[0] if updates else None,
         )
-    operation = updates[0] if updates else creates[0]
+    placeholders = _PATH_PARAM_RE.findall(feature.api_path)
+    fitting_updates = tuple(
+        op for op in updates if len(op.path_params) <= len(placeholders)
+    )
+    if updates and not fitting_updates and creates:
+        # The only update writer lives on the ITEM path but the asset
+        # was captured at its collection (its element-ID key follows no
+        # convention discovery knew at capture time — adaptive policy
+        # elements carry `adaptivePolicyId`). Synthesize the item-path
+        # create so identity, mapping, and adoption work normally.
+        item_op = updates[0]
+        element = _element_identity_from_payload(item_op, payload)
+        if element is not None:
+            return RestoreAction(
+                kind="create",
+                wave=wave,
+                api_path=item_op.path,
+                path_values=(*feature.path_values, element),
+                operation=creates[0],
+                payload=payload,
+                secret_reentry=redacted,
+                lookup=lookups.get(creates[0].path),
+                aligner=item_op,
+            )
+    operation = (
+        fitting_updates[0]
+        if fitting_updates
+        else (creates[0] if creates else updates[0])
+    )
     return RestoreAction(
-        kind="configure" if updates else "create",
+        kind="configure" if operation.method == "put" else "create",
         wave=wave,
         api_path=feature.api_path,
         path_values=feature.path_values,
@@ -835,6 +863,32 @@ _DEFAULT_FLAG_RE = re.compile(r"(?i)^isdefault")
 #: ("SGT has already been taken"); `shortName` is an API keyword the
 #: sanitizer preserves verbatim, so both work from sanitized snapshots.
 _NATURAL_MATCH_KEYS = ("name", "sgt", "shortName")
+
+
+def _element_identity_from_payload(
+    item_op: OperationSpec, payload: Mapping[str, Any]
+) -> str | None:
+    """The element's own ID read from its payload, by convention.
+
+    Tried in order: the item path's own placeholder, the collection's
+    ``<singular>Id``, the family segment's ``<parent>Id`` (adaptive
+    policy elements carry ``adaptivePolicyId``), then a generic ``id``.
+    """
+    candidates: list[str] = []
+    if item_op.path_params:
+        candidates.append(item_op.path_params[-1])
+    derived = _derived_collection_id_key(item_op.path)
+    if derived:
+        candidates.append(derived)
+    segments = [s for s in item_op.path.split("/") if s]
+    if len(segments) >= 3 and not segments[-3].startswith("{"):
+        candidates.append(f"{segments[-3]}Id")
+    candidates.append("id")
+    for key in candidates:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
 
 
 def _default_flag_key(payload: Mapping[str, Any]) -> str | None:

@@ -4012,3 +4012,100 @@ def test_resume_recovers_mapping_for_done_but_unmapped_create(
     assert any(c[0] == "getNetworkGroupPolicies" for c in calls2)
     # …and no object was re-created or re-configured.
     assert not any(c[0] == "createNetworkGroupPolicy" for c in calls2)
+
+
+def test_element_identity_from_payload_tries_family_convention() -> None:
+    """Adaptive-policy elements key on ``adaptivePolicyId`` — the
+    FAMILY segment's convention, after the placeholder and the
+    collection's ``<singular>Id``."""
+    from meraki2tf.restorer import _element_identity_from_payload
+    from meraki2tf.spec.engine import OperationSpec
+
+    op = OperationSpec(
+        operation_id="updateOrganizationAdaptivePolicyPolicy",
+        method="put",
+        path="/organizations/{organizationId}/adaptivePolicy/policies/{id}",
+        path_params=("organizationId", "id"), tags=("organizations",),
+        raw={},
+    )
+    assert _element_identity_from_payload(op, {"id": "7"}) == "7"
+    assert _element_identity_from_payload(op, {"policyId": "8"}) == "8"
+    assert _element_identity_from_payload(
+        op, {"adaptivePolicyId": "id-0052"}
+    ) == "id-0052"
+    assert _element_identity_from_payload(op, {"name": "x"}) is None
+
+
+def test_collection_captured_item_synthesizes_an_item_create(
+    tmp_path: Path,
+) -> None:
+    """An asset captured at its COLLECTION path whose only update
+    writer lives on the item path (extra {id} the feature cannot bind)
+    is planned as an item-path CREATE via the collection POST — the
+    live 'missing 1 required positional argument' failure."""
+    ap_collection = "/organizations/{organizationId}/adaptivePolicy/policies"
+    ap_item = ap_collection + "/{id}"
+    spec = {
+        "openapi": "3.0.0", "info": {"title": "app", "version": "1"},
+        "paths": {
+            "/organizations/{organizationId}/networks": {
+                "get": _op("getOrganizationNetworks", "organizations"),
+                "post": _op("createOrganizationNetwork", "organizations"),
+            },
+            "/networks/{networkId}/devices/claim": {
+                "post": _op("claimNetworkDevices", "networks"),
+            },
+            ap_collection: {
+                "get": _op(
+                    "getOrganizationAdaptivePolicyPolicies", "organizations"
+                ),
+                "post": _op(
+                    "createOrganizationAdaptivePolicyPolicy", "organizations"
+                ),
+            },
+            ap_item: {
+                "get": _op(
+                    "getOrganizationAdaptivePolicyPolicy", "organizations"
+                ),
+                "put": _op(
+                    "updateOrganizationAdaptivePolicyPolicy", "organizations"
+                ),
+            },
+        },
+    }
+    path = tmp_path / "app-spec.json"
+    path.write_text(json.dumps(spec), encoding="utf-8")
+    parser = OpenApiParser(path)
+    graph = _graph(
+        FeatureConfiguration(
+            ap_collection, ("org-123",),
+            {"adaptivePolicyId": "AP_1", "lastEntryRule": "deny"},
+        ),
+    )
+    plan = plan_restore(graph, parser)
+    action = next(
+        a for a in plan.actions if "adaptivePolicy" in a.api_path
+    )
+    assert action.kind == "create"
+    assert action.api_path == ap_item
+    assert action.path_values == ("org-123", "AP_1")
+    assert action.operation.operation_id == (
+        "createOrganizationAdaptivePolicyPolicy"
+    )
+    assert action.aligner is not None
+    assert action.aligner.operation_id == (
+        "updateOrganizationAdaptivePolicyPolicy"
+    )
+
+
+def test_discovery_element_id_knows_the_family_convention() -> None:
+    from meraki2tf.providers.discovery import element_id
+    from meraki2tf.spec.engine import OperationSpec
+
+    op = OperationSpec(
+        operation_id="getOrganizationAdaptivePolicyPolicy", method="get",
+        path="/organizations/{organizationId}/adaptivePolicy/policies/{id}",
+        path_params=("organizationId", "id"), tags=("organizations",),
+        raw={},
+    )
+    assert element_id(op, {"adaptivePolicyId": "AP_9"}) == "AP_9"
