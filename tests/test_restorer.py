@@ -3919,3 +3919,96 @@ def test_list_leaf_secret_slots_fan_out_with_distinct_placeholders() -> None:
     assert first.startswith("drill-") and second.startswith("drill-")
     assert first != second
     assert filled["psks"] == {"not": "a list"}
+
+
+def test_absent_schema_secrets_injected_into_list_elements() -> None:
+    """Write-only secrets (a RADIUS server's ``secret``) never appear
+    in GET echoes, so redaction recorded nothing — the drill must fill
+    them from the WRITE SCHEMA for every present list element. Absent
+    top-level secrets (an open SSID's psk) stay absent."""
+    from meraki2tf.restorer import _inject_absent_list_secrets
+    from meraki2tf.spec.engine import OperationSpec
+
+    op = OperationSpec(
+        operation_id="updateNetworkWirelessSsid", method="put",
+        path=SSID_ITEM, path_params=("networkId", "number"),
+        tags=("wireless",),
+        raw={"requestBody": {"content": {"application/json": {"schema": {
+            "type": "object",
+            "properties": {
+                "psk": {"type": "string"},
+                "radiusServers": {
+                    "type": "array",
+                    "items": {"properties": {
+                        "host": {"type": "string"},
+                        "port": {"type": "integer"},
+                        "secret": {"type": "string"},
+                    }},
+                },
+            },
+        }}}}},
+    )
+    payload = {
+        "radiusServers": [
+            {"host": "10.0.0.1", "port": 1812},
+            {"host": "10.0.0.2", "port": 1812},
+            {"host": "10.0.0.3", "port": 1812, "secret": "kept"},
+        ],
+    }
+    filled, injected = _inject_absent_list_secrets(payload, "seed", op)
+    assert injected == ("radiusServers[].secret",)
+    first, second, third = filled["radiusServers"]
+    assert first["secret"].startswith("drill-")
+    assert second["secret"].startswith("drill-")
+    assert first["secret"] != second["secret"]  # per-element digests
+    assert third["secret"] == "kept"  # present slots untouched
+    assert "psk" not in filled  # top-level absent secrets stay absent
+    assert "secret" not in payload["radiusServers"][0]  # input untouched
+    refill, _ = _inject_absent_list_secrets(payload, "seed", op)
+    assert refill == filled  # deterministic across resumed drills
+
+
+def test_resume_recovers_mapping_for_done_but_unmapped_create(
+    tmp_path: Path,
+) -> None:
+    """A journal-done create whose run never extracted a response ID
+    leaves every reference permanently dead on resume; the resume now
+    recovers the mapping by matching the existing target object."""
+    from meraki2tf.restorer import RestoreJournal
+
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(
+            GP_ITEM, ("N_1", "100"), {"groupPolicyId": "100", "name": "kiosk"}
+        ),
+        FeatureConfiguration(
+            SSID_ITEM, ("N_1", "0"),
+            {"number": 0, "name": "Corp", "groupPolicyId": "100"},
+        ),
+    )
+    plan = plan_restore(graph, parser)
+
+    # First pass: run everything, then rewrite the journal WITHOUT the
+    # group policy's mapping rows — simulating a run that created the
+    # object but could not extract its response ID.
+    restorer, calls = _executor(tmp_path)
+    assert restorer.execute(graph, plan).failed == ()
+    journal_path = tmp_path / "journal.jsonl"
+    lines = [
+        line
+        for line in journal_path.read_text().splitlines()
+        if not (
+            '"kind": "map"' in line and '"old": "100"' in line
+        )
+    ]
+    journal_path.write_text("\n".join(lines) + "\n")
+
+    restorer2, calls2 = _executor(tmp_path)
+    restorer2._journal = RestoreJournal(journal_path)
+    result = restorer2.execute(graph, plan)
+
+    assert result.failed == ()
+    # The resume looked the existing policy up by name…
+    assert any(c[0] == "getNetworkGroupPolicies" for c in calls2)
+    # …and no object was re-created or re-configured.
+    assert not any(c[0] == "createNetworkGroupPolicy" for c in calls2)
