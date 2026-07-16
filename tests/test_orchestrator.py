@@ -932,7 +932,20 @@ def test_sync_defer_round_cap_aborts_for_human_review(
 ) -> None:
     """Fresh racy addresses on every deferral round exhaust the defer
     budget and abort — the org is too hot for unattended progress."""
-    orchestrator, recorder, _, runner = _orchestrator(tmp_path, sync=True)
+    orchestrator, recorder, _, runner = _orchestrator(
+        tmp_path,
+        sync=True,
+        # A third pending import keeps the post-deferral target set
+        # non-empty, so every round replans (the all-deferred early
+        # exit is covered separately below).
+        generator=StubGenerator(
+            addresses=(
+                "meraki_devices.q2ab",
+                "meraki_networks.n_1",
+                "meraki_switch.s_3",
+            )
+        ),
+    )
     runner.plans = [(2, PLAN_WITH_CHANGES)] * 4
     runner.actions_queue = [
         {"meraki_networks.n_1": ("update",)},   # heal round 1
@@ -950,6 +963,41 @@ def test_sync_defer_round_cap_aborts_for_human_review(
     assert summary.deferred_addresses == (
         "meraki_networks.n_1", "meraki_devices.q2ab",
     )
+
+
+def test_sync_defer_exhausting_pending_skips_the_degenerate_replan(
+    tmp_path: Path, api_key: None
+) -> None:
+    """Deferral that removes EVERY pending import must not replan: an
+    empty target set would degenerate to a full untargeted plan (the
+    multi-hour race window targeting exists to close). The stale saved
+    plan is discarded so the guarded apply can never consume it, and
+    the run is not aborted — nothing mutating remains in the kit."""
+    orchestrator, recorder, _, runner = _orchestrator(tmp_path, sync=True)
+    runner.plans = [(2, PLAN_WITH_CHANGES)] * 3
+    runner.actions_queue = [
+        {"meraki_networks.n_1": ("update",)},   # heal round 1
+        {"meraki_networks.n_1": ("update",)},   # heal round 2 → no progress
+        {
+            "meraki_networks.n_1": ("update",),
+            "meraki_devices.q2ab": ("update",),
+        },                                       # defer round: all pending
+    ]
+    summary = orchestrator.run("org-123")
+
+    assert not runner.applied
+    assert summary.apply_aborted is False
+    assert runner.deferred_kit == [
+        ("meraki_devices.q2ab", "meraki_networks.n_1"),
+    ]
+    assert summary.deferred_addresses == (
+        "meraki_devices.q2ab", "meraki_networks.n_1",
+    )
+    assert runner.saved_plan_discarded is True
+    # Initial plan + one heal replan, and no deferral replan: the
+    # deferral round exits before planning once nothing is left to
+    # verify.
+    assert len(runner.plan_calls) == 2
 
 
 def test_sync_heal_round_cap_aborts_for_human_review(

@@ -1013,3 +1013,96 @@ def test_included_template_reference_names_survive_verbatim() -> None:
     assert custom_ref["name"].startswith("name-")
     # Coherent with the custom template object's pseudonymized name.
     assert custom_ref["name"] == features[1].payload["name"]
+
+
+def test_spec_declared_credential_fields_are_redacted() -> None:
+    """GET-visible credential fields whose names carry no classic
+    secret-ish stem must still vanish: OSPF md5AuthenticationKey (the
+    spec calls it "MD5 authentication credentials"), the coterm
+    licensing endpoint's bare `key` ("The key of the license"), and SM
+    software redemptionCode (redeemable VPP codes)."""
+    graph = NetworkGraph(
+        "org-123", (), (),
+        (
+            FeatureConfiguration(
+                "/networks/{networkId}/switch/routing/ospf",
+                ("N_1",),
+                {
+                    "enabled": True,
+                    "md5AuthenticationEnabled": True,
+                    "md5AuthenticationKey": "ospfmd5",
+                },
+            ),
+            FeatureConfiguration(
+                "/organizations/{organizationId}/licensing/coterm/licenses",
+                ("org-123",),
+                {"key": "Z2XXXXXX-LICENSE-KEY", "counts": [{"count": 5}]},
+            ),
+            FeatureConfiguration(
+                "/networks/{networkId}/sm/devices/{deviceId}/softwares",
+                ("N_1", "D_1"),
+                {"name": "App", "redemptionCode": "VPP-REDEEM-1234"},
+            ),
+        ),
+    )
+    cleaned = sanitize_graph(graph, salt=b"fixed").features
+    assert cleaned[0].payload["md5AuthenticationKey"] == REDACTED
+    assert cleaned[0].payload["enabled"] is True
+    assert cleaned[1].payload["key"] == REDACTED
+    assert cleaned[2].payload["redemptionCode"] == REDACTED
+
+
+def test_enrollment_string_is_pseudonymized() -> None:
+    """enrollmentString is a customer-chosen, globally unique SM slug —
+    the public n.meraki.com/<slug> enrollment path — and identifies the
+    organization as surely as its name does."""
+    graph = NetworkGraph(
+        "org-123",
+        (
+            MerakiNetwork(
+                "N_1", "org-123", "HQ", (),
+                payload={
+                    "id": "N_1",
+                    "name": "HQ",
+                    "enrollmentString": "acme-corp-enroll",
+                },
+            ),
+        ),
+        (),
+        (),
+    )
+    cleaned = sanitize_graph(graph, salt=b"fixed").networks[0]
+    assert cleaned.payload["enrollmentString"] != "acme-corp-enroll"
+    assert "acme" not in cleaned.payload["enrollmentString"]
+    # Deterministic like every other pseudonym (cross-run stability).
+    again = sanitize_graph(graph, salt=b"fixed").networks[0]
+    assert again.payload["enrollmentString"] == cleaned.payload["enrollmentString"]
+
+
+def test_certificate_pem_blocks_are_redacted() -> None:
+    """Certificate/CSR PEM blocks are identity: their DER encodes the
+    real Subject CN, Organization, and SAN hostnames. With private keys
+    already redacted they are not restorable material, so they vanish
+    like key blocks instead of shipping the org's PKI naming."""
+    cert = (
+        "-----BEGIN CERTIFICATE-----\nMIIBbase64identity\n"
+        "-----END CERTIFICATE-----"
+    )
+    csr = (
+        "-----BEGIN CERTIFICATE REQUEST-----\nMIIBbase64identity\n"
+        "-----END CERTIFICATE REQUEST-----"
+    )
+    graph = NetworkGraph(
+        "org-123", (), (),
+        (
+            FeatureConfiguration(
+                "/networks/{networkId}/sm/devices/{deviceId}/certs",
+                ("N_1", "D_1"),
+                {"certPem": cert, "csrPem": csr, "certUsage": "keep-me"},
+            ),
+        ),
+    )
+    payload = sanitize_graph(graph, salt=b"fixed").features[0].payload
+    assert payload["certPem"] == REDACTED
+    assert payload["csrPem"] == REDACTED
+    assert payload["certUsage"] == "keep-me"

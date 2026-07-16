@@ -269,9 +269,25 @@ class HclImportGenerator:
                     )
                 )
                 continue
-            import_id = ",".join(
-                self._import_components(match, candidate, graph.organization_id)
+            components = self._import_components(
+                match, candidate, graph.organization_id
             )
+            if any("," in component for component in components):
+                # The provider splits compound import IDs positionally
+                # on commas; a comma inside a component (only possible
+                # in a doctored dump — the dashboard never issues one)
+                # would shift every later component, in the worst case
+                # landing "true" in a force_delete slot.
+                unsupported.append(
+                    self._flag(
+                        candidate,
+                        "An import ID component contains a comma, which "
+                        "would corrupt the provider's compound import ID.",
+                        audit=audit,
+                    )
+                )
+                continue
+            import_id = ",".join(components)
             base = f"{match.terraform_name}.{self._label(candidate.id_values)}"
             address = self._resolve_address(
                 base, import_id, seen_addresses, ledger, pins

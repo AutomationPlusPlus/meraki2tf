@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import argparse
 import enum
+import json
 import os
 import re
 import tomllib
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -66,6 +68,7 @@ SECRET_BACKEND_KEYS = frozenset(
         "secret_key",
         "token",
         "sse_customer_key",
+        "web_identity_token",
         # gcs ('credentials' may hold the service-account key JSON inline)
         "credentials",
         "access_token",
@@ -106,11 +109,7 @@ def _refuse_credential_keys_in_file(path: Path) -> None:
         # Missing/unreadable file: terraform init will fail loudly on
         # the same path; nothing to scan here.
         return
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith(("#", "//")):
-            continue
-        key = stripped.partition("=")[0].strip().strip('"')
+    for key in _backend_config_file_keys(text):
         if key.lower() in SECRET_BACKEND_KEYS:
             raise BackendConfigError(
                 f"--backend-config-file {path} sets {key!r}, which is a "
@@ -119,6 +118,35 @@ def _refuse_credential_keys_in_file(path: Path) -> None:
                 "for azurerm, AWS_* for s3, GOOGLE_APPLICATION_CREDENTIALS "
                 "for gcs — or use an ambient managed identity)."
             )
+
+
+def _backend_config_file_keys(text: str) -> Iterator[str]:
+    """Every setting key a backend-config file supplies, both formats.
+
+    ``terraform init`` accepts the file as JSON as well as HCL; scanning
+    only ``key = value`` lines would let ``{"access_key": "..."}`` walk
+    straight past the credential refusal. JSON documents are walked
+    recursively (s3 nests credentials under ``assume_role_with_web_identity``);
+    anything that does not parse as JSON falls back to the HCL line scan.
+    """
+    try:
+        document = json.loads(text)
+    except ValueError:
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith(("#", "//")):
+                continue
+            yield stripped.partition("=")[0].strip().strip('"')
+        return
+    stack = [document]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            for key, value in node.items():
+                yield str(key)
+                stack.append(value)
+        elif isinstance(node, list):
+            stack.extend(node)
 
 
 @dataclass(frozen=True)

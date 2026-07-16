@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .config import API_KEY_ENV_VAR, BackendConfig
+from .fileio import atomic_write_text
 from .fsperms import restrict_to_owner
 from .plan_reconciler import (
     ReconciliationPlan,
@@ -376,6 +377,11 @@ class TerraformRunner:
         #: result is returned on subsequent calls so a remote state read
         #: can self-initialize without re-initializing the backend later.
         self._init_result: TerraformCommandResult | None = None
+        #: Run-private snapshot of the rebuild plan, taken at preview
+        #: time so ``rebuild_apply`` executes exactly the document the
+        #: operator confirmed — never the fixed-name file a concurrent
+        #: run may have rewritten between preview and apply.
+        self._rebuild_plan_snapshot: Path | None = None
         #: Optional fallback that resolves a Duplicate Set Element
         #: literal to resource addresses from the discovered payloads.
         #: Needed because a duplicate that breaks the provider's own
@@ -654,6 +660,18 @@ class TerraformRunner:
         ignored: dict[str, tuple[str, ...]] = {}
         normalized: dict[str, tuple[str, ...]] = {}
         case_repairs_attempted: set[tuple[str, str]] = set()
+        target_args = tuple(
+            f"-target={address}" for address in targets or ()
+        )
+        if targets is not None and not target_args:
+            # Same stance as plan_targeted: an empty target set would
+            # silently degenerate to a full untargeted plan — a multi-
+            # hour read window on a busy org. A full plan must be an
+            # explicit choice (targets=None), never an accident.
+            raise ValueError(
+                "plan_with_generation: refusing an empty target set; "
+                "pass targets=None for a deliberate full plan."
+            )
         args = (
             "plan",
             "-input=false",
@@ -661,7 +679,7 @@ class TerraformRunner:
             "-detailed-exitcode",
             f"-generate-config-out={GENERATED_CONFIG_FILENAME}",
             f"-out={SYNC_PLAN_FILENAME}",
-            *(f"-target={address}" for address in targets or ()),
+            *target_args,
         )
         allowed = (
             (_PLAN_NO_CHANGES, _PLAN_ERROR, _PLAN_CHANGES_PRESENT)
@@ -960,6 +978,34 @@ class TerraformRunner:
     #: Plan actions that mutate nothing (imports render as no-op).
     _HARMLESS_PLAN_ACTIONS = frozenset({"no-op", "read"})
 
+    def _exclusive_run_copy(self, source: Path) -> Path:
+        """Snapshot a saved plan into a run-private, owner-only copy.
+
+        The copy is created with ``O_EXCL`` so no concurrent run can
+        pre-plant or swap the file this run verifies and applies. A run
+        killed hard (OOM, power loss) leaves its copy behind: those are
+        secret-bearing documents that must not outlive their run, and a
+        later run recycling the same PID would trip the exclusive
+        create — so copies whose owning process is gone are swept first,
+        and a same-PID leftover (the old owner is dead by definition) is
+        replaced once.
+        """
+        for leftover in self._workdir.glob(f"{source.name}.verified-*"):
+            suffix = leftover.name.rsplit("-", 1)[-1]
+            if suffix.isdigit() and not _process_alive(int(suffix)):
+                leftover.unlink(missing_ok=True)
+        target = self._workdir / f"{source.name}.verified-{os.getpid()}"
+        plan_bytes = source.read_bytes()
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        try:
+            descriptor = os.open(target, flags, 0o600)
+        except FileExistsError:
+            target.unlink(missing_ok=True)
+            descriptor = os.open(target, flags, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(plan_bytes)
+        return target
+
     def apply_import_plan(self) -> tuple[str, ...]:
         """Guarded sync-mode apply: grow the state, never touch Meraki.
 
@@ -996,14 +1042,8 @@ class TerraformRunner:
         # moved — a mutating plan made against the same state would
         # apply unverified. Snapshot the plan into a run-private,
         # exclusively created owner-only copy; verify and apply THAT.
-        verified_name = f"{SYNC_PLAN_FILENAME}.verified-{os.getpid()}"
-        verified_file = self._workdir / verified_name
-        plan_bytes = plan_file.read_bytes()
-        descriptor = os.open(
-            verified_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
-        )
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(plan_bytes)
+        verified_file = self._exclusive_run_copy(plan_file)
+        verified_name = verified_file.name
         try:
             try:
                 document = self._show_plan_document(verified_name)
@@ -1170,12 +1210,31 @@ class TerraformRunner:
         content = generated.read_text(encoding="utf-8")
         if content.strip():
             aggregated = self._workdir / AGGREGATED_CONFIG_FILENAME
-            with aggregated.open("a", encoding="utf-8") as handle:
-                handle.write(content if content.endswith("\n") else content + "\n")
-            logger.info(
-                "Absorbed newly generated configuration into %s.",
-                AGGREGATED_CONFIG_FILENAME,
+            existing = (
+                aggregated.read_text(encoding="utf-8")
+                if aggregated.exists()
+                else ""
             )
+            addition = content if content.endswith("\n") else content + "\n"
+            if existing.endswith(addition):
+                # A crash between last run's absorb and the unlink below
+                # replays this call; appending again would duplicate
+                # every resource block and terraform would reject the
+                # workspace on every subsequent plan.
+                logger.info(
+                    "Generated configuration already absorbed into %s; "
+                    "cleaning up the leftover generation target.",
+                    AGGREGATED_CONFIG_FILENAME,
+                )
+            else:
+                # Atomic replace, never in-place append: a crash mid-
+                # append leaves a torn resources.tf that wedges every
+                # unattended run after it.
+                atomic_write_text(aggregated, existing + addition)
+                logger.info(
+                    "Absorbed newly generated configuration into %s.",
+                    AGGREGATED_CONFIG_FILENAME,
+                )
         generated.unlink()
 
     def has_config_baseline(self) -> bool:
@@ -1235,6 +1294,11 @@ class TerraformRunner:
         plan_path = self._workdir / REBUILD_PLAN_FILENAME
         if plan_path.exists():
             restrict_to_owner(plan_path)
+            # Bind the eventual apply to this exact document: the fixed
+            # filename can be rewritten by a concurrent run between
+            # preview and apply, and terraform only refuses a swapped
+            # plan when the state serial moved underneath it.
+            self._rebuild_plan_snapshot = self._exclusive_run_copy(plan_path)
         return result
 
     def rebuild_apply(self) -> TerraformCommandResult:
@@ -1246,20 +1310,22 @@ class TerraformRunner:
         is the exact plan file :meth:`plan_preview` showed the operator;
         terraform itself refuses the file if the state has changed since.
         """
-        plan_path = self._workdir / REBUILD_PLAN_FILENAME
-        if not plan_path.exists():
+        snapshot = self._rebuild_plan_snapshot
+        if snapshot is None or not snapshot.exists():
             raise TerraformError(
                 "No saved rebuild plan to apply; run the preview first "
                 "(the --rebuild flow plans before applying)."
             )
         try:
             result = self._run(
-                "apply", "-input=false", "-no-color", REBUILD_PLAN_FILENAME
+                "apply", "-input=false", "-no-color", snapshot.name
             )
         finally:
             # Saved plans embed refreshed sensitive values like the
             # state file; consume-or-delete, never leave one behind.
-            plan_path.unlink(missing_ok=True)
+            snapshot.unlink(missing_ok=True)
+            self._rebuild_plan_snapshot = None
+            (self._workdir / REBUILD_PLAN_FILENAME).unlink(missing_ok=True)
         self._restrict_state_permissions()
         return result
 
@@ -1267,6 +1333,9 @@ class TerraformRunner:
         """Delete the saved rebuild plan (preview-only runs must not
         leave a secret-bearing plan document on disk)."""
         (self._workdir / REBUILD_PLAN_FILENAME).unlink(missing_ok=True)
+        if self._rebuild_plan_snapshot is not None:
+            self._rebuild_plan_snapshot.unlink(missing_ok=True)
+            self._rebuild_plan_snapshot = None
 
     def discard_saved_plan(self) -> None:
         """Delete the saved sync plan file, if one is lingering.
@@ -1398,6 +1467,25 @@ class TerraformRunner:
             stdout=completed.stdout,
             stderr=completed.stderr,
         )
+
+
+def _process_alive(pid: int) -> bool:
+    """Whether a process with this PID currently exists.
+
+    Signal 0 probes without delivering; EPERM means the PID exists but
+    belongs to another user, which still counts as alive — its
+    run-private plan copy is not ours to sweep.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (OverflowError, ValueError):
+        # A PID the kernel cannot even represent names no process.
+        return False
+    except OSError:
+        return True
+    return True
 
 
 def _local_state_addresses(resources: Any) -> Iterator[str]:

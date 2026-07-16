@@ -357,11 +357,11 @@ def test_new_colliding_id_never_steals_a_state_tracked_address(
         "meraki_network.n_1_2": "org-123,N.1",
     }
 
-    # "N,1" sorts before both existing IDs — pre-ledger ordinal
+    # "N;1" sorts before both existing IDs — pre-ledger ordinal
     # assignment would hand it the state-tracked n_1 address.
     second = generator.generate(
         _graph(
-            networks=(_network("N-1"), _network("N.1"), _network("N,1")),
+            networks=(_network("N-1"), _network("N.1"), _network("N;1")),
             devices=(),
             features=(),
         ),
@@ -373,12 +373,12 @@ def test_new_colliding_id_never_steals_a_state_tracked_address(
     assert by_id["org-123,N-1"].already_in_state is True
     assert by_id["org-123,N.1"].address == "meraki_network.n_1_2"
     assert by_id["org-123,N.1"].already_in_state is True
-    assert by_id["org-123,N,1"].address == "meraki_network.n_1_3"
-    assert by_id["org-123,N,1"].already_in_state is False
+    assert by_id["org-123,N;1"].address == "meraki_network.n_1_3"
+    assert by_id["org-123,N;1"].already_in_state is False
     content = second.imports_file.read_text(encoding="utf-8")
     assert second.imports_written == 1
     assert "to = meraki_network.n_1_3\n" in content
-    assert 'id = "org-123,N,1"' in content
+    assert 'id = "org-123,N;1"' in content
 
 
 def test_deleted_asset_slot_stays_reserved_while_state_tracks_it(
@@ -391,16 +391,16 @@ def test_deleted_asset_slot_stays_reserved_while_state_tracks_it(
         _graph(networks=(_network("N-1"), _network("N.1")), devices=(), features=()),
         tmp_path,
     )
-    # "N-1" left Meraki (state still tracks it); "N,1" is new.
+    # "N-1" left Meraki (state still tracks it); "N;1" is new.
     second = generator.generate(
-        _graph(networks=(_network("N.1"), _network("N,1")), devices=(), features=()),
+        _graph(networks=(_network("N.1"), _network("N;1")), devices=(), features=()),
         tmp_path,
         existing_addresses=first.captured_addresses,
     )
     by_id = {asset.import_id: asset for asset in second.captured}
     assert by_id["org-123,N.1"].address == "meraki_network.n_1_2"
-    assert by_id["org-123,N,1"].address == "meraki_network.n_1_3"
-    assert by_id["org-123,N,1"].already_in_state is False
+    assert by_id["org-123,N;1"].address == "meraki_network.n_1_3"
+    assert by_id["org-123,N;1"].already_in_state is False
     assert "meraki_network.n_1" not in second.captured_addresses
     # The dead slot stays reserved in the ledger while state has it.
     assert _ledger(tmp_path)["meraki_network.n_1"] == "org-123,N-1"
@@ -641,3 +641,28 @@ def test_unmatched_entity_is_flagged_as_provider_gap(
         in report.unsupported[0].reason
     )
     assert recorder.events[0].event_type is EventType.UNSUPPORTED_FEATURE_FLAGGED
+
+
+def test_comma_bearing_id_component_is_flagged_unsupported(
+    generator: HclImportGenerator, tmp_path: Path
+) -> None:
+    """The provider splits compound import IDs positionally on commas;
+    a doctored dump planting a comma inside a component would shift
+    every later component (worst case arming a force_delete slot), so
+    the asset is refused into the coverage manifest instead."""
+    report = generator.generate(
+        _graph(
+            networks=(_network("N-1"), _network("true,123")),
+            devices=(),
+            features=(),
+        ),
+        tmp_path,
+    )
+    assert report.imports_written == 1
+    reasons = {
+        asset.identifiers: asset.reason for asset in report.unsupported
+    }
+    assert ("true,123",) in reasons
+    assert "comma" in reasons[("true,123",)]
+    content = report.imports_file.read_text(encoding="utf-8")
+    assert "true,123" not in content

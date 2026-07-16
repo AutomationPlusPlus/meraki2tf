@@ -71,15 +71,27 @@ def _captured(api_path: str, ids: tuple[str, ...], address: str) -> CapturedAsse
 
 
 class _FakeSection:
-    """SDK section stub recording calls; methods accept **kwargs."""
+    """SDK section stub recording calls; methods accept **kwargs.
 
-    def __init__(self, fail: set[str] | None = None) -> None:
+    ``listings`` serves collection GETs (the executor's item-ID
+    verification read-back) without recording them in ``calls``, so
+    write-call assertions keep their indexes.
+    """
+
+    def __init__(
+        self,
+        fail: set[str] | None = None,
+        listings: dict[str, list[dict[str, Any]]] | None = None,
+    ) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self._fail = fail or set()
+        self._listings = listings or {}
 
     def __getattr__(self, name: str) -> Any:
         if name.startswith("_"):
             raise AttributeError(name)
+        if name in self._listings:
+            return lambda **kwargs: list(self._listings[name])
 
         def method(**kwargs: Any) -> dict[str, Any]:
             if name in self._fail:
@@ -90,11 +102,26 @@ class _FakeSection:
         return method
 
 
+#: Read-back listings matching the fixture actions below: the item IDs
+#: exist live under their snapshot names, so verification admits the
+#: writes (mismatch/absence cases assert refusal separately).
+_DEFAULT_LISTINGS = {
+    "getNetworkApplianceVlans": [{"id": "10", "name": "Data"}],
+    "getNetworkWirelessSsids": [{"number": 0, "name": "Corp"}],
+}
+
+
 class _FakeDashboard:
-    def __init__(self, networks: list[dict[str, str]], fail: set[str] | None = None):
+    def __init__(
+        self,
+        networks: list[dict[str, str]],
+        fail: set[str] | None = None,
+        listings: dict[str, list[dict[str, Any]]] | None = None,
+    ):
         self._networks = networks
-        self.appliance = _FakeSection(fail)
-        self.wireless = _FakeSection(fail)
+        catalog = _DEFAULT_LISTINGS if listings is None else listings
+        self.appliance = _FakeSection(fail, catalog)
+        self.wireless = _FakeSection(fail, catalog)
         self.organizations = types.SimpleNamespace(
             getOrganizationNetworks=lambda org, total_pages: list(self._networks)
         )
@@ -434,7 +461,8 @@ def test_plan_replay_threads_the_collection_lookup_for_post_only_creates(
 ) -> None:
     """POST-only creates carry the collection GET so a retried replay
     can skip objects an earlier partially-failed run already created;
-    PUT-backed objects need no lookup (updates are idempotent)."""
+    PUT-backed item writes carry their enclosing collection's GET so
+    the executor can verify a server-assigned item ID before writing."""
     networks_path = "/organizations/{organizationId}/networks"
     graph = _graph(
         FeatureConfiguration(networks_path, ("org-123",), {"name": "HQ"}),
@@ -452,7 +480,9 @@ def test_plan_replay_threads_the_collection_lookup_for_post_only_creates(
     assert create.operation.method == "post"
     assert create.lookup is not None
     assert create.lookup.operation_id == "getOrganizationNetworks"
-    assert by_path[VLAN_PATH].lookup is None
+    vlan_lookup = by_path[VLAN_PATH].lookup
+    assert vlan_lookup is not None
+    assert vlan_lookup.operation_id == "getNetworkApplianceVlans"
 
 
 # ------------------------------------------------------------- id mapping
@@ -550,18 +580,25 @@ def test_execute_reaches_template_scoped_targets(
 # -------------------------------------------------------------- execution
 
 
-def _vlan_action(spec_parser: OpenApiParser, network: str = "N_2") -> ReplayAction:
-    op = next(
+def _lookup_op(
+    spec_parser: OpenApiParser, operation_id: str
+) -> OperationSpec:
+    return next(
         op
         for op in spec_parser.endpoints()
-        if op.operation_id == "updateNetworkApplianceVlan"
+        if op.operation_id == operation_id
     )
+
+
+def _vlan_action(spec_parser: OpenApiParser, network: str = "N_2") -> ReplayAction:
+    op = _lookup_op(spec_parser, "updateNetworkApplianceVlan")
     return ReplayAction(
         kind="object",
         api_path=VLAN_PATH,
         path_values=(network, "10"),
         payload={"id": 10, "name": "Data", "networkId": "N_2"},
         operation=op,
+        lookup=_lookup_op(spec_parser, "getNetworkApplianceVlans"),
     )
 
 
@@ -603,6 +640,7 @@ def test_execute_isolates_failures_per_action(
         payload={"psk": "wifi-secret"},
         operation=ssid_op,
         address="meraki_wireless_ssid.n_2_0",
+        lookup=_lookup_op(spec_parser, "getNetworkWirelessSsids"),
     )
     executed, failed = GapReplayer().execute(
         (_vlan_action(spec_parser), ssid),
@@ -631,6 +669,10 @@ def test_execute_withholds_error_detail_for_secret_bearing_objects(
         def updateNetworkWirelessSsid(**kwargs: Any) -> None:
             raise RuntimeError(f"psk {kwargs.get('psk')!r} was rejected")
 
+        @staticmethod
+        def getNetworkWirelessSsids(**kwargs: Any) -> list[dict[str, Any]]:
+            return [{"number": 0, "name": "Corp"}]
+
     dashboard = types.SimpleNamespace(wireless=EchoingSection())
     stub = types.ModuleType("meraki")
     stub.DashboardAPI = lambda **kwargs: dashboard  # type: ignore[attr-defined]
@@ -648,6 +690,7 @@ def test_execute_withholds_error_detail_for_secret_bearing_objects(
         path_values=("N_2", "0"),
         payload={"number": 0, "name": "Corp", "psk": "hunter2"},
         operation=ssid_op,
+        lookup=_lookup_op(spec_parser, "getNetworkWirelessSsids"),
     )
     executed, failed = GapReplayer().execute(
         (action,),
@@ -1240,3 +1283,79 @@ def test_shape_rules_strips_synthetic_rows() -> None:
     assert len(keep["rules"]) == 2
     # Bodies without a rules list pass through untouched.
     assert shape_rules(ssid_path, {"enabled": True}) == {"enabled": True}
+
+
+def test_execute_refuses_a_stale_item_id_with_no_live_counterpart(
+    monkeypatch: pytest.MonkeyPatch, spec_parser: OpenApiParser
+) -> None:
+    """A rebuilt tenant re-issues server-assigned item IDs; a snapshot
+    ID absent from the live collection must refuse, never 404-or-worse
+    against whatever now owns that ID."""
+    dashboard = _FakeDashboard(
+        networks=[],
+        listings={"getNetworkApplianceVlans": [{"id": "77", "name": "Other"}]},
+    )
+    _install_fake_meraki(monkeypatch, dashboard)
+    executed, failed = GapReplayer().execute(
+        (_vlan_action(spec_parser),),
+        target_organization_id="org-999",
+        snapshot_organization_id="org-123",
+        network_ids={"N_2": "N_9"},
+    )
+    assert executed == ()
+    ((_, reason),) = failed
+    assert "no live counterpart" in reason
+    assert dashboard.appliance.calls == []  # nothing was written
+
+
+def test_execute_refuses_an_item_id_that_now_names_a_different_object(
+    monkeypatch: pytest.MonkeyPatch, spec_parser: OpenApiParser
+) -> None:
+    """The live item exists under the snapshot's ID but carries another
+    name: the rebuilt tenant re-issued the ID to a different sibling,
+    and writing would silently misconfigure it."""
+    dashboard = _FakeDashboard(
+        networks=[],
+        listings={
+            "getNetworkApplianceVlans": [{"id": "10", "name": "Voice"}]
+        },
+    )
+    _install_fake_meraki(monkeypatch, dashboard)
+    executed, failed = GapReplayer().execute(
+        (_vlan_action(spec_parser),),  # snapshot expects VLAN 10 "Data"
+        target_organization_id="org-999",
+        snapshot_organization_id="org-123",
+        network_ids={"N_2": "N_9"},
+    )
+    assert executed == ()
+    ((_, reason),) = failed
+    assert "different object" in reason
+    assert dashboard.appliance.calls == []
+
+
+def test_execute_refuses_item_writes_with_no_collection_read_back(
+    monkeypatch: pytest.MonkeyPatch, spec_parser: OpenApiParser
+) -> None:
+    """No lookup GET in the spec means the item ID cannot be verified;
+    the write is refused like the networkId/serial guards, and the
+    failure reaches the alert/runbook for manual replay."""
+    dashboard = _FakeDashboard(networks=[])
+    _install_fake_meraki(monkeypatch, dashboard)
+    action = _vlan_action(spec_parser)
+    executed, failed = GapReplayer().execute(
+        (replace_action_lookup(action, None),),
+        target_organization_id="org-999",
+        snapshot_organization_id="org-123",
+        network_ids={"N_2": "N_9"},
+    )
+    assert executed == ()
+    ((_, reason),) = failed
+    assert "refusing to replay onto a server-assigned ID blind" in reason
+
+
+def replace_action_lookup(
+    action: ReplayAction, lookup: OperationSpec | None
+) -> ReplayAction:
+    import dataclasses
+
+    return dataclasses.replace(action, lookup=lookup)

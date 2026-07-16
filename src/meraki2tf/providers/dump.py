@@ -157,6 +157,21 @@ class MalformedDumpError(ValueError):
     """The snapshot file is unreadable or violates the snapshot contract."""
 
 
+def _require_mapping(item: Any, description: str) -> Any:
+    """Refuse a non-object element with a contract diagnostic.
+
+    ``from_payload`` would otherwise die on a bare ``AttributeError``
+    ('str' object has no attribute 'get') — an opaque fault where the
+    nested-export path names the offending section.
+    """
+    if not isinstance(item, dict):
+        raise MalformedDumpError(
+            f"Snapshot section {description} must contain JSON objects; "
+            f"found {type(item).__name__}."
+        )
+    return item
+
+
 class StaticJsonDataProvider(MerakiDataProvider):
     """Serves the domain graph from an offline snapshot file."""
 
@@ -237,11 +252,11 @@ class StaticJsonDataProvider(MerakiDataProvider):
                 f"Snapshot {self._path} records no organizationId and none was supplied."
             )
         networks = tuple(
-            MerakiNetwork.from_payload(item)
+            MerakiNetwork.from_payload(_require_mapping(item, "'networks'"))
             for item in coerce_sequence(self._document.get("networks"), "'networks'")
         )
         devices = tuple(
-            MerakiDevice.from_payload(item)
+            MerakiDevice.from_payload(_require_mapping(item, "'devices'"))
             for item in coerce_sequence(self._document.get("devices"), "'devices'")
         )
         features = tuple(

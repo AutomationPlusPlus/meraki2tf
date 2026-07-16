@@ -103,10 +103,20 @@ def parent_item_path(path: str) -> str:
     """
     segments = path.split("/")
     last_param = max(
-        index
-        for index, segment in enumerate(segments)
-        if segment.startswith("{")
+        (
+            index
+            for index, segment in enumerate(segments)
+            if segment.startswith("{")
+        ),
+        default=-1,
     )
+    if last_param < 0:
+        # A malformed/hostile spec can carry parameters only embedded
+        # mid-segment (`/x{a}/y{b}`), which counts as nested by
+        # parameter count yet owns no whole-segment parameter. No
+        # enclosing item path exists; the caller records the surface as
+        # a coverage gap instead of the whole run crashing.
+        return ""
     return "/".join(segments[: last_param + 1])
 
 
