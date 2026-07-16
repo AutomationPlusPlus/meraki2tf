@@ -4157,3 +4157,166 @@ def test_wipe_template_failure_blocks_the_org_deletion() -> None:
     assert result.organization_deleted is False
     assert deleted["orgs"] == []
     assert any(key == "configTemplate:L_T1" for key, _ in result.failed)
+
+
+def test_additive_only_adoption_never_aligns_surviving_content(
+    tmp_path: Path,
+) -> None:
+    """Heal's contract: surviving objects are never modified. A
+    name-conflicted create adopts the survivor mapping-only — the
+    content-alignment PUT that would push the stale snapshot payload
+    over an operator's manual recreation must never fire."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    vlan_collection = "/networks/{networkId}/appliance/vlans"
+    vlan_item = "/networks/{networkId}/appliance/vlans/{vlanId}"
+    create_op = dict(_op("createNetworkApplianceVlan", "appliance"))
+    create_op["requestBody"] = {
+        "content": {"application/json": {"schema": {
+            "type": "object",
+            "properties": {"id": {}, "name": {}, "subnet": {}},
+        }}}
+    }
+    spec = {
+        "openapi": "3.0.0", "info": {"title": "v", "version": "1"},
+        "paths": {
+            "/organizations/{organizationId}/networks": {
+                "get": _op("getOrganizationNetworks", "organizations"),
+                "post": _op("createOrganizationNetwork", "organizations"),
+            },
+            "/networks/{networkId}/devices/claim": {
+                "post": _op("claimNetworkDevices", "networks"),
+            },
+            vlan_collection: {
+                "get": _op("getNetworkApplianceVlans", "appliance"),
+                "post": create_op,
+            },
+            vlan_item: {
+                "get": _op("getNetworkApplianceVlan", "appliance"),
+                "put": _op("updateNetworkApplianceVlan", "appliance"),
+            },
+        },
+    }
+    path = tmp_path / "vlan-spec.json"
+    path.write_text(json.dumps(spec), encoding="utf-8")
+    parser = OpenApiParser(path)
+    graph = _graph(
+        FeatureConfiguration(
+            vlan_item, ("N_1", "1"),
+            {"id": "1", "name": "Default", "subnet": "10.0.0.0/24"},
+        )
+    )
+    plan = plan_restore(graph, parser)
+    calls: list = []
+
+    class Section(_RecordingSection):
+        def createNetworkApplianceVlan(self, *args, **kwargs) -> dict:
+            self._calls.append(("createNetworkApplianceVlan", args, kwargs))
+            raise _conflict_error("Vlan has already been taken")
+
+    section = Section(calls)
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "j.jsonl"),
+        skip_claims=True, additive_only=True,
+    )
+    restorer._client = SimpleNamespace(
+        organizations=section, networks=section, appliance=section
+    )
+    result = restorer.execute(graph, plan)
+    assert result.failed == ()
+    assert f"{vlan_item}::N_1,1" in result.executed
+    # Adoption stands (children can rewire) but the survivor's content
+    # was left exactly as the operator had it.
+    assert not [c for c in calls if c[0] == "updateNetworkApplianceVlan"]
+
+
+def test_throttled_writes_defer_instead_of_poisoning_the_subtree(
+    tmp_path: Path,
+) -> None:
+    """A 429 that survives the SDK's own retries is transient pressure,
+    not a verdict on the object: the action defers (with bucket
+    backoff) and is retried before the run gives up on it."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    parser = _restore_spec(tmp_path)
+    graph = _graph()
+    plan = plan_restore(graph, parser)
+    calls: list = []
+    throttles: list[bool] = []
+    bucket = SimpleNamespace(
+        acquire=lambda: None,
+        on_success=lambda: None,
+        on_throttle=lambda: throttles.append(True),
+    )
+
+    class Throttled(Exception):
+        status = 429
+
+    class Section(_RecordingSection):
+        def createOrganizationNetwork(self, *args, **kwargs) -> dict:
+            self._calls.append(("createOrganizationNetwork", args, kwargs))
+            raise Throttled("429 Too Many Requests")
+
+    section = Section(calls)
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "j.jsonl"),
+        skip_claims=True, bucket=bucket,  # type: ignore[arg-type]
+    )
+    restorer._client = SimpleNamespace(
+        organizations=section, networks=section
+    )
+    result = restorer.execute(graph, plan)
+    creates = [c for c in calls if c[0] == "createOrganizationNetwork"]
+    assert len(creates) >= 2  # deferred and retried, not failed outright
+    assert throttles  # the shared pacer was backed off
+    ((key, reason),) = [
+        (key, reason)
+        for key, reason in result.failed
+        if "throttled" in reason
+    ]
+    assert "429" in reason
+
+
+def test_journal_refuses_non_object_lines(tmp_path: Path) -> None:
+    """Line-valid JSON that is not an object must surface as the CLI's
+    'journal is unreadable' ValueError, not an AttributeError."""
+    from meraki2tf.restorer import RestoreJournal
+
+    path = tmp_path / "journal.jsonl"
+    path.write_text('"just-a-string"\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="not a JSON object"):
+        RestoreJournal(path)
+
+
+def test_journal_refuses_records_missing_required_fields(
+    tmp_path: Path,
+) -> None:
+    from meraki2tf.restorer import RestoreJournal
+
+    path = tmp_path / "journal.jsonl"
+    path.write_text('{"kind": "done"}\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="missing required field"):
+        RestoreJournal(path)
+
+
+def test_wipe_caller_email_match_is_case_insensitive() -> None:
+    """The identity and admin endpoints may case the same address
+    differently; mistaking the caller for 'other' would delete the API
+    key's own admin record mid-teardown."""
+    from meraki2tf.restorer import OrgWiper
+
+    wiper = OrgWiper()
+    wiper._client, deleted = _admin_wipe_dashboard(
+        admins=[
+            {"id": "1", "email": "Caller@Drill.INVALID "},
+            {"id": "2", "email": "user-4f6a@drill.invalid"},
+        ],
+        me={"email": "caller@drill.invalid"},
+    )
+    result = wiper.execute("org-drill", "Drill Org")
+    assert deleted["admins"] == ["2"]  # never the caller, however cased
+    assert result.organization_deleted is True

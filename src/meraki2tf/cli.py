@@ -129,6 +129,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         epilog=_HELP_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        # Prefix abbreviations would desynchronize the config-file
+        # explicit-flag detection (it scans argv for the spelled-out
+        # flag) and let two near-name DR flags shadow each other; every
+        # flag must be typed in full.
+        allow_abbrev=False,
     )
     core = parser.add_argument_group(
         "core options",
@@ -656,12 +661,18 @@ def _rebuild(config: RuntimeConfig) -> int:
         # instead of an unhandled traceback.
         logger.critical("%s", exc)
         return 1
-    if config.state_file is not None:
-        # Re-anchor the backend at the explicitly requested state file;
-        # otherwise init would silently use whatever path the previous
-        # pipeline run baked into provider.tf.
-        runner.prepare_workspace()
+    # Built before the plan, like every other guarded DR path: a
+    # misconfigured channel must refuse the action up front — before a
+    # secret-bearing saved plan ever lands in the workdir — and a
+    # mid-incident half-applied rebuild must reach the on-call channel,
+    # not just the local terminal.
+    dispatcher = build_dispatcher(config)
     try:
+        if config.state_file is not None:
+            # Re-anchor the backend at the explicitly requested state
+            # file; otherwise init would silently use whatever path the
+            # previous pipeline run baked into provider.tf.
+            runner.prepare_workspace()
         runner.init()
         preview = runner.plan_preview()
     except (TerraformError, OSError) as exc:
@@ -679,7 +690,7 @@ def _rebuild(config: RuntimeConfig) -> int:
             "Nothing to rebuild: the organization already matches the "
             "generated artifacts."
         )
-        return 0
+        return _alert_outage_exit(dispatcher)
     if not config.confirm:
         # The saved plan embeds refreshed sensitive values; a preview-
         # only run must not leave it on disk.
@@ -689,12 +700,7 @@ def _rebuild(config: RuntimeConfig) -> int:
             "'--rebuild --confirm' to execute terraform apply and rebuild "
             "the organization from the generated artifacts."
         )
-        return 0
-    # Built before the write, like every other guarded DR path: a
-    # misconfigured channel must refuse the action up front, and a
-    # mid-incident half-applied rebuild must reach the on-call channel,
-    # not just the local terminal.
-    dispatcher = build_dispatcher(config)
+        return _alert_outage_exit(dispatcher)
     try:
         runner.rebuild_apply()
     except (TerraformError, OSError) as exc:
@@ -711,7 +717,7 @@ def _rebuild(config: RuntimeConfig) -> int:
     dispatcher.dispatch(
         rebuild_executed(workspace=str(config.workdir), succeeded=True)
     )
-    return 0
+    return _alert_outage_exit(dispatcher)
 
 
 def _wipe_org(config: RuntimeConfig) -> int:
@@ -799,7 +805,12 @@ def _wipe_org(config: RuntimeConfig) -> int:
             failed=result.failed,
         )
     )
-    return 0 if result.organization_deleted else 1
+    if not result.organization_deleted:
+        return 1
+    # A write to Meraki happened; the mandated alert reaching nobody
+    # must surface as the notifier-outage exit, exactly like the
+    # pipeline paths.
+    return _alert_outage_exit(dispatcher)
 
 
 def _restore(config: RuntimeConfig) -> int:
@@ -914,13 +925,19 @@ def _restore(config: RuntimeConfig) -> int:
     except ValueError as exc:
         logger.critical("Restore journal is unreadable: %s", exc)
         return 2
-    if provider.snapshot_sanitized and not journal.completed:
+    if provider.snapshot_sanitized and not (
+        journal.completed or journal.attempted
+    ):
         # A sanitized snapshot's recorded org ID is a pseudonym, so the
         # never-restore-into-the-source-org interlock above cannot
         # recognize the source org. A fresh restore only ever targets a
         # fresh (empty) organization — a populated target is either the
         # source org itself or an org someone cares about. A journaled
-        # resume is exempt: its earlier waves populated the target.
+        # resume is exempt: its earlier waves populated the target (an
+        # attempt-only journal counts — a run that died inside its very
+        # first create/journal window may already have written, and
+        # refusing would wedge that resume forever; a journal bound to
+        # a different target still refuses at execute()'s bind).
         try:
             existing = _target_network_count(config.target_org)
         except Exception as exc:  # noqa: BLE001 - fail closed
@@ -992,7 +1009,11 @@ def _restore(config: RuntimeConfig) -> int:
             skipped=result.skipped,
         )
     )
-    return 0 if not result.failed else 1
+    if result.failed:
+        return 1
+    # Writes happened; an undelivered RESTORE_EXECUTED alert must
+    # surface as the notifier-outage exit, like the pipeline paths.
+    return _alert_outage_exit(dispatcher)
 
 
 def _target_network_count(target_org: str) -> int:
@@ -1108,7 +1129,11 @@ def _heal(config: RuntimeConfig) -> int:
         logger.critical("Heal journal is unreadable: %s", exc)
         return 2
     restorer = OrgRestorer(
-        config.org_id, journal, preset_mappings=plan.identity_mappings
+        config.org_id, journal, preset_mappings=plan.identity_mappings,
+        # Heal's contract: surviving objects are never modified. Without
+        # this, a name-conflicted create would adopt the survivor and
+        # push the stale snapshot payload over it via the alignment PUT.
+        additive_only=True,
     )
     try:
         result = restorer.execute(snapshot, plan.missing)
@@ -1147,7 +1172,11 @@ def _heal(config: RuntimeConfig) -> int:
             skipped=result.skipped,
         )
     )
-    return 0 if not result.failed else 1
+    if result.failed:
+        return 1
+    # Writes happened; an undelivered HEAL_EXECUTED alert must surface
+    # as the notifier-outage exit, like the pipeline paths.
+    return _alert_outage_exit(dispatcher)
 
 
 def _replay_gaps(config: RuntimeConfig) -> int:
@@ -1180,6 +1209,19 @@ def _replay_gaps(config: RuntimeConfig) -> int:
     # override as the source would defeat the remap and misdirect
     # org-scoped writes back into the snapshot's own organization.
     recorded_orgs = provider.recorded_organization_ids
+    if len(frozenset(recorded_orgs)) > 1:
+        # Same stance as --restore: the network-name join is built from
+        # every recorded org's networks, so a second org's same-named
+        # network would remap its objects and secrets onto the target —
+        # a cross-tenant config bleed.
+        logger.critical(
+            "This snapshot records %d organizations; --replay-gaps "
+            "replays exactly one organization per run. Export a "
+            "single-org snapshot for the organization you want to "
+            "replay into.",
+            len(frozenset(recorded_orgs)),
+        )
+        return 2
     snapshot_org = recorded_orgs[0] if recorded_orgs else graph.organization_id
     dispatcher = build_dispatcher(config)
     try:
@@ -1269,13 +1311,17 @@ def _replay_gaps(config: RuntimeConfig) -> int:
         "the snapshot.",
         len(executed),
     )
-    return 0
+    # Writes happened; an undelivered GAP_REPLAY_EXECUTED alert must
+    # surface as the notifier-outage exit, like the pipeline paths.
+    return _alert_outage_exit(dispatcher)
 
 
-#: Config-file keys that steer where a confirmed DR action WRITES.
-#: A long-lived file must never pick a write target: when a DR action
-#: is invoked, these must be typed on the command line.
-_DR_TARGET_DESTS = frozenset({"org_id", "from_dump"})
+#: Config-file keys that steer where a confirmed DR action WRITES —
+#: or WHAT executes it. A long-lived file must never pick a write
+#: target, the workdir whose kit/journal a DR action consumes, or the
+#: terraform binary --rebuild --confirm hands the API key to: when a DR
+#: action is invoked, these must be typed on the command line.
+_DR_TARGET_DESTS = frozenset({"org_id", "from_dump", "workdir", "terraform_bin"})
 
 
 def _apply_config_file(
@@ -1508,6 +1554,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             arg_parser.error(
                 "--rebuild operates on an existing --workdir; it cannot be "
                 "combined with --from-dump or --dump-to."
+            )
+        if config.org_id:
+            # Orphaned mode-scoped flags are refused, never silently
+            # ignored: the rebuild applies whatever kit the workdir
+            # holds — it is not scoped or verified against an
+            # organization ID, and accepting one would let the operator
+            # believe it was.
+            arg_parser.error(
+                "--rebuild does not take --org-id: the apply targets "
+                "whatever organization the workdir's kit and state "
+                "resolve to."
             )
         if (
             config.sync or config.confirm_deletions or config.fail_on_gaps

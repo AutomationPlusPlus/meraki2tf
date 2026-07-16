@@ -222,11 +222,13 @@ def plan_replay(
                 operation=writes[0],
                 # POST-only creates carry the collection GET (same path
                 # as the collection POST) so a retried replay can skip
-                # objects an earlier run already created.
+                # objects an earlier run already created; item writes
+                # carry their enclosing collection's GET so the executor
+                # can verify a server-assigned item ID before the write.
                 lookup=(
                     lookups.get(writes[0].path)
                     if writes[0].method == "post"
-                    else None
+                    else _item_collection_lookup(writes[0], lookups)
                 ),
             )
         )
@@ -277,9 +279,22 @@ def plan_replay(
                 payload={key: clean[key] for key in top_level},
                 operation=updates[0],
                 address=captured.address,
+                lookup=_item_collection_lookup(updates[0], lookups),
             )
         )
     return tuple(actions), tuple(skipped)
+
+
+def _item_collection_lookup(
+    op: OperationSpec, lookups: Mapping[str, OperationSpec]
+) -> OperationSpec | None:
+    """The collection GET enclosing an item write path, when the spec
+    has one — the executor's read-back source for verifying that a
+    server-assigned item ID still names the same object live."""
+    head, _, tail = op.path.rpartition("/")
+    if tail.startswith("{"):
+        return lookups.get(head)
+    return None
 
 
 class GapReplayer:
@@ -297,6 +312,12 @@ class GapReplayer:
                 suppress_logging=True,
                 print_console=False,
                 output_log=False,
+                # A replay competes for the shared 10 req/s org budget —
+                # in a real recovery, against every other integration
+                # hammering the rebuilt tenant. The SDK's default 2
+                # throttle retries give up far too early for writes
+                # whose failure poisons the run's results.
+                maximum_retries=8,
             )
             logger.debug("Meraki dashboard client initialized for replay.")
         return self._client
@@ -431,6 +452,7 @@ class GapReplayer:
                     action, target_organization_id,
                     snapshot_organization_id, network_ids, serials,
                 )
+                self._verify_item_scope(action, params)
                 if (
                     action.kind == "object"
                     and action.operation.method == "post"
@@ -474,6 +496,115 @@ class GapReplayer:
             logger.info("Replayed %s", action.target)
             executed.append(action.target)
         return tuple(executed), tuple(failed)
+
+    def _verify_item_scope(
+        self, action: ReplayAction, params: Mapping[str, str]
+    ) -> None:
+        """Refuse stale server-assigned item IDs the remap cannot vouch for.
+
+        ``_parameters`` remaps and verifies only ``organizationId``,
+        ``networkId``, and ``serial``; every other placeholder passes
+        the snapshot's server-assigned item ID through verbatim. A
+        rebuilt tenant re-issues such IDs in its own creation order, so
+        the snapshot's ID may now name a *different* sibling in the
+        same (verified) network — the write would silently misconfigure
+        it instead of 404ing. The item's collection is read back: the
+        ID must exist live, and when both sides carry a name it must
+        match the snapshot object's. Anything unverifiable refuses,
+        like the networkId/serial guards.
+        """
+        op_params = _placeholders(action.operation.path)
+        scoped = {"organizationId", "networkId", "serial"}
+        unverified = [name for name in op_params if name not in scoped]
+        if not unverified:
+            return
+        lookup = action.lookup
+        item_param = op_params[-1]
+        lookup_needed = (
+            _placeholders(lookup.path) if lookup is not None else ()
+        )
+        # Verifiable shape: the trailing parameter is the item's own ID
+        # and every other non-scope parameter appears in the lookup
+        # path itself — a wrong mid-path value then fails the read-back
+        # (404) instead of silently scoping the write elsewhere.
+        verifiable = (
+            lookup is not None
+            and unverified[-1] == item_param
+            and item_param not in lookup_needed
+            and all(name in params for name in lookup_needed)
+            and all(
+                name == item_param or name in lookup_needed
+                for name in unverified
+            )
+        )
+        if not verifiable or lookup is None:
+            raise ReplayDispatchError(
+                f"Cannot verify item parameter(s) "
+                f"{', '.join(sorted(unverified))} against the live "
+                "organization; refusing to replay onto a server-assigned "
+                "ID blind."
+            )
+        dashboard = self._dashboard()
+        section = (
+            getattr(dashboard, lookup.tags[0], None) if lookup.tags else None
+        )
+        method = (
+            getattr(section, lookup.operation_id, None)
+            if section is not None
+            else None
+        )
+        if method is None:
+            raise ReplayDispatchError(
+                f"SDK exposes no collection read for {action.target}; "
+                "refusing to replay onto a server-assigned ID blind."
+            )
+        lookup_params = {name: params[name] for name in lookup_needed}
+        try:
+            listing = (
+                method(**lookup_params, total_pages="all")
+                if "total_pages" in inspect.signature(method).parameters
+                else method(**lookup_params)
+            )
+        except Exception as exc:
+            raise ReplayDispatchError(
+                f"Collection read-back for {action.target} failed "
+                f"({type(exc).__name__}); refusing to replay onto a "
+                "server-assigned ID blind."
+            ) from exc
+        if isinstance(listing, Mapping):
+            listing = listing.get("items")
+        item_id = params[item_param]
+        live = next(
+            (
+                item
+                for item in (listing if isinstance(listing, list) else [])
+                if isinstance(item, Mapping)
+                and item_id
+                in {
+                    str(item.get("id", "")),
+                    str(item.get(item_param, "")),
+                }
+            ),
+            None,
+        )
+        if live is None:
+            raise ReplayDispatchError(
+                f"Item {item_id} has no live counterpart in the target "
+                "organization; refusing to guess a replay target."
+            )
+        snapshot_name = action.payload.get("name")
+        live_name = live.get("name")
+        if (
+            isinstance(snapshot_name, str) and snapshot_name
+            and isinstance(live_name, str) and live_name
+            and snapshot_name != live_name
+        ):
+            raise ReplayDispatchError(
+                f"Item {item_id} exists live but names a different object "
+                f"({live_name!r}, snapshot expects {snapshot_name!r}); the "
+                "rebuilt tenant re-issued this ID — refusing to overwrite "
+                "the wrong sibling."
+            )
 
     def _already_present(
         self, action: ReplayAction, params: Mapping[str, str]

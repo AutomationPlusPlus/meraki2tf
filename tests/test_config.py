@@ -257,3 +257,54 @@ def test_gcs_credential_key_in_backend_file_is_refused(
              "--backend-config-file", str(backend_file)]
         )
     assert "service_account" not in str(excinfo.value)
+
+
+def test_backend_config_file_credential_key_in_json_is_refused(
+    tmp_path: Path,
+) -> None:
+    """terraform init accepts JSON backend-config files too; a
+    line-based HCL scan alone would wave {"access_key": ...} straight
+    through the credential refusal."""
+    backend_file = tmp_path / "bc.json"
+    backend_file.write_text(
+        '{"storage_account_name": "sa", "container_name": "tfstate",\n'
+        ' "key": "org.tfstate", "access_key": "SUPERSECRET"}\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(BackendConfigError, match="credential") as excinfo:
+        _config(
+            ["--state-backend", "azurerm",
+             "--backend-config-file", str(backend_file)]
+        )
+    assert "SUPERSECRET" not in str(excinfo.value)
+
+
+def test_backend_config_file_nested_json_credential_is_refused(
+    tmp_path: Path,
+) -> None:
+    """s3 nests web-identity credentials under
+    assume_role_with_web_identity; the JSON walk must reach them."""
+    backend_file = tmp_path / "bc.json"
+    backend_file.write_text(
+        '{"bucket": "b", "key": "state", "region": "us-east-1",\n'
+        ' "assume_role_with_web_identity":\n'
+        '   {"web_identity_token": "SECRETJWT"}}\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(BackendConfigError, match="credential") as excinfo:
+        _config(
+            ["--state-backend", "s3",
+             "--backend-config-file", str(backend_file)]
+        )
+    assert "SECRETJWT" not in str(excinfo.value)
+
+
+def test_web_identity_token_is_refused_on_argv() -> None:
+    with pytest.raises(BackendConfigError, match="credential") as excinfo:
+        _config(
+            ["--state-backend", "s3",
+             "--backend-config", "bucket=b",
+             "--backend-config", "key=state",
+             "--backend-config", "web_identity_token=SECRETJWT"]
+        )
+    assert "SECRETJWT" not in str(excinfo.value)

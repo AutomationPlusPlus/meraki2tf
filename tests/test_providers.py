@@ -1377,3 +1377,36 @@ def test_empty_nested_level_is_a_noop(tmp_path: Path) -> None:
     )
     graph = provider.fetch_network_graph("org-123")
     assert graph.features == ()
+
+
+def test_parent_item_path_tolerates_paramless_nested_shapes() -> None:
+    """A malformed/hostile spec can carry parameters only embedded
+    mid-segment; there is no enclosing item path, and discovery must
+    record a coverage gap instead of crashing the whole run on max()."""
+    from meraki2tf.providers.discovery import parent_item_path
+
+    assert parent_item_path("/foo/x{a}/y{b}") == ""
+
+
+def test_contract_dump_refuses_non_object_network_elements(
+    tmp_path: Path,
+) -> None:
+    """A hand-corrupted snapshot with a bare string in 'networks' must
+    surface the contract diagnostic, not an AttributeError."""
+    from meraki2tf.providers.dump import (
+        MalformedDumpError,
+        StaticJsonDataProvider,
+    )
+
+    path = tmp_path / "broken.json"
+    path.write_text(
+        json.dumps(
+            {"organizationId": "org-123", "networks": ["oops"],
+             "devices": [], "features": []}
+        ),
+        encoding="utf-8",
+    )
+    provider = StaticJsonDataProvider(path)
+    with pytest.raises(MalformedDumpError, match="'networks'"):
+        with provider as source:
+            source.fetch_network_graph(None)

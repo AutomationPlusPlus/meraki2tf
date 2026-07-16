@@ -826,7 +826,10 @@ class PipelineOrchestrator:
             )
             plan = self._runner.plan_with_generation(
                 save_plan=True,
-                targets=self._pending_targets(report, plan),
+                # Regeneration just returned the modified addresses to
+                # pending, so the set is normally non-empty; `or None`
+                # makes the degenerate full replan an explicit choice.
+                targets=self._pending_targets(report, plan) or None,
             ).merged_with_earlier(plan)
             regenerated.extend(modified)
             if not plan.has_drift:
@@ -937,11 +940,21 @@ class PipelineOrchestrator:
             )
             self._runner.defer_resources(frozenset(racy))
             deferred.extend(racy)
+            remaining = self._pending_targets(report, plan, tuple(deferred))
+            if not remaining:
+                # Deferral removed every remaining pending import;
+                # replanning would degenerate to a full untargeted plan
+                # (the multi-hour race window targeting exists to
+                # close) just to confirm there is nothing left. The
+                # saved plan predates the deferral surgery, so it must
+                # not survive to the guarded apply; downstream, batched
+                # materialization sees zero pending imports and
+                # finishes immediately.
+                self._runner.discard_saved_plan()
+                return plan, tuple(deferred), False
             plan = self._runner.plan_with_generation(
                 save_plan=True,
-                targets=self._pending_targets(
-                    report, plan, tuple(deferred)
-                ),
+                targets=remaining,
             ).merged_with_earlier(plan)
             if not plan.has_drift:
                 return plan, tuple(deferred), False

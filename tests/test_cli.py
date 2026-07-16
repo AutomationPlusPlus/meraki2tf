@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
@@ -574,9 +575,13 @@ def test_rebuild_with_confirm_applies(
 
     assert main(["--rebuild", "--confirm", "--workdir", str(workdir)]) == 0
     assert [call[1] for call in calls] == ["init", "plan", "apply"]
-    # The apply consumed the exact previewed plan file, not -auto-approve.
+    # The apply consumed this run's verified snapshot of the previewed
+    # plan (never the swappable fixed-name file, never -auto-approve).
     apply_command = calls[-1]
-    assert terraform_runner.REBUILD_PLAN_FILENAME in apply_command
+    assert (
+        f"{terraform_runner.REBUILD_PLAN_FILENAME}.verified-{os.getpid()}"
+        in apply_command
+    )
     assert "-auto-approve" not in apply_command
 
 
@@ -1468,9 +1473,18 @@ def _install_fake_meraki_module(
             recorded["ssid"].append(kwargs)
             return kwargs
 
+        @staticmethod
+        def getNetworkWirelessSsids(**kwargs: Any) -> list[dict[str, Any]]:
+            # Serves the executor's item-ID verification read-back.
+            return [{"number": 0, "name": "Corp"}]
+
     def get_networks(org: str, total_pages: str) -> list[dict[str, str]]:
         recorded["networks"] += 1
         return [{"id": "N_1", "name": "HQ"}]
+
+    def get_admins(**kwargs: Any) -> list[dict[str, Any]]:
+        # Verification read-back for the admin item write.
+        return [{"id": "A_1", "name": "Jordan Sample"}]
 
     def update_admin(**kwargs: Any) -> dict[str, Any]:
         recorded["admin"].append(kwargs)
@@ -1480,6 +1494,7 @@ def _install_fake_meraki_module(
         wireless=Wireless(),
         organizations=SimpleNamespace(
             getOrganizationNetworks=get_networks,
+            getOrganizationAdmins=get_admins,
             updateOrganizationAdmin=update_admin,
         ),
     )
@@ -3096,3 +3111,137 @@ def test_heal_with_nothing_missing_exits_zero(
     console = capsys.readouterr().err
     assert exit_code == 0
     assert "Nothing to heal" in console
+
+
+def test_rebuild_refuses_an_org_id() -> None:
+    """Orphaned mode-scoped flags are refused, never silently ignored:
+    the rebuild applies whatever kit the workdir holds — it is not
+    scoped or verified against an organization ID."""
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--rebuild", "--org-id", "999"])
+    assert excinfo.value.code == 2
+
+
+def test_rebuild_dispatcher_refusal_leaves_no_saved_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A misconfigured alert channel must refuse --rebuild --confirm
+    BEFORE terraform plans: otherwise the secret-embedding saved plan
+    outlives the failed run — a third secret-at-rest artifact."""
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    workdir = _rebuild_workspace(tmp_path)
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(command: tuple[str, ...], **kwargs: Any) -> SimpleNamespace:
+        calls.append(command)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake_run)
+    with pytest.raises(SystemExit):
+        main(
+            ["--rebuild", "--confirm", "--workdir", str(workdir),
+             "--webhook-url", "ftp://not-a-webhook"]
+        )
+    assert calls == []  # refused before init/plan ever ran
+    assert not (workdir / terraform_runner.REBUILD_PLAN_FILENAME).exists()
+
+
+def test_replay_gaps_refuses_multi_org_snapshots(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same stance as --restore: the network-name join spans every
+    recorded org, so a second org's same-named network would remap its
+    objects and secrets onto the target — cross-tenant bleed."""
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    document = {
+        "organizations": [
+            {"info": {"id": "org-123", "name": "A"}, "networks": []},
+            {"info": {"id": "org-456", "name": "B"}, "networks": []},
+        ]
+    }
+    dump = tmp_path / "multi-org.json"
+    dump.write_text(json.dumps(document), encoding="utf-8")
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(dump),
+         "--workdir", str(tmp_path / "ws"), "--replay-gaps"]
+    )
+    assert exit_code == 2
+
+
+def test_replay_gaps_alert_outage_exits_five(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A DR write happened and the mandated GAP_REPLAY_EXECUTED alert
+    reached nobody: that is the notifier-outage exit, exactly like the
+    pipeline paths — never a clean 0."""
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    _install_fake_meraki_module(monkeypatch)
+    _failing_urlopen(monkeypatch)
+    dump = _secret_dump(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(dump),
+         "--workdir", str(tmp_path / "ws"), "--replay-gaps", "--confirm",
+         "--webhook-url", "https://hooks.example/alerts"]
+    )
+    assert exit_code == 5
+
+
+def test_sanitized_restore_resume_honors_an_attempt_only_journal(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run that died inside its very first create/journal window left
+    only meta + attempt records — but it may already have written into
+    the target. Refusing that resume as 'populated target' would wedge
+    it forever; the write-ahead attempt record is exactly the proof
+    this workdir's restore touched the target."""
+    import sys as _sys
+    import types as _types
+
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+
+    def forbidden(target_org: str) -> int:
+        raise AssertionError("a journaled resume must not count networks")
+
+    monkeypatch.setattr("meraki2tf.cli._target_network_count", forbidden)
+    calls: list[str] = []
+
+    class Section:
+        def __getattr__(self, operation_id: str):  # noqa: ANN204
+            def _dispatch(*args: Any, **kwargs: Any) -> dict:
+                calls.append(operation_id)
+                if operation_id == "createOrganizationNetwork":
+                    return {"id": "L_NEW"}
+                if operation_id == "getOrganizationNetworks":
+                    return []
+                return {}
+
+            return _dispatch
+
+    section = Section()
+    dashboard = SimpleNamespace(
+        organizations=section, networks=section, wireless=section
+    )
+    stub = _types.ModuleType("meraki")
+    stub.DashboardAPI = lambda **kwargs: dashboard  # type: ignore[attr-defined]
+    monkeypatch.setitem(_sys.modules, "meraki", stub)
+    workdir = tmp_path / "ws"
+    workdir.mkdir()
+    (workdir / "restore-journal.jsonl").write_text(
+        json.dumps({"kind": "meta", "target": "org-999", "source": "org-123"})
+        + "\n"
+        + json.dumps(
+            {"kind": "attempt",
+             "key": "/organizations/{organizationId}/networks::N_1"}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    dump = _sanitized_restore_dump(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--restore", "--from-dump", str(dump),
+         "--target-org", "org-999", "--workdir", str(workdir), "--confirm"]
+    )
+    assert exit_code == 0

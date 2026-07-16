@@ -1270,34 +1270,53 @@ class RestoreJournal:
                         )
                         continue
                     raise
-                if record.get("kind") == "done":
-                    self.completed.add(str(record["key"]))
-                elif record.get("kind") == "attempt":
-                    self.attempted.add(str(record["key"]))
-                elif record.get("kind") == "map":
-                    old, new = str(record["old"]), str(record["new"])
-                    self.id_map[old] = new
-                    self.mappings.append(
-                        (
-                            str(record.get("scope", "")),
-                            old,
-                            new,
-                            tuple(
-                                str(v)
-                                for v in record.get("context") or ()
-                            ),
-                        )
+                if not isinstance(record, dict):
+                    # Line-valid JSON that is not an object (a bare
+                    # scalar from hand editing) must surface as the
+                    # CLI's "journal is unreadable" diagnostic, not an
+                    # AttributeError traceback.
+                    raise ValueError(
+                        f"Restore journal {path} line {index + 1} is "
+                        "not a JSON object."
                     )
-                elif record.get("kind") == "meta":
-                    self.meta = {
-                        str(key): str(value)
-                        for key, value in record.items()
-                        if key != "kind"
-                    }
+                try:
+                    self._load_record(record)
+                except KeyError as exc:
+                    raise ValueError(
+                        f"Restore journal {path} line {index + 1} "
+                        f"({record.get('kind')!r} record) is missing "
+                        f"required field {exc}."
+                    ) from exc
         else:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.touch(mode=0o600)
         restrict_to_owner(path)
+
+    def _load_record(self, record: dict[str, Any]) -> None:
+        if record.get("kind") == "done":
+            self.completed.add(str(record["key"]))
+        elif record.get("kind") == "attempt":
+            self.attempted.add(str(record["key"]))
+        elif record.get("kind") == "map":
+            old, new = str(record["old"]), str(record["new"])
+            self.id_map[old] = new
+            self.mappings.append(
+                (
+                    str(record.get("scope", "")),
+                    old,
+                    new,
+                    tuple(
+                        str(v)
+                        for v in record.get("context") or ()
+                    ),
+                )
+            )
+        elif record.get("kind") == "meta":
+            self.meta = {
+                str(key): str(value)
+                for key, value in record.items()
+                if key != "kind"
+            }
 
     def bind(self, target: str, source: str) -> None:
         """Bind the journal to exactly one target org and snapshot source.
@@ -1399,6 +1418,7 @@ class OrgRestorer:
         bucket: AdaptiveTokenBucket | None = None,
         skip_claims: bool = False,
         preset_mappings: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (),
+        additive_only: bool = False,
     ) -> None:
         self._target = target_organization_id
         self._journal = journal
@@ -1413,6 +1433,13 @@ class OrgRestorer:
         #: execution — heal seeds identity mappings for objects that
         #: survived the incident so references to them resolve in place.
         self._preset_mappings = preset_mappings
+        #: Heal mode: surviving objects are never modified. Adopting an
+        #: already-existing counterpart still records its ID mapping
+        #: (children must rewire to the survivor), but the content-
+        #: alignment PUT that would overwrite live content is skipped —
+        #: an operator's manual recreation of a deleted object must not
+        #: be reverted to the stale snapshot copy.
+        self._additive_only = additive_only
         self._client: Any = None
 
     def _dashboard(self) -> Any:
@@ -1424,6 +1451,12 @@ class OrgRestorer:
                 suppress_logging=True,
                 print_console=False,
                 output_log=False,
+                # These engines compete for the shared 10 req/s org
+                # budget — post-disaster, against every surviving
+                # integration. The SDK's default 2 throttle retries give
+                # up far too early for writes whose failure poisons a
+                # whole subtree (or aborts a teardown mid-way).
+                maximum_retries=8,
             )
         return self._client
 
@@ -1725,6 +1758,19 @@ class OrgRestorer:
                     deferred.append((action, str(exc)))
                     continue
                 except Exception as exc:  # noqa: BLE001 - per-object isolation
+                    if getattr(exc, "status", None) == 429:
+                        # Even the SDK's own throttle retries were
+                        # exhausted: a saturated shared budget (exactly
+                        # the post-disaster situation) is transient
+                        # pressure, not a verdict on the object — defer
+                        # it to the next round with backoff instead of
+                        # failing it and poisoning its whole subtree.
+                        self._bucket.on_throttle()
+                        deferred.append(
+                            (action, "the dashboard throttled the write "
+                             "(429) beyond the SDK's retries")
+                        )
+                        continue
                     verdict, salvage = self._salvage_failure(
                         dashboard, dispatch_action, resolver,
                         graph.organization_id, exc,
@@ -2161,6 +2207,13 @@ class OrgRestorer:
         # PUT can resolve its own path scope; the duplicate row the
         # caller records is harmless (same mapping).
         resolver.record(own_stem, own_old, adopted, context)
+        if self._additive_only:
+            logger.warning(
+                "Adopted %s without modifying it: heal is additive-only, "
+                "so the surviving object keeps its live content (the "
+                "snapshot copy is NOT pushed onto it).", action.key,
+            )
+            return
         follow_up = replace(action, kind="configure", operation=action.aligner)
         try:
             self._dispatch(dashboard, follow_up, resolver, source_org)
@@ -2356,10 +2409,22 @@ class OrgRestorer:
         scope_values = action.path_values
         if action.wave == WAVE_NETWORKS:
             scope_values = (source_org,)
-        params = {
-            param: resolver.resolve_scope(param, value, action.path_values)
-            for param, value in zip(op.path_params, scope_values)
-        }
+        try:
+            params = {
+                param: resolver.resolve_scope(param, value, action.path_values)
+                for param, value in zip(op.path_params, scope_values)
+            }
+        except (UnmappedReferenceError, ForeignScopeError) as exc:
+            # A journaled-complete parent whose ID mapping was never
+            # recovered: the lookup's scope cannot resolve. Degrade to
+            # "collection unreadable" — the caller proceeds without
+            # adoption — instead of aborting the whole run outside the
+            # per-action isolation.
+            logger.debug(
+                "Adoption lookup for %s could not resolve its scope "
+                "(%s); proceeding without it.", action.key, exc,
+            )
+            return None
         section = getattr(dashboard, op.tags[0], None) if op.tags else None
         method = (
             getattr(section, op.operation_id, None)
@@ -2455,6 +2520,12 @@ class OrgWiper:
                 suppress_logging=True,
                 print_console=False,
                 output_log=False,
+                # These engines compete for the shared 10 req/s org
+                # budget — post-disaster, against every surviving
+                # integration. The SDK's default 2 throttle retries give
+                # up far too early for writes whose failure poisons a
+                # whole subtree (or aborts a teardown mid-way).
+                maximum_retries=8,
             )
         return self._client
 
@@ -2574,7 +2645,12 @@ class OrgWiper:
             (str(admin.get("id", "")), str(admin.get("email", "")))
             for admin in (admins if isinstance(admins, list) else [])
             if isinstance(admin, Mapping)
-            and str(admin.get("email", "")) != own_email
+            # Case-insensitive: the identity and admin endpoints may
+            # case the same address differently, and mistaking the
+            # caller for "other" would delete the API key's own admin
+            # record mid-teardown.
+            and str(admin.get("email", "")).strip().lower()
+            != own_email.strip().lower()
             and admin.get("id")
         ]
 

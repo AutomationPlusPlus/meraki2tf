@@ -1,6 +1,7 @@
 """Terraform CLI runner: workspace management and subprocess contracts."""
 
 import json
+import os
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -916,21 +917,37 @@ def test_plan_preview_never_generates_config(
 def test_rebuild_apply_consumes_the_previewed_plan_file(
     runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The confirmed apply executes exactly the saved preview plan —
-    never an unattended ``-auto-approve`` re-plan that could differ
-    from what the operator reviewed."""
+    """The confirmed apply executes exactly the plan the preview
+    snapshotted for this run — never the fixed-name file (a concurrent
+    run can rewrite that between preview and apply) and never an
+    unattended ``-auto-approve`` re-plan."""
+
+    def planning_run(command: Any, **kwargs: Any) -> Any:
+        if "plan" in command:
+            (
+                runner.workdir / terraform_runner.REBUILD_PLAN_FILENAME
+            ).write_text("saved-plan", encoding="utf-8")
+        return fake.run(command, **kwargs)
+
     fake = FakeSubprocess(stdout="Apply complete")
-    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    monkeypatch.setattr(terraform_runner.subprocess, "run", planning_run)
     runner.workdir.mkdir(parents=True, exist_ok=True)
     plan_file = runner.workdir / terraform_runner.REBUILD_PLAN_FILENAME
-    plan_file.write_text("saved-plan", encoding="utf-8")
+    runner.plan_preview()
+    verified_name = (
+        f"{terraform_runner.REBUILD_PLAN_FILENAME}.verified-{os.getpid()}"
+    )
+    assert (runner.workdir / verified_name).exists()
+    # A concurrent run swapping the shared filename after the preview
+    # must not change what the confirmed apply executes.
+    plan_file.write_text("swapped-by-another-run", encoding="utf-8")
     runner.rebuild_apply()
-    assert fake.calls[0]["command"] == (
-        "terraform", "apply", "-input=false", "-no-color",
-        terraform_runner.REBUILD_PLAN_FILENAME,
+    assert fake.calls[-1]["command"] == (
+        "terraform", "apply", "-input=false", "-no-color", verified_name,
     )
     # Consume-or-delete: saved plans embed refreshed sensitive values.
     assert not plan_file.exists()
+    assert not (runner.workdir / verified_name).exists()
 
 
 def test_rebuild_apply_refuses_without_a_saved_plan(
@@ -939,6 +956,11 @@ def test_rebuild_apply_refuses_without_a_saved_plan(
     fake = FakeSubprocess(stdout="Apply complete")
     monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
     runner.workdir.mkdir(parents=True, exist_ok=True)
+    # Even a plan file already on disk is refused: without this run's
+    # preview snapshot there is no verified document to bind the apply to.
+    (runner.workdir / terraform_runner.REBUILD_PLAN_FILENAME).write_text(
+        "planted", encoding="utf-8"
+    )
     with pytest.raises(TerraformError, match="No saved rebuild plan"):
         runner.rebuild_apply()
     assert fake.calls == []
@@ -2009,3 +2031,79 @@ def test_state_restriction_routes_through_owner_only_helper(
     restricted.clear()
     restriction_runner._restrict_state_permissions()
     assert restricted == [state, backup]
+
+
+def test_apply_import_plan_survives_a_leftover_verified_copy(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run killed hard (OOM, power loss) leaves its run-private plan
+    copy behind: a later run recycling the same PID must replace it —
+    not crash on the exclusive create — and copies from dead PIDs are
+    swept so no secret-bearing plan document outlives its run."""
+    runner.prepare_workspace()
+    (runner.workdir / SYNC_PLAN_FILENAME).write_bytes(b"opaque-plan")
+    own_leftover = (
+        runner.workdir / f"{SYNC_PLAN_FILENAME}.verified-{os.getpid()}"
+    )
+    own_leftover.write_bytes(b"stale-from-a-recycled-pid")
+    # A PID far above any real pid_max: definitely not alive.
+    dead_leftover = (
+        runner.workdir / f"{SYNC_PLAN_FILENAME}.verified-4194304999"
+    )
+    dead_leftover.write_bytes(b"stale-from-a-dead-run")
+    show_json = json.dumps(
+        {
+            "resource_changes": [
+                {
+                    "address": "meraki_networks.n_1",
+                    "change": {"actions": ["no-op"], "importing": {"id": "N_1"}},
+                },
+            ]
+        }
+    )
+    scripted = ScriptedSubprocess(
+        (0, show_json, None),
+        (
+            0,
+            "Apply complete!",
+            lambda: _write_state(runner.state_path, "meraki_networks.n_1"),
+        ),
+    )
+    monkeypatch.setattr(terraform_runner.subprocess, "run", scripted.run)
+    added = runner.apply_import_plan()
+    assert added == ("meraki_networks.n_1",)
+    assert not dead_leftover.exists()
+    assert not own_leftover.exists()
+
+
+def test_absorb_generated_config_is_atomic_and_replay_safe(
+    runner: TerraformRunner,
+) -> None:
+    """A crash between the absorb and the unlink replays the absorb on
+    the next run; appending again would duplicate every resource block
+    and terraform would reject the workspace on every subsequent plan."""
+    runner.prepare_workspace()
+    aggregated = runner.workdir / terraform_runner.AGGREGATED_CONFIG_FILENAME
+    generated = runner.workdir / terraform_runner.GENERATED_CONFIG_FILENAME
+    block = 'resource "meraki_network" "n_1" {\n  name = "HQ"\n}\n'
+    generated.write_text(block, encoding="utf-8")
+    runner._absorb_generated_config()
+    assert aggregated.read_text(encoding="utf-8") == block
+    assert not generated.exists()
+    # Crash replay: the generation target reappears with content the
+    # baseline already ends with — absorbing again must be a no-op.
+    generated.write_text(block, encoding="utf-8")
+    runner._absorb_generated_config()
+    assert aggregated.read_text(encoding="utf-8") == block
+    assert not generated.exists()
+
+
+def test_plan_with_generation_refuses_an_empty_target_set(
+    runner: TerraformRunner,
+) -> None:
+    """Same stance as plan_targeted: an empty target set would silently
+    degenerate to a full untargeted plan (a multi-hour read window); a
+    full plan must be requested explicitly with targets=None."""
+    runner.prepare_workspace()
+    with pytest.raises(ValueError, match="empty target set"):
+        runner.plan_with_generation(targets=())

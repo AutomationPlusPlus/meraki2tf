@@ -76,9 +76,16 @@ REDACTED = "**REDACTED**"
 #: counts as a secret (redact in artifacts, restore from the dump).
 SECRET_KEY_PATTERN = re.compile(
     r"secret|psk|passphrase|password(?!expiration|length|s$|count)"
-    r"|community|token|api_?key|auth_?key"
+    r"|community|token|api_?key|auth_?key|authentication_?key"
     r"|shared_?key|auth_?pass|priv_?pass|passcode|pin$|private_?key"
-    r"|credential|license_?key|encryption_?key|wep_?key|wpa_?key",
+    r"|credential|license_?key|encryption_?key|wep_?key|wpa_?key"
+    # Spec-declared credential fields whose names carry no secret-ish
+    # stem: the coterm licensing endpoint's bare `key` ("The key of the
+    # license") and SM software `redemptionCode` (redeemable VPP codes).
+    # Bare `key` over-matches a few non-credential fields (GRE keys);
+    # for a sanitizer and the secret-reporting union, over-redaction is
+    # the safe direction.
+    r"|redemption_?code|^key$",
     re.IGNORECASE,
 )
 _SECRET_KEY = SECRET_KEY_PATTERN
@@ -87,7 +94,10 @@ _SECRET_KEY = SECRET_KEY_PATTERN
 #: value shape, so they must be caught by key like names and serials.
 _IDENTITY_KEY = re.compile(
     r"name$|names$|email|url$|urls$|address|notes|^mac$|^tags$|serial|phone"
-    r"|^imei$|^iccid$|^eid$|^meid$|^msisdn$",
+    # enrollmentString is a customer-chosen, globally unique SM slug
+    # (the public n.meraki.com/<slug> enrollment path) — it identifies
+    # the organization as surely as its name does.
+    r"|^imei$|^iccid$|^eid$|^meid$|^msisdn$|^enrollmentstring$",
     re.IGNORECASE,
 )
 _COORDINATE_KEYS = frozenset({"lat", "lng"})
@@ -524,9 +534,13 @@ class _GraphSanitizer:
 
     def _clean_identity_shaped(self, value: str) -> str:
         """Pseudonymize identity-shaped values regardless of their key."""
-        if "PRIVATE KEY-----" in value:
+        if "PRIVATE KEY-----" in value or "-----BEGIN CERTIFICATE" in value:
             # PEM private-key blocks (RADSEC, custom certs) are secrets
             # even under non-secret-shaped keys like `certificate`.
+            # Certificate/CSR blocks are identity: their DER encodes the
+            # real Subject CN, Organization, and SAN hostnames — and
+            # with the private key already redacted they are not
+            # restorable material anyway.
             return REDACTED
         if _LIQUID_TAG.search(value):
             # Template code passes through verbatim; the literal text
