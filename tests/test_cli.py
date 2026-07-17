@@ -807,6 +807,54 @@ def test_fail_on_gaps_passes_a_fully_covered_run(
     assert exit_code == 0
 
 
+def test_fail_on_gaps_gates_a_snapshot_export_run(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The weekly job is snapshot-only since the terraform demotion
+    (2026-07-17); its coverage gate rides the --dump-to invocation."""
+    _no_network(monkeypatch)
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    from conftest import DUMP_DOCUMENT
+
+    document = json.loads(json.dumps(DUMP_DOCUMENT))
+    document["features"].append(
+        {"apiPath": "/networks/{networkId}/unknownFeature", "pathValues": ["N_1"]}
+    )
+    dump = tmp_path / "gappy.json"
+    dump.write_text(json.dumps(document), encoding="utf-8")
+    workdir = tmp_path / "workspace"
+    out = tmp_path / "snapshot.json"
+
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(dump),
+         "--dump-to", str(out), "--workdir", str(workdir), "--fail-on-gaps"]
+    )
+
+    assert exit_code == 3
+    # The gate does not truncate the run: snapshot, manifest, and the
+    # DR runbook are complete before the nonzero exit.
+    assert out.exists()
+    assert (workdir / "runbook.md").exists()
+    manifest = json.loads((workdir / "coverage.json").read_text(encoding="utf-8"))
+    assert manifest["totals"]["unsupported"] == 1
+
+
+def test_fail_on_gaps_passes_a_fully_covered_snapshot_export(
+    spec_file: Path,
+    dump_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _no_network(monkeypatch)
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(dump_file),
+         "--dump-to", str(tmp_path / "snapshot.json"),
+         "--workdir", str(tmp_path / "workspace"), "--fail-on-gaps"]
+    )
+    assert exit_code == 0
+
+
 def test_coverage_manifest_is_part_of_every_kit(
     spec_file: Path,
     dump_file: Path,

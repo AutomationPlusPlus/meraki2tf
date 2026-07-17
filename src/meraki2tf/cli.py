@@ -36,6 +36,7 @@ import sys
 import tempfile
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 from meraki2tf.alerts import (
     drift_detected,
@@ -268,7 +269,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Exit with code 3 when the run discovers objects Terraform "
             "cannot rebuild (coverage gaps), so schedulers and CI can gate "
-            "on full coverage."
+            "on full coverage. Valid in every read-only mode, including "
+            "--dump-to snapshot exports."
         ),
     )
     actions = parser.add_argument_group(
@@ -519,7 +521,7 @@ def _export_coverage(
     parser: OpenApiParser,
     dispatcher: AlertDispatcher,
     drift_was_detected: bool,
-) -> None:
+) -> dict[str, Any]:
     """Coverage manifest + RUN_SUCCESS for a snapshot-export run.
 
     The scheduled weekly job is a --dump-to invocation, and Cardinal
@@ -530,7 +532,11 @@ def _export_coverage(
     workdir's accumulated kit is not touched.
     """
     from meraki2tf.restorer import plan_restore, restore_verdicts
-    from meraki2tf.runbook import payload_index, secret_attribute_union
+    from meraki2tf.runbook import (
+        payload_index,
+        secret_attribute_union,
+        write_runbook,
+    )
 
     generator = HclImportGenerator(
         parser,
@@ -556,6 +562,18 @@ def _export_coverage(
     )
     config.workdir.mkdir(parents=True, exist_ok=True)
     write_manifest(manifest, config.workdir)
+    # The DR runbook is regenerated every run in every mode: after a
+    # disaster the manual-rebuild list must be as fresh as the snapshot
+    # it accompanies, not as old as the last terraform rehearsal.
+    write_runbook(
+        workdir=config.workdir,
+        organization_id=graph.organization_id,
+        graph=graph,
+        captured=report.captured,
+        unsupported=report.unsupported,
+        unmanaged_secret_attributes=unmanaged_secrets,
+        parser=parser,
+    )
     logger.info(
         "Snapshot export complete; dispatching RUN_SUCCESS notification. "
         "The Meraki organization was not modified — every run is "
@@ -575,6 +593,7 @@ def _export_coverage(
             unmanaged_secret_attributes=unmanaged_secrets,
         )
     )
+    return manifest
 
 
 def _export_snapshot(
@@ -626,7 +645,11 @@ def _export_snapshot(
             "use --sanitize for any copy that leaves the DR vault."
         )
     write_snapshot(graph, config.dump_to, sanitized=config.sanitize)
-    _export_coverage(raw_graph, config, parser, dispatcher, drift_was_detected)
+    manifest = _export_coverage(
+        raw_graph, config, parser, dispatcher, drift_was_detected
+    )
+    if config.fail_on_gaps:
+        return _coverage_gap_exit(int(manifest["totals"]["unsupported"]))
     return 0
 
 
@@ -1585,15 +1608,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.info("meraki2tf starting in rebuild (disaster recovery) mode.")
         return _rebuild(config)
     if config.dump_to is not None and (
-        config.sync or config.confirm_deletions or config.fail_on_gaps
-        or config.rebaseline
+        config.sync or config.confirm_deletions or config.rebaseline
     ):
         # --rebaseline resets the resources.tf baseline, which the
         # export path never touches; accepting it silently would let an
         # operator believe the baseline was reset when it was not.
+        # (--fail-on-gaps is accepted: export runs write the coverage
+        # manifest too, and the snapshot-only weekly job needs the gate.)
         arg_parser.error(
             "--dump-to only exports a snapshot; it cannot be combined with "
-            "--sync, --confirm-deletions, --fail-on-gaps, or --rebaseline."
+            "--sync, --confirm-deletions, or --rebaseline."
         )
     if config.mode is ExecutionMode.LIVE and not config.org_id:
         arg_parser.error("--org-id is required in live mode.")
@@ -1639,7 +1663,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             # channels, not just the local log (the contract's
             # "critical script processing faults" trigger).
             try:
-                _export_snapshot(provider, config, spec_parser, dispatcher)
+                export_exit = _export_snapshot(
+                    provider, config, spec_parser, dispatcher
+                )
             except Exception as exc:
                 logger.critical("Snapshot export failed: %s", exc)
                 dispatcher.dispatch(
@@ -1648,7 +1674,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
                 )
                 return 1
-            return _alert_outage_exit(dispatcher)
+            # Same priority as the pipeline path: known coverage gaps
+            # (3) outrank a silent notifier outage (5). The outage
+            # helper runs unconditionally so the outage is always
+            # LOGGED even when the gap code wins the exit.
+            outage_exit = _alert_outage_exit(dispatcher)
+            return export_exit or outage_exit
         runner = TerraformRunner(
             config.workdir,
             executable=config.terraform_bin,
@@ -1695,7 +1726,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     _report(summary)
     # Exit-code priority (see the module docstring): a stalled full-kit
     # materialization (4) outranks known coverage gaps (3), which
-    # outrank a silent notifier outage (5).
+    # outrank a silent notifier outage (5). The outage helper runs
+    # first and unconditionally: on a permanently-gapped org the gap
+    # code wins the exit every run, and a notifier outage would
+    # otherwise never even be logged.
+    outage_exit = _alert_outage_exit(dispatcher)
     if summary.apply_aborted:
         # A sync run whose full-kit apply was refused (the plan carried
         # mutations) must not report success — a scheduler gating on the
@@ -1717,15 +1752,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             growth,
         )
         return 4
-    if config.fail_on_gaps and summary.unsupported_count > 0:
+    if config.fail_on_gaps:
+        gap_exit = _coverage_gap_exit(summary.unsupported_count)
+        if gap_exit:
+            return gap_exit
+    return outage_exit
+
+
+def _coverage_gap_exit(unsupported_count: int) -> int:
+    """0, or 3 when the run discovered objects Terraform cannot rebuild.
+
+    One definition of the --fail-on-gaps gate for both the pipeline and
+    the snapshot-export paths — the Azure wrapper treats exit 3 as a
+    completed, fresh-artifact run, so the two paths must never diverge.
+    """
+    if unsupported_count > 0:
         logger.error(
             "--fail-on-gaps: %d discovered object(s) cannot be rebuilt by "
             "Terraform; exiting nonzero. See coverage.json in the workdir "
             "for the manual-rebuild list.",
-            summary.unsupported_count,
+            unsupported_count,
         )
         return 3
-    return _alert_outage_exit(dispatcher)
+    return 0
 
 
 def _alert_outage_exit(dispatcher: AlertDispatcher) -> int:
