@@ -184,6 +184,52 @@ _PLAN_NO_CHANGES_RE = re.compile(
 _RESOURCE_BLOCK_RE = re.compile(r'^resource\s+"(?P<type>[^"]+)"\s+"(?P<name>[^"]+)"\s*\{')
 
 
+def _split_resource_blocks(text: str) -> tuple[str, dict[str, str]]:
+    """(preamble, address → block text) for terraform-generated config.
+
+    Blocks are hclfmt-shaped: the opener at column 0, the closing ``}``
+    at column 0, and each block's ``# __generated__ …`` header comment
+    travels with it. Anything outside a resource block (rare — the
+    baseline is purely generated) is preserved verbatim as preamble.
+    Every returned chunk ends with exactly one trailing newline so the
+    caller can join blocks with a single blank separator line.
+    """
+    lines = text.splitlines(keepends=True)
+    preamble: list[str] = []
+    blocks: dict[str, str] = {}
+    pending: list[str] = []  # header comments owned by the next block
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        match = _RESOURCE_BLOCK_RE.match(line)
+        if match is None:
+            if line.lstrip().startswith("#"):
+                pending.append(line)
+            else:
+                if line.strip():
+                    preamble.extend(pending)
+                    preamble.append(line)
+                pending.clear()
+            index += 1
+            continue
+        chunk = list(pending)
+        pending.clear()
+        chunk.append(line)
+        if line.rstrip().endswith("{"):  # multi-line block
+            index += 1
+            while index < len(lines) and not lines[index].startswith("}"):
+                chunk.append(lines[index])
+                index += 1
+            if index < len(lines):
+                chunk.append(lines[index])
+        index += 1
+        body = "".join(chunk)
+        blocks[f"{match['type']}.{match['name']}"] = body.rstrip("\n") + "\n"
+    preamble.extend(pending)
+    joined = "".join(preamble)
+    return (joined.rstrip("\n") + "\n" if joined.strip() else ""), blocks
+
+
 class TerraformError(RuntimeError):
     """A terraform invocation failed; message carries the CLI diagnostics."""
 
@@ -1215,22 +1261,36 @@ class TerraformRunner:
                 if aggregated.exists()
                 else ""
             )
-            addition = content if content.endswith("\n") else content + "\n"
-            if existing.endswith(addition):
+            old_preamble, old_blocks = _split_resource_blocks(existing)
+            new_preamble, new_blocks = _split_resource_blocks(content)
+            replayed = (
+                bool(new_blocks)
+                and all(
+                    old_blocks.get(address) == body
+                    for address, body in new_blocks.items()
+                )
+                and (not new_preamble or new_preamble in old_preamble)
+            )
+            if replayed:
                 # A crash between last run's absorb and the unlink below
-                # replays this call; appending again would duplicate
-                # every resource block and terraform would reject the
-                # workspace on every subsequent plan.
+                # replays this call; absorbing again would be a no-op,
+                # so only clean up the leftover generation target.
                 logger.info(
                     "Generated configuration already absorbed into %s; "
                     "cleaning up the leftover generation target.",
                     AGGREGATED_CONFIG_FILENAME,
                 )
             else:
-                # Atomic replace, never in-place append: a crash mid-
-                # append leaves a torn resources.tf that wedges every
-                # unattended run after it.
-                atomic_write_text(aggregated, existing + addition)
+                # Merge by address (fresh generation wins) and write the
+                # blocks in address order: terraform emits them in plan
+                # order, which varies run to run and would churn diffs
+                # for anyone committing the kit. Atomic replace, never
+                # in-place append: a crash mid-append leaves a torn
+                # resources.tf that wedges every unattended run after it.
+                merged = {**old_blocks, **new_blocks}
+                parts = [p for p in (old_preamble, new_preamble) if p.strip()]
+                parts.extend(merged[address] for address in sorted(merged))
+                atomic_write_text(aggregated, "\n".join(parts))
                 logger.info(
                     "Absorbed newly generated configuration into %s.",
                     AGGREGATED_CONFIG_FILENAME,

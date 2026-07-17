@@ -2098,6 +2098,40 @@ def test_absorb_generated_config_is_atomic_and_replay_safe(
     assert not generated.exists()
 
 
+def test_absorb_orders_blocks_by_address_deterministically(
+    runner: TerraformRunner,
+) -> None:
+    """terraform emits generated blocks in plan order, which varies run
+    to run; the absorbed baseline must not churn diffs for kit-committers.
+    Headers travel with their block, and a regenerated address replaces
+    the stale copy instead of duplicating it."""
+    runner.prepare_workspace()
+    aggregated = runner.workdir / terraform_runner.AGGREGATED_CONFIG_FILENAME
+    generated = runner.workdir / terraform_runner.GENERATED_CONFIG_FILENAME
+    zeta = (
+        '# __generated__ by Terraform from "Z_9"\n'
+        'resource "meraki_network" "zeta" {\n  name = "Z"\n}\n'
+    )
+    alpha = (
+        '# __generated__ by Terraform from "A_1"\n'
+        'resource "meraki_network" "alpha" {\n  name = "A"\n}\n'
+    )
+    generated.write_text(zeta + "\n" + alpha, encoding="utf-8")
+    runner._absorb_generated_config()
+    assert aggregated.read_text(encoding="utf-8") == alpha + "\n" + zeta
+
+    # A later run regenerates zeta (Meraki-is-truth) plus a new block:
+    # same address replaces, ordering stays sorted.
+    zeta2 = zeta.replace('name = "Z"', 'name = "Z2"')
+    mid = 'resource "meraki_network" "mid" {\n  name = "M"\n}\n'
+    generated.write_text(zeta2 + "\n" + mid, encoding="utf-8")
+    runner._absorb_generated_config()
+    assert (
+        aggregated.read_text(encoding="utf-8")
+        == alpha + "\n" + mid + "\n" + zeta2
+    )
+
+
 def test_plan_with_generation_refuses_an_empty_target_set(
     runner: TerraformRunner,
 ) -> None:
