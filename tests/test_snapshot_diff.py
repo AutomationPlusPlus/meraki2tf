@@ -198,6 +198,77 @@ def test_envelope_collections_diff_despite_the_writable_filter(
     assert diff_graphs(previous, previous, parser).is_empty
 
 
+FIRMWARE_PATH = "/networks/{networkId}/firmwareUpgrades"
+
+
+def _firmware(product: dict[str, object]) -> FeatureConfiguration:
+    return FeatureConfiguration(
+        FIRMWARE_PATH,
+        ("N_1",),
+        {
+            "timezone": "US/Eastern",
+            "participateInNextBetaRelease": False,
+            "products": {"appliance": dict(product)},
+        },
+    )
+
+
+def test_firmware_catalog_churn_is_not_drift() -> None:
+    """A Cisco release changes availableVersions (and a completed
+    upgrade changes currentVersion/lastUpgrade) on every network with
+    zero operator involvement — the weekly loop must not page on it."""
+    previous = _graph(
+        _firmware(
+            {
+                "availableVersions": [{"id": "18842", "shortName": "MX 26.2.1"}],
+                "currentVersion": {"id": "18800", "shortName": "MX 26.2"},
+                "lastUpgrade": {"time": "2026-06-01T00:00:00Z"},
+                "nextUpgrade": {"time": "", "toVersion": None},
+            }
+        )
+    )
+    current = _graph(
+        _firmware(
+            {
+                "availableVersions": [{"id": "21104", "shortName": "MX 26.2.2"}],
+                "currentVersion": {"id": "18842", "shortName": "MX 26.2.1"},
+                "lastUpgrade": {"time": "2026-07-16T06:00:00Z"},
+                "nextUpgrade": {"time": "", "toVersion": None},
+            }
+        )
+    )
+    assert diff_graphs(previous, current).is_empty
+
+
+def test_firmware_scheduled_upgrade_is_still_drift() -> None:
+    """nextUpgrade is operator-scheduled configuration; stripping the
+    catalog noise must not silence it."""
+    previous = _graph(_firmware({"nextUpgrade": {"time": "", "toVersion": None}}))
+    current = _graph(
+        _firmware(
+            {
+                "nextUpgrade": {
+                    "time": "2026-08-01T04:00:00Z",
+                    "toVersion": {"id": "21104", "shortName": "MX 26.2.2"},
+                }
+            }
+        )
+    )
+    (mod,) = diff_graphs(previous, current).modified
+    assert "products" in mod.changed
+
+
+def test_volatile_strip_leaves_other_paths_untouched() -> None:
+    from meraki2tf.snapshot_diff import _strip_volatile_subtrees
+
+    payload = {"products": {"appliance": {"availableVersions": [1]}}}
+    assert _strip_volatile_subtrees(VLAN_PATH, payload) == payload
+    stripped = _strip_volatile_subtrees(FIRMWARE_PATH, payload)
+    assert stripped == {"products": {"appliance": {}}}
+    # the original payload is never mutated
+    assert payload["products"]["appliance"]["availableVersions"] == [1]
+
+
 def test_device_network_moves_are_drift(tmp_path: Path) -> None:
     """networkId is not in the device PUT schema (claims are separate
     endpoints), but a device re-homed between networks is exactly the
