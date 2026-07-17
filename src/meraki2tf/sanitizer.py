@@ -469,8 +469,16 @@ class _GraphSanitizer:
                 return self._id_map[value]
             # Opaque ID references seen only inside payloads
             # (`interfaceId`, nested `id` echoes, `…Ids` lists) map to
-            # the same consistent pseudonyms as path-level IDs.
-            if _ID_REFERENCE_KEY.search(key) and not _is_structural_number(value):
+            # the same consistent pseudonyms as path-level IDs. Global
+            # catalog URIs are exempt (an L7 rule's application id
+            # `meraki:layer7/application/…`): the same value exists in
+            # every organization — not identity — and a pseudonym fails
+            # the dashboard's URI-format validation on restore.
+            if (
+                _ID_REFERENCE_KEY.search(key)
+                and not _is_structural_number(value)
+                and not value.startswith("meraki:")
+            ):
                 self._assign(value, "id")
                 return self._id_map[value]
         if isinstance(value, int) and not isinstance(value, bool):
@@ -520,6 +528,13 @@ class _GraphSanitizer:
             if value.lower() == "default":
                 # The fixed-slot selector again, echoed in payloads
                 # (a vlan profile's own `iname`).
+                return value
+            if value.startswith("meraki:"):
+                # Global catalog URIs (an L7 rule's application id
+                # `meraki:layer7/application/…`, content-filtering
+                # category ids): the same value exists in every
+                # organization — not identity — and a pseudonym fails
+                # the dashboard's URI-format validation on restore.
                 return value
             if "email" in key.lower() or _EMAIL_VALUE.fullmatch(value):
                 return self._fake_email(value)

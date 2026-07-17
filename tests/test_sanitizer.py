@@ -202,6 +202,42 @@ def test_extended_secret_keys_are_redacted() -> None:
     assert payload["pinEnabled"] is True
 
 
+def test_meraki_catalog_uris_survive_sanitization() -> None:
+    """An L7 rule's application id (`meraki:layer7/application/…`) is a
+    global catalog URI, identical in every organization — pseudonymizing
+    it breaks the dashboard's URI-format validation on restore drills."""
+    graph = NetworkGraph(
+        "org-123", (), (),
+        (
+            FeatureConfiguration(
+                "/networks/{networkId}/groupPolicies/{groupPolicyId}",
+                ("N_1", "100"),
+                {
+                    "groupPolicyId": "100",
+                    "name": "Guest-policy",
+                    "firewallAndTrafficShaping": {
+                        "l7FirewallRules": [
+                            {
+                                "policy": "deny",
+                                "type": "application",
+                                "value": {
+                                    "id": "meraki:layer7/application/171",
+                                    "name": "Video streaming",
+                                },
+                            }
+                        ]
+                    },
+                },
+            ),
+        ),
+    )
+    payload = sanitize_graph(graph).features[0].payload
+    rule = payload["firewallAndTrafficShaping"]["l7FirewallRules"][0]
+    assert rule["value"]["id"] == "meraki:layer7/application/171"
+    # the policy's own name is still pseudonymized
+    assert payload["name"] != "Guest-policy"
+
+
 def test_pem_private_keys_are_redacted_regardless_of_key() -> None:
     """A PEM private-key block under a non-secret-shaped key (e.g. a
     combined `certificate` blob) must still be redacted."""
