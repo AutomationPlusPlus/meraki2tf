@@ -566,7 +566,7 @@ def test_execute_reaches_template_scoped_targets(
     the map covers it (regression: it was always refused)."""
     dashboard = _FakeDashboard(networks=[])
     _install_fake_meraki(monkeypatch, dashboard)
-    executed, failed = GapReplayer().execute(
+    executed, failed, _skipped = GapReplayer().execute(
         (_vlan_action(spec_parser, network="T_1"),),
         target_organization_id="org-999",
         snapshot_organization_id="org-123",
@@ -607,7 +607,7 @@ def test_execute_remaps_ids_and_prefers_path_params(
 ) -> None:
     dashboard = _FakeDashboard(networks=[])
     _install_fake_meraki(monkeypatch, dashboard)
-    executed, failed = GapReplayer().execute(
+    executed, failed, _skipped = GapReplayer().execute(
         (_vlan_action(spec_parser),),
         target_organization_id="org-999",
         snapshot_organization_id="org-123",
@@ -642,7 +642,7 @@ def test_execute_isolates_failures_per_action(
         address="meraki_wireless_ssid.n_2_0",
         lookup=_lookup_op(spec_parser, "getNetworkWirelessSsids"),
     )
-    executed, failed = GapReplayer().execute(
+    executed, failed, _skipped = GapReplayer().execute(
         (_vlan_action(spec_parser), ssid),
         target_organization_id="org-999",
         snapshot_organization_id="org-123",
@@ -652,6 +652,93 @@ def test_execute_isolates_failures_per_action(
     assert len(executed) == 1  # the SSID still went through
     assert dashboard.wireless.calls[0][1]["psk"] == "wifi-secret"
     assert "wifi-secret" not in failed[0][0]  # targets carry no values
+
+
+def test_template_bound_400_is_a_skip_not_a_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    spec_parser: OpenApiParser,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Template-governed surfaces on a bound network refuse direct
+    writes permanently and by design; counting them as failures makes
+    every scheduled weekly replay exit nonzero forever."""
+
+    class RefusingSection:
+        @staticmethod
+        def updateNetworkWirelessSsid(**kwargs: Any) -> None:
+            error = RuntimeError("this setting is managed by the template")
+            error.status = 400  # type: ignore[attr-defined]
+            raise error
+
+        @staticmethod
+        def getNetworkWirelessSsids(**kwargs: Any) -> list[dict[str, Any]]:
+            return [{"number": 0, "name": "Corp"}]
+
+    dashboard = types.SimpleNamespace(wireless=RefusingSection())
+    stub = types.ModuleType("meraki")
+    stub.DashboardAPI = lambda **kwargs: dashboard  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "meraki", stub)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "unit-test-key")
+
+    ssid_op = next(
+        op
+        for op in spec_parser.endpoints()
+        if op.operation_id == "updateNetworkWirelessSsid"
+    )
+    action = ReplayAction(
+        kind="secrets",
+        api_path=SSID_PATH,
+        path_values=("N_2", "0"),
+        payload={"psk": "wifi-secret"},
+        operation=ssid_op,
+        address="meraki_wireless_ssid.n_2_0",
+        lookup=_lookup_op(spec_parser, "getNetworkWirelessSsids"),
+    )
+    executed, failed, skipped = GapReplayer().execute(
+        (action,),
+        target_organization_id="org-999",
+        snapshot_organization_id="org-123",
+        network_ids={"N_2": "N_9"},
+        template_bound=frozenset({"N_2"}),
+    )
+    assert failed == ()
+    assert executed == ()
+    (skip,) = skipped
+    assert skip.api_path == SSID_PATH
+    assert "config template" in skip.reason
+    assert "wifi-secret" not in caplog.text
+
+    # The same 400 on an unbound network is still a real failure.
+    executed, failed, skipped = GapReplayer().execute(
+        (action,),
+        target_organization_id="org-999",
+        snapshot_organization_id="org-123",
+        network_ids={"N_2": "N_9"},
+        template_bound=frozenset(),
+    )
+    assert len(failed) == 1 and skipped == ()
+
+
+def test_template_bound_networks_reads_the_snapshot_flag() -> None:
+    from meraki2tf.models import MerakiNetwork
+    from meraki2tf.replayer import template_bound_networks
+
+    bound = MerakiNetwork(
+        network_id="N_2", organization_id="org-123", name="branch",
+        product_types=("appliance",),
+        payload={"isBoundToConfigTemplate": True, "configTemplateId": "T_1"},
+    )
+    free = MerakiNetwork(
+        network_id="N_3", organization_id="org-123", name="hq",
+        product_types=("appliance",), payload={},
+    )
+    graph = NetworkGraph(
+        organization_id="org-123",
+        networks=(bound, free),
+        devices=(),
+        features=(),
+    )
+    assert template_bound_networks(graph) == frozenset({"N_2"})
 
 
 def test_execute_withholds_error_detail_for_secret_bearing_objects(
@@ -692,7 +779,7 @@ def test_execute_withholds_error_detail_for_secret_bearing_objects(
         operation=ssid_op,
         lookup=_lookup_op(spec_parser, "getNetworkWirelessSsids"),
     )
-    executed, failed = GapReplayer().execute(
+    executed, failed, _skipped = GapReplayer().execute(
         (action,),
         target_organization_id="org-999",
         snapshot_organization_id="org-123",
@@ -724,7 +811,7 @@ def test_execute_keeps_dispatch_error_text_for_secret_payloads(
         payload={"psk": "hunter2"},
         operation=ssid_op,
     )
-    executed, failed = GapReplayer().execute(
+    executed, failed, _skipped = GapReplayer().execute(
         (action,),
         target_organization_id="org-999",
         snapshot_organization_id="org-123",
@@ -788,7 +875,7 @@ def _run_idempotency(
     monkeypatch: pytest.MonkeyPatch,
     section: _IdempotencySection,
     actions: tuple[ReplayAction, ...],
-) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
+):
     dashboard = types.SimpleNamespace(organizations=section)
     stub = types.ModuleType("meraki")
     stub.DashboardAPI = lambda **kwargs: dashboard  # type: ignore[attr-defined]
@@ -809,7 +896,7 @@ def test_execute_skips_post_only_creates_that_already_exist(
     duplicate every object that already succeeded: same-named items in
     the collection are skipped with a reason, never re-POSTed."""
     section = _IdempotencySection(existing=[{"id": "L_1", "name": "HQ"}])
-    executed, failed = _run_idempotency(
+    executed, failed, _skipped = _run_idempotency(
         monkeypatch,
         section,
         (
@@ -833,7 +920,7 @@ def test_already_present_lookup_failures_fall_back_to_the_create(
     """An unreadable collection keeps today's behavior — the POST fires
     and, worst case, the API rejects one duplicate per object."""
     section = _IdempotencySection(existing=RuntimeError("listing exploded"))
-    executed, failed = _run_idempotency(
+    executed, failed, _skipped = _run_idempotency(
         monkeypatch, section, (_networks_create_action(spec_parser, "HQ"),)
     )
     assert failed == ()
@@ -854,7 +941,7 @@ def test_already_present_needs_a_lookup_and_a_name(
     nameless = dataclasses.replace(
         _networks_create_action(spec_parser, "HQ"), payload={"timeZone": "UTC"}
     )
-    executed, failed = _run_idempotency(
+    executed, failed, _skipped = _run_idempotency(
         monkeypatch, section, (no_lookup, nameless)
     )
     assert failed == ()
@@ -907,7 +994,7 @@ def test_already_present_unwraps_envelope_listings(
         return {"items": [{"id": "L_1", "name": "HQ"}], "meta": {}}
 
     section.getOrganizationNetworks = envelope  # type: ignore[method-assign]
-    executed, failed = _run_idempotency(
+    executed, failed, _skipped = _run_idempotency(
         monkeypatch, section, (_networks_create_action(spec_parser, "HQ"),)
     )
     assert failed == ()
@@ -920,7 +1007,7 @@ def test_execute_refuses_unmapped_network(
 ) -> None:
     dashboard = _FakeDashboard(networks=[])
     _install_fake_meraki(monkeypatch, dashboard)
-    executed, failed = GapReplayer().execute(
+    executed, failed, _skipped = GapReplayer().execute(
         (_vlan_action(spec_parser, network="N_GONE"),),
         target_organization_id="org-999",
         snapshot_organization_id="org-123",
@@ -1296,7 +1383,7 @@ def test_execute_refuses_a_stale_item_id_with_no_live_counterpart(
         listings={"getNetworkApplianceVlans": [{"id": "77", "name": "Other"}]},
     )
     _install_fake_meraki(monkeypatch, dashboard)
-    executed, failed = GapReplayer().execute(
+    executed, failed, _skipped = GapReplayer().execute(
         (_vlan_action(spec_parser),),
         target_organization_id="org-999",
         snapshot_organization_id="org-123",
@@ -1321,7 +1408,7 @@ def test_execute_refuses_an_item_id_that_now_names_a_different_object(
         },
     )
     _install_fake_meraki(monkeypatch, dashboard)
-    executed, failed = GapReplayer().execute(
+    executed, failed, _skipped = GapReplayer().execute(
         (_vlan_action(spec_parser),),  # snapshot expects VLAN 10 "Data"
         target_organization_id="org-999",
         snapshot_organization_id="org-123",
@@ -1342,7 +1429,7 @@ def test_execute_refuses_item_writes_with_no_collection_read_back(
     dashboard = _FakeDashboard(networks=[])
     _install_fake_meraki(monkeypatch, dashboard)
     action = _vlan_action(spec_parser)
-    executed, failed = GapReplayer().execute(
+    executed, failed, _skipped = GapReplayer().execute(
         (replace_action_lookup(action, None),),
         target_organization_id="org-999",
         snapshot_organization_id="org-123",
