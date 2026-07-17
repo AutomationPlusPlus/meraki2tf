@@ -401,8 +401,8 @@ changes ever fire `DRIFT_DETECTED`.
 
 The default invocation is the ad-hoc/open-source mode: strictly
 read-only end to end, safe for anyone to run against any org. The
-weekly DR job passes `--sync` to also **materialize Terraform state**
-unattended:
+scheduled terraform rehearsal (monthly in the recommended cadence)
+passes `--sync` to also **materialize Terraform state** unattended:
 
 - After the speculative plan, the run auto-applies **only when the plan
   is 100% imports (0 to add, 0 to change, 0 to destroy)**. Import
@@ -422,8 +422,8 @@ unattended:
   human re-runs with `--confirm-deletions`, which removes them from
   `resources.tf` and the state.
 - Every applied run reports exactly which resources were added to state
-  (log + `RUN_SUCCESS.resources_added_to_state`), so weekly reruns tell
-  you what grew.
+  (log + `RUN_SUCCESS.resources_added_to_state`), so scheduled reruns
+  tell you what grew.
 
 `--sync` requires `MERAKI_DASHBOARD_API_KEY` and fails loudly without
 it — silently skipping the apply would let the scheduled job believe it
@@ -663,8 +663,16 @@ support.
 
 > The terraform kit remains in the rotation deliberately: it is the
 > proven tool for *same-org subset* restores, and the monthly plan
-> preview catches provider regressions before a disaster does. Retiring
-> it from the schedule is gated on a passed full-org restore drill.
+> preview catches provider regressions before a disaster does. The kit
+> ran weekly until the full-org restore drill passed; since then the
+> weekly job is snapshot-only and terraform runs on the monthly
+> rehearsal. (`--fail-on-gaps` works on `--dump-to` exports too, so
+> the weekly coverage gate survives the change.) One cadence caveat:
+> the weekly snapshot-diff reports a deletion **once** — the next
+> week's baseline already lacks the object — while the kit-based
+> `DELETION_PENDING_CONFIRMATION` reminder re-fires on every monthly
+> terraform run until a human confirms. Treat weekly deletion drift
+> alerts as act-now signals.
 
 ### Transitioning to Infrastructure-as-Code
 
@@ -1081,17 +1089,34 @@ environment itself.
 The CLI is non-interactive end to end and reports outcome via exit code
 (0 clean, 1 fault, 2 usage error, 3 coverage gaps with `--fail-on-gaps`,
 4 sync auto-apply aborted for human review, 5 run succeeded but at
-least one alert reached no configured channel), so a weekly headless
-run is one crontab line:
+least one alert reached no configured channel), so each scheduled job
+is one crontab line. The recommended cadence is a weekly snapshot job
+plus a monthly terraform rehearsal:
 
 ```cron
-# Every Monday 06:00 — stream live, materialize state, alert to the NetOps webhook.
+# Every Monday 06:00 — export this week's snapshot, diff it against last
+# week's, alert on drift and coverage gaps. Snapshot-only: no terraform.
 0 6 * * 1 cd /opt/meraki2tf && . .venv/bin/activate && \
+  { [ ! -f snapshots/latest.jsonl.gz ] || mv -f snapshots/latest.jsonl.gz snapshots/previous.jsonl.gz; } && \
+  MERAKI_DASHBOARD_API_KEY=$(cat /etc/meraki2tf/token) \
+  MERAKI2TF_WEBHOOK_URL=$(cat /etc/meraki2tf/webhook-url) \
+  meraki2tf --org-id 123456 --spec ./openapi.json --fail-on-gaps \
+  --dump-to snapshots/latest.jsonl.gz --drift-baseline snapshots/previous.jsonl.gz \
+  >> /var/log/meraki2tf.log 2>&1
+
+# The 1st of every month 03:00 — terraform rehearsal: regenerate the kit
+# and materialize state under the guarded import-only apply.
+0 3 1 * * cd /opt/meraki2tf && . .venv/bin/activate && \
   MERAKI_DASHBOARD_API_KEY=$(cat /etc/meraki2tf/token) \
   MERAKI2TF_WEBHOOK_URL=$(cat /etc/meraki2tf/webhook-url) \
   meraki2tf --org-id 123456 --spec ./openapi.json --sync \
   >> /var/log/meraki2tf.log 2>&1
 ```
+
+On the very first weekly run there is no previous snapshot yet — omit
+`--drift-baseline` for that run (a missing baseline file is an error,
+not a silent skip). On Azure, the deployment wrapper does this snapshot
+rotation for you (see below).
 
 Create the token (and webhook-URL) files owner-only so no other local
 account can read the org-admin key or the bearer-token-bearing webhook
@@ -1102,9 +1127,10 @@ same for the webhook URL, whose path may itself be a secret (use it
 instead of `--webhook-url` in scheduled jobs). Separate multiple webhook
 targets with `:::`.
 
-Drop `--sync` if you want the job to stay plan-only (state building
-then remains a manual step), and add `--fail-on-gaps` to turn
-unsupported objects into a nonzero exit your scheduler can page on.
+`--fail-on-gaps` turns unsupported objects into a nonzero exit your
+scheduler can page on; it is valid on every read-only shape, snapshot
+exports included. Drop `--sync` from the monthly line if you want that
+job to stay plan-only (state building then remains a manual step).
 
 Running on Azure? A full deployment guide — Azure Automation with a
 Hybrid Runbook Worker (or a Container Apps Job), the API key in Key
