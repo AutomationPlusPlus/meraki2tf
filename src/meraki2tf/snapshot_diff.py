@@ -170,7 +170,11 @@ def diff_graphs(
             # separate endpoint — so the writable filter would silence
             # every clickops device move.
             allowed = allowed | {"networkId"}
-        changed = _payload_changes(old.payload, feature.payload, allowed)
+        changed = _payload_changes(
+            _strip_volatile_subtrees(old.api_path, old.payload),
+            _strip_volatile_subtrees(feature.api_path, feature.payload),
+            allowed,
+        )
         if changed:
             modified.append(
                 AssetDiff(
@@ -275,6 +279,47 @@ def _writable_fields(
         if names:
             fields[api_path] = frozenset(names)
     return fields
+
+
+# Nested read-only subtrees the writable filter cannot see: it gates
+# top-level keys only, and these hide under a genuinely writable parent
+# (the firmwareUpgrades PUT accepts `products`, but only its nested
+# `nextUpgrade`). Catalog/history data here changes whenever Cisco
+# publishes a release or an upgrade completes — dashboard-managed state,
+# not operator configuration, and not restorable. "*" matches any key.
+_VOLATILE_SUBTREES: dict[str, tuple[tuple[str, ...], ...]] = {
+    "/networks/{networkId}/firmwareUpgrades": (
+        ("products", "*", "availableVersions"),
+        ("products", "*", "currentVersion"),
+        ("products", "*", "lastUpgrade"),
+    ),
+}
+
+
+def _strip_volatile_subtrees(api_path: str, payload: Any) -> Any:
+    """A copy of ``payload`` without the api_path's volatile subtrees."""
+    routes = _VOLATILE_SUBTREES.get(api_path)
+    if not routes or not isinstance(payload, Mapping):
+        return payload
+
+    def prune(node: Any, route: tuple[str, ...]) -> Any:
+        if not isinstance(node, Mapping):
+            return node
+        head, rest = route[0], route[1:]
+        keys = list(node) if head == "*" else [head]
+        out = dict(node)
+        for key in keys:
+            if key not in out:
+                continue
+            if rest:
+                out[key] = prune(out[key], rest)
+            else:
+                del out[key]
+        return out
+
+    for route in routes:
+        payload = prune(payload, route)
+    return payload
 
 
 def _payload_changes(

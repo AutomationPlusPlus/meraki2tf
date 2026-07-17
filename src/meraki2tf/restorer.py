@@ -864,6 +864,15 @@ _DEFAULT_FLAG_RE = re.compile(r"(?i)^isdefault")
 #: sanitizer preserves verbatim, so both work from sanitized snapshots.
 _NATURAL_MATCH_KEYS = ("name", "sgt", "shortName")
 
+#: The one configure endpoint whose payload embeds org-local catalog
+#: references (firmware version IDs) that no snapshot mapping can
+#: resolve — see OrgRestorer._shape_firmware_upgrades.
+_FIRMWARE_UPGRADES_PATH = "/networks/{networkId}/firmwareUpgrades"
+
+#: Read-only catalog/history subkeys of each firmwareUpgrades product:
+#: never writable, and carrying stale source-org version rows.
+_FIRMWARE_CATALOG_KEYS = ("availableVersions", "currentVersion", "lastUpgrade")
+
 
 def _element_identity_from_payload(
     item_op: OperationSpec, payload: Mapping[str, Any]
@@ -2096,8 +2105,10 @@ class OrgRestorer:
             return None
         logger.warning(
             "Adopted %s: the target already provisions this object (a "
-            "Meraki default or an earlier restore); aligning its "
-            "content with the snapshot.", action.key,
+            "Meraki default or an earlier restore); %s.", action.key,
+            "keeping its live content (additive-only)"
+            if self._additive_only
+            else "aligning its content with the snapshot",
         )
         self._align_adopted(dashboard, action, resolver, source_org, adopted)
         return adopted
@@ -2146,8 +2157,10 @@ class OrgRestorer:
         logger.warning(
             "Adopted %s: the snapshot object is its collection's "
             "default and the target organization already provisions "
-            "one; aligning the existing default instead of creating a "
-            "duplicate.", action.key,
+            "one; %s instead of creating a duplicate.", action.key,
+            "keeping the existing default as-is (additive-only)"
+            if self._additive_only
+            else "aligning the existing default",
         )
         self._align_adopted(dashboard, action, resolver, source_org, adopted)
         if adopted == "-1":
@@ -2327,6 +2340,10 @@ class OrgRestorer:
                 body = {field: items}
         body = _strip_nulls(body)
         body = shape_rules(action.api_path, body)
+        if action.api_path == _FIRMWARE_UPGRADES_PATH:
+            body = self._shape_firmware_upgrades(
+                dashboard, action, params.get("networkId"), body
+            )
         if action.kind == "configure" and _effectively_empty(body):
             raise _EmptyConfigureSkip(
                 "the captured payload holds no writable values (null "
@@ -2450,6 +2467,118 @@ class OrgRestorer:
         if isinstance(listing, Mapping):
             listing = listing.get("items")
         return listing if isinstance(listing, list) else None
+
+    def _shape_firmware_upgrades(
+        self,
+        dashboard: Any,
+        action: RestoreAction,
+        network_id: str | None,
+        body: Any,
+    ) -> Any:
+        """Remap scheduled-upgrade version references to the target.
+
+        Firmware version IDs are rows of an org-local catalog: the
+        snapshot's ID (or its sanitized pseudonym) means nothing to the
+        target organization, and the dashboard coerces the stray value
+        to 0 — "Unable to find version with ID: 0". ``shortName``
+        survives sanitization, so a pending ``nextUpgrade`` is remapped
+        by shortName against the target network's own catalog; an
+        unmatchable upgrade is dropped from the body (and logged as a
+        manual follow-up) so the remaining settings still restore. The
+        products' read-only catalog/history subtrees are stripped
+        outright — they are not configuration.
+        """
+        if not isinstance(body, Mapping):
+            return body
+        products = body.get("products")
+        if not isinstance(products, Mapping):
+            return body
+        catalog: Mapping[str, Mapping[str, Any]] | None = None
+        shaped: dict[str, Any] = {}
+        for product, config in products.items():
+            if not isinstance(config, Mapping):
+                shaped[product] = config
+                continue
+            config = {
+                key: value
+                for key, value in config.items()
+                if key not in _FIRMWARE_CATALOG_KEYS
+            }
+            next_upgrade = config.get("nextUpgrade")
+            to_version = (
+                next_upgrade.get("toVersion")
+                if isinstance(next_upgrade, Mapping)
+                else None
+            )
+            if isinstance(to_version, Mapping) and to_version.get("id"):
+                if catalog is None:
+                    catalog = self._target_firmware_catalog(
+                        dashboard, network_id
+                    )
+                short_name = str(to_version.get("shortName") or "")
+                target_id = (
+                    catalog.get(str(product), {}).get(short_name)
+                    if short_name
+                    else None
+                )
+                if target_id is not None and isinstance(
+                    next_upgrade, Mapping
+                ):
+                    config["nextUpgrade"] = {
+                        **next_upgrade,
+                        "toVersion": {"id": target_id},
+                    }
+                else:
+                    config.pop("nextUpgrade", None)
+                    logger.warning(
+                        "Restored %s without its pending %s upgrade to "
+                        "%s: the target's firmware catalog offers no "
+                        "matching version (a device-less drill network "
+                        "offers none at all); re-schedule it manually "
+                        "if still wanted.",
+                        action.key, product, short_name or "<unnamed>",
+                    )
+            shaped[product] = config
+        return {**body, "products": shaped}
+
+    def _target_firmware_catalog(
+        self, dashboard: Any, network_id: str | None
+    ) -> dict[str, dict[str, Any]]:
+        """product → shortName → version ID from the target network."""
+        if not network_id:
+            return {}
+        method = getattr(
+            getattr(dashboard, "networks", None),
+            "getNetworkFirmwareUpgrades",
+            None,
+        )
+        if method is None:
+            return {}
+        self._bucket.acquire()
+        try:
+            current = method(network_id)
+        except Exception as exc:  # noqa: BLE001 - degrade to "no match"
+            logger.debug(
+                "Target firmware catalog for %s is unreadable (%s); "
+                "pending upgrades will be dropped as unmatchable.",
+                network_id, exc,
+            )
+            return {}
+        self._bucket.on_success()
+        catalog: dict[str, dict[str, Any]] = {}
+        if not isinstance(current, Mapping):
+            return catalog
+        for product, config in (current.get("products") or {}).items():
+            if not isinstance(config, Mapping):
+                continue
+            catalog[str(product)] = {
+                str(version.get("shortName")): version.get("id")
+                for version in config.get("availableVersions") or []
+                if isinstance(version, Mapping)
+                and version.get("shortName")
+                and version.get("id") is not None
+            }
+        return catalog
 
 
 @dataclass(frozen=True)

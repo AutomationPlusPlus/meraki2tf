@@ -1,6 +1,7 @@
 """Restore planner: waves, create-vs-configure classification, audit."""
 
 import json
+import logging
 import re
 from pathlib import Path
 
@@ -1020,6 +1021,108 @@ def test_dispatch_unwraps_collection_envelopes(tmp_path: Path) -> None:
         if c[0] == "updateNetworkFirmwareUpgradesStagedStages"
     )
     assert stages[2] == {"_json": [{"group": {"id": "1"}}]}
+
+
+FIRMWARE_PATH = "/networks/{networkId}/firmwareUpgrades"
+
+
+def _firmware_spec(tmp_path: Path) -> OpenApiParser:
+    put = dict(_op("updateNetworkFirmwareUpgrades", "networks"))
+    put["requestBody"] = {
+        "content": {"application/json": {"schema": {
+            "type": "object",
+            "properties": {
+                "products": {}, "timezone": {},
+                "participateInNextBetaRelease": {},
+            },
+        }}}
+    }
+    spec = {
+        "openapi": "3.0.0", "info": {"title": "fw", "version": "1"},
+        "paths": {
+            FIRMWARE_PATH: {
+                "get": _op("getNetworkFirmwareUpgrades", "networks"),
+                "put": put,
+            },
+        },
+    }
+    path = tmp_path / "fw-spec.json"
+    path.write_text(json.dumps(spec), encoding="utf-8")
+    return OpenApiParser(path)
+
+
+def _firmware_feature(to_version: dict) -> FeatureConfiguration:
+    return FeatureConfiguration(
+        FIRMWARE_PATH, ("N_1",),
+        {
+            "timezone": "US/Eastern",
+            "participateInNextBetaRelease": False,
+            "products": {"switch": {
+                "availableVersions": [{"id": "6016", "shortName": "MS 17"}],
+                "currentVersion": {"id": "6016", "shortName": "MS 17"},
+                "lastUpgrade": {"time": "2026-06-01T00:00:00Z"},
+                "nextUpgrade": {
+                    "time": "2026-08-01T04:00:00Z", "toVersion": to_version,
+                },
+            }},
+        },
+    )
+
+
+def test_firmware_next_upgrade_remaps_by_shortname(tmp_path: Path) -> None:
+    """Firmware version IDs are org-local catalog rows: the snapshot's
+    ID (or sanitized pseudonym) reaches the dashboard as version 0 and
+    the whole PUT 400s. The pending upgrade must be re-keyed by
+    shortName against the target network's own catalog."""
+    parser = _firmware_spec(tmp_path)
+    graph = _graph(
+        _firmware_feature({"id": "id-0092", "shortName": "MS 17.2.1"})
+    )
+    plan = plan_restore(graph, parser)
+    restorer, calls = _executor(
+        tmp_path,
+        responses={"getNetworkFirmwareUpgrades": {"products": {"switch": {
+            "availableVersions": [
+                {"id": 4242, "shortName": "MS 17.1"},
+                {"id": 9999, "shortName": "MS 17.2.1"},
+            ]
+        }}}},
+    )
+    result = restorer.execute(graph, plan)
+    assert result.failed == ()
+    update = next(c for c in calls if c[0] == "updateNetworkFirmwareUpgrades")
+    switch = update[2]["products"]["switch"]
+    assert switch["nextUpgrade"]["toVersion"] == {"id": 9999}
+    # read-only catalog/history subtrees never reach the PUT
+    for noise in ("availableVersions", "currentVersion", "lastUpgrade"):
+        assert noise not in switch
+    assert update[2]["timezone"] == "US/Eastern"
+
+
+def test_firmware_unmatchable_upgrade_drops_with_manual_pointer(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A device-less drill network offers no catalog at all: the pending
+    upgrade is dropped (logged as a manual follow-up) so the remaining
+    settings still restore instead of failing the whole surface."""
+    parser = _firmware_spec(tmp_path)
+    graph = _graph(
+        _firmware_feature({"id": "id-0092", "shortName": "MS 17.2.1"})
+    )
+    plan = plan_restore(graph, parser)
+    restorer, calls = _executor(
+        tmp_path,
+        responses={"getNetworkFirmwareUpgrades": {"products": {}}},
+    )
+    with caplog.at_level(logging.WARNING, logger="meraki2tf.restorer"):
+        result = restorer.execute(graph, plan)
+    assert result.failed == ()
+    update = next(c for c in calls if c[0] == "updateNetworkFirmwareUpgrades")
+    assert "nextUpgrade" not in update[2]["products"]["switch"]
+    assert update[2]["timezone"] == "US/Eastern"
+    assert any(
+        "re-schedule it manually" in r.getMessage() for r in caplog.records
+    )
 
 
 def test_empty_collections_plan_as_nothing_to_restore(tmp_path: Path) -> None:
@@ -4230,6 +4333,81 @@ def test_additive_only_adoption_never_aligns_surviving_content(
     # Adoption stands (children can rewire) but the survivor's content
     # was left exactly as the operator had it.
     assert not [c for c in calls if c[0] == "updateNetworkApplianceVlan"]
+
+
+def test_additive_only_adoption_log_never_claims_alignment(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The adoption message must describe what actually happens: in
+    additive-only mode the alignment PUT is skipped, so logging
+    "aligning its content with the snapshot" right before "NOT pushed"
+    reads as a contradiction to the operator reviewing a heal run."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    vlan_collection = "/networks/{networkId}/appliance/vlans"
+    vlan_item = "/networks/{networkId}/appliance/vlans/{vlanId}"
+    create_op = dict(_op("createNetworkApplianceVlan", "appliance"))
+    create_op["requestBody"] = {
+        "content": {"application/json": {"schema": {
+            "type": "object",
+            "properties": {"id": {}, "name": {}, "subnet": {}},
+        }}}
+    }
+    spec = {
+        "openapi": "3.0.0", "info": {"title": "v", "version": "1"},
+        "paths": {
+            "/organizations/{organizationId}/networks": {
+                "get": _op("getOrganizationNetworks", "organizations"),
+                "post": _op("createOrganizationNetwork", "organizations"),
+            },
+            "/networks/{networkId}/devices/claim": {
+                "post": _op("claimNetworkDevices", "networks"),
+            },
+            vlan_collection: {
+                "get": _op("getNetworkApplianceVlans", "appliance"),
+                "post": create_op,
+            },
+            vlan_item: {
+                "get": _op("getNetworkApplianceVlan", "appliance"),
+                "put": _op("updateNetworkApplianceVlan", "appliance"),
+            },
+        },
+    }
+    path = tmp_path / "vlan-spec.json"
+    path.write_text(json.dumps(spec), encoding="utf-8")
+    parser = OpenApiParser(path)
+    graph = _graph(
+        FeatureConfiguration(
+            vlan_item, ("N_1", "1"),
+            {"id": "1", "name": "Default", "subnet": "10.0.0.0/24"},
+        )
+    )
+    plan = plan_restore(graph, parser)
+    calls: list = []
+
+    class Section(_RecordingSection):
+        def createNetworkApplianceVlan(self, *args, **kwargs) -> dict:
+            self._calls.append(("createNetworkApplianceVlan", args, kwargs))
+            raise _conflict_error("Vlan has already been taken")
+
+    section = Section(calls)
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "j.jsonl"),
+        skip_claims=True, additive_only=True,
+    )
+    restorer._client = SimpleNamespace(
+        organizations=section, networks=section, appliance=section
+    )
+    with caplog.at_level(logging.WARNING, logger="meraki2tf.restorer"):
+        restorer.execute(graph, plan)
+    adoption = [
+        r.getMessage() for r in caplog.records if "Adopted" in r.getMessage()
+    ]
+    assert adoption, "expected an adoption log line"
+    assert not any("aligning" in message for message in adoption)
+    assert any("additive-only" in message for message in adoption)
 
 
 def test_throttled_writes_defer_instead_of_poisoning_the_subtree(

@@ -120,6 +120,24 @@ class SkippedReplay:
     reason: str
 
 
+def template_bound_networks(graph: NetworkGraph) -> frozenset[str]:
+    """Snapshot IDs of networks bound to a config template.
+
+    The dashboard refuses direct writes to template-governed surfaces
+    on a bound network (staged upgrade stages, SSID credentials, …);
+    those settings live on — and replay via — the template itself. The
+    executor uses this set to report such refusals as skips with a
+    pointer at the template rather than failures: a permanent, by-design
+    condition must not make every scheduled replay exit nonzero.
+    """
+    return frozenset(
+        network.network_id
+        for network in graph.networks
+        if isinstance(network.payload, Mapping)
+        and network.payload.get("isBoundToConfigTemplate") is True
+    )
+
+
 def plan_replay(
     graph: NetworkGraph,
     report: GenerationReport,
@@ -430,10 +448,21 @@ class GapReplayer:
         target_organization_id: str,
         snapshot_organization_id: str,
         network_ids: Mapping[str, str],
-    ) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
-        """Perform the writes; every failure is recorded, never raised."""
+        template_bound: frozenset[str] = frozenset(),
+    ) -> tuple[
+        tuple[str, ...],
+        tuple[tuple[str, str], ...],
+        tuple[SkippedReplay, ...],
+    ]:
+        """Perform the writes; every failure is recorded, never raised.
+
+        Returns ``(executed, failed, skipped)``; the skips are refusals
+        classified at execution time (template-bound surfaces) that the
+        pure planner cannot foresee.
+        """
         executed: list[str] = []
         failed: list[tuple[str, str]] = []
+        skipped: list[SkippedReplay] = []
         serials: frozenset[str] | None = None
         if any(
             "serial" in _placeholders(action.operation.path)
@@ -475,6 +504,31 @@ class GapReplayer:
                     continue
                 self._call(action.operation, params, action.payload)
             except Exception as exc:  # per-object isolation by design
+                if (
+                    getattr(exc, "status", None) == 400
+                    and self._network_scope(action) in template_bound
+                ):
+                    # The dashboard refuses direct writes to template-
+                    # governed surfaces on a bound network — permanent
+                    # and by design, so it must not fail the run week
+                    # after week. The setting replays via the template.
+                    reason = (
+                        "the dashboard refuses this write on a "
+                        "template-bound network; the setting is "
+                        "governed by its config template — re-apply "
+                        "it via the template"
+                    )
+                    logger.warning(
+                        "Skipped %s: %s", action.target, reason
+                    )
+                    skipped.append(
+                        SkippedReplay(
+                            api_path=action.api_path,
+                            identifiers=action.path_values,
+                            reason=reason,
+                        )
+                    )
+                    continue
                 message = str(exc)
                 if not isinstance(exc, ReplayDispatchError) and (
                     action.kind == "secrets"
@@ -495,7 +549,17 @@ class GapReplayer:
                 continue
             logger.info("Replayed %s", action.target)
             executed.append(action.target)
-        return tuple(executed), tuple(failed)
+        return tuple(executed), tuple(failed), tuple(skipped)
+
+    @staticmethod
+    def _network_scope(action: ReplayAction) -> str | None:
+        """The action's snapshot-side ``{networkId}`` scope value."""
+        for name, value in zip(
+            _placeholders(action.operation.path), action.path_values
+        ):
+            if name == "networkId":
+                return value
+        return None
 
     def _verify_item_scope(
         self, action: ReplayAction, params: Mapping[str, str]

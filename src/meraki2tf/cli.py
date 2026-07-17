@@ -80,7 +80,11 @@ from meraki2tf.provider_catalog import (
     ProviderCatalog,
     resolve_catalog,
 )
-from meraki2tf.replayer import GapReplayer, plan_replay
+from meraki2tf.replayer import (
+    GapReplayer,
+    plan_replay,
+    template_bound_networks,
+)
 from meraki2tf.providers import (
     LiveApiDataProvider,
     MerakiDataProvider,
@@ -1288,9 +1292,11 @@ def _replay_gaps(config: RuntimeConfig) -> int:
     except Exception as exc:
         logger.critical("Gap replay could not enumerate live networks: %s", exc)
         return 1
-    executed, failed = replayer.execute(
-        actions, target_org, snapshot_org, network_ids
+    executed, failed, refused = replayer.execute(
+        actions, target_org, snapshot_org, network_ids,
+        template_bound=template_bound_networks(graph),
     )
+    skipped = (*skipped, *refused)
     dispatcher.dispatch(
         gap_replay_executed(
             organization_id=target_org,
@@ -1308,8 +1314,8 @@ def _replay_gaps(config: RuntimeConfig) -> int:
         return 1
     logger.info(
         "Gap replay complete: %d object(s)/secret set(s) restored from "
-        "the snapshot.",
-        len(executed),
+        "the snapshot (%d skipped with documented reasons).",
+        len(executed), len(skipped),
     )
     # Writes happened; an undelivered GAP_REPLAY_EXECUTED alert must
     # surface as the notifier-outage exit, like the pipeline paths.
