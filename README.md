@@ -2,7 +2,7 @@
 
 [![Python 3.11–3.14](https://img.shields.io/badge/python-3.11%20%E2%80%93%203.14-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Terraform](https://img.shields.io/badge/terraform-CiscoDevNet%2Fmeraki-844FBA?logo=terraform&logoColor=white)](https://registry.terraform.io/providers/CiscoDevNet/meraki)
-[![Tests](https://img.shields.io/badge/tests-passing-success?logo=pytest&logoColor=white)](#contributor-architecture)
+[![CI](https://github.com/AutomationPlusPlus/meraki2tf/actions/workflows/ci.yml/badge.svg)](https://github.com/AutomationPlusPlus/meraki2tf/actions/workflows/ci.yml)
 [![Coverage](https://img.shields.io/badge/coverage-100%25-success)](#contributor-architecture)
 [![Typing: mypy strict](https://img.shields.io/badge/typing-mypy%20strict-blue)](#contributor-architecture)
 [![License: AGPL v3](https://img.shields.io/badge/license-AGPL%20v3-blue)](LICENSE)
@@ -1242,3 +1242,12 @@ House rules: near-100% test coverage on parsing/translation/alerting
 engines (fixtures only, no network sockets), signed atomic commits on
 scoped feature branches, and no poetry/ruff/uv anywhere in the
 toolchain.
+
+## Contributing
+
+Contributions are welcome — start with [CONTRIBUTING.md](CONTRIBUTING.md)
+(setup, workflow, and the two non-negotiable safety rules), and see
+[SECURITY.md](SECURITY.md) for reporting vulnerabilities privately.
+Operational practice for maintainers lives in
+[MAINTAINING.md](MAINTAINING.md). This project follows the
+[Contributor Covenant](CODE_OF_CONDUCT.md).
