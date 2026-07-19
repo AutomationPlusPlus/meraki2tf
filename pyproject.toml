@@ -19,7 +19,7 @@ classifiers = [
 # mid-incident can't silently pull an untested SDK (DR reproducibility)
 # or a compromised future major. For the deployment path, resolve this
 # through a hash-pinned constraints file (pip install --require-hashes).
-dependencies = ["meraki>=3.0,<4"]
+dependencies = ["meraki>=3.0,<5"]
 
 [project.scripts]
 meraki2tf = "meraki2tf.cli:main"

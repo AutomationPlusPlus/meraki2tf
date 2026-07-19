@@ -1,5 +1,5 @@
 # Approved dependencies only — see CLAUDE.md Dependency Escalation Policy.
-meraki>=3.0,<4
+meraki>=3.0,<5
 pre-commit
 flake8
 mypy
