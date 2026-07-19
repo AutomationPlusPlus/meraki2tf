@@ -1,0 +1,26 @@
+name: Feature request
+description: Suggest an improvement or new capability
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What can't you do today, or what is harder than it should be?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: What should the tool do? Include example CLI invocations if relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Read-only guarantee check
+      description: |
+        meraki2tf never mutates a Meraki organization outside the explicit,
+        human-confirmed DR actions. If your proposal writes to Meraki,
+        explain how it fits that contract (see CLAUDE.md).

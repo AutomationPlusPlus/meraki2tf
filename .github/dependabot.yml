@@ -1,0 +1,13 @@
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    # New/updated runtime dependencies still need maintainer sign-off per
+    # CONTRIBUTING.md; dependabot PRs are proposals, not auto-approvals.
+    open-pull-requests-limit: 5
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

@@ -1,0 +1,58 @@
+name: Bug report
+description: Something behaved incorrectly or crashed
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Before you file: **redact everything
+        organization-identifying** — org IDs, network IDs, device serials,
+        hostnames, URLs, and API keys must never appear in an issue. Use
+        placeholders like `123456`, `N_1`, or `Q2XX-XXXX-XXXX`.
+  - type: input
+    id: version
+    attributes:
+      label: meraki2tf version / commit
+      placeholder: e.g. main @ 6a395fd
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Python and terraform versions
+      placeholder: e.g. Python 3.14.1, Terraform 1.15.8
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode the run used
+      options:
+        - Default (read-only pipeline)
+        - Snapshot export (--dump-to)
+        - Offline dump (--from-dump)
+        - Sync (--sync)
+        - DR action preview (--rebuild / --restore / --heal / --replay-gaps / --wipe-org, no --confirm)
+        - DR action execution (--confirm)
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: Include the exact command (redacted) and the relevant, redacted log lines.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: checkboxes
+    id: redaction
+    attributes:
+      label: Redaction check
+      options:
+        - label: I confirm this report contains no org IDs, serials, hostnames, tokens, or other identifying data.
+          required: true
