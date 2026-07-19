@@ -240,3 +240,52 @@ def test_plan_heal_with_nothing_missing_is_empty(tmp_path: Path) -> None:
     assert plan.missing.actions == ()
     assert plan.missing.unrestorable == ()
     assert plan.surviving_count == plan.snapshot_asset_count == 6
+
+
+def test_live_default_state_protects_survivor_from_heal(
+    tmp_path: Path,
+) -> None:
+    """A live empty capture means the object exists at Meraki defaults.
+    Its key must count as alive — otherwise the snapshot-configured
+    counterpart classifies as missing and heal would MODIFY a survivor,
+    violating additive-only."""
+    snapshot = NetworkGraph(
+        organization_id="org-123",
+        networks=(_network("N_1", "HQ"),),
+        devices=(),
+        features=(
+            FeatureConfiguration(SNMP_PATH, ("N_1",), {"access": "none"}),
+        ),
+    )
+    live = NetworkGraph(
+        organization_id="org-123",
+        networks=(_network("N_1", "HQ"),),
+        devices=(),
+        features=(FeatureConfiguration(SNMP_PATH, ("N_1",), {}),),
+    )
+    plan = plan_heal(snapshot, live, _heal_spec(tmp_path))
+    assert plan.missing.actions == ()
+    assert plan.surviving_count == plan.snapshot_asset_count == 2
+
+
+def test_missing_defaults_are_accounted_not_recreated(
+    tmp_path: Path,
+) -> None:
+    """A snapshot asset captured at defaults whose parent vanished has
+    nothing to write, but the accounting must still surface it."""
+    snapshot = NetworkGraph(
+        organization_id="org-123",
+        networks=(_network("N_1", "HQ"), _network("N_2", "Branch")),
+        devices=(),
+        features=(FeatureConfiguration(SNMP_PATH, ("N_2",), {}),),
+    )
+    live = NetworkGraph(
+        organization_id="org-123",
+        networks=(_network("N_1", "HQ"),),
+        devices=(),
+        features=(),
+    )
+    plan = plan_heal(snapshot, live, _heal_spec(tmp_path))
+    assert [a.kind for a in plan.missing.actions] == ["create"]  # N_2 itself
+    assert [d.api_path for d in plan.missing.defaults] == [SNMP_PATH]
+    assert "1 missing asset(s) were at Meraki defaults" in plan.summary()

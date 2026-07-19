@@ -174,6 +174,21 @@ def test_plan_replay_skips_dashboard_only_and_payloadless(
     assert "No payload" in reasons[VLAN_PATH]
 
 
+def test_plan_replay_skips_empty_default_captures(
+    spec_parser: OpenApiParser,
+) -> None:
+    """An empty object is a real capture (asset at Meraki defaults) —
+    the skip reason must say so, not claim the payload is missing."""
+    graph = _graph(FeatureConfiguration(VLAN_PATH, ("N_1", "10"), {}))
+    report = _report(
+        unsupported=(UnsupportedAsset(VLAN_PATH, "no match", ("N_1", "10")),)
+    )
+    actions, skipped = plan_replay(graph, report, spec_parser)
+    assert actions == ()
+    (skip,) = skipped
+    assert "Meraki-provisioned defaults" in skip.reason
+
+
 def test_plan_replay_skips_unreadable_gap_records(
     spec_parser: OpenApiParser,
 ) -> None:

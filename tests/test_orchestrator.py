@@ -1379,6 +1379,9 @@ def test_reconciliation_drops_become_unsupported_with_alert(
     summary = orchestrator.run("org-123")
 
     assert summary.reconciliation_dropped == ("meraki_networks.n_1",)
+    assert summary.reconciliation_drop_categories == {
+        "Invalid Attribute Value Match": 1
+    }
     assert summary.unsupported_count == 1
     assert summary.imports_written == 1  # the dropped import no longer counts
     flagged = [
@@ -1403,6 +1406,9 @@ def test_reconciliation_drops_become_unsupported_with_alert(
         e for e in recorder.events if e.event_type is EventType.RUN_SUCCESS
     ][0]
     assert success.details["unsupported_count"] == 1
+    assert success.details["reconciliation_drop_categories"] == {
+        "Invalid Attribute Value Match": 1
+    }
 
 
 def test_reconciliation_drop_reports_raw_path_identifiers(

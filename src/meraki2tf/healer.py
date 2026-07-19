@@ -49,13 +49,19 @@ class HealPlan:
     snapshot_asset_count: int
 
     def summary(self) -> str:
-        return (
+        text = (
             f"{self.snapshot_asset_count} snapshot asset(s): "
             f"{self.surviving_count} still present live (untouched), "
             f"{len(self.missing.actions)} missing and planned for "
             f"recreation, {len(self.missing.unrestorable)} missing but "
             "not restorable via the API (rebuild manually)."
         )
+        if self.missing.defaults:
+            text += (
+                f" {len(self.missing.defaults)} missing asset(s) were at "
+                "Meraki defaults (nothing to write)."
+            )
+        return text
 
 
 def live_asset_keys(live: NetworkGraph, parser: OpenApiParser) -> frozenset[str]:
@@ -77,6 +83,11 @@ def live_asset_keys(live: NetworkGraph, parser: OpenApiParser) -> frozenset[str]
         f"{item.api_path}::{','.join(item.path_values)}"
         for item in live_plan.unrestorable
     }
+    # At-defaults assets are alive too: an empty capture means the
+    # object exists with nothing configured. Without these keys a
+    # snapshot-configured counterpart would classify as "missing" and
+    # heal would modify a survivor, violating additive-only.
+    keys |= {entry.key for entry in live_plan.defaults}
     return frozenset(keys)
 
 
@@ -116,8 +127,13 @@ def plan_heal(
         for item in full.unrestorable
         if f"{item.api_path}::{','.join(item.path_values)}" not in alive
     )
+    defaults = tuple(
+        entry for entry in full.defaults if entry.key not in alive
+    )
     return HealPlan(
-        missing=RestorePlan(actions=missing, unrestorable=unrestorable),
+        missing=RestorePlan(
+            actions=missing, unrestorable=unrestorable, defaults=defaults
+        ),
         identity_mappings=tuple(mappings),
         surviving_count=len(surviving),
         snapshot_asset_count=len(full.actions),

@@ -180,6 +180,16 @@ def plan_replay(
                 )
             )
             continue
+        if isinstance(payload, Mapping) and not payload:
+            skipped.append(
+                SkippedReplay(
+                    asset.api_path,
+                    asset.identifiers,
+                    "Captured empty — the asset is at Meraki-provisioned "
+                    "defaults; nothing to replay.",
+                )
+            )
+            continue
         if not payload:
             skipped.append(
                 SkippedReplay(

@@ -49,6 +49,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -225,6 +226,22 @@ def duplicate_set_reason(value: str) -> str:
         f"{value!r} more than once in a set-typed "
         "attribute, which the provider cannot represent."
     )
+
+
+def drop_reason_categories(dropped: Mapping[str, str]) -> dict[str, int]:
+    """Aggregate drop reasons by diagnostic title, most common first.
+
+    Every reason this module produces leads with the terraform
+    diagnostic title ("Invalid Attribute Value Match: …", "Duplicate
+    Set Element: …"), so the title is the category. A provider release
+    that breaks one resource class then reports as one large bucket the
+    operator can act on, instead of a scroll of per-address rows.
+    """
+    counts = Counter(
+        reason.split(":", 1)[0].strip() or "uncategorized"
+        for reason in dropped.values()
+    )
+    return dict(counts.most_common())
 
 
 def locate_duplicate_value_resources(

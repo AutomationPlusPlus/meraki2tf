@@ -214,6 +214,7 @@ def run_success(
     deletions_pending: Sequence[str] = (),
     unmanaged_secret_attributes: Mapping[str, Sequence[str]] | None = None,
     deferred_addresses: Sequence[str] = (),
+    reconciliation_drop_categories: Mapping[str, int] | None = None,
 ) -> AlertEvent:
     """Contract payload for a flawless snapshot-generation run.
 
@@ -225,7 +226,9 @@ def run_success(
     confirmation, secret attributes the kit cannot carry (restore them
     manually after a rebuild), and — when the plan comparison ran — how
     many imports are still pending aggregation into state (None when
-    unknown).
+    unknown). Reconciliation drops additionally arrive aggregated by
+    diagnostic title, so a provider regression names the resource class
+    it broke.
     """
     return AlertEvent(
         event_type=EventType.RUN_SUCCESS,
@@ -256,6 +259,9 @@ def run_success(
                 for address, attrs in (unmanaged_secret_attributes or {}).items()
             },
             "deferred_addresses": list(deferred_addresses),
+            "reconciliation_drop_categories": dict(
+                reconciliation_drop_categories or {}
+            ),
         },
     )
 
