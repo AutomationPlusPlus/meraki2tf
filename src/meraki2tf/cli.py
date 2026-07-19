@@ -1839,6 +1839,15 @@ def _report(summary: RunSummary) -> None:
             len(summary.unmanaged_secret_attributes),
             len(summary.normalized_addresses),
         )
+    if summary.reconciliation_drop_categories:
+        logger.info(
+            "Unexpressible drop categories: %s",
+            "; ".join(
+                f"{count} × {title}"
+                for title, count in
+                summary.reconciliation_drop_categories.items()
+            ),
+        )
     if summary.unmanaged_secret_attributes:
         logger.warning(
             "Secrets not captured in the DR kit (restore manually after a "

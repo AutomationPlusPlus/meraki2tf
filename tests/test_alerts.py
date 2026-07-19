@@ -95,6 +95,7 @@ def test_run_success_payload_contract() -> None:
         coverage_percent=90.0,
         deletions_pending=["meraki_devices.q2ab"],
         unmanaged_secret_attributes={"meraki_wireless_ssid.s_0": ("psk",)},
+        reconciliation_drop_categories={"Invalid Attribute Value Match": 2},
     ).to_payload()
     assert payload["event_type"] == "RUN_SUCCESS"
     assert payload["severity"] == EventSeverity.INFO.value
@@ -114,6 +115,9 @@ def test_run_success_payload_contract() -> None:
         "unmanaged_secret_attribute_count": 1,
         "unmanaged_secret_attributes": {"meraki_wireless_ssid.s_0": ["psk"]},
         "deferred_addresses": [],
+        "reconciliation_drop_categories": {
+            "Invalid Attribute Value Match": 2
+        },
     }
     assert "1 resource(s) added to state" in run_success(
         imports_written=4,

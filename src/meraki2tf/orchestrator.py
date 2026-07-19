@@ -54,6 +54,7 @@ from meraki2tf.hcl_generator import (
 )
 from meraki2tf.models import NetworkGraph
 from meraki2tf.plan_reconciler import (
+    drop_reason_categories,
     duplicate_set_reason,
     payload_carries_duplicate,
 )
@@ -130,6 +131,11 @@ class RunSummary:
     #: Resources reconciliation dropped because the provider rejects its
     #: own generated configuration (reported as unsupported).
     reconciliation_dropped: tuple[str, ...] = ()
+    #: The same drops aggregated by diagnostic title → count, so a
+    #: provider regression names the class it broke, not just a number.
+    reconciliation_drop_categories: dict[str, int] = dataclasses.field(
+        default_factory=dict
+    )
     #: address → secret attributes excluded from management; the DR kit
     #: cannot carry them, restore manually after a rebuild.
     unmanaged_secret_attributes: dict[str, tuple[str, ...]] = dataclasses.field(
@@ -298,6 +304,7 @@ class PipelineOrchestrator:
             regenerated: tuple[str, ...] = ()
             deferred: tuple[str, ...] = ()
             recon_dropped: tuple[str, ...] = ()
+            recon_drop_categories: dict[str, int] = {}
             unmanaged_secrets: dict[str, tuple[str, ...]] = {}
             normalized_addresses: tuple[str, ...] = ()
             self._reconciliation_alerted.clear()
@@ -402,6 +409,7 @@ class PipelineOrchestrator:
                         )
 
                 recon_dropped = tuple(sorted(plan.dropped))
+                recon_drop_categories = drop_reason_categories(plan.dropped)
                 unmanaged_secrets = dict(sorted(plan.ignored_secrets.items()))
                 normalized_addresses = tuple(sorted(plan.normalized))
 
@@ -466,6 +474,7 @@ class PipelineOrchestrator:
                     deletions_pending=deletions_pending,
                     unmanaged_secret_attributes=unmanaged_secrets,
                     deferred_addresses=deferred,
+                    reconciliation_drop_categories=recon_drop_categories,
                 )
             )
             return RunSummary(
@@ -485,6 +494,7 @@ class PipelineOrchestrator:
                 deferred_addresses=deferred,
                 coverage_percent=coverage_percent,
                 reconciliation_dropped=recon_dropped,
+                reconciliation_drop_categories=recon_drop_categories,
                 unmanaged_secret_attributes=unmanaged_secrets,
                 normalized_addresses=normalized_addresses,
                 snapshot_drift=snapshot_drift,
@@ -555,6 +565,15 @@ class PipelineOrchestrator:
                         )
                     )
                     self._reconciliation_alerted.add(asset.address)
+            logger.warning(
+                "Unexpressible drop categories: %s",
+                "; ".join(
+                    f"{count} × {title}"
+                    for title, count in drop_reason_categories(
+                        plan.dropped
+                    ).items()
+                ),
+            )
             report = dataclasses.replace(
                 report,
                 captured=tuple(

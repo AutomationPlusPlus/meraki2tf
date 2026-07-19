@@ -54,6 +54,7 @@ from meraki2tf.models import (
 from meraki2tf.openapi_parser import OpenApiParser
 from meraki2tf.config import read_api_key
 from meraki2tf.fsperms import restrict_to_owner
+from meraki2tf.hcl_generator import DEVICE_API_PATH, NETWORK_API_PATH
 from meraki2tf.providers.ratelimit import AdaptiveTokenBucket
 from meraki2tf.replayer import (
     ACTION_LOG_REASON,
@@ -77,6 +78,13 @@ WAVE_NETWORKS = 2
 WAVE_DEVICE_CLAIM = 3
 WAVE_NETWORK_FEATURES = 4
 WAVE_DEVICE_FEATURES = 5
+
+#: Write endpoints for the container waves. Containers are *captured*
+#: under the pseudo-paths in ``hcl_generator`` (``/networks/{networkId}``,
+#: ``/devices/{serial}``) but *restored* through these collection
+#: endpoints, so verdict joins must key both spellings.
+NETWORK_CREATE_PATH = "/organizations/{organizationId}/networks"
+DEVICE_CLAIM_PATH = "/networks/{networkId}/devices/claim"
 
 
 @dataclass(frozen=True)
@@ -121,11 +129,33 @@ class Unrestorable:
 
 
 @dataclass(frozen=True)
+class DefaultState:
+    """One asset captured as an empty object: the endpoint answered and
+    the asset sits at Meraki-provisioned defaults, so a restore has
+    nothing to write. Distinct from an unrestorable gap — coverage is
+    complete for these."""
+
+    api_path: str
+    path_values: tuple[str, ...]
+
+    @property
+    def key(self) -> str:
+        return f"{self.api_path}::{','.join(self.path_values)}"
+
+
+DEFAULT_STATE_VERDICT = (
+    "default: captured empty — the asset is at Meraki-provisioned "
+    "defaults; a restore has nothing to write."
+)
+
+
+@dataclass(frozen=True)
 class RestorePlan:
     """The offline answer to "what will and will not rebuild"."""
 
     actions: tuple[RestoreAction, ...] = ()
     unrestorable: tuple[Unrestorable, ...] = ()
+    defaults: tuple[DefaultState, ...] = ()
 
     def summary(self) -> str:
         kinds: dict[str, int] = {}
@@ -133,6 +163,8 @@ class RestorePlan:
             kinds[action.kind] = kinds.get(action.kind, 0) + 1
         parts = [f"{count} {kind}" for kind, count in sorted(kinds.items())]
         parts.append(f"{len(self.unrestorable)} unrestorable")
+        if self.defaults:
+            parts.append(f"{len(self.defaults)} at Meraki defaults")
         return ", ".join(parts)
 
 
@@ -154,11 +186,11 @@ def plan_restore(graph: NetworkGraph, parser: OpenApiParser) -> RestorePlan:
             RestoreAction(
                 kind="create",
                 wave=WAVE_NETWORKS,
-                api_path="/organizations/{organizationId}/networks",
+                api_path=NETWORK_CREATE_PATH,
                 path_values=(network.network_id,),
                 operation=_network_create_operation(parser),
                 payload=dict(network.payload),
-                lookup=lookups.get("/organizations/{organizationId}/networks"),
+                lookup=lookups.get(NETWORK_CREATE_PATH),
             )
         )
     for device in graph.devices:
@@ -166,23 +198,30 @@ def plan_restore(graph: NetworkGraph, parser: OpenApiParser) -> RestorePlan:
             RestoreAction(
                 kind="claim",
                 wave=WAVE_DEVICE_CLAIM,
-                api_path="/networks/{networkId}/devices/claim",
+                api_path=DEVICE_CLAIM_PATH,
                 path_values=(device.network_id, device.serial),
                 operation=_device_claim_operation(parser),
                 payload=dict(device.payload),
             )
         )
 
+    defaults: list[DefaultState] = []
     for feature in graph.features:
         classified = _classify_feature(feature, parser, writes, lookups)
         if isinstance(classified, Unrestorable):
             unrestorable.append(classified)
+        elif isinstance(classified, DefaultState):
+            defaults.append(classified)
         else:
             actions.append(classified)
 
     actions.sort(key=lambda a: (a.wave, len(a.operation.path_params),
                                 a.api_path, a.path_values))
-    return RestorePlan(actions=tuple(actions), unrestorable=tuple(unrestorable))
+    return RestorePlan(
+        actions=tuple(actions),
+        unrestorable=tuple(unrestorable),
+        defaults=tuple(defaults),
+    )
 
 
 def _classify_feature(
@@ -190,7 +229,7 @@ def _classify_feature(
     parser: OpenApiParser,
     writes: Mapping[str, tuple[OperationSpec, ...]],
     lookups: Mapping[str, OperationSpec],
-) -> RestoreAction | Unrestorable:
+) -> RestoreAction | Unrestorable | DefaultState:
     if UNREADABLE_MARKER in feature.payload:
         return Unrestorable(
             feature.api_path,
@@ -215,6 +254,11 @@ def _classify_feature(
             feature.path_values,
             ACTION_LOG_REASON,
         )
+    if isinstance(feature.payload, Mapping) and not feature.payload:
+        # An empty object is a faithful capture, not a gap: the GET
+        # answered and the asset sits at Meraki-provisioned defaults
+        # (e.g. an SSID whose eapOverride was never configured).
+        return DefaultState(feature.api_path, feature.path_values)
     if not feature.payload:
         return Unrestorable(
             feature.api_path,
@@ -322,9 +366,7 @@ def _feature_wave(api_path: str) -> int:
 
 def _network_create_operation(parser: OpenApiParser) -> OperationSpec:
     for op in parser.endpoints():
-        if op.method == "post" and op.path == (
-            "/organizations/{organizationId}/networks"
-        ):
+        if op.method == "post" and op.path == NETWORK_CREATE_PATH:
             return op
     # Synthesized fallback keeps planning honest even against a spec
     # slice that omits the endpoint (unit fixtures): the executor
@@ -332,7 +374,7 @@ def _network_create_operation(parser: OpenApiParser) -> OperationSpec:
     return OperationSpec(
         operation_id="createOrganizationNetwork",
         method="post",
-        path="/organizations/{organizationId}/networks",
+        path=NETWORK_CREATE_PATH,
         path_params=("organizationId",),
         tags=("organizations",),
     )
@@ -340,14 +382,12 @@ def _network_create_operation(parser: OpenApiParser) -> OperationSpec:
 
 def _device_claim_operation(parser: OpenApiParser) -> OperationSpec:
     for op in parser.endpoints():
-        if op.method == "post" and op.path == (
-            "/networks/{networkId}/devices/claim"
-        ):
+        if op.method == "post" and op.path == DEVICE_CLAIM_PATH:
             return op
     return OperationSpec(
         operation_id="claimNetworkDevices",
         method="post",
-        path="/networks/{networkId}/devices/claim",
+        path=DEVICE_CLAIM_PATH,
         path_params=("networkId",),
         tags=("networks",),
     )
@@ -361,10 +401,19 @@ def restore_verdicts(
     verdicts: dict[tuple[str, tuple[str, ...]], str] = {}
     for action in plan.actions:
         verdicts[(action.api_path, action.path_values)] = action.kind
+        # Containers are captured under pseudo-paths, not the write
+        # endpoints the plan uses, so emit the capture-time key too —
+        # otherwise networks and devices join to no verdict at all.
+        if action.kind == "create" and action.api_path == NETWORK_CREATE_PATH:
+            verdicts[(NETWORK_API_PATH, action.path_values)] = action.kind
+        elif action.kind == "claim" and action.api_path == DEVICE_CLAIM_PATH:
+            verdicts[(DEVICE_API_PATH, action.path_values[-1:])] = action.kind
     for item in plan.unrestorable:
         verdicts[(item.api_path, item.path_values)] = (
             f"unrestorable: {item.reason}"
         )
+    for entry in plan.defaults:
+        verdicts[(entry.api_path, entry.path_values)] = DEFAULT_STATE_VERDICT
     return verdicts
 
 
@@ -388,6 +437,11 @@ def render_restore_plan(plan: RestorePlan, limit: int = 30) -> str:
     if len(plan.unrestorable) > limit:
         lines.append(
             f"... and {len(plan.unrestorable) - limit} more unrestorable"
+        )
+    if plan.defaults:
+        lines.append(
+            f"{len(plan.defaults)} asset(s) at Meraki defaults "
+            "(captured empty — nothing to write)"
         )
     return "\n".join(lines)
 

@@ -11,6 +11,7 @@ from meraki2tf.plan_reconciler import (
     classify_plan,
     deep_json_equal,
     drop_import_blocks,
+    drop_reason_categories,
     drop_resource_blocks,
     duplicate_set_values,
     enum_case_repairs,
@@ -64,6 +65,26 @@ def _update(
             "after_sensitive": after_sensitive or {},
         },
     }
+
+
+def test_drop_reason_categories_aggregates_by_diagnostic_title() -> None:
+    categories = drop_reason_categories(
+        {
+            "meraki_a.one": "Invalid Attribute Value Match: must be one of X",
+            "meraki_a.two": "Invalid Attribute Value Match: must be one of Y",
+            "meraki_b.one": (
+                "Duplicate Set Element: the API returns 'x' more than once"
+            ),
+            "meraki_c.one": "",
+        }
+    )
+    assert categories == {
+        "Invalid Attribute Value Match": 2,
+        "Duplicate Set Element": 1,
+        "uncategorized": 1,
+    }
+    # Most-common first, so the biggest broken class leads the report.
+    assert list(categories)[0] == "Invalid Attribute Value Match"
 
 
 def test_validation_failures_parses_every_error_block() -> None:

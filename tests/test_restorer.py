@@ -164,8 +164,80 @@ def test_unrestorable_reasons_are_spec_derived(tmp_path: Path) -> None:
     )
     reasons = {u.api_path: u.reason for u in plan.unrestorable}
     assert "dashboard-only" in reasons[CLIENTS_PATH]
-    assert "No payload captured" in reasons[SNMP_PATH]
     assert "unreadable at capture" in reasons[GP_ITEM]
+    # An empty object is a faithful capture (Meraki defaults), not a
+    # missing payload: it must land in the defaults bucket, not as an
+    # unrestorable gap.
+    assert SNMP_PATH not in reasons
+    assert [(d.api_path, d.path_values) for d in plan.defaults] == [
+        (SNMP_PATH, ("N_1",))
+    ]
+
+
+def test_restore_verdicts_key_containers_under_capture_paths(
+    tmp_path: Path,
+) -> None:
+    """The coverage manifest joins on capture-time pseudo-paths, so
+    container verdicts must be keyed both ways (regression: every
+    network and device row lacked ``restore_via``)."""
+    from meraki2tf.coverage import build_manifest
+    from meraki2tf.hcl_generator import (
+        DEVICE_API_PATH,
+        NETWORK_API_PATH,
+        CapturedAsset,
+    )
+    from meraki2tf.restorer import (
+        DEVICE_CLAIM_PATH,
+        NETWORK_CREATE_PATH,
+        restore_verdicts,
+    )
+
+    verdicts = restore_verdicts(plan_restore(_graph(), _restore_spec(tmp_path)))
+    # Write-endpoint keys (the restore plan's own spelling) survive.
+    assert verdicts[(NETWORK_CREATE_PATH, ("N_1",))] == "create"
+    assert verdicts[(DEVICE_CLAIM_PATH, ("N_1", "Q2AB-CDEF-GHIJ"))] == "claim"
+    # Capture-time keys land the manifest join.
+    assert verdicts[(NETWORK_API_PATH, ("N_1",))] == "create"
+    assert verdicts[(DEVICE_API_PATH, ("Q2AB-CDEF-GHIJ",))] == "claim"
+
+    manifest = build_manifest(
+        organization_id="org-123",
+        captured=(
+            CapturedAsset(
+                address="meraki_networks.n_1",
+                api_path=NETWORK_API_PATH,
+                import_id="N_1",
+                already_in_state=False,
+                identifiers=("N_1",),
+            ),
+            CapturedAsset(
+                address="meraki_devices.q2ab_cdef_ghij",
+                api_path=DEVICE_API_PATH,
+                import_id="Q2AB-CDEF-GHIJ",
+                already_in_state=False,
+                identifiers=("Q2AB-CDEF-GHIJ",),
+            ),
+        ),
+        unsupported=(),
+        state_addresses=frozenset(),
+        restore_via=verdicts,
+    )
+    by_path = {obj["api_path"]: obj for obj in manifest["objects"]}
+    assert by_path[NETWORK_API_PATH]["restore_via"] == "create"
+    assert by_path[DEVICE_API_PATH]["restore_via"] == "claim"
+
+
+def test_empty_capture_gets_default_state_verdict(tmp_path: Path) -> None:
+    from meraki2tf.restorer import DEFAULT_STATE_VERDICT, restore_verdicts
+
+    plan = plan_restore(
+        _graph(FeatureConfiguration(SNMP_PATH, ("N_1",), {})),
+        _restore_spec(tmp_path),
+    )
+    verdicts = restore_verdicts(plan)
+    assert verdicts[(SNMP_PATH, ("N_1",))] == DEFAULT_STATE_VERDICT
+    assert "1 at Meraki defaults" in plan.summary()
+    assert "at Meraki defaults" in render_restore_plan(plan)
 
 
 SENSOR_COMMANDS = "/devices/{serial}/sensor/commands"
