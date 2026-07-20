@@ -969,3 +969,12 @@ def test_apply_remediations_combines_all_edit_kinds(tmp_path: Path) -> None:
         "meraki_organization_saml.r_1": ("body", "sp_initiated_idp_id")
     }
     assert ignored == {"meraki_organization_saml.r_1": ("certificate",)}
+
+
+def test_reopen_one_line_block_leaves_braceless_lines_alone() -> None:
+    """A single line that does not end in `{}` has nothing to reopen —
+    the rewrite must return it untouched rather than mangle it."""
+    from meraki2tf.plan_reconciler import _reopen_one_line_block
+
+    braceless = 'resource "meraki_networks" "oneliner"'
+    assert _reopen_one_line_block(braceless) == braceless

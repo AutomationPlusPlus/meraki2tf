@@ -4570,3 +4570,466 @@ def test_wipe_caller_email_match_is_case_insensitive() -> None:
     result = wiper.execute("org-drill", "Drill Org")
     assert deleted["admins"] == ["2"]  # never the caller, however cased
     assert result.organization_deleted is True
+
+
+def test_falsy_non_mapping_payload_is_unrestorable(tmp_path: Path) -> None:
+    """A capture that recorded no payload object at all (empty array,
+    no body) has nothing to write back and must land as an explicit
+    unrestorable gap — never crash or silently vanish."""
+    parser = _restore_spec(tmp_path)
+    plan = plan_restore(
+        _graph(FeatureConfiguration(SNMP_PATH, ("N_1",), [])),
+        parser,
+    )
+    (item,) = plan.unrestorable
+    assert item.api_path == SNMP_PATH
+    assert "No payload captured" in item.reason
+
+
+def test_verdicts_cover_defaults_and_unrestorable_keys(
+    tmp_path: Path,
+) -> None:
+    """DefaultState carries the same journal-style key as actions, and
+    unrestorable assets join the coverage manifest with their reason."""
+    from meraki2tf.restorer import DefaultState, restore_verdicts
+
+    assert DefaultState(SNMP_PATH, ("N_1",)).key == f"{SNMP_PATH}::N_1"
+    plan = plan_restore(
+        _graph(FeatureConfiguration(CLIENTS_PATH, ("N_1",), {"usage": 1})),
+        _restore_spec(tmp_path),
+    )
+    verdict = restore_verdicts(plan)[(CLIENTS_PATH, ("N_1",))]
+    assert verdict.startswith("unrestorable: ")
+    assert "dashboard-only" in verdict
+
+
+def test_absent_secret_injection_skips_unschematized_shapes() -> None:
+    """The write-schema walk only fills slots it can vouch for: absent
+    properties declarations, non-mapping property schemas, itemless or
+    scalar-item arrays, and non-object list elements all pass through
+    untouched, while declared numeric secrets get numeric placeholders."""
+    from meraki2tf.restorer import _inject_absent_list_secrets
+    from meraki2tf.spec.engine import OperationSpec
+
+    def op_for(schema: dict) -> OperationSpec:
+        return OperationSpec(
+            operation_id="updateNetworkWirelessSsid", method="put",
+            path=SSID_ITEM, path_params=("networkId", "number"),
+            tags=("wireless",),
+            raw={"requestBody": {"content": {"application/json": {
+                "schema": schema,
+            }}}},
+        )
+
+    # A schema without a properties mapping offers no verifiable slots.
+    filled, injected = _inject_absent_list_secrets(
+        {"radiusServers": [{"host": "10.0.0.1"}]}, "seed",
+        op_for({"type": "object"}),
+    )
+    assert injected == ()
+    assert filled == {"radiusServers": [{"host": "10.0.0.1"}]}
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "radius": {"type": "object", "properties": {
+                "servers": {"type": "array", "items": {"properties": {
+                    "host": {"type": "string"},
+                    "secret": {"type": "string"},
+                    "passcode": {"type": "integer"},
+                }}},
+            }},
+            "typo": True,  # non-mapping property schema
+            "bareList": {"type": "array"},  # no items schema
+            "scalarList": {"type": "array", "items": {"type": "string"}},
+        },
+    }
+    payload = {
+        "radius": {"servers": [{"host": "10.0.0.1"}, "not-an-object"]},
+        "typo": ["x"],
+        "unknown": ["y"],  # key the schema does not declare
+        "bareList": ["z"],
+        "scalarList": ["w"],
+    }
+    filled, injected = _inject_absent_list_secrets(
+        payload, "seed", op_for(schema)
+    )
+    assert injected == (
+        "radius.servers[].passcode", "radius.servers[].secret",
+    )
+    element = filled["radius"]["servers"][0]
+    assert element["secret"].startswith("drill-")
+    assert isinstance(element["passcode"], int)
+    assert 10000000 <= element["passcode"] <= 99999999
+    assert filled["radius"]["servers"][1] == "not-an-object"
+    # Unschematized shapes pass through untouched.
+    assert filled["typo"] == ["x"] and filled["unknown"] == ["y"]
+    assert filled["bareList"] == ["z"]
+    assert filled["scalarList"] == ["w"]
+
+
+def test_resume_recovery_bookkeeps_the_matched_mapping(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """When the resume's reconcile lookup DOES find the already-restored
+    object, the recovered mapping must be recorded (resolver + journal)
+    so references stop dying on every future resume."""
+    from meraki2tf.restorer import RestoreJournal
+
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(
+            GP_ITEM, ("N_1", "100"), {"groupPolicyId": "100", "name": "kiosk"}
+        ),
+    )
+    plan = plan_restore(graph, parser)
+
+    restorer, _calls = _executor(tmp_path)
+    assert restorer.execute(graph, plan).failed == ()
+    journal_path = tmp_path / "journal.jsonl"
+    lines = [
+        line
+        for line in journal_path.read_text().splitlines()
+        if not ('"kind": "map"' in line and '"old": "100"' in line)
+    ]
+    journal_path.write_text("\n".join(lines) + "\n")
+
+    restorer2, calls2 = _executor(
+        tmp_path,
+        responses={"getNetworkGroupPolicies": {"items": [
+            {"groupPolicyId": "900", "name": "kiosk"},
+        ]}},
+    )
+    restorer2._journal = RestoreJournal(journal_path)
+    with caplog.at_level(logging.WARNING, logger="meraki2tf.restorer"):
+        result = restorer2.execute(graph, plan)
+
+    assert result.failed == ()
+    assert any(
+        "Recovered the missing ID mapping" in r.getMessage()
+        for r in caplog.records
+    )
+    # The recovered mapping is journaled for every future resume.
+    assert any(
+        '"kind": "map"' in line and '"old": "100"' in line
+        and '"new": "900"' in line
+        for line in journal_path.read_text().splitlines()
+    )
+    # Nothing was re-created: the object was matched, not duplicated.
+    assert not any(c[0] == "createNetworkGroupPolicy" for c in calls2)
+
+
+def test_serial_scoped_writes_refuse_foreign_hardware(
+    tmp_path: Path,
+) -> None:
+    """A feature addressed at a serial the snapshot never recorded
+    would write to hardware the restore does not own (possibly still
+    claimed by production) — refused outright, never dispatched."""
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(
+            PORT_ITEM, ("Q2ZZ-AAAA-ZZZZ", "1"),
+            {"portId": "1", "name": "rogue"},
+        ),
+    )
+    plan = plan_restore(graph, parser)
+    restorer, calls = _executor(tmp_path)
+    result = restorer.execute(graph, plan)
+
+    reasons = dict(result.failed)
+    key = f"{PORT_ITEM}::Q2ZZ-AAAA-ZZZZ,1"
+    assert "not recorded in the snapshot" in reasons[key]
+    assert "refusing to write to hardware" in reasons[key]
+    assert all(c[0] != "updateDeviceSwitchPort" for c in calls)
+
+
+def test_preset_mappings_resolve_surviving_parents(tmp_path: Path) -> None:
+    """Heal-style preset mappings seed the resolver before execution,
+    so children of a surviving (never-recreated) parent dispatch at the
+    survivor's live ID."""
+    from types import SimpleNamespace
+
+    from meraki2tf.models import NetworkGraph as _NetworkGraph
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    parser = _restore_spec(tmp_path)
+    graph = _NetworkGraph(
+        "org-123", (), (),
+        (
+            FeatureConfiguration(
+                GP_ITEM, ("N_1", "100"),
+                {"groupPolicyId": "100", "name": "kiosk"},
+            ),
+        ),
+    )
+    plan = plan_restore(graph, parser)
+    calls: list = []
+    section = _RecordingSection(calls)
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "j.jsonl"),
+        preset_mappings=(("network", "N_1", "L_SURV", ()),),
+    )
+    restorer._client = SimpleNamespace(networks=section)
+    result = restorer.execute(graph, plan)
+
+    assert result.failed == ()
+    create = next(c for c in calls if c[0] == "createNetworkGroupPolicy")
+    assert create[1] == ("L_SURV",)
+
+
+def test_adoption_survives_a_failed_content_alignment(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Alignment of an adopted counterpart is best-effort: the adopted
+    object exists and is mapped, so a failing follow-up PUT downgrades
+    to a warning instead of failing the object."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(
+            GP_ITEM, ("N_1", "100"), {"groupPolicyId": "100", "name": "gp"}
+        )
+    )
+    plan = plan_restore(graph, parser)
+    calls: list = []
+
+    class Section(_RecordingSection):
+        def createNetworkGroupPolicy(self, *args, **kwargs) -> dict:
+            self._calls.append(("createNetworkGroupPolicy", args, kwargs))
+            raise _conflict_error("'gp' is a reserved name and cannot be used")
+
+        def getNetworkGroupPolicies(self, networkId: str) -> list[dict]:
+            self._calls.append(("getNetworkGroupPolicies", (networkId,), {}))
+            return [{"groupPolicyId": "901", "name": "gp"}]
+
+        def updateNetworkGroupPolicy(self, *args, **kwargs) -> dict:
+            self._calls.append(("updateNetworkGroupPolicy", args, kwargs))
+            raise _conflict_error("alignment rejected")
+
+    section = Section(calls)
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "j.jsonl"), skip_claims=True
+    )
+    restorer._client = SimpleNamespace(
+        organizations=section, networks=section
+    )
+    with caplog.at_level(logging.WARNING, logger="meraki2tf.restorer"):
+        result = restorer.execute(graph, plan)
+
+    assert result.failed == ()  # the adoption stands
+    assert f"{GP_ITEM}::N_1,100" in result.executed
+    assert any(
+        "could not align its content" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_dispatch_interlocks_on_a_foreign_resolved_org_scope(
+    tmp_path: Path,
+) -> None:
+    """Whatever the resolver produced, an organization scope other than
+    the restore target must never reach the dashboard."""
+    from types import SimpleNamespace
+
+    from meraki2tf.models import NetworkGraph as _NetworkGraph
+    from meraki2tf.restorer import (
+        ForeignScopeError,
+        OrgRestorer,
+        ReferenceResolver,
+        RestoreAction,
+        RestoreJournal,
+        WAVE_ORG_FEATURES,
+    )
+    from meraki2tf.spec.engine import OperationSpec
+
+    resolver = ReferenceResolver(_NetworkGraph("org-123", (), (), ()))
+    resolver.record("organization", "org-123", "org-OTHER")
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "j.jsonl")
+    )
+    op = OperationSpec(
+        operation_id="updateOrganizationAdmin", method="put",
+        path=ADMINS_ITEM, path_params=("organizationId", "adminId"),
+        tags=("organizations",),
+    )
+    action = RestoreAction(
+        kind="configure", wave=WAVE_ORG_FEATURES, api_path=ADMINS_ITEM,
+        path_values=("org-123", "A_1"), operation=op,
+        payload={"name": "Jordan Sample"},
+    )
+    with pytest.raises(
+        ForeignScopeError, match="not the restore target organization"
+    ):
+        restorer._dispatch(SimpleNamespace(), action, resolver, "org-123")
+
+
+def test_adoption_lookup_degrades_when_its_scope_cannot_resolve(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A lookup whose scope cannot resolve (journaled-complete parent
+    with an unrecovered mapping) degrades to 'collection unreadable'
+    instead of aborting the run outside per-action isolation."""
+    from types import SimpleNamespace
+
+    from meraki2tf.models import NetworkGraph as _NetworkGraph
+    from meraki2tf.restorer import (
+        OrgRestorer,
+        ReferenceResolver,
+        RestoreAction,
+        RestoreJournal,
+    )
+    from meraki2tf.spec.engine import OperationSpec
+
+    resolver = ReferenceResolver(_NetworkGraph("org-123", (), (), ()))
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "j.jsonl")
+    )
+    lookup = OperationSpec(
+        operation_id="getNetworkGroupPolicies", method="get",
+        path=GP_COLLECTION, path_params=("networkId",), tags=("networks",),
+    )
+    action = RestoreAction(
+        kind="create", wave=4, api_path=GP_ITEM,
+        path_values=("N_1", "100"), operation=lookup,
+        payload={"name": "kiosk"}, lookup=lookup,
+    )
+    with caplog.at_level(logging.DEBUG, logger="meraki2tf.restorer"):
+        listing = restorer._list_collection(
+            SimpleNamespace(), action, resolver, "org-123"
+        )
+    assert listing is None
+    assert any(
+        "could not resolve its scope" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def _firmware_shaping_action() -> object:
+    from meraki2tf.restorer import RestoreAction
+    from meraki2tf.spec.engine import OperationSpec
+
+    op = OperationSpec(
+        operation_id="updateNetworkFirmwareUpgrades", method="put",
+        path=FIRMWARE_PATH, path_params=("networkId",), tags=("networks",),
+    )
+    return RestoreAction(
+        kind="configure", wave=4, api_path=FIRMWARE_PATH,
+        path_values=("N_1",), operation=op, payload={},
+    )
+
+
+def test_firmware_shaping_passes_through_unshaped_bodies(
+    tmp_path: Path,
+) -> None:
+    """Bodies without the products mapping shape (or with non-mapping
+    product configs) pass through untouched — nothing to remap."""
+    from types import SimpleNamespace
+
+    restorer, _calls = _executor(tmp_path)
+    action = _firmware_shaping_action()
+    dashboard = SimpleNamespace()
+
+    body: object = ["not-a-mapping"]
+    assert restorer._shape_firmware_upgrades(
+        dashboard, action, "N_9", body
+    ) == ["not-a-mapping"]
+    assert restorer._shape_firmware_upgrades(
+        dashboard, action, "N_9", {"products": "n/a"}
+    ) == {"products": "n/a"}
+    shaped = restorer._shape_firmware_upgrades(
+        dashboard, action, "N_9", {"products": {"switch": "n/a"}}
+    )
+    assert shaped == {"products": {"switch": "n/a"}}
+
+
+def test_target_firmware_catalog_degrades_on_unreadable_shapes(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Every unreadable catalog shape (no network, no SDK reader, a
+    failing read, a non-mapping response) degrades to an empty catalog
+    so pending upgrades drop as unmatchable instead of crashing."""
+    from types import SimpleNamespace
+
+    restorer, _calls = _executor(tmp_path)
+
+    # A drill without a rebuilt network has no catalog to read.
+    assert restorer._target_firmware_catalog(SimpleNamespace(), None) == {}
+    # SDK without the reader method.
+    assert restorer._target_firmware_catalog(SimpleNamespace(), "N_9") == {}
+
+    class Boom:
+        @staticmethod
+        def getNetworkFirmwareUpgrades(network_id: str) -> None:
+            raise RuntimeError("boom")
+
+    with caplog.at_level(logging.DEBUG, logger="meraki2tf.restorer"):
+        assert restorer._target_firmware_catalog(
+            SimpleNamespace(networks=Boom()), "N_9"
+        ) == {}
+    assert any(
+        "unreadable" in r.getMessage() for r in caplog.records
+    )
+
+    class Listy:
+        @staticmethod
+        def getNetworkFirmwareUpgrades(network_id: str) -> list:
+            return ["not-a-mapping"]
+
+    assert restorer._target_firmware_catalog(
+        SimpleNamespace(networks=Listy()), "N_9"
+    ) == {}
+
+    class Mixed:
+        @staticmethod
+        def getNetworkFirmwareUpgrades(network_id: str) -> dict:
+            return {"products": {
+                "switch": "n/a",  # non-mapping product config: ignored
+                "wireless": {"availableVersions": [
+                    {"id": 7, "shortName": "MR 31"},
+                    "junk",
+                    {"shortName": "MR 32"},  # no id: filtered out
+                ]},
+            }}
+
+    catalog = restorer._target_firmware_catalog(
+        SimpleNamespace(networks=Mixed()), "N_9"
+    )
+    assert catalog == {"wireless": {"MR 31": 7}}
+
+
+def test_lazy_dashboard_clients_construct_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Restorer and wiper build their SDK client lazily, exactly once,
+    with logging suppressed and the key read from the environment."""
+    import sys
+    import types
+    from types import SimpleNamespace
+
+    from meraki2tf.config import API_KEY_ENV_VAR
+    from meraki2tf.restorer import OrgRestorer, OrgWiper, RestoreJournal
+
+    dashboard = SimpleNamespace()
+    captured: list[dict] = []
+
+    def factory(**kwargs: object) -> SimpleNamespace:
+        captured.append(dict(kwargs))
+        return dashboard
+
+    stub = types.ModuleType("meraki")
+    stub.DashboardAPI = factory  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "meraki", stub)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "unit-test-key")
+
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "j.jsonl")
+    )
+    assert restorer._dashboard() is dashboard
+    assert restorer._dashboard() is dashboard  # cached, not rebuilt
+    wiper = OrgWiper()
+    assert wiper._dashboard() is dashboard
+    assert len(captured) == 2
+    assert all(kw["suppress_logging"] is True for kw in captured)

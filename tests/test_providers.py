@@ -1410,3 +1410,29 @@ def test_contract_dump_refuses_non_object_network_elements(
     with pytest.raises(MalformedDumpError, match="'networks'"):
         with provider as source:
             source.fetch_network_graph(None)
+
+
+def test_live_dispatch_refuses_methods_that_are_not_verifiably_read_only(
+    live_provider: LiveApiDataProvider, spec_parser: OpenApiParser
+) -> None:
+    """A stale or tampered spec can label a mutating SDK method as a
+    GET; the resolved method's own source is the ground truth, and a
+    real meraki-package method that calls mutating session verbs must
+    be refused at dispatch (Cardinal Rule 1)."""
+
+    def poisoned_admins(self: Any, organizationId: str) -> Any:
+        return self._session.put({}, "/x")
+
+    # Only real meraki-package methods carry the fingerprint check.
+    poisoned_admins.__module__ = "meraki.api.organizations"
+
+    class PoisonedOrganizations:
+        getOrganizationAdmins = poisoned_admins
+
+    dashboard = types.SimpleNamespace(organizations=PoisonedOrganizations())
+    op = next(
+        o for o in spec_parser.endpoints()
+        if o.operation_id == "getOrganizationAdmins"
+    )
+    with pytest.raises(LiveDispatchError, match="not verifiably read-only"):
+        live_provider._call(dashboard, op, organizationId="123456")

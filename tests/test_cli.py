@@ -3589,3 +3589,401 @@ def test_multi_org_fan_out_builds_per_org_kits(
     out = capsys.readouterr().out
     assert "Per-organization DR kits" in out
     assert "111222" in out and "333444" in out
+
+
+# ---------------------------------------------------------------------------
+# Heal execution (--heal --confirm) and remaining DR-surface edges.
+# ---------------------------------------------------------------------------
+
+
+def test_heal_rejects_combination_with_restore(
+    spec_file: Path, tmp_path: Path
+) -> None:
+    """--heal is a standalone DR action; pairing it with another DR
+    write mode is refused as a usage error."""
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            ["--spec", str(spec_file), "--heal",
+             "--from-dump", str(tmp_path / "x.json"),
+             "--org-id", "org-123", "--restore"]
+        )
+    assert excinfo.value.code == 2
+
+
+def test_multi_org_remote_backend_rejects_backend_config_file(
+    spec_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A single --backend-config-file names ONE state address, so it
+    cannot serve several organizations; the placeholder form must be
+    used instead."""
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            ["--spec", str(spec_file), "--org-id", "111222",
+             "--org-id", "333444", "--state-backend", "azurerm",
+             "--backend-config-file", "azure.tfbackend"]
+        )
+    assert excinfo.value.code == 2
+
+
+def test_report_names_reconciliation_drop_categories(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Drop categories are named with counts so a provider regression
+    identifies the class it broke, not just a number."""
+    from meraki2tf.cli import _report
+    from meraki2tf.orchestrator import RunSummary
+
+    summary = RunSummary(
+        organization_id="org-123",
+        discovered_assets=3,
+        imports_written=1,
+        imports_skipped_existing=0,
+        unsupported_count=2,
+        drift_detected=False,
+        comparison_skipped=False,
+        pending_imports=1,
+        reconciliation_dropped=(
+            "meraki_network_firmware_upgrades.l_1",
+            "meraki_network_firmware_upgrades.l_2",
+        ),
+        reconciliation_drop_categories={
+            "Invalid Attribute Combination": 2,
+        },
+    )
+    with caplog.at_level("INFO", logger="meraki2tf.cli"):
+        _report(summary)
+    assert "Unexpressible drop categories" in caplog.text
+    assert "2 × Invalid Attribute Combination" in caplog.text
+
+
+def test_restore_confirm_reports_drill_placeholders(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Placeholder secrets written during a sanitized-snapshot drill are
+    surfaced per action so the operator knows to re-enter real values if
+    the organization is ever kept."""
+    from meraki2tf import restorer as restorer_module
+
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+
+    def placeholder_result(
+        self: Any, graph: Any, plan: Any
+    ) -> restorer_module.RestoreResult:
+        return restorer_module.RestoreResult(
+            executed=("networks|create|N_1",),
+            drill_placeholders=(
+                ("wireless-ssids|update|N_1,0", "payload.psk"),
+            ),
+        )
+
+    monkeypatch.setattr(
+        restorer_module.OrgRestorer, "execute", placeholder_result
+    )
+    delivered: list[dict[str, Any]] = []
+
+    def fake_urlopen(request: Any, timeout: float) -> FakeResponse:
+        delivered.append(json.loads(request.data.decode("utf-8")))
+        return FakeResponse()
+
+    monkeypatch.setattr("meraki2tf.alerts.webhook._open", fake_urlopen)
+    dump = _restore_dump(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--restore", "--from-dump", str(dump),
+         "--target-org", "org-999", "--workdir", str(tmp_path / "ws"),
+         "--confirm", "--webhook-url", "https://hooks.example/dr"]
+    )
+    console = capsys.readouterr().err
+    assert exit_code == 0
+    assert "Drill placeholder secret(s) written" in console
+    assert "payload.psk" in console
+    (event,) = delivered
+    assert event["event_type"] == "RESTORE_EXECUTED"
+
+
+def test_heal_fails_cleanly_on_unreadable_snapshot(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    exit_code = main(
+        ["--spec", str(spec_file), "--heal",
+         "--from-dump", str(tmp_path / "missing.json"),
+         "--org-id", "org-123", "--workdir", str(tmp_path / "ws")]
+    )
+    console = capsys.readouterr().err
+    assert exit_code == 1
+    assert "Heal could not load the snapshot" in console
+
+
+def test_heal_live_discovery_fault_exits_1(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A live-API failure mid-discovery must exit cleanly: without the
+    live picture there is no way to decide what is missing."""
+    from meraki2tf import cli as cli_module
+
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+
+    class ExplodingLiveProvider(_StubLiveProvider):
+        def fetch_network_graph(
+            self, organization_id: str | None = None
+        ) -> Any:
+            raise RuntimeError("api unreachable mid-discovery")
+
+    monkeypatch.setattr(
+        cli_module, "LiveApiDataProvider", ExplodingLiveProvider
+    )
+    dump = _heal_dump(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--heal", "--from-dump", str(dump),
+         "--org-id", "org-123", "--workdir", str(tmp_path / "ws")]
+    )
+    console = capsys.readouterr().err
+    assert exit_code == 1
+    assert "Heal could not discover the live organization" in console
+
+
+def test_heal_preview_reports_unrestorables(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Missing objects the API cannot recreate are named with a reason —
+    that list is the operator's manual-recovery runbook."""
+    from meraki2tf import cli as cli_module
+    from meraki2tf.models import MerakiNetwork, NetworkGraph
+
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    _StubLiveProvider.graph = NetworkGraph(
+        organization_id="org-123",
+        networks=(
+            MerakiNetwork.from_payload(
+                {"id": "N_1", "organizationId": "org-123", "name": "HQ",
+                 "productTypes": ["wireless"], "timeZone": "UTC"}
+            ),
+        ),
+        devices=(),
+        features=(),
+    )
+    monkeypatch.setattr(cli_module, "LiveApiDataProvider", _StubLiveProvider)
+    dump = tmp_path / "heal-snapshot.json"
+    dump.write_text(
+        json.dumps(
+            {
+                "organizationId": "org-123",
+                "networks": [
+                    {"id": "N_1", "organizationId": "org-123", "name": "HQ",
+                     "productTypes": ["wireless"], "timeZone": "UTC"}
+                ],
+                "devices": [],
+                "features": [
+                    {
+                        "apiPath": (
+                            "/networks/{networkId}/wireless/ssids/{number}"
+                        ),
+                        "pathValues": ["N_1", "0"],
+                        "payload": {"number": 0, "name": "Corp"},
+                    },
+                    {
+                        "apiPath": "/networks/{networkId}/clients",
+                        "pathValues": ["N_1"],
+                        "payload": {"usage": 1},
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    exit_code = main(
+        ["--spec", str(spec_file), "--heal", "--from-dump", str(dump),
+         "--org-id", "org-123", "--workdir", str(tmp_path / "ws")]
+    )
+    console = capsys.readouterr().err
+    assert exit_code == 0
+    assert "Cannot heal /networks/{networkId}/clients" in console
+    assert "Preview only" in console
+
+
+def _heal_confirm_setup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> Path:
+    """Snapshot + live stub where exactly the SSID is missing live."""
+    from meraki2tf import cli as cli_module
+    from meraki2tf.models import MerakiNetwork, NetworkGraph
+
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    _StubLiveProvider.graph = NetworkGraph(
+        organization_id="org-123",
+        networks=(
+            MerakiNetwork.from_payload(
+                {"id": "N_1", "organizationId": "org-123", "name": "HQ",
+                 "productTypes": ["wireless"], "timeZone": "UTC"}
+            ),
+        ),
+        devices=(),
+        features=(),
+    )
+    monkeypatch.setattr(cli_module, "LiveApiDataProvider", _StubLiveProvider)
+    return _heal_dump(tmp_path)
+
+
+def test_heal_unreadable_journal_exits_2(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A corrupted heal journal refuses the run instead of silently
+    re-creating already-recreated objects."""
+    dump = _heal_confirm_setup(monkeypatch, tmp_path)
+    workdir = tmp_path / "ws"
+    workdir.mkdir()
+    (workdir / "heal-journal.jsonl").write_text(
+        'not-json\n{"kind": "done", "key": "x"}\n', encoding="utf-8"
+    )
+    exit_code = main(
+        ["--spec", str(spec_file), "--heal", "--from-dump", str(dump),
+         "--org-id", "org-123", "--workdir", str(workdir), "--confirm"]
+    )
+    assert exit_code == 2
+
+
+def test_heal_journal_mismatch_exits_2(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from meraki2tf import restorer as restorer_module
+
+    dump = _heal_confirm_setup(monkeypatch, tmp_path)
+
+    def mismatch(self: Any, graph: Any, plan: Any) -> Any:
+        raise restorer_module.RestoreJournalMismatchError(
+            "journal bound to a different organization"
+        )
+
+    monkeypatch.setattr(restorer_module.OrgRestorer, "execute", mismatch)
+    exit_code = main(
+        ["--spec", str(spec_file), "--heal", "--from-dump", str(dump),
+         "--org-id", "org-123", "--workdir", str(tmp_path / "ws"),
+         "--confirm"]
+    )
+    assert exit_code == 2
+
+
+def test_heal_execution_fault_alerts_and_exits_1(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An exception escaping the heal executor must alert and exit
+    cleanly — completed writes stay journaled for a resume."""
+    from meraki2tf import restorer as restorer_module
+
+    dump = _heal_confirm_setup(monkeypatch, tmp_path)
+
+    def exploding(self: Any, graph: Any, plan: Any) -> Any:
+        raise RuntimeError("api unreachable mid-heal")
+
+    monkeypatch.setattr(restorer_module.OrgRestorer, "execute", exploding)
+    delivered: list[dict[str, Any]] = []
+
+    def fake_urlopen(request: Any, timeout: float) -> FakeResponse:
+        delivered.append(json.loads(request.data.decode("utf-8")))
+        return FakeResponse()
+
+    monkeypatch.setattr("meraki2tf.alerts.webhook._open", fake_urlopen)
+    exit_code = main(
+        ["--spec", str(spec_file), "--heal", "--from-dump", str(dump),
+         "--org-id", "org-123", "--workdir", str(tmp_path / "ws"),
+         "--confirm", "--webhook-url", "https://hooks.example/dr"]
+    )
+    assert exit_code == 1
+    (event,) = delivered
+    assert event["event_type"] == "PROCESSING_FAULT"
+    assert "--heal --confirm" in event["details"]["stage"]
+    assert "api unreachable mid-heal" in event["details"]["error"]
+
+
+def test_heal_confirm_executes_and_alerts(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from meraki2tf import restorer as restorer_module
+
+    dump = _heal_confirm_setup(monkeypatch, tmp_path)
+
+    def succeed(self: Any, graph: Any, plan: Any) -> Any:
+        return restorer_module.RestoreResult(
+            executed=("wireless-ssids|update|N_1,0",),
+            skipped=(
+                {"target": "devices|claim", "reason": "drill mode"},
+            ),
+        )
+
+    monkeypatch.setattr(restorer_module.OrgRestorer, "execute", succeed)
+    delivered: list[dict[str, Any]] = []
+
+    def fake_urlopen(request: Any, timeout: float) -> FakeResponse:
+        delivered.append(json.loads(request.data.decode("utf-8")))
+        return FakeResponse()
+
+    monkeypatch.setattr("meraki2tf.alerts.webhook._open", fake_urlopen)
+    exit_code = main(
+        ["--spec", str(spec_file), "--heal", "--from-dump", str(dump),
+         "--org-id", "org-123", "--workdir", str(tmp_path / "ws"),
+         "--confirm", "--webhook-url", "https://hooks.example/dr"]
+    )
+    console = capsys.readouterr().err
+    assert exit_code == 0
+    assert "Heal skipped devices|claim: drill mode" in console
+    assert "1 recreated, 0 failed, 1 skipped" in console
+    (event,) = delivered
+    assert event["event_type"] == "HEAL_EXECUTED"
+    assert event["details"]["organization_id"] == "org-123"
+
+
+def test_heal_confirm_reports_failures_nonzero(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from meraki2tf import restorer as restorer_module
+
+    dump = _heal_confirm_setup(monkeypatch, tmp_path)
+
+    def fail(self: Any, graph: Any, plan: Any) -> Any:
+        return restorer_module.RestoreResult(
+            failed=(("wireless-ssids|update|N_1,0", "simulated failure"),),
+        )
+
+    monkeypatch.setattr(restorer_module.OrgRestorer, "execute", fail)
+    delivered: list[dict[str, Any]] = []
+
+    def fake_urlopen(request: Any, timeout: float) -> FakeResponse:
+        delivered.append(json.loads(request.data.decode("utf-8")))
+        return FakeResponse()
+
+    monkeypatch.setattr("meraki2tf.alerts.webhook._open", fake_urlopen)
+    exit_code = main(
+        ["--spec", str(spec_file), "--heal", "--from-dump", str(dump),
+         "--org-id", "org-123", "--workdir", str(tmp_path / "ws"),
+         "--confirm", "--webhook-url", "https://hooks.example/dr"]
+    )
+    console = capsys.readouterr().err
+    assert exit_code == 1
+    assert (
+        "Heal FAILED for wireless-ssids|update|N_1,0: simulated failure"
+        in console
+    )

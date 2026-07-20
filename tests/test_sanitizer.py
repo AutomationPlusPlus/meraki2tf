@@ -1142,3 +1142,65 @@ def test_certificate_pem_blocks_are_redacted() -> None:
     assert payload["certPem"] == REDACTED
     assert payload["csrPem"] == REDACTED
     assert payload["certUsage"] == "keep-me"
+
+
+def test_default_fixed_slot_path_selector_survives() -> None:
+    """The literal `default` fixed-slot selector (vlanProfiles/{iname}
+    names its built-in profile "default") is identity-free — a
+    pseudonym would make the slot unaddressable on restore. The
+    placeholder is name-shaped, so only the special case saves it."""
+    graph = NetworkGraph(
+        "org-123", (), (),
+        (
+            FeatureConfiguration(
+                "/networks/{networkId}/vlanProfiles/{iname}",
+                ("N_1", "default"),
+                {"iname": "default", "name": "Default profile"},
+            ),
+        ),
+    )
+    cleaned = sanitize_graph(graph, salt=b"fixed").features[0]
+    assert cleaned.path_values == ("net-0001", "default")
+    # The profile's own iname echo stays addressable too, while the
+    # display name is still pseudonymized.
+    assert cleaned.payload["iname"] == "default"
+    assert cleaned.payload["name"] != "Default profile"
+
+
+def test_early_access_shortname_slugs_survive() -> None:
+    """Early-access feature shortNames (`has_beta_api`) are API
+    keywords the opt-in POST validates against a fixed list — a
+    pseudonym would fail validation on restore."""
+    graph = NetworkGraph(
+        "org-123", (), (),
+        (
+            FeatureConfiguration(
+                "/organizations/{organizationId}/earlyAccess/features"
+                "/optIns/{optInId}",
+                ("org-123", "opt-99887766"),
+                {"shortName": "has_beta_api", "name": "Beta API access"},
+            ),
+        ),
+    )
+    payload = sanitize_graph(graph, salt=b"fixed").features[0].payload
+    assert payload["shortName"] == "has_beta_api"
+    assert payload["name"] != "Beta API access"
+
+
+def test_catalog_uris_survive_under_identity_shaped_keys() -> None:
+    """Global catalog URIs (`meraki:…`) are identical in every
+    organization — not identity — and a pseudonym fails the dashboard's
+    URI-format validation on restore, even when the URI sits under an
+    identity-shaped key."""
+    graph = NetworkGraph(
+        "org-123", (), (),
+        (
+            FeatureConfiguration(
+                "/networks/{networkId}/appliance/contentFiltering",
+                ("N_1",),
+                {"name": "meraki:contentFiltering/category/C7"},
+            ),
+        ),
+    )
+    payload = sanitize_graph(graph, salt=b"fixed").features[0].payload
+    assert payload["name"] == "meraki:contentFiltering/category/C7"

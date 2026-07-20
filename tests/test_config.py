@@ -13,6 +13,7 @@ from meraki2tf.config import (
     MissingApiKeyError,
     RuntimeConfig,
     StateBackend,
+    WEBHOOK_URL_ENV_VAR,
     read_api_key,
 )
 
@@ -308,3 +309,68 @@ def test_web_identity_token_is_refused_on_argv() -> None:
              "--backend-config", "web_identity_token=SECRETJWT"]
         )
     assert "SECRETJWT" not in str(excinfo.value)
+
+
+def test_backend_config_file_hcl_scan_skips_comments_and_blanks(
+    tmp_path: Path,
+) -> None:
+    """A benign HCL file with comment and blank lines scans clean end to
+    end — nothing there is credential-shaped."""
+    backend_file = tmp_path / "azure.tfbackend"
+    backend_file.write_text(
+        "# state address for the DR runbook\n"
+        "\n"
+        "// terraform init reads this via -backend-config\n"
+        'storage_account_name = "sa"\n'
+        'container_name        = "tfstate"\n'
+        'key                   = "org.tfstate"\n',
+        encoding="utf-8",
+    )
+    backend = _config(
+        ["--state-backend", "azurerm",
+         "--backend-config-file", str(backend_file)]
+    ).backend
+    assert backend.is_remote
+    assert backend.init_args()[0] == f"-backend-config={backend_file}"
+
+
+def test_backend_config_file_json_credential_inside_list_is_refused(
+    tmp_path: Path,
+) -> None:
+    """The JSON walk descends into list values too — a credential
+    wrapped in an array must not slip past the refusal."""
+    backend_file = tmp_path / "bc.json"
+    backend_file.write_text(
+        '{"bucket": "meraki-dr-state", "key": "org.tfstate",\n'
+        ' "extras": [{"region": "us-east-1"},\n'
+        '            {"secret_key": "SUPERSECRET"}]}\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(BackendConfigError, match="credential") as excinfo:
+        _config(
+            ["--state-backend", "s3",
+             "--backend-config-file", str(backend_file)]
+        )
+    assert "SUPERSECRET" not in str(excinfo.value)
+
+
+def test_webhook_urls_come_from_env_var_and_dedupe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The env var keeps token-bearing URLs out of argv: ':::'-separated
+    targets are split, blanks dropped, and env-sourced entries lead with
+    duplicates collapsed."""
+    monkeypatch.setenv(
+        WEBHOOK_URL_ENV_VAR,
+        " https://hooks.example/a ::: https://hooks.example/b :::",
+    )
+    config = _config(
+        ["--spec", "openapi.json",
+         "--webhook-url", "https://hooks.example/a",
+         "--webhook-url", "https://hooks.example/c"]
+    )
+    assert config.webhook_urls == (
+        "https://hooks.example/a",
+        "https://hooks.example/b",
+        "https://hooks.example/c",
+    )

@@ -507,3 +507,33 @@ def test_matcher_reads_object_response_schemas(tmp_path: Path) -> None:
     assert matcher.match("wireless_settings").path == (
         "/networks/{networkId}/wireless/settings"
     )
+
+
+def test_parent_scope_id_key_requires_a_family_nested_item(
+    tmp_path: Path,
+) -> None:
+    """The <parentSegment>Id fallback only exists for family-nested
+    item paths; shallow or non-item shapes derive nothing, and a
+    parameter parent segment names no field."""
+    from meraki2tf.providers.discovery import _parent_scope_id_key
+
+    parser = _write_spec(
+        tmp_path,
+        {
+            "/organizations/{organizationId}": {
+                "get": {"operationId": "getOrg", "tags": ["organizations"]},
+            },
+            "/networks/{networkId}/appliance/trafficShaping": {
+                "get": {"operationId": "getShaping", "tags": ["appliance"]},
+            },
+            "/organizations/{organizationId}/{scope}/{itemId}": {
+                "get": {"operationId": "getScoped", "tags": ["organizations"]},
+            },
+        },
+    )
+    shallow = _get_op(parser, "/organizations/{organizationId}")
+    assert _parent_scope_id_key(shallow) is None  # too shallow
+    shaping = _get_op(parser, "/networks/{networkId}/appliance/trafficShaping")
+    assert _parent_scope_id_key(shaping) is None  # not an item path
+    scoped = _get_op(parser, "/organizations/{organizationId}/{scope}/{itemId}")
+    assert _parent_scope_id_key(scoped) is None  # parent is a parameter

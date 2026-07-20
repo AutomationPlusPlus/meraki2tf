@@ -899,3 +899,72 @@ def test_email_without_credentials_never_logs_in(
     assert smtp is not None
     assert smtp.logins == []
     assert len(smtp.sent) == 1
+
+
+def test_condense_diff_collapses_blank_runs_left_by_removals() -> None:
+    from meraki2tf.alerts.models import condense_diff
+
+    # Progress lines sandwiched between blank lines leave consecutive
+    # blanks behind; the condensed diff collapses them to one.
+    diff = (
+        "Terraform will perform the following actions:\n"
+        "\n"
+        "meraki_network_snmp.l_1: Refreshing state... [id=L_1]\n"
+        "\n"
+        "  # meraki_network_snmp.l_1 will be updated in-place\n"
+    )
+    assert condense_diff(diff) == (
+        "Terraform will perform the following actions:\n"
+        "\n"
+        "  # meraki_network_snmp.l_1 will be updated in-place"
+    )
+
+
+def test_heal_executed_severity_tracks_failures() -> None:
+    from meraki2tf.alerts import heal_executed
+
+    clean = heal_executed(
+        organization_id="123456",
+        surviving=7,
+        executed=["create /networks/{networkId}/groupPolicies"],
+        failed=[],
+        skipped=[{"operation": "op-1", "reason": "sanitized"}],
+    )
+    assert clean.severity is EventSeverity.INFO
+    assert clean.event_type is EventType.HEAL_EXECUTED
+    assert "1 missing object(s) recreated" in clean.summary
+    assert clean.details["surviving_untouched"] == 7
+
+    failing = heal_executed(
+        organization_id="123456",
+        surviving=7,
+        executed=[],
+        failed=[["create /networks/{networkId}/groupPolicies", "HTTP 400"]],
+        skipped=[],
+    )
+    assert failing.severity is EventSeverity.WARNING
+    assert failing.details["failed"] == [
+        ["create /networks/{networkId}/groupPolicies", "HTTP 400"]
+    ]
+
+
+def test_pagerduty_open_delegates_to_urlopen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The _open seam (patched everywhere else) itself just hands the
+    request to urllib against the fixed https Events API endpoint."""
+    captured: dict[str, Any] = {}
+    sentinel = FakeResponse(202)
+
+    def fake_urlopen(request: urllib.request.Request, timeout: float) -> FakeResponse:
+        captured["request"] = request
+        captured["timeout"] = timeout
+        return sentinel
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    request = urllib.request.Request(
+        "https://events.pagerduty.com/v2/enqueue", data=b"{}"
+    )
+    assert pagerduty_module._open(request, timeout=5.0) is sentinel
+    assert captured["request"] is request
+    assert captured["timeout"] == 5.0
