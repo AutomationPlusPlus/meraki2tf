@@ -333,5 +333,5 @@ The worker VM may be gone; the Blob container is the recovery source.
    what it cannot. Both are preview-first: run each without
    `--confirm` and read the output before executing.
 
-See the [Disaster Recovery](../README.md#disaster-recovery) section of
+See the [Disaster Recovery](DR-GUIDE.md#disaster-recovery) section of
 the README for the full restore flows.

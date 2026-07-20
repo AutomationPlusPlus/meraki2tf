@@ -1,0 +1,356 @@
+# Disaster Recovery Guide
+
+How the DR kit is produced, what coverage means, and every
+recovery action (`--rebuild`, `--heal`, `--replay-gaps`,
+`--restore`, `--wipe-org`) — each preview-first, `--confirm` to
+execute. Part of the [meraki2tf](../README.md) docs.
+
+## Disaster Recovery
+
+meraki2tf is designed as a DR tool: schedule it to run continuously so
+your organization's configuration is always captured as runnable
+Terraform, and when a major incident hits, rebuild from the latest
+artifacts. Normal runs are **strictly read-only** toward Meraki — no
+`terraform apply` ever happens during the pipeline.
+
+### What a run produces
+
+Each run leaves a complete rebuild kit in `--workdir`:
+
+| Artifact | Written by | Purpose |
+| --- | --- | --- |
+| `imports.tf` | meraki2tf | One `import {}` block per discovered asset (compound IDs included) |
+| `provider.tf` | meraki2tf | Credential-free provider + backend anchor (local by default; a partial remote block for `--state-backend`) |
+| `resources.tf` | meraki2tf (accumulated from `terraform plan -generate-config-out`) | Full HCL configuration for every captured asset — the actual rebuild material and the drift-comparison baseline |
+| `generated_resources.tf` | terraform (transient) | Freshly generated config for new imports; folded into `resources.tf` after every plan |
+| `coverage.json` / `coverage.txt` | meraki2tf | Per-run coverage manifest: every discovered object with status `imported`, `pending-import`, or `unsupported` (with reason), plus totals and a coverage percentage |
+| `runbook.md` | meraki2tf | Per-run DR runbook: for each object Terraform can't rebuild — the endpoint, identifiers, reason, redacted payload, and the `--replay-gaps` write op — plus which secret attributes to restore and where in the snapshot they live |
+| `meraki2tf.tfstate` | terraform (`--sync` runs, `--rebuild --confirm`, or a manual apply) | State tracking, once the resources are adopted (local backend; a remote `--state-backend` keeps state in its own store instead) |
+
+Back up the workdir (and ideally a `--dump-to` snapshot) somewhere that
+survives the disaster you are protecting against.
+
+### Knowing what is (and isn't) covered
+
+Every run audits Terraform coverage so you can trust the kit *before*
+you need it. The workdir always contains a machine-readable
+`coverage.json` and a human-readable `coverage.txt` listing **every**
+discovered object with a status — `imported` (in state),
+`pending-import` (in the kit, not yet in state), or `unsupported`
+(cannot be rebuilt by Terraform, with the reason) — plus totals and a
+coverage percentage. The log and the `RUN_SUCCESS` payload carry the
+same picture, and each asset the provider **cannot express** is flagged
+with an `UNSUPPORTED_FEATURE_FLAGGED` alert; the full unsupported list
+also rides along on every success and drift notification — those are
+the pieces you would have to rebuild manually in a DR event, so review
+them ahead of time. Pass `--fail-on-gaps` to exit with code 3 whenever
+unsupported objects exist, so CI or your scheduler can gate on full
+coverage. Alongside the manifest, every run regenerates `runbook.md` —
+the human DR runbook that, for each uncoverable object, records the
+endpoint, identifiers, reason, a redacted payload, and the exact
+`--replay-gaps` write operation that would restore it (plus which secret
+attributes to re-enter and where in the snapshot they live). When the
+plan comparison runs (API key available), the plan's own summary is also
+reported: pending imports (discovered but not yet aggregated into state)
+versus real add/change/destroy pressure, which fires `DRIFT_DETECTED`.
+By default the plan stays speculative — nothing is applied unless you
+opt into `--sync`.
+
+The comparison also **reconciles provider round-trip artifacts** before
+judging drift (see `docs/ARCHITECTURE.md`, *Plan Reconciliation*):
+configurations the provider itself refuses to accept are dropped and
+reported `unsupported`; secret attributes the generated config cannot
+carry (Wi-Fi PSKs, SNMP community strings, …) are excluded from
+management and listed as `unmanaged_secret_attributes` in the manifest
+and the success notification — **restore those manually after any
+rebuild**; formatting-only differences are normalized away. Only real
+changes ever fire `DRIFT_DETECTED`.
+
+### Scheduled DR automation (`--sync`)
+
+The default invocation is the ad-hoc/open-source mode: strictly
+read-only end to end, safe for anyone to run against any org. The
+scheduled terraform rehearsal (monthly in the recommended cadence)
+passes `--sync` to also **materialize Terraform state** unattended:
+
+- After the speculative plan, the run auto-applies **only when the plan
+  is 100% imports (0 to add, 0 to change, 0 to destroy)**. Import
+  blocks only write state — Meraki is never touched. The guard lives in
+  the Terraform runner itself and re-verifies the saved plan
+  immediately before applying it, so no code path can sneak a mutation
+  through.
+- Any mutating plan **aborts the apply** and fires a `DRIFT_DETECTED`
+  alert with the diff (`apply_aborted: true`). A human decides next.
+- Modified objects (Meraki is truth): their HCL baseline is regenerated
+  to mirror the current dashboard via local state surgery
+  (`terraform state rm` + baseline prune + re-import) and the diff is
+  alerted with `regenerated_addresses`.
+- Deleted objects: **alert-only** in every mode. Resources tracked in
+  the kit that discovery no longer finds fire a
+  `DELETION_PENDING_CONFIRMATION` alert and stay in the kit until a
+  human re-runs with `--confirm-deletions`, which removes them from
+  `resources.tf` and the state.
+- Every applied run reports exactly which resources were added to state
+  (log + `RUN_SUCCESS.resources_added_to_state`), so scheduled reruns
+  tell you what grew.
+
+`--sync` requires `MERAKI_DASHBOARD_API_KEY` and fails loudly without
+it — silently skipping the apply would let the scheduled job believe it
+built state when it did not.
+
+Drift is measured against the captured baseline in `resources.tf`, so a
+`DRIFT_DETECTED` alert keeps firing until you act on it: either fix the
+organization back to the baseline (that's the DR posture), or accept
+the new reality with `--rebaseline`, which discards `resources.tf` so
+the next plan regenerates it from live data:
+
+```bash
+# After reviewing the drift diff and deciding the change is legitimate:
+meraki2tf --org-id 123456 --rebaseline
+```
+
+### Restoring an existing organization (primary DR path)
+
+When the org still exists but its configuration was damaged (mass
+misconfiguration, botched change, malicious edits), the artifacts
+restore it to the last captured snapshot:
+
+```bash
+export MERAKI_DASHBOARD_API_KEY="<your-dashboard-api-key>"
+
+# 1. Preview — read-only, shows exactly what would change:
+meraki2tf --rebuild --workdir ./generated
+
+# 2. Execute — the ONLY way meraki2tf ever runs terraform apply:
+meraki2tf --rebuild --confirm --workdir ./generated
+```
+
+`--rebuild` alone is always a dry run (`terraform plan`); nothing is
+touched until you add `--confirm`. Prefer doing it by hand? The workdir
+is a plain Terraform root module:
+
+```bash
+cd ./generated
+terraform init
+terraform plan     # inspect
+terraform apply    # rebuild
+```
+
+On the first apply the `import {}` blocks adopt every still-existing
+resource into state, then Terraform reverts any settings that diverged
+from the snapshot.
+
+### Rebuilding from scratch (org or resources destroyed)
+
+If resources no longer exist, their `import {}` blocks will fail —
+Terraform cannot import something that is gone. Adjust the kit first:
+
+1. Copy the workdir to a fresh directory (keep the original as backup).
+2. Delete `imports.tf` (or just the blocks for destroyed resources) so
+   Terraform **creates** instead of imports.
+3. Start from an empty state (delete/relocate `meraki2tf.tfstate` if
+   the old one references destroyed resources).
+4. `terraform init && terraform plan && terraform apply`.
+
+> **Greenfield caveat:** `resources.tf` captures IDs as
+> literal strings (organization ID, `network_id = "N_…"`, serials).
+> Rebuilding into a **brand-new organization** assigns new IDs, so
+> cross-resource references must be re-pointed (e.g. replace literal
+> network IDs with `meraki_networks.<name>.id` references) and device
+> serials must match hardware you actually own. Restoring into the
+> *same* organization avoids all of this, which is why it is the
+> primary DR path.
+
+### Healing accidental deletions (`--heal`)
+
+`--rebuild` reverts *modified* settings, but when objects were
+**deleted** from a still-healthy organization (the classic clickops
+accident), their `import {}` blocks fail — Terraform cannot import
+something that is gone. `--heal` covers exactly this case: it diffs
+your snapshot against a fresh live discovery of the **same**
+organization and recreates only what is missing, directly through the
+API:
+
+```bash
+export MERAKI_DASHBOARD_API_KEY="<your-dashboard-api-key>"
+
+# 1. Preview — shows every missing object and what would be recreated:
+meraki2tf --heal --from-dump vault/latest.jsonl.gz --org-id 123456
+
+# 2. Execute — recreates the missing objects; survivors are untouched:
+meraki2tf --heal --confirm --from-dump vault/latest.jsonl.gz --org-id 123456
+```
+
+Notes:
+
+- **Additive-only.** Objects still present in the organization are
+  never modified or dispatched — heal only creates what is missing. A
+  deleted parent's children are rewired to the parent's new ID.
+- **Same-org interlock** (the inverse of `--restore`): `--org-id` must
+  match the snapshot's source organization, or the run is refused. To
+  rebuild a *different* organization, use `--restore --target-org`.
+- **Unsanitized snapshot required.** A sanitized snapshot's
+  identifiers are pseudonyms and cannot be matched against the live
+  organization.
+- **API key required even for preview** — deciding what is "missing"
+  takes a live discovery of the organization as it is right now.
+- **Crash-resumable.** Executed writes are journaled
+  (`<workdir>/heal-journal.jsonl`); re-running `--heal --confirm`
+  resumes instead of duplicating creates.
+- Execution dispatches a `HEAL_EXECUTED` alert with the recreated,
+  failed, skipped, and surviving counts; objects the API cannot
+  recreate are reported with reasons, never silently dropped.
+
+### Restoring what Terraform can't rebuild (`--replay-gaps`)
+
+`--rebuild` restores everything the Terraform provider can express. Two
+things it *cannot* carry always remain:
+
+- **Unsupported objects** — Meraki configuration the `CiscoDevNet/meraki`
+  provider has no resource for (listed as `unsupported` in
+  `coverage.json`).
+- **Secret values** — the provider refuses to read secrets back (PSKs,
+  SNMP community strings), so a Terraform rebuild leaves them blank.
+
+`runbook.md` documents every one of these for manual restoration. When
+you'd rather automate it, `--replay-gaps` replays them from your
+unsanitized `--dump-to` snapshot straight to the Meraki API:
+
+```bash
+export MERAKI_DASHBOARD_API_KEY="<your-dashboard-api-key>"
+
+# 1. Preview — read-only, prints exactly what would be written:
+meraki2tf --replay-gaps --from-dump ./snapshots/org-123456.json
+
+# 2. Execute — writes the gap objects and secrets back via the SDK:
+meraki2tf --replay-gaps --confirm --from-dump ./snapshots/org-123456.json
+```
+
+Run it **after** `--rebuild --confirm` has restored the Terraform-covered
+resources. Notes:
+
+- **Inert by default.** `--replay-gaps` alone is a preview; nothing is
+  written without `--confirm`.
+- **Snapshot must be unsanitized.** Replay reads the real secret values
+  from the snapshot; a `--sanitize`d snapshot has them masked and those
+  entries are skipped (and reported).
+- **New-org remapping.** A rebuilt organization issues new network IDs;
+  snapshot path values are remapped to the live tenant by network
+  name before each call. Values embedded *inside* payloads are not
+  rewritten — per-object failures are reported, and `runbook.md` remains
+  the manual fallback.
+- Success dispatches a `GAP_REPLAY_EXECUTED` notification summarizing
+  what was restored, skipped, and (if any) failed.
+
+### Rebuilding an entire organization (`--restore`)
+
+`--rebuild` applies the Terraform kit and is the right tool when the
+organization still exists (the statistically likely disaster: a subset
+of objects was deleted or mangled). For **total organization loss** the
+kit is not enough — its generated configuration carries the old org's
+literal IDs. `--restore` rebuilds directly through the API from an
+unsanitized snapshot:
+
+```bash
+# Preview (default): the full restore plan — what will be created,
+# configured, claimed, and what cannot be restored (with reasons).
+meraki2tf --restore --from-dump vault/latest.jsonl.gz --target-org 999999
+
+# Execute. Only ever into --target-org; the snapshot's own source
+# organization is refused outright.
+meraki2tf --restore --from-dump vault/latest.jsonl.gz --target-org 999999 \
+  --confirm --workdir ./restore-run
+
+# Hardware was lost too? Map old device serials to replacement units.
+meraki2tf --restore --from-dump vault/latest.jsonl.gz --target-org 999999 \
+  --serial-map replacements.json --confirm
+```
+
+The restore runs in dependency waves — organization-level objects,
+config templates, network creation, device claiming, then features
+(shallow before nested) — capturing every server-assigned ID into a
+crash-resumable journal (`<workdir>/restore-journal.jsonl`) and
+rewriting payload-embedded references (`*Id`/`*Ids` fields, firewall
+`GRP()`/`OBJ()` grammar) to the rebuilt IDs. A reference that cannot be
+rewritten fails that one object loudly; children of failed parents are
+skipped with reasons. Re-running with the same journal resumes instead
+of duplicating creates. The run ends with a `RESTORE_EXECUTED` alert
+listing executed/failed/skipped (identifiers only, never values).
+
+Every weekly coverage manifest also carries each asset's `restore_via`
+verdict (`create` / `configure` / `claim` / `unrestorable: <reason>`),
+so "will the API rebuild it?" is answered **before** any disaster.
+
+#### Restore drills (and cleaning up after them)
+
+Rehearse into a scratch organization — Meraki organizations are free to
+create. Two drill realities the tool handles for you:
+
+**Hardware is mono-org.** Your devices are claimed by production, so a
+drill cannot claim them. `--skip-claims` marks device claiming and
+device-scoped features as drill-skipped verdicts (never failures); the
+drill still exercises everything risky — network creation, ID
+remapping, the journal, and every network-scoped feature:
+
+```bash
+meraki2tf --restore --from-dump vault/sanitized.jsonl.gz \
+  --target-org <scratch-org> --skip-claims --confirm
+```
+
+**No sensitive residue.** Prefer drilling from the **sanitized**
+snapshot: it is structurally faithful (same object graph, same
+ordering and remapping exercise) but contains pseudonymized names,
+fake IPs, and no secret values — so the drill org never holds real
+environment data. Run one full-fidelity unsanitized drill before final
+sign-off, then tear the org down:
+
+```bash
+# Preview: verifies the interlocks and shows the blast radius.
+meraki2tf --wipe-org <scratch-org> --wipe-org-name "DR Drill"
+
+# Execute: deletes every network, then the organization itself.
+meraki2tf --wipe-org <scratch-org> --wipe-org-name "DR Drill" --confirm
+```
+
+The wipe is refused outright for **any organization holding claimed
+devices** — production always has hardware, a drill org never does, so
+the destructive path physically cannot target production. The exact
+organization name is a required second factor, and the interlocks are
+re-verified immediately before deletion. Note that dashboard deletion
+is immediate, but backend retention of deleted-organization data is
+governed by Cisco's data-handling policy — for hard-erasure guarantees
+after an unsanitized drill, file a data-deletion request with Meraki
+support.
+
+### Recommended operating cadence
+
+| Cadence | Job | Cost |
+| --- | --- | --- |
+| Weekly | `--dump-to <new> --drift-baseline <previous>` + rotate snapshots | one discovery sweep |
+| Monthly | Terraform kit export + `--rebuild` preview (`--sync` run or plain pipeline) | one kit/plan cycle |
+| Quarterly | Restore drill: `--restore --confirm` into a scratch org, verify by discovering the rebuilt org and diffing vs the source snapshot | one restore + one sweep |
+
+> The terraform kit remains in the rotation deliberately: it is the
+> proven tool for *same-org subset* restores, and the monthly plan
+> preview catches provider regressions before a disaster does. The kit
+> ran weekly until the full-org restore drill passed; since then the
+> weekly job is snapshot-only and terraform runs on the monthly
+> rehearsal. (`--fail-on-gaps` works on `--dump-to` exports too, so
+> the weekly coverage gate survives the change.) One cadence caveat:
+> the weekly snapshot-diff reports a deletion **once** — the next
+> week's baseline already lacks the object — while the kit-based
+> `DELETION_PENDING_CONFIRMATION` reminder re-fires on every monthly
+> terraform run until a human confirms. Treat weekly deletion drift
+> alerts as act-now signals.
+
+### Transitioning to Infrastructure-as-Code
+
+The full Terraform pipeline is a permanent, first-class capability —
+not a legacy path. When (or if) your team decides to stop clickops and
+manage Meraki as code, the transition is one `--sync` run away: the
+kit (`imports.tf`, `resources.tf`, `provider.tf`) plus the materialized
+state file are a complete, importable Terraform root module reflecting
+the live organization. From there you own the HCL — commit it, review
+changes as pull requests, and `terraform plan/apply` becomes your
+change-management process, with meraki2tf's weekly snapshot+diff
+continuing to serve as the independent DR safety net underneath.
