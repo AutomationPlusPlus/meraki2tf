@@ -94,3 +94,92 @@ def test_configure_logging_sets_level_and_redaction(verbose: bool, expected: int
         )
     finally:
         root.handlers, root.level = saved_handlers, saved_level
+
+
+def test_json_format_emits_parseable_lines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import json as _json
+
+    configure_logging(log_format="json")
+    handler = logging.getLogger().handlers[0]
+    record = logging.LogRecord(
+        name="meraki2tf.test",
+        level=logging.WARNING,
+        pathname=__file__,
+        lineno=1,
+        msg="drift detected on %s",
+        args=("meraki_networks.n_1",),
+        exc_info=None,
+    )
+    for filt in handler.filters:
+        filt.filter(record)
+    entry = _json.loads(handler.format(record))
+    assert entry["level"] == "WARNING"
+    assert entry["logger"] == "meraki2tf.test"
+    assert entry["message"] == "drift detected on meraki_networks.n_1"
+    assert "timestamp" in entry
+    assert "exception" not in entry
+
+
+def test_json_format_redacts_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
+    import json as _json
+
+    monkeypatch.setenv(API_KEY_ENV_VAR, "super-secret-token")
+    configure_logging(log_format="json")
+    handler = logging.getLogger().handlers[0]
+    record = logging.LogRecord(
+        name="meraki2tf.test",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="key is super-secret-token",
+        args=None,
+        exc_info=None,
+    )
+    for filt in handler.filters:
+        filt.filter(record)
+    entry = _json.loads(handler.format(record))
+    assert "super-secret-token" not in entry["message"]
+    assert "[REDACTED]" in entry["message"]
+
+
+def test_json_format_carries_scrubbed_exceptions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import json as _json
+
+    configure_logging(log_format="json")
+    handler = logging.getLogger().handlers[0]
+    try:
+        raise ValueError("boom")
+    except ValueError:
+        record = logging.LogRecord(
+            name="meraki2tf.test",
+            level=logging.ERROR,
+            pathname=__file__,
+            lineno=1,
+            msg="failed",
+            args=None,
+            exc_info=sys.exc_info(),
+        )
+    for filt in handler.filters:
+        filt.filter(record)
+    entry = _json.loads(handler.format(record))
+    assert entry["message"] == "failed"
+    assert "ValueError: boom" in entry["exception"]
+
+
+def test_text_format_stays_the_default() -> None:
+    configure_logging()
+    handler = logging.getLogger().handlers[0]
+    assert not isinstance(
+        handler.formatter, type(None)
+    )
+    record = logging.LogRecord(
+        name="meraki2tf.test", level=logging.INFO, pathname=__file__,
+        lineno=1, msg="hello", args=None, exc_info=None,
+    )
+    rendered = handler.format(record)
+    assert "hello" in rendered
+    assert not rendered.startswith("{")

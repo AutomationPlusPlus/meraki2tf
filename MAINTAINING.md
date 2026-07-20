@@ -49,9 +49,11 @@ the module.
 | 0 | Clean run | Nothing |
 | 1 | Pipeline/critical fault (API down, terraform failed, restore had failures) | Read the last `CRITICAL`/`ERROR` line; it names the stage |
 | 2 | Refusal — an interlock or invalid invocation (wrong org, sanitized snapshot where forbidden, bad flags) | The message says exactly which interlock; this is the tool protecting you |
-| 3 | `--fail-on-gaps`: unsupported objects exist | Expected on this org (26 known); the list is in `coverage.json` |
-| 4 | Deletions detected in Meraki, awaiting human confirmation | Review the alert; rerun with `--confirm-deletions` if the deletion was intended |
-| 5 | Run succeeded but **no alert channel could deliver** | Work product is fine; fix the webhook/SMTP endpoint |
+| 3 | `--fail-on-gaps`: unsupported objects exist | Normal on an org with known coverage gaps; the list is in `coverage.json` |
+| 4 | `--sync` full-kit auto-apply ABORTED — the plan carried mutations | Review the `DRIFT_DETECTED` alert (`apply_aborted: true`); import-only chunks may still have grown state |
+| 5 | Run succeeded but **no alert channel could deliver** | Work product is fine; fix the webhook/SMTP/PagerDuty endpoint |
+
+(Deletions pending confirmation are an *alert* (`DELETION_PENDING_CONFIRMATION`), not an exit code — the run still exits by the table above; rerun with `--confirm-deletions` after review.)
 
 ## 3. Routine operations
 
@@ -75,7 +77,7 @@ Usually a provider round-trip quirk on a new resource type. Ask an assistant
 to add normalization in `plan_reconciler.py`, or accept the abort (state just
 doesn't grow this week; nothing is harmed).
 
-**Exit 4 / DELETION_PENDING_CONFIRMATION** — something was deleted in Meraki.
+**DELETION_PENDING_CONFIRMATION alert** — something was deleted in Meraki.
 If intended: rerun with `--confirm-deletions`. If not intended: the DR kit
 still holds the object — rebuild it via `--rebuild --confirm` (subset) or
 `--heal --confirm` (recreates whatever a snapshot has that live lacks).
@@ -185,3 +187,29 @@ House rules (enforced by contract + pre-commit):
 6. Sanitized snapshots must stay drill-valid (resolvable URLs, coherent CIDRs,
    preserved product constants) — the sanitizer is part of the DR path, not
    just a privacy filter.
+
+## 9. Releasing a version
+
+Releases are tags on `main` plus a matching `CHANGELOG.md` entry (Keep a
+Changelog). Checklist:
+
+1. Land everything for the release on `main`; CI green (lint, strict mypy,
+   pip-audit, py311–py314, coverage gate).
+2. Update `CHANGELOG.md`: move `[Unreleased]` content under a new
+   `[X.Y.Z] - YYYY-MM-DD` heading and refresh the link references at the
+   bottom.
+3. Bump `version` in `pyproject.toml` to match.
+4. Regenerate `requirements-lock.txt` if the `meraki` pin or its closure
+   moved (instructions in that file's header).
+5. Merge that PR, then tag the merge commit (signed) and publish:
+
+   ```bash
+   git checkout main && git pull
+   git tag -s vX.Y.Z -m "meraki2tf vX.Y.Z"
+   git push origin vX.Y.Z
+   gh release create vX.Y.Z --title "meraki2tf vX.Y.Z" \
+     --notes "See CHANGELOG.md for the full list."
+   ```
+
+6. If the release touched `restorer.py`, `sanitizer.py`, or discovery, run a
+   scratch-org drill before announcing it (§7 rule — no exceptions).

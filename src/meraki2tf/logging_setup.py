@@ -2,13 +2,16 @@
 
 Two profiles are exposed: a clean INFO-level console format for normal
 and scheduled (cron) runs, and a verbose DEBUG format for diagnosis.
-Both attach :class:`SecretRedactionFilter` to the root handler so that
+An alternative ``json`` output format emits one JSON object per line
+for log aggregators (Splunk, ELK, Cloud Logging). Every combination
+attaches :class:`SecretRedactionFilter` to the root handler so that
 raw ``Authorization`` headers or API token values can never reach the
-console or log files, regardless of verbosity.
+console or log files, regardless of verbosity or format.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -74,16 +77,47 @@ class SecretRedactionFilter(logging.Filter):
         return redacted
 
 
-def configure_logging(verbose: bool = False) -> None:
+#: Accepted values for the console log output format.
+LOG_FORMATS = ("text", "json")
+
+
+class JsonLineFormatter(logging.Formatter):
+    """One JSON object per line — machine-parseable structured logs.
+
+    Runs downstream of :class:`SecretRedactionFilter` (redaction
+    happens on the record before any formatter sees it), so the JSON
+    stream carries the same guarantees as the text stream. Exception
+    text arrives pre-rendered in ``exc_text`` because the filter scrubs
+    it there; it is carried as a plain field, never re-rendered.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        entry: dict[str, object] = {
+            "timestamp": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_text:
+            entry["exception"] = record.exc_text
+        return json.dumps(entry, default=str)
+
+
+def configure_logging(verbose: bool = False, log_format: str = "text") -> None:
     """Install the console handler for this process.
 
-    ``verbose`` widens the level to DEBUG and the format to include
-    logger origin; redaction is applied unconditionally.
+    ``verbose`` widens the level to DEBUG and (in text format) the
+    layout to include logger origin; ``log_format`` selects the plain
+    console layout or one-JSON-object-per-line output. Redaction is
+    applied unconditionally in every combination.
     """
     handler = logging.StreamHandler()
-    handler.setFormatter(
-        logging.Formatter(_VERBOSE_FORMAT if verbose else _CLEAN_FORMAT)
-    )
+    if log_format == "json":
+        handler.setFormatter(JsonLineFormatter())
+    else:
+        handler.setFormatter(
+            logging.Formatter(_VERBOSE_FORMAT if verbose else _CLEAN_FORMAT)
+        )
     handler.addFilter(SecretRedactionFilter())
     root = logging.getLogger()
     root.handlers = [handler]

@@ -3,7 +3,7 @@
 [![Python 3.11–3.14](https://img.shields.io/badge/python-3.11%20%E2%80%93%203.14-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Terraform](https://img.shields.io/badge/terraform-CiscoDevNet%2Fmeraki-844FBA?logo=terraform&logoColor=white)](https://registry.terraform.io/providers/CiscoDevNet/meraki)
 [![CI](https://github.com/AutomationPlusPlus/meraki2tf/actions/workflows/ci.yml/badge.svg)](https://github.com/AutomationPlusPlus/meraki2tf/actions/workflows/ci.yml)
-[![Coverage](https://img.shields.io/badge/coverage-100%25-success)](#contributor-architecture)
+[![Coverage](https://img.shields.io/badge/coverage-%E2%89%A598%25%20(CI--gated)-success)](#contributor-architecture)
 [![Typing: mypy strict](https://img.shields.io/badge/typing-mypy%20strict-blue)](#contributor-architecture)
 [![License: AGPL v3](https://img.shields.io/badge/license-AGPL%20v3-blue)](LICENSE)
 
@@ -158,6 +158,29 @@ pip install --upgrade pip
 pip install -r requirements.txt
 pip install -e .
 ```
+
+**Reproducible worker installs** — unattended schedulers should pin
+the runtime closure by hash so a mid-incident rebuild cannot silently
+pull an untested or tampered SDK:
+
+```bash
+pip install --require-hashes -r requirements-lock.txt
+pip install --no-deps .
+```
+
+**Container** — a general-purpose image (bare `meraki2tf` entrypoint,
+pinned + checksum-verified Terraform, non-root, hash-locked runtime
+deps) builds from the repo-root [`Dockerfile`](Dockerfile):
+
+```bash
+docker build -t meraki2tf .
+docker run --rm -e MERAKI_DASHBOARD_API_KEY \
+  -v "$PWD/generated:/data" meraki2tf --org-id 123456 --workdir /data
+```
+
+(The Azure-specific image with the runbook wrapper entrypoint lives at
+`deploy/azure/Dockerfile`.) Releases are tagged (`vX.Y.Z`) and listed
+in [`CHANGELOG.md`](CHANGELOG.md) — pin a tag for production use.
 
 ## Usage Guide
 
@@ -738,6 +761,7 @@ Quick reference (each flag is described in detail below):
 | `--email-from` | `meraki2tf@localhost` | Sender address for email alerts |
 | `--terraform-bin` | `terraform` | Terraform executable to invoke |
 | `-v`, `--verbose` | off | Debug logging (secrets always redacted) |
+| `--log-format {text,json}` | `text` | Console log output; `json` emits one JSON object per line for log aggregators |
 
 ### Config file (`--config`)
 
@@ -991,6 +1015,11 @@ meraki2tf --org-id 123456 --terraform-bin /opt/terraform-1.9/terraform
 **`-v` / `--verbose`** — DEBUG logging with logger origins and full
 terraform output, including the complete drift diff. Credentials are
 redacted at every level, so verbose is safe for shared logs.
+
+**`--log-format {text,json}`** — console log output. `json` emits one
+JSON object per line (`timestamp`, `level`, `logger`, `message`, plus
+`exception` when present) for Splunk/ELK/Cloud-Logging pipelines. The
+secret-redaction filter applies identically in both formats.
 
 ### Terraform state management
 
@@ -1261,6 +1290,16 @@ scheduled or ad-hoc, live or dump — is read-only toward Meraki. Only
 the five human-invoked DR actions gated behind `--confirm` can write;
 each is a read-only preview without it. See the
 [read-only guarantee](#project-overview).
+
+**Does it work behind a corporate proxy?**
+Mostly, via the standard environment variables. The Meraki SDK
+(`requests`) and the webhook/PagerDuty notifiers (`urllib`) honor
+`HTTPS_PROXY`/`NO_PROXY`, and Terraform does the same for provider
+traffic. The one exception is SMTP: Python's `smtplib` does not speak
+HTTP proxies at all, so email alerts need a directly reachable relay
+(or use webhooks/PagerDuty instead). Spec auto-download also goes over
+HTTPS and follows the same proxy variables; pre-stage `spec3.json` for
+fully air-gapped hosts.
 
 **Is it on PyPI?**
 Not yet — install from a clone (`pip install -e .` puts the

@@ -295,3 +295,8 @@ def test_notification_keys_are_accepted(tmp_path: Path) -> None:
     overrides = load_config_file(path)
     assert overrides["webhook_format"] == "teams"
     assert overrides["pagerduty"] is True
+
+
+def test_log_format_key_is_accepted(tmp_path: Path) -> None:
+    path = _write(tmp_path, 'log-format = "json"')
+    assert load_config_file(path)["log_format"] == "json"
