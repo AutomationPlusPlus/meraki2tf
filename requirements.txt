@@ -1,4 +1,5 @@
 # Approved dependencies only — see CLAUDE.md Dependency Escalation Policy.
+# Runtime closure with hashes for unattended workers: requirements-lock.txt.
 meraki>=3.0,<5
 pre-commit
 flake8
@@ -6,3 +7,4 @@ mypy
 tox
 pytest
 pytest-cov
+pip-audit

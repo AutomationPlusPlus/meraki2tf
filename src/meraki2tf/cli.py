@@ -225,6 +225,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Enable verbose debug logging; credentials are redacted at every level.",
     )
+    core.add_argument(
+        "--log-format",
+        choices=["text", "json"],
+        default="text",
+        help=(
+            "Console log output (default: %(default)s). 'json' emits one "
+            "JSON object per line for log aggregators; secret redaction "
+            "applies in both formats."
+        ),
+    )
     snapshots = parser.add_argument_group(
         "snapshots & offline",
         "Produce and consume offline snapshots; no API key needed to read one.",
@@ -1529,7 +1539,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         config = RuntimeConfig.from_args(args)
     except BackendConfigError as exc:
         arg_parser.error(str(exc))
-    configure_logging(verbose=config.verbose)
+    configure_logging(verbose=config.verbose, log_format=config.log_format)
 
     if config.list_orgs:
         # Orphaned companions are refused, never silently ignored (the

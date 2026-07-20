@@ -284,6 +284,7 @@ _CONFIG_STR_KEYS = {
     "smtp-host": "smtp_host",
     "email-from": "email_from",
     "webhook-format": "webhook_format",
+    "log-format": "log_format",
 }
 _CONFIG_BOOL_KEYS = {
     "verbose": "verbose",
@@ -491,6 +492,8 @@ class RuntimeConfig:
     #: Terraform state backend selection (default: on-disk local).
     backend: BackendConfig
     verbose: bool
+    #: Console log output: human text (default) or JSON lines.
+    log_format: str
     webhook_urls: tuple[str, ...]
     #: Webhook POST body shape: raw event JSON (default) or a
     #: Slack/Teams-native rendering of the same event.
@@ -544,6 +547,7 @@ class RuntimeConfig:
             state_file=Path(args.state_file) if args.state_file else None,
             backend=backend,
             verbose=args.verbose,
+            log_format=args.log_format,
             webhook_urls=_webhook_urls(args.webhook_url),
             webhook_format=args.webhook_format,
             pagerduty=args.pagerduty,

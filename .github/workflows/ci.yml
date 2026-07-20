@@ -32,6 +32,17 @@ jobs:
       - run: pip install tox
       - run: tox -e type
 
+  audit:
+    name: pip-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - run: pip install tox
+      - run: tox -e audit
+
   test:
     name: pytest (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
