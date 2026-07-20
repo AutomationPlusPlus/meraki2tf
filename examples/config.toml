@@ -29,9 +29,11 @@ fail-on-gaps = true
 # Alert channels. Prefer the MERAKI2TF_WEBHOOK_URL environment variable
 # for token-bearing webhook URLs so the secret stays out of this file.
 #webhook-url = "https://hooks.example.com/meraki2tf"
+#webhook-format = "slack"        # json (default) | slack | teams
+#pagerduty = true                # routing key via MERAKI2TF_PAGERDUTY_ROUTING_KEY
 #alert-email = ["netops@corp.example"]
 #smtp-host = "smtp.corp.example"
-#smtp-port = 25
+#smtp-port = 587                 # AUTH creds via MERAKI2TF_SMTP_USERNAME/_PASSWORD
 #email-from = "meraki2tf@corp.example"
 
 # Remote Terraform state (recommended for scheduled DR). Credentials

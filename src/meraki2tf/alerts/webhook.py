@@ -9,6 +9,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from meraki2tf.alerts.base import Notifier
+from meraki2tf.alerts.formats import WEBHOOK_FORMATS, render_payload
 from meraki2tf.alerts.models import AlertEvent
 
 logger = logging.getLogger(__name__)
@@ -65,7 +66,17 @@ class WebhookNotifier(Notifier):
 
     channel = "webhook"
 
-    def __init__(self, url: str, timeout: float = _DEFAULT_TIMEOUT_SECONDS) -> None:
+    def __init__(
+        self,
+        url: str,
+        timeout: float = _DEFAULT_TIMEOUT_SECONDS,
+        payload_format: str = "json",
+    ) -> None:
+        if payload_format not in WEBHOOK_FORMATS:
+            raise WebhookConfigError(
+                f"unknown webhook payload format {payload_format!r}; "
+                f"expected one of {', '.join(WEBHOOK_FORMATS)}."
+            )
         parts = urlsplit(url)
         scheme = parts.scheme.lower()
         if scheme != "https":
@@ -91,6 +102,7 @@ class WebhookNotifier(Notifier):
             if len(fragment) > 1
         )
         self._timeout = timeout
+        self._payload_format = payload_format
 
     def _scrub(self, text: str) -> str:
         for fragment in self._sensitive_fragments:
@@ -98,7 +110,9 @@ class WebhookNotifier(Notifier):
         return text
 
     def send(self, event: AlertEvent) -> None:
-        body = json.dumps(event.to_payload()).encode("utf-8")
+        body = json.dumps(
+            render_payload(event, self._payload_format)
+        ).encode("utf-8")
         try:
             request = urllib.request.Request(
                 self._url,

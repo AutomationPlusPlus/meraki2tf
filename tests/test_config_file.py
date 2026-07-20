@@ -280,3 +280,18 @@ def test_offline_pipeline_run_from_config_file(
     exit_code = main(["--config", str(path)])
     assert exit_code == 0
     assert (workdir / "imports.tf").exists()
+
+
+def test_notification_keys_are_accepted(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path,
+        '\n'.join(
+            (
+                'webhook-format = "teams"',
+                'pagerduty = true',
+            )
+        ),
+    )
+    overrides = load_config_file(path)
+    assert overrides["webhook_format"] == "teams"
+    assert overrides["pagerduty"] is True
