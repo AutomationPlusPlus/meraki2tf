@@ -480,6 +480,9 @@ class RuntimeConfig:
     confirm_deletions: bool
     #: Exit nonzero when unsupported objects exist (CI coverage gate).
     fail_on_gaps: bool
+    #: Standalone discovery helper: print the organizations the API key
+    #: can see (ID + name) and exit — how a new user finds --org-id.
+    list_orgs: bool
     workdir: Path
     #: None means "terraform.tfstate inside the workdir".
     state_file: Path | None
@@ -528,6 +531,7 @@ class RuntimeConfig:
             sync=args.sync,
             confirm_deletions=args.confirm_deletions,
             fail_on_gaps=args.fail_on_gaps,
+            list_orgs=args.list_orgs,
             workdir=Path(args.workdir),
             state_file=Path(args.state_file) if args.state_file else None,
             backend=backend,

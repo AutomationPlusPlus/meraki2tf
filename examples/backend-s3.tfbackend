@@ -1,0 +1,11 @@
+# Amazon S3 state backend — pass with:
+#   meraki2tf --org-id 123456 --state-backend s3 \
+#     --backend-config-file examples/backend-s3.tfbackend
+#
+# Credentials are NOT set here: terraform authenticates via the
+# environment (AWS_* variables) or an instance/task role.
+# Credential-shaped keys in this file are refused.
+bucket       = "example-terraform-state"
+key          = "meraki2tf/org.tfstate"
+region       = "us-east-1"
+use_lockfile = true

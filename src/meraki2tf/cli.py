@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import importlib.metadata
 import json
 import logging
 import sys
@@ -63,6 +64,7 @@ from meraki2tf.config import (
     StateBackend,
     api_key_present,
     load_config_file,
+    read_api_key,
 )
 from meraki2tf.coverage import build_manifest, unsupported_payload, write_manifest
 from meraki2tf.hcl_generator import HclImportGenerator
@@ -105,8 +107,11 @@ logger = logging.getLogger(__name__)
 
 _HELP_EPILOG = """\
 examples:
-  # One-shot read-only export of an organization to Terraform:
+  # New here? List the organizations your API key can see:
   export MERAKI_DASHBOARD_API_KEY="<key>"
+  meraki2tf --list-orgs
+
+  # One-shot read-only export of an organization to Terraform:
   meraki2tf --org-id 123456
 
   # Capture an offline snapshot and diff it against last week's:
@@ -123,6 +128,15 @@ examples:
 The default invocation is strictly read-only toward Meraki. See the
 README for the full guide: https://github.com/AutomationPlusPlus/meraki2tf
 """
+
+
+def _distribution_version() -> str:
+    """The installed distribution's version for ``--version``."""
+    try:
+        return importlib.metadata.version("meraki2tf")
+    except importlib.metadata.PackageNotFoundError:  # pragma: no cover
+        # Running from an uninstalled source tree (no dist metadata).
+        return "0+unknown"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -143,6 +157,21 @@ def build_parser() -> argparse.ArgumentParser:
     core = parser.add_argument_group(
         "core options",
         "Everything a plain read-only export needs.",
+    )
+    core.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {_distribution_version()}",
+        help="Print the installed meraki2tf version and exit.",
+    )
+    core.add_argument(
+        "--list-orgs",
+        action="store_true",
+        help=(
+            "Discovery helper: list every organization the "
+            f"{API_KEY_ENV_VAR} key can see (ID and name) and exit — the "
+            "way to find your --org-id value. Standalone and read-only."
+        ),
     )
     core.add_argument(
         "--config",
@@ -1345,6 +1374,49 @@ def _replay_gaps(config: RuntimeConfig) -> int:
     return _alert_outage_exit(dispatcher)
 
 
+def _list_orgs() -> int:
+    """Print every organization the API key can see — the --org-id helper.
+
+    Read-only: a single ``getOrganizations`` call. The table goes to
+    stdout so it works interactively and in shell pipelines; nothing is
+    written to the workdir and no alerts are dispatched.
+    """
+    import meraki
+
+    try:
+        client = meraki.DashboardAPI(
+            api_key=read_api_key(),
+            suppress_logging=True,
+            print_console=False,
+            output_log=False,
+            wait_on_rate_limit=True,
+        )
+        organizations = client.organizations.getOrganizations()
+    except Exception as exc:
+        logger.critical("Could not list organizations: %s", exc)
+        return 1
+    if not organizations:
+        print(
+            "The API key is valid but sees no organizations; check its "
+            "access in the Meraki dashboard."
+        )
+        return 0
+    rows = sorted(
+        (
+            (str(org.get("id", "")), str(org.get("name", "")))
+            for org in organizations
+        ),
+        key=lambda row: row[1].lower(),
+    )
+    width = max(len("ORG ID"), *(len(org_id) for org_id, _ in rows))
+    print(f"{'ORG ID':<{width}}  ORGANIZATION NAME")
+    for org_id, name in rows:
+        print(f"{org_id:<{width}}  {name}")
+    print()
+    print("Next: meraki2tf --org-id <ORG ID>")
+    return 0
+
+
 #: Config-file keys that steer where a confirmed DR action WRITES —
 #: or WHAT executes it. A long-lived file must never pick a write
 #: target, the workdir whose kit/journal a DR action consumes, or the
@@ -1413,6 +1485,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     except BackendConfigError as exc:
         arg_parser.error(str(exc))
     configure_logging(verbose=config.verbose)
+
+    if config.list_orgs:
+        # Orphaned companions are refused, never silently ignored (the
+        # house rule): the helper answers one question and exits, so any
+        # mode or target flag alongside it marks a misunderstanding.
+        if (
+            config.org_id or config.dump_path or config.dump_to
+            or config.drift_baseline or config.sanitize
+            or config.rebuild or config.heal or config.replay_gaps
+            or config.restore or config.wipe_org or config.wipe_org_name
+            or config.confirm or config.target_org or config.serial_map
+            or config.skip_claims or config.sync or config.rebaseline
+            or config.confirm_deletions or config.fail_on_gaps
+        ):
+            arg_parser.error(
+                "--list-orgs is a standalone discovery helper; do not "
+                "combine it with any other mode or target flag."
+            )
+        if not api_key_present():
+            arg_parser.error(
+                f"--list-orgs asks the dashboard which organizations your "
+                f"key can see; export {API_KEY_ENV_VAR} first."
+            )
+        return _list_orgs()
 
     if config.backend.is_remote and config.state_file is not None:
         arg_parser.error(
@@ -1653,6 +1749,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         dispatcher.dispatch(processing_fault(stage="startup", error=message))
         return 1
 
+    if config.mode is ExecutionMode.LIVE and not api_key_present():
+        # Fail fast with a purposeful message before any work starts:
+        # every live path (discovery, snapshot export) must
+        # authenticate, and a scheduled job with a lost key needs the
+        # fault on its alert channels, not a late generic stack trace.
+        message = (
+            f"A live run requires the {API_KEY_ENV_VAR} environment "
+            "variable. Export the dashboard API key first (--list-orgs "
+            "then shows the organization IDs it can see), or run "
+            "offline against a snapshot with --from-dump."
+        )
+        logger.critical("%s", message)
+        dispatcher.dispatch(processing_fault(stage="startup", error=message))
+        return 1
+
     logger.info("meraki2tf starting in %s mode.", config.mode.value)
     try:
         spec_parser = OpenApiParser(resolve_spec(config.spec_path))
@@ -1724,6 +1835,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     _report(summary)
+    if not config.sync:
+        # Interactive next-step pointer for the ad-hoc/open-source mode;
+        # scheduled --sync runs read the log summary and alerts instead.
+        print(
+            f"\nDR kit written to {config.workdir}: imports.tf, "
+            "resources.tf, provider.tf, coverage.txt, runbook.md."
+        )
+        print(
+            f"Next steps: cd {config.workdir} && terraform init && "
+            "terraform plan"
+        )
     # Exit-code priority (see the module docstring): a stalled full-kit
     # materialization (4) outranks known coverage gaps (3), which
     # outrank a silent notifier outage (5). The outage helper runs
@@ -1748,7 +1870,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.error(
             "--sync full-kit auto-apply was ABORTED: mutations blocked "
             "the full apply%s. A human must review the DRIFT_DETECTED "
-            "alert before the remaining state can grow.",
+            "alert before the remaining state can grow (exit code 4).",
             growth,
         )
         return 4
@@ -1769,8 +1891,8 @@ def _coverage_gap_exit(unsupported_count: int) -> int:
     if unsupported_count > 0:
         logger.error(
             "--fail-on-gaps: %d discovered object(s) cannot be rebuilt by "
-            "Terraform; exiting nonzero. See coverage.json in the workdir "
-            "for the manual-rebuild list.",
+            "Terraform; exiting with code 3. See coverage.json in the "
+            "workdir for the manual-rebuild list.",
             unsupported_count,
         )
         return 3

@@ -1,0 +1,11 @@
+# Azure Blob Storage state backend — pass with:
+#   meraki2tf --org-id 123456 --state-backend azurerm \
+#     --backend-config-file examples/backend-azurerm.tfbackend
+#
+# Credentials are NOT set here: terraform authenticates via the
+# environment (ARM_* variables) or a managed identity. Credential-shaped
+# keys in this file are refused.
+resource_group_name  = "rg-meraki2tf"
+storage_account_name = "storacct"
+container_name       = "tfstate"
+key                  = "meraki2tf/org.tfstate"

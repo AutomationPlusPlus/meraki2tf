@@ -20,12 +20,17 @@ ever touched, and nothing is applied:
 
 ```bash
 # Install (needs Python ≥ 3.11 and terraform ≥ 1.5 on PATH; not on PyPI yet)
-git clone git@github.com:AutomationPlusPlus/meraki2tf.git && cd meraki2tf
+git clone https://github.com/AutomationPlusPlus/meraki2tf.git && cd meraki2tf
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt && pip install -e .
 
-# Run — the API key only ever comes from the environment, never a flag
+# The API key only ever comes from the environment, never a flag
 export MERAKI_DASHBOARD_API_KEY="<your-dashboard-api-key>"
+
+# Don't know your organization ID? List every org the key can see:
+meraki2tf --list-orgs
+
+# Run
 meraki2tf --org-id 123456
 ```
 
@@ -130,6 +135,11 @@ is flagged through the exception auditor instead of silently dropped.
 - Python 3.11–3.14 (every CPython version still receiving security patches;
   3.14 recommended — the floor is 3.11 because the `meraki` SDK requires it)
 - The `terraform` CLI on your `PATH` (any version supporting `import` blocks, ≥ 1.5)
+- The [`CiscoDevNet/meraki`](https://registry.terraform.io/providers/CiscoDevNet/meraki)
+  Terraform provider **≥ v1.12.0** — `terraform init` in the generated
+  workdir fetches it; with an older (or not-yet-initialized) provider the
+  tool falls back to a bundled v1.12.2 identity catalog, which can drift
+  from what your workdir actually runs
 - A Meraki dashboard API key (live mode only)
 - The Meraki OpenAPI spec — fetched from GitHub automatically; only
   air-gapped runs need a local copy pre-staged (see
@@ -139,7 +149,7 @@ This project deliberately uses plain `venv` + `pip` — poetry and uv are
 not used and not supported.
 
 ```bash
-git clone git@github.com:AutomationPlusPlus/meraki2tf.git
+git clone https://github.com/AutomationPlusPlus/meraki2tf.git   # or SSH: git@github.com:AutomationPlusPlus/meraki2tf.git
 cd meraki2tf
 
 python3 -m venv .venv
@@ -692,6 +702,8 @@ Quick reference (each flag is described in detail below):
 
 | Flag | Default | Purpose |
 | --- | --- | --- |
+| `--version` | — | Print the installed meraki2tf version and exit |
+| `--list-orgs` | — | List every organization the API key can see (ID + name) and exit — the way to find `--org-id` |
 | `--config PATH` | — | TOML file of recurring settings (CLI > file > default); DR actions, confirmations, and credentials refused |
 | `--org-id` | — | Organization to discover (required in live mode) |
 | `--spec PATH` | `./spec3.json` | Meraki OpenAPI JSON document; auto-downloaded/refreshed from GitHub |
@@ -753,7 +765,9 @@ Keys mirror the long flag names (`org-id`, `state-backend`,
 `webhook-url` — repeatable flags take a string or an array of strings;
 `backend-config` is a table). Precedence is strictly **command line >
 config file > built-in default**: a file value applies only where the
-flag was not typed.
+flag was not typed. A ready-to-copy annotated sample lives in
+[`examples/config.toml`](examples/config.toml), alongside
+`--backend-config-file` samples for each remote state backend.
 
 Two classes of keys are refused in the file, by design:
 
@@ -770,12 +784,19 @@ Two classes of keys are refused in the file, by design:
 
 ### Parameters in detail
 
+**`--list-orgs`** — standalone discovery helper: print the ID and name
+of every organization the `MERAKI_DASHBOARD_API_KEY` key can see, then
+exit. Read-only (one `getOrganizations` call), touches nothing on disk,
+and refuses to be combined with any other mode or target flag. This is
+the fastest way to find the `--org-id` value.
+
 **`--config PATH`** — TOML file of recurring settings; see
 [Config file](#config-file---config) above.
 
-**`--org-id ID`** — the Meraki organization to discover. Required in
-live mode. In dump mode it may be omitted (the organization recorded in
-the snapshot's `organizationId` is used) or supplied to override it.
+**`--org-id ID`** — the Meraki organization to discover (find it with
+`--list-orgs`). Required in live mode. In dump mode it may be omitted
+(the organization recorded in the snapshot's `organizationId` is used)
+or supplied to override it.
 
 ```bash
 meraki2tf --org-id 123456                          # live discovery
@@ -1181,9 +1202,9 @@ works too).
 
 **`meraki2tf could not start: …` right after launch.**
 Usually a bad `--org-id` or an API key without access to that
-organization. Find your organization ID in the dashboard URL or via
-`GET /organizations`; the run exits 1 and dispatches a
-`PROCESSING_FAULT` alert.
+organization. Run `meraki2tf --list-orgs` to see exactly which
+organization IDs your key can reach; the failed run exits 1 and
+dispatches a `PROCESSING_FAULT` alert.
 
 **Resource names look right but import IDs seem off / resources are
 missing.**

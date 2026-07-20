@@ -1,0 +1,9 @@
+# Google Cloud Storage state backend — pass with:
+#   meraki2tf --org-id 123456 --state-backend gcs \
+#     --backend-config-file examples/backend-gcs.tfbackend
+#
+# Credentials are NOT set here: terraform authenticates via
+# GOOGLE_APPLICATION_CREDENTIALS or workload identity.
+# Credential-shaped keys in this file are refused.
+bucket = "example-terraform-state"
+prefix = "meraki2tf"

@@ -22,7 +22,7 @@ The full contract lives in [`CLAUDE.md`](CLAUDE.md); operational practice in
 ## Getting set up
 
 ```bash
-git clone git@github.com:AutomationPlusPlus/meraki2tf.git && cd meraki2tf
+git clone https://github.com/AutomationPlusPlus/meraki2tf.git && cd meraki2tf   # or SSH: git@github.com:AutomationPlusPlus/meraki2tf.git
 python3 -m venv .venv && source .venv/bin/activate
 pip install --upgrade pip && pip install -r requirements.txt && pip install -e .
 pre-commit install

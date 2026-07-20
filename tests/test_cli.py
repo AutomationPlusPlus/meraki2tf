@@ -459,6 +459,7 @@ def test_offline_run_without_api_key_skips_terraform(
     dump_file: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Air-gapped dump runs generate artifacts without ever invoking terraform."""
     _no_network(monkeypatch)
@@ -478,6 +479,10 @@ def test_offline_run_without_api_key_skips_terraform(
     assert exit_code == 0
     assert (workdir / "imports.tf").exists()
     assert (workdir / "provider.tf").exists()
+    # Ad-hoc (non---sync) runs end with a printed next-step pointer.
+    out = capsys.readouterr().out
+    assert "DR kit written to" in out
+    assert "terraform init" in out
 
 
 def _rebuild_workspace(tmp_path: Path) -> Path:
@@ -3293,3 +3298,132 @@ def test_sanitized_restore_resume_honors_an_attempt_only_journal(
          "--target-org", "org-999", "--workdir", str(workdir), "--confirm"]
     )
     assert exit_code == 0
+
+
+# ---------------------------------------------------------------------------
+# First-run ergonomics: --version, python -m, --list-orgs, fast key failure.
+# ---------------------------------------------------------------------------
+
+
+def test_version_flag_prints_version(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--version"])
+    assert excinfo.value.code == 0
+    out = capsys.readouterr().out
+    assert out.startswith("meraki2tf ")
+    assert out.strip() != "meraki2tf"
+
+
+def test_module_entrypoint_matches_console_script() -> None:
+    import importlib
+    import subprocess
+    import sys as _sys
+
+    # Importing the module covers its assembly; the subprocess proves the
+    # `python -m meraki2tf` surface end to end.
+    importlib.import_module("meraki2tf.__main__")
+    result = subprocess.run(
+        [_sys.executable, "-m", "meraki2tf", "--version"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0
+    assert result.stdout.startswith("meraki2tf ")
+
+
+def _stub_meraki_orgs(
+    monkeypatch: pytest.MonkeyPatch, organizations: Any
+) -> dict[str, Any]:
+    """Fake meraki module whose getOrganizations returns (or raises) as told."""
+    import sys as _sys
+    import types as _types
+
+    captured: dict[str, Any] = {}
+
+    def get_orgs() -> Any:
+        if isinstance(organizations, Exception):
+            raise organizations
+        return organizations
+
+    def dashboard(**kwargs: Any) -> SimpleNamespace:
+        captured.update(kwargs)
+        return SimpleNamespace(
+            organizations=SimpleNamespace(getOrganizations=get_orgs)
+        )
+
+    stub = _types.ModuleType("meraki")
+    stub.DashboardAPI = dashboard  # type: ignore[attr-defined]
+    monkeypatch.setitem(_sys.modules, "meraki", stub)
+    return captured
+
+
+def test_list_orgs_prints_sorted_table(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    captured = _stub_meraki_orgs(
+        monkeypatch,
+        [
+            {"id": "222333", "name": "Zeta Networks"},
+            {"id": "111222", "name": "Acme Corp"},
+        ],
+    )
+    exit_code = main(["--list-orgs"])
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "ORG ID" in out
+    assert out.index("Acme Corp") < out.index("Zeta Networks")  # name-sorted
+    assert "111222" in out and "222333" in out
+    assert "--org-id" in out  # the next-step pointer
+    assert captured["api_key"] == "test-token"
+    assert captured["suppress_logging"] is True
+
+
+def test_list_orgs_requires_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--list-orgs"])
+    assert excinfo.value.code == 2
+
+
+def test_list_orgs_refuses_companion_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    for extra in (["--org-id", "123456"], ["--sync"], ["--rebuild"]):
+        with pytest.raises(SystemExit) as excinfo:
+            main(["--list-orgs", *extra])
+        assert excinfo.value.code == 2
+
+
+def test_list_orgs_api_failure_exits_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    _stub_meraki_orgs(monkeypatch, RuntimeError("403 forbidden"))
+    assert main(["--list-orgs"]) == 1
+
+
+def test_list_orgs_reports_an_empty_key(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    _stub_meraki_orgs(monkeypatch, [])
+    assert main(["--list-orgs"]) == 0
+    assert "sees no organizations" in capsys.readouterr().out
+
+
+def test_live_run_without_api_key_fails_fast(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No key + live mode dies immediately with a purposeful pointer."""
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    exit_code = main(["--org-id", "123456"])
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert API_KEY_ENV_VAR in err
+    assert "--list-orgs" in err
+    assert "--from-dump" in err
