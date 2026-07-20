@@ -295,7 +295,11 @@ _CONFIG_BOOL_KEYS = {
 }
 _CONFIG_INT_KEYS = {"smtp-port": "smtp_port"}
 #: Accept a single string or an array of strings (repeatable flags).
-_CONFIG_LIST_KEYS = {"webhook-url": "webhook_url", "alert-email": "alert_email"}
+_CONFIG_LIST_KEYS = {
+    "webhook-url": "webhook_url",
+    "alert-email": "alert_email",
+    "org-ids": "org_id",
+}
 
 
 def _config_file_allowed_keys() -> str:
@@ -363,6 +367,13 @@ def load_config_file(path: Path) -> dict[str, object]:
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         raise ConfigFileError(f"--config {path} is not valid TOML: {exc}") from exc
 
+    if "org-id" in data and "org-ids" in data:
+        # Both spell the same destination; silently letting one win
+        # would leave the operator believing the other applied.
+        raise ConfigFileError(
+            f"--config {path} sets both 'org-id' and 'org-ids'; use one "
+            "(org-ids takes an array for multi-organization runs)."
+        )
     overrides: dict[str, object] = {}
     for key, value in data.items():
         if key in CONFIG_FILE_REFUSED_KEYS:
@@ -434,7 +445,10 @@ class RuntimeConfig:
     """
 
     mode: ExecutionMode
-    org_id: str | None
+    #: Organizations to discover, in CLI order (deduplicated). The
+    #: pipeline modes accept several (sequential fan-out with per-org
+    #: workdirs); snapshot modes and DR actions take at most one.
+    org_ids: tuple[str, ...]
     #: None means "resolve automatically" — see meraki2tf.spec_resolver.
     spec_path: Path | None
     dump_path: Path | None
@@ -507,6 +521,16 @@ class RuntimeConfig:
     email_from: str
     terraform_bin: str
 
+    @property
+    def org_id(self) -> str | None:
+        """The single configured organization, or None.
+
+        Single-organization call sites (DR actions, the dump-mode
+        override, the per-org pipeline) read this; their validations
+        guarantee at most one value exists by the time they run.
+        """
+        return self.org_ids[0] if len(self.org_ids) == 1 else None
+
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> "RuntimeConfig":
         """Derive the run configuration from parsed CLI arguments.
@@ -518,9 +542,19 @@ class RuntimeConfig:
         backend = BackendConfig.from_cli(
             args.state_backend, args.backend_config, args.backend_config_file
         )
+        # --org-id is repeatable (argparse append → list); a config-file
+        # 'org-id' arrives as a bare string. Normalize and deduplicate,
+        # preserving CLI order.
+        raw_org_ids = args.org_id
+        if raw_org_ids is None:
+            org_values: tuple[str, ...] = ()
+        elif isinstance(raw_org_ids, str):
+            org_values = (raw_org_ids,)
+        else:
+            org_values = tuple(raw_org_ids)
         return cls(
             mode=ExecutionMode.DUMP if dump_path else ExecutionMode.LIVE,
-            org_id=args.org_id,
+            org_ids=tuple(dict.fromkeys(value for value in org_values if value)),
             spec_path=Path(args.spec) if args.spec else None,
             dump_path=dump_path,
             drift_baseline=(

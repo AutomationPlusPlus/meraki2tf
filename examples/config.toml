@@ -18,6 +18,10 @@
 # The organization to discover (find yours with: meraki2tf --list-orgs).
 org-id = "123456"
 
+# Several organizations? Use org-ids instead (sequential fan-out; each
+# org gets its own <workdir>/<org-id>/ kit and state).
+#org-ids = ["111222", "333444"]
+
 # Where the DR kit, coverage manifest, runbook, and (local) state live.
 workdir = "/var/lib/meraki2tf/dr-kit"
 
