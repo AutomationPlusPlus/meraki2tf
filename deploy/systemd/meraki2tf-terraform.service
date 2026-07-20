@@ -1,0 +1,34 @@
+# Monthly terraform rehearsal: regenerate the DR kit and materialize
+# Terraform state under the guarded import-only apply (--sync). See
+# meraki2tf-snapshot.service for the account/EnvironmentFile setup —
+# this unit reuses it. Requires the terraform binary on PATH (or set
+# --terraform-bin).
+
+[Unit]
+Description=meraki2tf monthly terraform rehearsal (guarded import-only apply)
+Documentation=https://github.com/AutomationPlusPlus/meraki2tf
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=meraki2tf
+Group=meraki2tf
+WorkingDirectory=/var/lib/meraki2tf
+EnvironmentFile=/etc/meraki2tf/env
+ExecStart=/opt/meraki2tf/.venv/bin/meraki2tf --org-id 123456 --sync \
+    --workdir /var/lib/meraki2tf/dr-kit
+# Exit 3 = coverage gaps (if you pass --fail-on-gaps), exit 4 = the
+# auto-apply stalled on a human review — both are "job ran, humans
+# alerted" outcomes; keep 4 a failure so the stall is visible in
+# systemctl status too. Adjust to taste.
+SuccessExitStatus=3
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/meraki2tf
+
+[Install]
+WantedBy=multi-user.target

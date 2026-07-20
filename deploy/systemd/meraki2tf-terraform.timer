@@ -1,0 +1,11 @@
+# Fires the monthly terraform rehearsal (meraki2tf-terraform.service).
+[Unit]
+Description=Monthly meraki2tf terraform rehearsal
+
+[Timer]
+OnCalendar=*-*-01 03:00:00
+RandomizedDelaySec=30m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

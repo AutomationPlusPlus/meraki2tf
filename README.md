@@ -188,7 +188,7 @@ in [`CHANGELOG.md`](CHANGELOG.md) — pin a tag for production use.
 | --- | --- |
 | [Usage & Configuration](docs/USAGE.md) | Run modes (live/dump/snapshot), every flag in detail, `--config` files, Terraform state backends, alerting settings, spec resolution |
 | [Disaster Recovery Guide](docs/DR-GUIDE.md) | The DR kit, coverage guarantees, `--sync` automation, and the five recovery actions (`--rebuild`, `--heal`, `--replay-gaps`, `--restore`, `--wipe-org`) |
-| [Operations](docs/OPERATIONS.md) | Alert events, scheduled (cron) execution, exit codes, performance & scale, troubleshooting & FAQ |
+| [Operations](docs/OPERATIONS.md) | Alert events, scheduling (cron, systemd timers, AWS Fargate, GCP Cloud Run Jobs), exit codes, performance & scale, troubleshooting & FAQ |
 | [Azure deployment](docs/azure-automation.md) | Azure Automation / Container Apps Job wrapper: Key Vault, Blob archival, snapshot rotation |
 | [Architecture](docs/ARCHITECTURE.md) | Package layout and pipeline design (contributors) |
 | [CHANGELOG](CHANGELOG.md) | Release history (tags `vX.Y.Z`) |
