@@ -300,3 +300,16 @@ def test_notification_keys_are_accepted(tmp_path: Path) -> None:
 def test_log_format_key_is_accepted(tmp_path: Path) -> None:
     path = _write(tmp_path, 'log-format = "json"')
     assert load_config_file(path)["log_format"] == "json"
+
+
+def test_org_ids_array_is_accepted(tmp_path: Path) -> None:
+    path = _write(tmp_path, 'org-ids = ["111222", "333444"]')
+    assert load_config_file(path)["org_id"] == ["111222", "333444"]
+
+
+def test_org_id_and_org_ids_together_are_refused(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path, 'org-id = "111222"\norg-ids = ["333444"]'
+    )
+    with pytest.raises(ConfigFileError):
+        load_config_file(path)

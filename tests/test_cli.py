@@ -3468,3 +3468,124 @@ def test_pagerduty_flag_without_routing_key_refuses_loudly(
     with pytest.raises(SystemExit) as excinfo:
         build_dispatcher(_config(["--spec", str(spec_file), "--pagerduty"]))
     assert ROUTING_KEY_ENV_VAR in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# Multi-organization fan-out.
+# ---------------------------------------------------------------------------
+
+
+def test_repeated_org_id_collects_and_dedupes(spec_file: Path) -> None:
+    config = _config(
+        ["--spec", str(spec_file), "--org-id", "111222",
+         "--org-id", "333444", "--org-id", "111222"]
+    )
+    assert config.org_ids == ("111222", "333444")
+    assert config.org_id is None  # ambiguous with several orgs
+    single = _config(["--spec", str(spec_file), "--org-id", "111222"])
+    assert single.org_ids == ("111222",)
+    assert single.org_id == "111222"
+
+
+def test_multi_org_refuses_snapshot_and_state_file_modes(
+    spec_file: Path, dump_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    multi = ["--org-id", "111222", "--org-id", "333444"]
+    for extra in (
+        ["--from-dump", str(dump_file)],
+        ["--dump-to", "snap.json"],
+        ["--drift-baseline", str(dump_file)],
+        ["--state-file", "state.tfstate"],
+    ):
+        with pytest.raises(SystemExit) as excinfo:
+            main(["--spec", str(spec_file), *multi, *extra])
+        assert excinfo.value.code == 2
+
+
+def test_multi_org_refuses_path_shaped_org_ids(spec_file: Path) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--spec", str(spec_file), "--org-id", "111222",
+              "--org-id", "../evil"])
+    assert excinfo.value.code == 2
+
+
+def test_multi_org_remote_backend_requires_placeholder(
+    spec_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    base = [
+        "--spec", str(spec_file), "--org-id", "111222", "--org-id", "333444",
+        "--state-backend", "s3", "--backend-config", "bucket=example-state",
+    ]
+    with pytest.raises(SystemExit) as excinfo:
+        main([*base, "--backend-config", "key=meraki2tf.tfstate"])
+    assert excinfo.value.code == 2
+    # With the placeholder the validation passes and each derived
+    # per-org config substitutes its own state address.
+    from meraki2tf.cli import _single_org_config
+
+    config = _config(
+        [*base, "--backend-config", "key=meraki2tf/{org-id}.tfstate"]
+    )
+    derived = _single_org_config(config, "333444")
+    assert derived.org_ids == ("333444",)
+    assert derived.workdir == config.workdir / "333444"
+    assert ("key", "meraki2tf/333444.tfstate") in derived.backend.settings
+
+
+def test_heal_requires_exactly_one_org(
+    spec_file: Path, dump_file: Path
+) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--spec", str(spec_file), "--heal",
+              "--from-dump", str(dump_file),
+              "--org-id", "111222", "--org-id", "333444"])
+    assert excinfo.value.code == 2
+
+
+def test_aggregate_exit_prefers_most_severe() -> None:
+    from meraki2tf.cli import _aggregate_exit
+
+    assert _aggregate_exit([0, 0]) == 0
+    assert _aggregate_exit([0, 3, 5]) == 3
+    assert _aggregate_exit([5, 4]) == 4
+    assert _aggregate_exit([3, 1, 4]) == 1
+    assert _aggregate_exit([0, 5]) == 5
+
+
+def test_multi_org_fan_out_builds_per_org_kits(
+    spec_file: Path,
+    dump_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Two organizations, one invocation: per-org workdirs, aggregate 0."""
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    monkeypatch.setattr(
+        terraform_runner.subprocess,
+        "run",
+        lambda command, **kwargs: SimpleNamespace(
+            returncode=0, stdout="", stderr=""
+        ),
+    )
+    monkeypatch.setattr(
+        "meraki2tf.cli.build_provider",
+        lambda config, parser: StaticJsonDataProvider(dump_file, parser=parser),
+    )
+    workdir = tmp_path / "orgs"
+
+    exit_code = main(
+        ["--spec", str(spec_file), "--workdir", str(workdir),
+         "--org-id", "111222", "--org-id", "333444"]
+    )
+
+    assert exit_code == 0
+    for org in ("111222", "333444"):
+        assert (workdir / org / "imports.tf").exists()
+        assert (workdir / org / "provider.tf").exists()
+    out = capsys.readouterr().out
+    assert "Per-organization DR kits" in out
+    assert "111222" in out and "333444" in out

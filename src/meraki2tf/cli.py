@@ -191,10 +191,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     core.add_argument(
         "--org-id",
+        action="append",
         default=None,
         help=(
-            "Meraki organization ID to discover. Required in live mode; "
-            "dump mode falls back to the organization recorded in the snapshot."
+            "Meraki organization ID to discover; repeat the flag to fan "
+            "out over several organizations sequentially (each gets its "
+            "own sub-workdir and state). Required in live mode; dump "
+            "mode falls back to the organization recorded in the "
+            "snapshot. DR actions take at most one."
         ),
     )
     core.add_argument(
@@ -1546,7 +1550,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # house rule): the helper answers one question and exits, so any
         # mode or target flag alongside it marks a misunderstanding.
         if (
-            config.org_id or config.dump_path or config.dump_to
+            config.org_ids or config.dump_path or config.dump_to
             or config.drift_baseline or config.sanitize
             or config.rebuild or config.heal or config.replay_gaps
             or config.restore or config.wipe_org or config.wipe_org_name
@@ -1612,7 +1616,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "--wipe-org is a standalone drill-teardown action; do not "
                 "combine it with any other mode."
             )
-        if config.org_id:
+        if config.org_ids:
             # A differing --org-id would be silently ignored while the
             # operator believes it scoped the wipe (no-silent-orphans);
             # a matching one marks a production-shaped target.
@@ -1630,10 +1634,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "--heal recreates missing objects from an offline "
                 "snapshot; pass the unsanitized export via --from-dump."
             )
-        if not config.org_id:
+        if len(config.org_ids) != 1:
             arg_parser.error(
-                "--heal requires --org-id: the organization to heal, "
-                "which must be the snapshot's own source organization."
+                "--heal requires exactly one --org-id: the organization "
+                "to heal, which must be the snapshot's own source "
+                "organization."
             )
         if config.restore or config.rebuild or config.replay_gaps:
             arg_parser.error(
@@ -1671,7 +1676,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "--restore is a standalone DR action; do not combine it "
                 "with --rebuild or --replay-gaps."
             )
-        if config.org_id:
+        if config.org_ids:
             # The never-write-to-source interlock compares --target-org
             # against the snapshot's *recorded* source organization; an
             # --org-id override would replace that recorded value and
@@ -1735,7 +1740,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "--rebuild operates on an existing --workdir; it cannot be "
                 "combined with --from-dump or --dump-to."
             )
-        if config.org_id:
+        if config.org_ids:
             # Orphaned mode-scoped flags are refused, never silently
             # ignored: the rebuild applies whatever kit the workdir
             # holds — it is not scoped or verified against an
@@ -1770,7 +1775,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "--dump-to only exports a snapshot; it cannot be combined with "
             "--sync, --confirm-deletions, or --rebaseline."
         )
-    if config.mode is ExecutionMode.LIVE and not config.org_id:
+    if config.mode is ExecutionMode.LIVE and not config.org_ids:
         arg_parser.error("--org-id is required in live mode.")
     if config.sanitize and config.dump_to is None:
         arg_parser.error("--sanitize requires --dump-to.")
@@ -1785,6 +1790,54 @@ def main(argv: Sequence[str] | None = None) -> int:
             "of the next one. Export the unsanitized snapshot for the "
             "drift chain and sanitize a separate copy for sharing."
         )
+    if len(config.org_ids) > 1:
+        # Multi-organization fan-out covers the pipeline modes only
+        # (default read-only and --sync). Snapshot modes are inherently
+        # single-organization (one snapshot file per org), and shared
+        # state targets would silently interleave organizations.
+        if config.mode is ExecutionMode.DUMP:
+            arg_parser.error(
+                "--from-dump holds a single organization's snapshot; "
+                "run one invocation per snapshot instead of repeating "
+                "--org-id."
+            )
+        if config.dump_to is not None or config.drift_baseline is not None:
+            arg_parser.error(
+                "snapshot export/diff (--dump-to / --drift-baseline) is "
+                "single-organization; run one invocation per "
+                "organization, each with its own snapshot paths."
+            )
+        if config.state_file is not None:
+            arg_parser.error(
+                "--state-file cannot be combined with multiple --org-id "
+                "values; each organization keeps its own state under "
+                "<workdir>/<org-id>/."
+            )
+        for org in config.org_ids:
+            if "/" in org or "\\" in org or ".." in org:
+                arg_parser.error(
+                    f"--org-id {org!r} is not usable in a multi-org run: "
+                    "organization IDs become workdir path segments."
+                )
+        if config.backend.is_remote:
+            if config.backend.config_file is not None:
+                arg_parser.error(
+                    "--backend-config-file cannot be combined with "
+                    "multiple --org-id values; pass repeated "
+                    "--backend-config settings with an {org-id} "
+                    "placeholder in the state address instead."
+                )
+            if not any(
+                ORG_ID_PLACEHOLDER in value
+                for _, value in config.backend.settings
+            ):
+                arg_parser.error(
+                    "a remote --state-backend with multiple --org-id "
+                    "values requires an {org-id} placeholder in the "
+                    "state address (the azurerm/s3 'key' or gcs "
+                    "'prefix' setting), so each organization gets its "
+                    "own state object."
+                )
     # The dispatcher only needs config, so it exists before anything
     # that can fail: every fatal path below — spec resolution, provider
     # or runner construction included — gets at least one
@@ -1819,6 +1872,112 @@ def main(argv: Sequence[str] | None = None) -> int:
         dispatcher.dispatch(processing_fault(stage="startup", error=message))
         return 1
 
+    if len(config.org_ids) > 1:
+        return _run_multi_org(config, dispatcher)
+    pipeline_exit = _run_org_pipeline(config, dispatcher)
+    # Exit-code priority (see the module docstring): the pipeline codes
+    # (1/2 over 4 over 3) outrank a silent notifier outage (5). The
+    # outage helper runs unconditionally so the outage is always LOGGED
+    # even when another code wins the exit.
+    return pipeline_exit or _alert_outage_exit(dispatcher)
+
+
+#: Substituted with the organization ID in remote-backend state
+#: addresses during multi-org fan-out (azurerm/s3 ``key``, gcs
+#: ``prefix``), so every organization gets its own state object.
+ORG_ID_PLACEHOLDER = "{org-id}"
+
+#: Exit codes ordered most severe first, per the module docstring:
+#: nothing usable (1/2) over a stalled materialization (4) over known
+#: coverage gaps (3) over a notifier outage (5).
+_EXIT_SEVERITY = (1, 2, 4, 3, 5)
+
+
+def _aggregate_exit(codes: Sequence[int]) -> int:
+    """The most severe exit code across a multi-organization run."""
+    for code in _EXIT_SEVERITY:
+        if code in codes:
+            return code
+    return 0
+
+
+def _single_org_config(config: RuntimeConfig, org_id: str) -> RuntimeConfig:
+    """The per-organization view of a multi-org invocation.
+
+    Each organization gets its own sub-workdir (and therefore its own
+    local state/artifacts); remote-backend state addresses have the
+    ``{org-id}`` placeholder substituted so state objects never
+    collide.
+    """
+    backend = config.backend
+    if backend.is_remote:
+        backend = dataclasses.replace(
+            backend,
+            settings=tuple(
+                (key, value.replace(ORG_ID_PLACEHOLDER, org_id))
+                for key, value in backend.settings
+            ),
+        )
+    return dataclasses.replace(
+        config,
+        org_ids=(org_id,),
+        workdir=config.workdir / org_id,
+        backend=backend,
+    )
+
+
+def _run_multi_org(config: RuntimeConfig, dispatcher: AlertDispatcher) -> int:
+    """Sequential fan-out over every configured organization.
+
+    A failing organization never stops the remaining ones — for a DR
+    tool, capturing N-1 organizations beats capturing zero — and the
+    final exit code is the most severe per-org outcome, so schedulers
+    still notice the failure.
+    """
+    total = len(config.org_ids)
+    codes: list[int] = []
+    for index, org_id in enumerate(config.org_ids, start=1):
+        logger.info(
+            "=== organization %s (%d of %d) ===", org_id, index, total
+        )
+        codes.append(
+            _run_org_pipeline(
+                _single_org_config(config, org_id),
+                dispatcher,
+                print_epilogue=False,
+            )
+        )
+    outage_exit = _alert_outage_exit(dispatcher)
+    logger.info(
+        "Multi-organization run complete: %s.",
+        "; ".join(
+            f"{org_id}: exit {code}"
+            for org_id, code in zip(config.org_ids, codes)
+        ),
+    )
+    if not config.sync:
+        print(
+            f"\nPer-organization DR kits written under {config.workdir}: "
+            + ", ".join(config.org_ids)
+            + " (one sub-directory each)."
+        )
+        print(
+            f"Next steps per org: cd {config.workdir}/<org-id> && "
+            "terraform init && terraform plan"
+        )
+    return _aggregate_exit(codes) or outage_exit
+
+
+def _run_org_pipeline(
+    config: RuntimeConfig,
+    dispatcher: AlertDispatcher,
+    print_epilogue: bool = True,
+) -> int:
+    """One organization's pipeline: spec → provider → orchestrate → report.
+
+    Returns the run's exit code EXCLUDING the notifier-outage code (5),
+    which is dispatcher-wide and applied once by the caller.
+    """
     logger.info("meraki2tf starting in %s mode.", config.mode.value)
     try:
         spec_parser = OpenApiParser(resolve_spec(config.spec_path))
@@ -1829,7 +1988,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             # channels, not just the local log (the contract's
             # "critical script processing faults" trigger).
             try:
-                export_exit = _export_snapshot(
+                return _export_snapshot(
                     provider, config, spec_parser, dispatcher
                 )
             except Exception as exc:
@@ -1840,12 +1999,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
                 )
                 return 1
-            # Same priority as the pipeline path: known coverage gaps
-            # (3) outrank a silent notifier outage (5). The outage
-            # helper runs unconditionally so the outage is always
-            # LOGGED even when the gap code wins the exit.
-            outage_exit = _alert_outage_exit(dispatcher)
-            return export_exit or outage_exit
         runner = TerraformRunner(
             config.workdir,
             executable=config.terraform_bin,
@@ -1890,7 +2043,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     _report(summary)
-    if not config.sync:
+    if print_epilogue and not config.sync:
         # Interactive next-step pointer for the ad-hoc/open-source mode;
         # scheduled --sync runs read the log summary and alerts instead.
         print(
@@ -1901,13 +2054,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"Next steps: cd {config.workdir} && terraform init && "
             "terraform plan"
         )
-    # Exit-code priority (see the module docstring): a stalled full-kit
-    # materialization (4) outranks known coverage gaps (3), which
-    # outrank a silent notifier outage (5). The outage helper runs
-    # first and unconditionally: on a permanently-gapped org the gap
-    # code wins the exit every run, and a notifier outage would
-    # otherwise never even be logged.
-    outage_exit = _alert_outage_exit(dispatcher)
     if summary.apply_aborted:
         # A sync run whose full-kit apply was refused (the plan carried
         # mutations) must not report success — a scheduler gating on the
@@ -1933,7 +2079,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         gap_exit = _coverage_gap_exit(summary.unsupported_count)
         if gap_exit:
             return gap_exit
-    return outage_exit
+    return 0
 
 
 def _coverage_gap_exit(unsupported_count: int) -> int:

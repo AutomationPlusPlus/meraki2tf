@@ -200,7 +200,7 @@ Quick reference (each flag is described in detail below):
 | `--version` | — | Print the installed meraki2tf version and exit |
 | `--list-orgs` | — | List every organization the API key can see (ID + name) and exit — the way to find `--org-id` |
 | `--config PATH` | — | TOML file of recurring settings (CLI > file > default); DR actions, confirmations, and credentials refused |
-| `--org-id` | — | Organization to discover (required in live mode) |
+| `--org-id` | — | Organization to discover (required in live mode); repeat for sequential multi-org fan-out |
 | `--spec PATH` | `./spec3.json` | Meraki OpenAPI JSON document; auto-downloaded/refreshed from GitHub |
 | `--from-dump PATH` | — | Offline snapshot; switches to dump mode |
 | `--dump-to PATH` | — | Export discovery output as a snapshot instead of running Terraform |
@@ -291,10 +291,32 @@ the fastest way to find the `--org-id` value.
 **`--config PATH`** — TOML file of recurring settings; see
 [Config file](#config-file---config) above.
 
-**`--org-id ID`** — the Meraki organization to discover (find it with
-`--list-orgs`). Required in live mode. In dump mode it may be omitted
-(the organization recorded in the snapshot's `organizationId` is used)
-or supplied to override it.
+**`--org-id ID`** *(repeatable)* — the Meraki organization to discover
+(find it with `--list-orgs`). Required in live mode. In dump mode it
+may be omitted (the organization recorded in the snapshot's
+`organizationId` is used) or supplied to override it.
+
+Repeat the flag to fan out over several organizations in one
+invocation (config-file key: `org-ids = ["111222", "333444"]`). The
+organizations run **sequentially**; each gets its own sub-workdir
+(`<workdir>/<org-id>/`) and therefore its own kit, coverage manifest,
+and local state, and a failing organization never stops the remaining
+ones. The final exit code is the most severe per-org outcome
+(1 > 4 > 3 > 5 > 0). Constraints:
+
+- Pipeline modes only (default read-only and `--sync`). Snapshot
+  modes (`--from-dump`, `--dump-to`, `--drift-baseline`) and DR
+  actions stay single-organization — run one invocation per org.
+- `--state-file` cannot be combined with multiple organizations.
+- A remote `--state-backend` requires an `{org-id}` placeholder in
+  the state address so state objects never collide:
+
+```bash
+meraki2tf --org-id 111222 --org-id 333444 \
+  --state-backend s3 \
+  --backend-config bucket=example-terraform-state \
+  --backend-config 'key=meraki2tf/{org-id}.tfstate'
+```
 
 ```bash
 meraki2tf --org-id 123456                          # live discovery
