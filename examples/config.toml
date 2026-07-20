@@ -1,0 +1,43 @@
+# Example meraki2tf --config file — copy, edit, and run:
+#
+#   meraki2tf --config /etc/meraki2tf/meraki2tf.toml
+#
+# Keys mirror the long flag names; precedence is strictly
+# command line > config file > built-in default.
+#
+# Two classes of keys are refused here by design:
+#   - disaster-recovery actions, targets, and confirmations
+#     (--rebuild, --heal, --restore, --confirm, ...) — a write to
+#     Meraki must be typed by a human, never inherited from a file;
+#   - credentials — the API key only ever comes from the
+#     MERAKI_DASHBOARD_API_KEY environment variable, and
+#     credential-shaped backend-config keys are rejected.
+# Because this file never holds a secret, it needs no special
+# file permissions.
+
+# The organization to discover (find yours with: meraki2tf --list-orgs).
+org-id = "123456"
+
+# Where the DR kit, coverage manifest, runbook, and (local) state live.
+workdir = "/var/lib/meraki2tf/dr-kit"
+
+# Scheduled-DR shape: guarded import-only state materialization plus a
+# nonzero exit (code 3) whenever objects Terraform cannot rebuild exist.
+sync = true
+fail-on-gaps = true
+
+# Alert channels. Prefer the MERAKI2TF_WEBHOOK_URL environment variable
+# for token-bearing webhook URLs so the secret stays out of this file.
+#webhook-url = "https://hooks.example.com/meraki2tf"
+#alert-email = ["netops@corp.example"]
+#smtp-host = "smtp.corp.example"
+#smtp-port = 25
+#email-from = "meraki2tf@corp.example"
+
+# Remote Terraform state (recommended for scheduled DR). Credentials
+# come from the environment or a managed identity, never from here.
+#state-backend = "azurerm"
+#[backend-config]
+#storage_account_name = "storacct"
+#container_name = "tfstate"
+#key = "meraki2tf/org.tfstate"
