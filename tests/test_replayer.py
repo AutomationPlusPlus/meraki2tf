@@ -1461,3 +1461,223 @@ def replace_action_lookup(
     import dataclasses
 
     return dataclasses.replace(action, lookup=lookup)
+
+
+def _device_action(spec_parser: OpenApiParser) -> ReplayAction:
+    device_op = next(
+        op
+        for op in spec_parser.endpoints()
+        if op.operation_id == "updateDevice"
+    )
+    return ReplayAction(
+        kind="object",
+        api_path="/devices/{serial}",
+        path_values=("Q2XX-AAAA-BBBB",),
+        payload={"name": "edge"},
+        operation=device_op,
+    )
+
+
+def test_execute_verifies_serials_against_the_target_inventory(
+    monkeypatch: pytest.MonkeyPatch, spec_parser: OpenApiParser
+) -> None:
+    """A device-scoped replay enumerates the target's claimed devices
+    (network-assigned AND inventory-only) once, then dispatches only at
+    serials that set vouches for."""
+    devices = _FakeSection()
+    organizations = types.SimpleNamespace(
+        getOrganizationDevices=lambda org, total_pages="all": [
+            {"serial": "Q2XX-AAAA-BBBB"},
+            "junk",  # non-mapping rows never poison the set
+        ],
+        getOrganizationInventoryDevices=lambda org, total_pages="all": [
+            {"serial": "Q2YY-CCCC-DDDD"},
+            {"serial": ""},  # blank serials are dropped
+        ],
+    )
+    dashboard = types.SimpleNamespace(
+        devices=devices, organizations=organizations
+    )
+    stub = types.ModuleType("meraki")
+    stub.DashboardAPI = lambda **kwargs: dashboard  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "meraki", stub)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "unit-test-key")
+
+    executed, failed, _skipped = GapReplayer().execute(
+        (_device_action(spec_parser),),
+        target_organization_id="org-999",
+        snapshot_organization_id="org-123",
+        network_ids={},
+    )
+    assert failed == ()
+    assert len(executed) == 1
+    (name, kwargs) = devices.calls[0]
+    assert name == "updateDevice"
+    assert kwargs["serial"] == "Q2XX-AAAA-BBBB"
+
+
+def test_execute_fails_serial_actions_when_enumeration_breaks(
+    monkeypatch: pytest.MonkeyPatch,
+    spec_parser: OpenApiParser,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unreadable claimed-device set must refuse every device-scoped
+    write (never dispatch blind), with the outage logged once."""
+
+    def explode(org: str, total_pages: str = "all") -> None:
+        raise RuntimeError("inventory endpoint down")
+
+    devices = _FakeSection()
+    dashboard = types.SimpleNamespace(
+        devices=devices,
+        organizations=types.SimpleNamespace(getOrganizationDevices=explode),
+    )
+    stub = types.ModuleType("meraki")
+    stub.DashboardAPI = lambda **kwargs: dashboard  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "meraki", stub)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "unit-test-key")
+
+    executed, failed, _skipped = GapReplayer().execute(
+        (_device_action(spec_parser),),
+        target_organization_id="org-999",
+        snapshot_organization_id="org-123",
+        network_ids={},
+    )
+    assert executed == ()
+    ((_, reason),) = failed
+    assert "Cannot verify device" in reason
+    assert devices.calls == []  # nothing was written
+    assert any(
+        "Cannot enumerate the target organization's claimed devices"
+        in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_device_scoped_400_is_never_template_bound(
+    monkeypatch: pytest.MonkeyPatch, spec_parser: OpenApiParser
+) -> None:
+    """The template-bound skip keys on the action's networkId scope; a
+    device-scoped action has none, so its 400 stays a real failure even
+    when template-bound networks exist."""
+
+    class RefusingDevices:
+        @staticmethod
+        def updateDevice(**kwargs: Any) -> None:
+            error = RuntimeError("bad request")
+            error.status = 400  # type: ignore[attr-defined]
+            raise error
+
+    organizations = types.SimpleNamespace(
+        getOrganizationDevices=lambda org, total_pages="all": [
+            {"serial": "Q2XX-AAAA-BBBB"},
+        ],
+        getOrganizationInventoryDevices=lambda org, total_pages="all": [],
+    )
+    dashboard = types.SimpleNamespace(
+        devices=RefusingDevices(), organizations=organizations
+    )
+    stub = types.ModuleType("meraki")
+    stub.DashboardAPI = lambda **kwargs: dashboard  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "meraki", stub)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "unit-test-key")
+
+    executed, failed, skipped = GapReplayer().execute(
+        (_device_action(spec_parser),),
+        target_organization_id="org-999",
+        snapshot_organization_id="org-123",
+        network_ids={},
+        template_bound=frozenset({"N_9"}),
+    )
+    assert executed == () and skipped == ()
+    assert len(failed) == 1
+
+
+def test_execute_refuses_item_writes_without_an_sdk_collection_read(
+    monkeypatch: pytest.MonkeyPatch, spec_parser: OpenApiParser
+) -> None:
+    """The spec declares a collection GET but the installed SDK does not
+    expose it: the item ID still cannot be verified, so the write is
+    refused rather than dispatched blind."""
+    dashboard = types.SimpleNamespace(appliance=types.SimpleNamespace())
+    stub = types.ModuleType("meraki")
+    stub.DashboardAPI = lambda **kwargs: dashboard  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "meraki", stub)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "unit-test-key")
+
+    executed, failed, _skipped = GapReplayer().execute(
+        (_vlan_action(spec_parser),),
+        target_organization_id="org-999",
+        snapshot_organization_id="org-123",
+        network_ids={"N_2": "N_9"},
+    )
+    assert executed == ()
+    ((_, reason),) = failed
+    assert "SDK exposes no collection read" in reason
+
+
+def test_execute_refuses_item_writes_when_the_read_back_fails(
+    monkeypatch: pytest.MonkeyPatch, spec_parser: OpenApiParser
+) -> None:
+    """An unreadable collection cannot vouch for the snapshot's item ID
+    — refuse the write instead of guessing."""
+
+    class BoomSection:
+        @staticmethod
+        def getNetworkApplianceVlans(**kwargs: Any) -> None:
+            raise RuntimeError("collection read failed")
+
+        @staticmethod
+        def updateNetworkApplianceVlan(**kwargs: Any) -> None:
+            raise AssertionError("the write must never fire")
+
+    dashboard = types.SimpleNamespace(appliance=BoomSection())
+    stub = types.ModuleType("meraki")
+    stub.DashboardAPI = lambda **kwargs: dashboard  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "meraki", stub)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "unit-test-key")
+
+    executed, failed, _skipped = GapReplayer().execute(
+        (_vlan_action(spec_parser),),
+        target_organization_id="org-999",
+        snapshot_organization_id="org-123",
+        network_ids={"N_2": "N_9"},
+    )
+    assert executed == ()
+    ((_, reason),) = failed
+    assert "Collection read-back" in reason and "RuntimeError" in reason
+
+
+def test_item_verification_unwraps_envelope_listings(
+    monkeypatch: pytest.MonkeyPatch, spec_parser: OpenApiParser
+) -> None:
+    """Collection GETs that answer {"items": [...]} envelopes still
+    verify the item ID; the write then proceeds."""
+
+    class EnvelopeSection:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def getNetworkApplianceVlans(self, **kwargs: Any) -> dict[str, Any]:
+            return {"items": [{"id": "10", "name": "Data"}]}
+
+        def updateNetworkApplianceVlan(self, **kwargs: Any) -> dict[str, Any]:
+            self.calls.append(kwargs)
+            return kwargs
+
+    section = EnvelopeSection()
+    dashboard = types.SimpleNamespace(appliance=section)
+    stub = types.ModuleType("meraki")
+    stub.DashboardAPI = lambda **kwargs: dashboard  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "meraki", stub)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "unit-test-key")
+
+    executed, failed, _skipped = GapReplayer().execute(
+        (_vlan_action(spec_parser),),
+        target_organization_id="org-999",
+        snapshot_organization_id="org-123",
+        network_ids={"N_2": "N_9"},
+    )
+    assert failed == ()
+    assert len(executed) == 1
+    assert section.calls[0]["networkId"] == "N_9"

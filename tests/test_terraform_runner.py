@@ -2141,3 +2141,122 @@ def test_plan_with_generation_refuses_an_empty_target_set(
     runner.prepare_workspace()
     with pytest.raises(ValueError, match="empty target set"):
         runner.plan_with_generation(targets=())
+
+
+def test_plan_targeted_refuses_an_empty_address_set(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty -target set silently degenerates into a full untargeted
+    multi-hour plan — reopening exactly the race window targeted
+    chunking exists to close."""
+    runner.prepare_workspace()
+    fake = FakeSubprocess()
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    with pytest.raises(ValueError, match="at least one address"):
+        runner.plan_targeted([])
+    assert fake.calls == []
+
+
+def test_plan_targeted_drops_the_saved_plan_when_the_plan_errors(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An errored plan writes no (or a partial) plan file; whatever is
+    on disk must go, or a previous window's saved plan could be
+    mistaken for this one downstream."""
+    runner.prepare_workspace()
+    stale = runner.workdir / SYNC_PLAN_FILENAME
+    stale.write_text("previous-window-plan", encoding="utf-8")
+    scripted = ScriptedSubprocess(
+        (1, "", None, "Error: provider produced inconsistent result"),
+    )
+    monkeypatch.setattr(terraform_runner.subprocess, "run", scripted.run)
+    result = runner.plan_targeted(["meraki_networks.n_1"])
+    assert result.returncode == 1
+    assert not stale.exists()
+
+
+def test_discard_rebuild_plan_removes_the_verified_snapshot(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Preview-only --rebuild runs must not leave the run-private
+    verified plan copy (a secret-bearing document) on disk."""
+
+    def planning_run(command: Any, **kwargs: Any) -> Any:
+        if "plan" in command:
+            (
+                runner.workdir / terraform_runner.REBUILD_PLAN_FILENAME
+            ).write_text("saved-plan", encoding="utf-8")
+        return fake.run(command, **kwargs)
+
+    fake = FakeSubprocess(returncode=2, stdout="Plan: 1 to add")
+    monkeypatch.setattr(terraform_runner.subprocess, "run", planning_run)
+    runner.workdir.mkdir(parents=True, exist_ok=True)
+    runner.plan_preview()
+    verified = runner.workdir / (
+        f"{terraform_runner.REBUILD_PLAN_FILENAME}.verified-{os.getpid()}"
+    )
+    assert verified.exists()
+    runner.discard_rebuild_plan()
+    assert not verified.exists()
+    assert not (
+        runner.workdir / terraform_runner.REBUILD_PLAN_FILENAME
+    ).exists()
+    assert runner._rebuild_plan_snapshot is None
+    # Idempotent: a second discard with nothing snapshotted is a no-op.
+    runner.discard_rebuild_plan()
+
+
+def test_run_failure_with_json_output_reports_size_not_body(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed -json command's stdout can carry sensitive values, and
+    the error message flows into alert payloads — it must report the
+    body's size, never the body."""
+    fake = FakeSubprocess(returncode=1, stdout='{"psk": "wifi-secret"}')
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+    with pytest.raises(TerraformError) as excinfo:
+        runner._run("show", "-json", "plan.tfplan")
+    message = str(excinfo.value)
+    assert "wifi-secret" not in message
+    assert "machine-readable JSON" in message
+    # stderr, when present, is terraform's own (masked) diagnostics and
+    # is preferred over the size notice.
+    fake_err = FakeSubprocess(
+        returncode=1, stdout='{"psk": "wifi-secret"}', stderr="Error: boom"
+    )
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake_err.run)
+    with pytest.raises(TerraformError, match="Error: boom"):
+        runner._run("show", "-json", "plan.tfplan")
+
+
+def test_process_alive_probe_verdicts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Signal-0 probe semantics: a missing PID is dead, an unrepresentable
+    PID names no process, and EPERM means alive (another user's run —
+    its run-private plan copy is not ours to sweep)."""
+
+    def raising_kill(exc: Exception) -> Any:
+        def kill(pid: int, sig: int) -> None:
+            raise exc
+
+        return kill
+
+    monkeypatch.setattr(
+        terraform_runner.os, "kill", raising_kill(ProcessLookupError())
+    )
+    assert terraform_runner._process_alive(4242) is False
+    monkeypatch.setattr(
+        terraform_runner.os, "kill", raising_kill(OverflowError())
+    )
+    assert terraform_runner._process_alive(2**63) is False
+    monkeypatch.setattr(
+        terraform_runner.os,
+        "kill",
+        raising_kill(PermissionError("operation not permitted")),
+    )
+    assert terraform_runner._process_alive(4242) is True
+    monkeypatch.setattr(
+        terraform_runner.os, "kill", lambda pid, sig: None
+    )
+    assert terraform_runner._process_alive(os.getpid()) is True

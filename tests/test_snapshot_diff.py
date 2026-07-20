@@ -455,3 +455,16 @@ def test_baseline_drift_diffs_against_unsanitized_baselines(
     )
     (mod,) = diff.modified
     assert mod.changed == {"name": ("Data", "Data-renamed")}
+
+
+def test_volatile_strip_leaves_non_mapping_products_untouched() -> None:
+    """A product entry that is not an object (an API oddity or partial
+    capture) has no volatile subtree to prune — it must survive as-is
+    instead of crashing the weekly diff."""
+    from meraki2tf.snapshot_diff import _strip_volatile_subtrees
+
+    payload = {
+        "timezone": "US/Eastern",
+        "products": {"appliance": "unavailable"},
+    }
+    assert _strip_volatile_subtrees(FIRMWARE_PATH, payload) == payload

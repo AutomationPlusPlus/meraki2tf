@@ -489,3 +489,16 @@ def test_config_file_execution_steering_is_refused_for_dr_actions(
     with pytest.raises(SystemExit) as excinfo:
         main(["--config", str(config), "--rebuild"])
     assert excinfo.value.code == 2
+
+
+def test_read_only_guard_memoizes_sdk_verdicts() -> None:
+    """The SDK surface is a few hundred functions and source parsing is
+    not free; the second probe of the same function must come from the
+    memo (and agree with the first)."""
+
+    def probe(self: Any) -> Any:
+        return self._session.get({}, "/x")
+
+    probe.__module__ = "meraki.api.networks"
+    assert _method_is_read_only(probe) is True
+    assert _method_is_read_only(probe) is True  # cached verdict
