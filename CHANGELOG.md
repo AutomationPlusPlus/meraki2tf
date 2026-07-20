@@ -6,6 +6,23 @@ the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- Multi-organization fan-out: `--org-id` is repeatable (config file:
+  `org-ids` array). Organizations run sequentially with per-org
+  sub-workdirs and state; remote backends take an `{org-id}`
+  placeholder in the state address; the exit code is the most severe
+  per-org outcome. Snapshot modes and DR actions remain
+  single-organization.
+- Scheduling recipes beyond Azure: hardened systemd service+timer
+  pairs under `deploy/systemd/`, plus AWS (EventBridge → Fargate) and
+  GCP (Cloud Scheduler → Cloud Run Job) recipes in
+  `docs/OPERATIONS.md`.
+
+### Changed
+- The monolithic README is split into `docs/USAGE.md`,
+  `docs/DR-GUIDE.md`, and `docs/OPERATIONS.md`; the README is now a
+  landing page with a documentation index.
+
 ## [0.1.0] - 2026-07-20
 
 First tagged release. Everything below is the state of the tool at
