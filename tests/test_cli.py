@@ -3427,3 +3427,44 @@ def test_live_run_without_api_key_fails_fast(
     assert API_KEY_ENV_VAR in err
     assert "--list-orgs" in err
     assert "--from-dump" in err
+
+
+# ---------------------------------------------------------------------------
+# Notification channel wiring: --webhook-format and --pagerduty.
+# ---------------------------------------------------------------------------
+
+
+def test_webhook_format_reaches_the_notifier(spec_file: Path) -> None:
+    config = _config(
+        [
+            "--spec", str(spec_file),
+            "--webhook-url", "https://hooks.example/a",
+            "--webhook-format", "slack",
+        ]
+    )
+    dispatcher = build_dispatcher(config)
+    (notifier,) = dispatcher._notifiers
+    assert notifier._payload_format == "slack"  # type: ignore[attr-defined]
+
+
+def test_pagerduty_flag_registers_the_channel(
+    spec_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from meraki2tf.alerts.pagerduty import ROUTING_KEY_ENV_VAR
+
+    monkeypatch.setenv(ROUTING_KEY_ENV_VAR, "rk-test-0001")
+    dispatcher = build_dispatcher(
+        _config(["--spec", str(spec_file), "--pagerduty"])
+    )
+    assert [n.channel for n in dispatcher._notifiers] == ["pagerduty"]
+
+
+def test_pagerduty_flag_without_routing_key_refuses_loudly(
+    spec_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from meraki2tf.alerts.pagerduty import ROUTING_KEY_ENV_VAR
+
+    monkeypatch.delenv(ROUTING_KEY_ENV_VAR, raising=False)
+    with pytest.raises(SystemExit) as excinfo:
+        build_dispatcher(_config(["--spec", str(spec_file), "--pagerduty"]))
+    assert ROUTING_KEY_ENV_VAR in str(excinfo.value)

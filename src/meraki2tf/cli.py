@@ -46,12 +46,17 @@ from meraki2tf.alerts import (
     processing_fault,
     rebuild_executed,
     restore_executed,
+    routing_key_present,
     run_success,
     AlertDispatcher,
     EmailNotifier,
+    PagerDutyNotifier,
     WebhookConfigError,
     WebhookNotifier,
     gap_replay_executed,
+)
+from meraki2tf.alerts.pagerduty import (
+    ROUTING_KEY_ENV_VAR as PAGERDUTY_ROUTING_KEY_ENV_VAR,
 )
 from meraki2tf.alerts.models import condense_diff, redact_diff
 from meraki2tf.config import (
@@ -467,10 +472,38 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     alerting.add_argument(
+        "--webhook-format",
+        choices=["json", "slack", "teams"],
+        default="json",
+        help=(
+            "Shape of the webhook POST body (default: %(default)s). "
+            "'json' is the raw machine-readable event payload; 'slack' "
+            "renders Slack incoming-webhook text; 'teams' renders a "
+            "Teams Workflows Adaptive Card message. Applies to every "
+            "configured webhook target."
+        ),
+    )
+    alerting.add_argument(
+        "--pagerduty",
+        action="store_true",
+        help=(
+            "Trigger a PagerDuty incident (Events API v2) for WARNING "
+            "and CRITICAL events — drift, coverage gaps, pending "
+            "deletions, faults. INFO events never page. The routing key "
+            "comes only from the MERAKI2TF_PAGERDUTY_ROUTING_KEY "
+            "environment variable."
+        ),
+    )
+    alerting.add_argument(
         "--alert-email",
         action="append",
         metavar="ADDR",
-        help="Email alert recipient; repeat the flag for multiple recipients.",
+        help=(
+            "Email alert recipient; repeat the flag for multiple "
+            "recipients. Authenticated relays: set "
+            "MERAKI2TF_SMTP_USERNAME and MERAKI2TF_SMTP_PASSWORD in the "
+            "environment (AUTH runs only inside verified STARTTLS)."
+        ),
     )
     alerting.add_argument(
         "--smtp-host",
@@ -496,11 +529,23 @@ def build_dispatcher(config: RuntimeConfig) -> AlertDispatcher:
     dispatcher = AlertDispatcher()
     for url in config.webhook_urls:
         try:
-            dispatcher.register(WebhookNotifier(url))
+            dispatcher.register(
+                WebhookNotifier(url, payload_format=config.webhook_format)
+            )
         except WebhookConfigError as exc:
             # A misconfigured endpoint must not silently disable
             # alerting for the whole run: refuse loudly at startup.
             raise SystemExit(f"Invalid --webhook-url / {WEBHOOK_URL_ENV_VAR}: {exc}")
+    if config.pagerduty:
+        if not routing_key_present():
+            # Same loud-refusal rule as a bad webhook URL: a paging
+            # channel that silently cannot page is worse than none.
+            raise SystemExit(
+                "--pagerduty requires the "
+                f"{PAGERDUTY_ROUTING_KEY_ENV_VAR} environment variable "
+                "(an Events API v2 routing key)."
+            )
+        dispatcher.register(PagerDutyNotifier())
     if config.alert_emails:
         dispatcher.register(
             EmailNotifier(

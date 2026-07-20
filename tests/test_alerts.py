@@ -10,10 +10,14 @@ import pytest
 from meraki2tf.alerts import (
     AlertDispatcher,
     AlertEvent,
+    EmailConfigError,
     EmailNotifier,
     EventSeverity,
     EventType,
     Notifier,
+    PagerDutyConfigError,
+    PagerDutyDeliveryError,
+    PagerDutyNotifier,
     WebhookConfigError,
     WebhookDeliveryError,
     WebhookNotifier,
@@ -23,8 +27,15 @@ from meraki2tf.alerts import (
     run_success,
     unsupported_feature_flagged,
 )
+from meraki2tf.alerts import pagerduty as pagerduty_module
 from meraki2tf.alerts import webhook as webhook_module
-from meraki2tf.alerts.email import _default_smtp_factory
+from meraki2tf.alerts.email import (
+    SMTP_PASSWORD_ENV_VAR,
+    SMTP_USERNAME_ENV_VAR,
+    _default_smtp_factory,
+)
+from meraki2tf.alerts.formats import render_payload
+from meraki2tf.alerts.pagerduty import ROUTING_KEY_ENV_VAR
 
 
 class RecordingNotifier(Notifier):
@@ -596,3 +607,295 @@ def test_email_notifier_logs_partial_recipient_refusals(
     (record,) = [r for r in caplog.records if "refused" in r.message]
     assert "sec@example.com" in record.message
     assert "1 of 2 recipient(s)" in record.message
+
+
+# ---------------------------------------------------------------------------
+# Channel-native webhook formats (Slack / Teams).
+# ---------------------------------------------------------------------------
+
+
+def _drift_event() -> AlertEvent:
+    return drift_detected(diff="~ update", workspace="generated")
+
+
+def test_render_payload_json_is_the_raw_event() -> None:
+    event = _drift_event()
+    assert render_payload(event, "json") == event.to_payload()
+
+
+def test_render_payload_slack_shape() -> None:
+    body = render_payload(_drift_event(), "slack")
+    assert set(body) == {"text"}
+    assert "[meraki2tf] DRIFT_DETECTED (warning)" in body["text"]
+    assert "Configuration drift detected" in body["text"]
+    assert "```" in body["text"]  # details ride in a code block
+
+
+def test_render_payload_teams_is_an_adaptive_card_message() -> None:
+    body = render_payload(_drift_event(), "teams")
+    assert body["type"] == "message"
+    attachment = body["attachments"][0]
+    assert attachment["contentType"] == "application/vnd.microsoft.card.adaptive"
+    card = attachment["content"]
+    assert card["type"] == "AdaptiveCard"
+    texts = [block["text"] for block in card["body"]]
+    assert any("DRIFT_DETECTED" in text for text in texts)
+    assert any("Configuration drift detected" in text for text in texts)
+
+
+def test_render_payload_truncates_oversized_details_for_chat() -> None:
+    event = drift_detected(diff="x" * 50_000, workspace="generated")
+    slack_text = render_payload(event, "slack")["text"]
+    assert len(slack_text) < 10_000
+    assert "truncated for chat delivery" in slack_text
+    # The raw json format stays lossless.
+    raw = render_payload(event, "json")
+    assert raw["details"]["diff"] == "x" * 50_000
+
+
+def test_render_payload_rejects_unknown_formats() -> None:
+    with pytest.raises(ValueError):
+        render_payload(_drift_event(), "discord")
+
+
+def test_webhook_posts_slack_format_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_urlopen(request: urllib.request.Request, timeout: float) -> FakeResponse:
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse(200)
+
+    monkeypatch.setattr(webhook_module, "_open", fake_urlopen)
+    WebhookNotifier(
+        "https://hooks.example/abc", payload_format="slack"
+    ).send(_drift_event())
+    assert set(captured["body"]) == {"text"}
+
+
+def test_webhook_rejects_unknown_payload_format() -> None:
+    with pytest.raises(WebhookConfigError):
+        WebhookNotifier("https://hooks.example/abc", payload_format="discord")
+
+
+# ---------------------------------------------------------------------------
+# PagerDuty Events API v2 notifier.
+# ---------------------------------------------------------------------------
+
+
+def test_pagerduty_handles_only_problem_severities() -> None:
+    notifier = PagerDutyNotifier()
+    assert notifier.handles(_drift_event())  # WARNING
+    assert notifier.handles(processing_fault(stage="x", error="y"))  # CRITICAL
+    clean = run_success(
+        imports_written=0,
+        drift_was_detected=False,
+        workspace="w",
+        discovered_assets=0,
+        imports_already_tracked=0,
+        unsupported=[],
+        pending_imports=0,
+        comparison_performed=True,
+    )
+    assert not notifier.handles(clean)  # INFO never pages
+
+
+def test_pagerduty_triggers_an_incident(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(ROUTING_KEY_ENV_VAR, "rk-test-0001")
+    captured: dict[str, Any] = {}
+
+    def fake_urlopen(request: urllib.request.Request, timeout: float) -> FakeResponse:
+        captured["url"] = request.full_url
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse(202)
+
+    monkeypatch.setattr(pagerduty_module, "_open", fake_urlopen)
+    PagerDutyNotifier().send(processing_fault(stage="startup", error="boom"))
+
+    assert captured["url"] == "https://events.pagerduty.com/v2/enqueue"
+    body = captured["body"]
+    assert body["routing_key"] == "rk-test-0001"
+    assert body["event_action"] == "trigger"
+    assert body["payload"]["severity"] == "critical"
+    assert body["payload"]["source"] == "meraki2tf"
+    assert body["payload"]["summary"].startswith("[meraki2tf] PROCESSING_FAULT")
+    assert body["payload"]["custom_details"]["stage"] == "startup"
+
+
+def test_pagerduty_requires_the_routing_key_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(ROUTING_KEY_ENV_VAR, raising=False)
+    with pytest.raises(PagerDutyConfigError):
+        PagerDutyNotifier().send(processing_fault(stage="x", error="y"))
+
+
+def test_pagerduty_raises_on_api_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(ROUTING_KEY_ENV_VAR, "rk-test-0001")
+    monkeypatch.setattr(
+        pagerduty_module, "_open", lambda request, timeout: FakeResponse(400)
+    )
+    with pytest.raises(PagerDutyDeliveryError):
+        PagerDutyNotifier().send(processing_fault(stage="x", error="y"))
+
+
+def test_pagerduty_transport_failure_never_leaks_the_routing_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(ROUTING_KEY_ENV_VAR, "rk-secret-9999")
+
+    def fake_urlopen(request: urllib.request.Request, timeout: float) -> FakeResponse:
+        raise OSError("request with rk-secret-9999 refused")
+
+    monkeypatch.setattr(pagerduty_module, "_open", fake_urlopen)
+    with pytest.raises(PagerDutyDeliveryError) as excinfo:
+        PagerDutyNotifier().send(processing_fault(stage="x", error="y"))
+    assert "rk-secret-9999" not in str(excinfo.value)
+    assert "<routing-key>" in str(excinfo.value)
+    assert excinfo.value.__cause__ is None
+
+
+# ---------------------------------------------------------------------------
+# Dispatcher routing with declining (paging) channels.
+# ---------------------------------------------------------------------------
+
+
+class DecliningNotifier(Notifier):
+    channel = "declining"
+
+    def handles(self, event: AlertEvent) -> bool:
+        return False
+
+    def send(self, event: AlertEvent) -> None:  # pragma: no cover - never routed
+        raise AssertionError("dispatcher routed a declined event")
+
+
+def test_dispatcher_skips_channels_that_decline_the_event() -> None:
+    recording = RecordingNotifier()
+    dispatcher = AlertDispatcher([DecliningNotifier(), recording])
+    delivered = dispatcher.dispatch(_drift_event())
+    assert delivered == 1
+    assert len(recording.events) == 1
+    assert dispatcher.failed_event_count == 0
+
+
+def test_event_declined_by_every_channel_is_not_an_outage(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    dispatcher = AlertDispatcher([DecliningNotifier()])
+    with caplog.at_level("INFO", logger="meraki2tf.alerts.dispatcher"):
+        delivered = dispatcher.dispatch(_drift_event())
+    assert delivered == 0
+    assert dispatcher.failed_event_count == 0
+    assert "No configured alert channel handles" in caplog.text
+
+
+def test_failure_counter_ignores_declining_channels() -> None:
+    """All *handling* channels failing is an outage even when a
+    declining channel sits alongside them."""
+    dispatcher = AlertDispatcher([DecliningNotifier(), ExplodingNotifier()])
+    dispatcher.dispatch(_drift_event())
+    assert dispatcher.failed_event_count == 1
+
+
+# ---------------------------------------------------------------------------
+# SMTP AUTH (environment-only credentials, TLS required).
+# ---------------------------------------------------------------------------
+
+
+class AuthRecordingSmtp:
+    """SMTP stand-in advertising STARTTLS and recording login()."""
+
+    last_instance: "AuthRecordingSmtp | None" = None
+
+    def __init__(self, host: str, port: int, timeout: float) -> None:
+        self.logins: list[tuple[str, str]] = []
+        self.sent: list[EmailMessage] = []
+        self.tls_active = False
+        AuthRecordingSmtp.last_instance = self
+
+    def __enter__(self) -> "AuthRecordingSmtp":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        return None
+
+    def ehlo(self) -> None:
+        return None
+
+    def has_extn(self, name: str) -> bool:
+        return name == "starttls"
+
+    def starttls(self, *, context: Any = None) -> None:
+        self.tls_active = True
+
+    def login(self, username: str, password: str) -> None:
+        assert self.tls_active, "login attempted before STARTTLS"
+        self.logins.append((username, password))
+
+    def send_message(self, message: EmailMessage) -> dict[str, Any]:
+        self.sent.append(message)
+        return {}
+
+
+def _auth_notifier(factory: Any) -> EmailNotifier:
+    return EmailNotifier(
+        host="smtp.corp.example",
+        port=587,
+        sender="meraki2tf@corp.example",
+        recipients=["netops@corp.example"],
+        smtp_factory=factory,
+    )
+
+
+def test_email_authenticates_inside_tls_when_credentials_are_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(SMTP_USERNAME_ENV_VAR, "alert-bot")
+    monkeypatch.setenv(SMTP_PASSWORD_ENV_VAR, "relay-pass")
+    _auth_notifier(AuthRecordingSmtp).send(processing_fault(stage="x", error="y"))
+    smtp = AuthRecordingSmtp.last_instance
+    assert smtp is not None
+    assert smtp.logins == [("alert-bot", "relay-pass")]
+    assert len(smtp.sent) == 1
+
+
+def test_email_refuses_auth_over_cleartext(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A relay that never advertises STARTTLS must not receive the
+    credential — and the alert must visibly fail, not silently skip AUTH."""
+    monkeypatch.setenv(SMTP_USERNAME_ENV_VAR, "alert-bot")
+    monkeypatch.setenv(SMTP_PASSWORD_ENV_VAR, "relay-pass")
+    FakeSmtp.sent.clear()
+    with pytest.raises(EmailConfigError):
+        _auth_notifier(FakeSmtp).send(processing_fault(stage="x", error="y"))
+    assert FakeSmtp.sent == []
+
+
+def test_email_half_credential_pair_fails_loudly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(SMTP_USERNAME_ENV_VAR, "alert-bot")
+    monkeypatch.delenv(SMTP_PASSWORD_ENV_VAR, raising=False)
+    with pytest.raises(EmailConfigError):
+        _auth_notifier(AuthRecordingSmtp).send(
+            processing_fault(stage="x", error="y")
+        )
+
+
+def test_email_without_credentials_never_logs_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(SMTP_USERNAME_ENV_VAR, raising=False)
+    monkeypatch.delenv(SMTP_PASSWORD_ENV_VAR, raising=False)
+    _auth_notifier(AuthRecordingSmtp).send(processing_fault(stage="x", error="y"))
+    smtp = AuthRecordingSmtp.last_instance
+    assert smtp is not None
+    assert smtp.logins == []
+    assert len(smtp.sent) == 1

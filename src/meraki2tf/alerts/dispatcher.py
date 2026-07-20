@@ -36,16 +36,33 @@ class AlertDispatcher:
         return self._failed_events
 
     def dispatch(self, event: AlertEvent) -> int:
-        """Send ``event`` to all channels; returns the count delivered.
+        """Send ``event`` to every channel that handles it; returns the
+        count delivered.
 
         A failing channel is logged and skipped so one broken endpoint
         never suppresses drift or success alerts on the others. When
-        every configured channel fails, an ERROR makes the total
+        every *handling* channel fails, an ERROR makes the total
         delivery failure unmissable in the run log — a drift alert that
-        reached nobody must never look like a delivered one.
+        reached nobody must never look like a delivered one. Channels
+        that decline the event by design (a paging channel skipping
+        RUN_SUCCESS) are not failures; an event no configured channel
+        wants is logged so a paging-only setup knows routine events
+        reach the run log alone.
         """
+        handlers = [
+            notifier for notifier in self._notifiers
+            if notifier.handles(event)
+        ]
+        if self._notifiers and not handlers:
+            logger.info(
+                "No configured alert channel handles event %s (paging-only "
+                "channels decline routine events); it reaches the run log "
+                "only.",
+                event.event_type.value,
+            )
+            return 0
         delivered = 0
-        for notifier in self._notifiers:
+        for notifier in handlers:
             try:
                 notifier.send(event)
                 delivered += 1
@@ -55,13 +72,13 @@ class AlertDispatcher:
                     notifier.channel,
                     event.event_type.value,
                 )
-        if self._notifiers and not delivered:
+        if handlers and not delivered:
             self._failed_events += 1
             logger.error(
                 "Alert delivery failed on ALL %d configured channel(s) for "
                 "event %s — nobody was notified. Check the notifier "
                 "endpoints/configuration.",
-                len(self._notifiers),
+                len(handlers),
                 event.event_type.value,
             )
         return delivered

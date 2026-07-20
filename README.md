@@ -731,7 +731,9 @@ Quick reference (each flag is described in detail below):
 | `--backend-config KEY=VALUE` | — | Remote-backend setting (repeatable); e.g. azurerm `storage_account_name`, `container_name`, `key` |
 | `--backend-config-file PATH` | — | File of remote-backend settings (composes with `--backend-config`) |
 | `--webhook-url URL` | — | Webhook alert endpoint (repeatable) |
-| `--alert-email ADDR` | — | Email alert recipient (repeatable) |
+| `--webhook-format {json,slack,teams}` | `json` | Webhook body shape: raw event JSON, Slack incoming-webhook text, or a Teams Workflows Adaptive Card |
+| `--pagerduty` | off | Page WARNING/CRITICAL events via PagerDuty Events API v2 (routing key from `MERAKI2TF_PAGERDUTY_ROUTING_KEY`) |
+| `--alert-email ADDR` | — | Email alert recipient (repeatable); authenticated relays via `MERAKI2TF_SMTP_USERNAME`/`MERAKI2TF_SMTP_PASSWORD` |
 | `--smtp-host` / `--smtp-port` | `localhost` / `25` | SMTP relay for email alerts |
 | `--email-from` | `meraki2tf@localhost` | Sender address for email alerts |
 | `--terraform-bin` | `terraform` | Terraform executable to invoke |
@@ -926,7 +928,7 @@ or a log.
 passed to `terraform init -backend-config=PATH` (composes with repeated
 `--backend-config`). Useful for keeping a `*.tfbackend` file per org.
 
-**`--webhook-url URL`** *(repeatable)* — HTTP endpoint(s) receiving
+**`--webhook-url URL`** *(repeatable)* — HTTPS endpoint(s) receiving
 each alert as a JSON POST (`Content-Type: application/json`). Repeat
 the flag to fan out to several receivers:
 
@@ -935,6 +937,31 @@ meraki2tf --org-id 123456 \
   --webhook-url https://hooks.example.com/netops \
   --webhook-url https://hooks.example.com/audit
 ```
+
+**`--webhook-format {json,slack,teams}`** — the shape of the webhook
+POST body (applies to every webhook target). `json` (default) is the
+raw machine-readable event payload for generic receivers. `slack`
+renders each event as Slack incoming-webhook text (`{"text": …}` with
+the event type, summary, and a budgeted details block). `teams`
+renders a Teams **Workflows** Adaptive Card `message` — the format the
+Power Automate "when a Teams webhook request is received" trigger
+expects (the retired Office 365 connectors are not targeted). Chat
+formats truncate oversized detail blocks; the run log, workdir
+artifacts, and `json` format always keep the full payload.
+
+```bash
+meraki2tf --org-id 123456 \
+  --webhook-url https://hooks.slack.com/services/T000/B000/XXXX \
+  --webhook-format slack
+```
+
+**`--pagerduty`** — trigger a PagerDuty incident (Events API v2) for
+every **WARNING/CRITICAL** event: drift, unsupported coverage gaps,
+deletions awaiting confirmation, processing faults, and failed DR
+actions. INFO events (clean runs, successful DR confirmations) never
+page — pair PagerDuty with a webhook/email channel if you also want
+routine notifications. The routing key is a credential and comes only
+from the `MERAKI2TF_PAGERDUTY_ROUTING_KEY` environment variable.
 
 **`--alert-email ADDR`** *(repeatable)* — email recipient(s) for
 alerts. Delivery goes through the relay configured with
@@ -947,6 +974,12 @@ meraki2tf --org-id 123456 \
   --smtp-host smtp.example.com --smtp-port 587 \
   --email-from meraki2tf@example.com
 ```
+
+Authenticated relays: set `MERAKI2TF_SMTP_USERNAME` and
+`MERAKI2TF_SMTP_PASSWORD` in the environment (never flags or config
+keys). AUTH runs only inside the verified STARTTLS session — if the
+relay never advertises STARTTLS, the send fails rather than letting
+the credential cross the network in cleartext.
 
 **`--terraform-bin PATH`** — alternative Terraform executable (e.g. a
 pinned binary or `tofu`):

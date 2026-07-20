@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import smtplib
 import ssl
 from collections.abc import Callable, Sequence
@@ -17,6 +18,35 @@ logger = logging.getLogger(__name__)
 #: Ceiling on connect/delivery so a black-holed relay cannot wedge a
 #: scheduled run inside the alert dispatcher.
 DEFAULT_SMTP_TIMEOUT = 30.0
+
+#: SMTP AUTH credentials for authenticated relays — environment-only,
+#: like every other credential (never flags, never config-file keys).
+SMTP_USERNAME_ENV_VAR = "MERAKI2TF_SMTP_USERNAME"
+SMTP_PASSWORD_ENV_VAR = "MERAKI2TF_SMTP_PASSWORD"
+
+
+class EmailConfigError(ValueError):
+    """The email channel's environment configuration is unusable."""
+
+
+def _read_smtp_credentials() -> tuple[str, str] | None:
+    """The AUTH credential pair from the environment, or None.
+
+    Read at send time and held only on the stack — the notifier object
+    never stores a credential. Half a pair is a configuration mistake
+    that must fail loudly, not silently skip authentication.
+    """
+    username = os.environ.get(SMTP_USERNAME_ENV_VAR, "").strip()
+    password = os.environ.get(SMTP_PASSWORD_ENV_VAR, "")
+    if not username and not password:
+        return None
+    if not username or not password:
+        raise EmailConfigError(
+            f"SMTP AUTH needs both {SMTP_USERNAME_ENV_VAR} and "
+            f"{SMTP_PASSWORD_ENV_VAR} set; exactly one of them is present."
+        )
+    return username, password
+
 
 SmtpFactory = Callable[[str, int, float], smtplib.SMTP]
 
@@ -72,6 +102,7 @@ class EmailNotifier(Notifier):
 
     def send(self, event: AlertEvent) -> None:
         message = self.build_message(event)
+        credentials = _read_smtp_credentials()
         with self._smtp_factory(self._host, self._port, self._timeout) as smtp:
             # Opportunistic STARTTLS with a VERIFIED context: alert
             # bodies carry the full resource inventory and drift diffs,
@@ -97,9 +128,23 @@ class EmailNotifier(Notifier):
             # so without this has_extn("starttls") is always False
             # and the hop is never encrypted.
             smtp.ehlo()
+            tls_established = False
             if smtp.has_extn("starttls"):
                 smtp.starttls(context=ssl.create_default_context())
                 smtp.ehlo()
+                tls_established = True
+            if credentials is not None:
+                # AUTH only ever inside the verified TLS session: over a
+                # cleartext hop the credential would cross the network
+                # readable, and an active MITM that suppressed STARTTLS
+                # would harvest it. Fail the send instead.
+                if not tls_established:
+                    raise EmailConfigError(
+                        "SMTP AUTH credentials are configured but the "
+                        f"relay {self._host} never advertised STARTTLS; "
+                        "refusing to authenticate over cleartext."
+                    )
+                smtp.login(*credentials)
             refused = smtp.send_message(message)
         if refused:
             logger.error(

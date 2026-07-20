@@ -283,12 +283,14 @@ _CONFIG_STR_KEYS = {
     "backend-config-file": "backend_config_file",
     "smtp-host": "smtp_host",
     "email-from": "email_from",
+    "webhook-format": "webhook_format",
 }
 _CONFIG_BOOL_KEYS = {
     "verbose": "verbose",
     "sanitize": "sanitize",
     "sync": "sync",
     "fail-on-gaps": "fail_on_gaps",
+    "pagerduty": "pagerduty",
 }
 _CONFIG_INT_KEYS = {"smtp-port": "smtp_port"}
 #: Accept a single string or an array of strings (repeatable flags).
@@ -490,6 +492,12 @@ class RuntimeConfig:
     backend: BackendConfig
     verbose: bool
     webhook_urls: tuple[str, ...]
+    #: Webhook POST body shape: raw event JSON (default) or a
+    #: Slack/Teams-native rendering of the same event.
+    webhook_format: str
+    #: Page WARNING/CRITICAL events via the PagerDuty Events API v2
+    #: (routing key environment-only).
+    pagerduty: bool
     alert_emails: tuple[str, ...]
     smtp_host: str
     smtp_port: int
@@ -537,6 +545,8 @@ class RuntimeConfig:
             backend=backend,
             verbose=args.verbose,
             webhook_urls=_webhook_urls(args.webhook_url),
+            webhook_format=args.webhook_format,
+            pagerduty=args.pagerduty,
             alert_emails=tuple(args.alert_email or ()),
             smtp_host=args.smtp_host,
             smtp_port=args.smtp_port,
