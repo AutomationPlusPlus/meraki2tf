@@ -1,0 +1,49 @@
+# Weekly DR snapshot: export this week's snapshot, diff it against last
+# week's, alert on drift and coverage gaps. Snapshot-only — no terraform.
+#
+# Setup (as root):
+#   useradd --system --create-home --home-dir /var/lib/meraki2tf meraki2tf
+#   install -d -o meraki2tf -g meraki2tf /var/lib/meraki2tf/snapshots
+#   install -m 0600 -o meraki2tf /dev/null /etc/meraki2tf/env
+#   # then put the secrets in /etc/meraki2tf/env:
+#   #   MERAKI_DASHBOARD_API_KEY=...
+#   #   MERAKI2TF_WEBHOOK_URL=https://hooks.example.com/meraki2tf
+#   cp meraki2tf-snapshot.{service,timer} /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now meraki2tf-snapshot.timer
+#
+# Assumes meraki2tf is installed in a venv at /opt/meraki2tf/.venv
+# (see the README's reproducible-install section).
+
+[Unit]
+Description=meraki2tf weekly DR snapshot (read-only toward Meraki)
+Documentation=https://github.com/AutomationPlusPlus/meraki2tf
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=meraki2tf
+Group=meraki2tf
+WorkingDirectory=/var/lib/meraki2tf
+EnvironmentFile=/etc/meraki2tf/env
+# Rotate last week's snapshot into the drift baseline. On the very
+# first run there is no baseline yet — the export shape below handles
+# that by only passing --drift-baseline when previous.jsonl.gz exists.
+ExecStartPre=/bin/sh -c 'if [ -f snapshots/latest.jsonl.gz ]; then mv -f snapshots/latest.jsonl.gz snapshots/previous.jsonl.gz; fi'
+ExecStart=/bin/sh -c '/opt/meraki2tf/.venv/bin/meraki2tf --org-id 123456 \
+    --dump-to snapshots/latest.jsonl.gz --fail-on-gaps \
+    $([ -f snapshots/previous.jsonl.gz ] && echo "--drift-baseline snapshots/previous.jsonl.gz")'
+# Exit 3 = coverage gaps (expected on orgs with known unsupported
+# objects); the alert already carries the list. Treat it as success so
+# the unit does not flap; remove it to page on gaps instead.
+SuccessExitStatus=3
+
+# Hardening: the job only needs its state directory and the network.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/meraki2tf
+
+[Install]
+WantedBy=multi-user.target

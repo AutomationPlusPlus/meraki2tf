@@ -73,6 +73,93 @@ Vault, and every run's artifacts archived to Blob Storage — lives in
 ready-made wrapper runbook in
 [`deploy/azure/runbook.py`](../deploy/azure/runbook.py).
 
+## Scheduled execution with systemd
+
+Ready-made hardened units live in
+[`deploy/systemd/`](../deploy/systemd/): a weekly snapshot
+service+timer pair (with automatic `--drift-baseline` rotation and a
+first-run-safe baseline check) and a monthly `--sync` terraform
+rehearsal pair. Both run as a dedicated system user, read the API key
+and webhook URL from a root-owned 0600 `EnvironmentFile`, and confine
+writes to `/var/lib/meraki2tf` (`ProtectSystem=strict`). The setup
+steps (user, directories, secret file, `systemctl enable --now`) are
+in the header of
+[`meraki2tf-snapshot.service`](../deploy/systemd/meraki2tf-snapshot.service).
+
+Timer-driven jobs report through the same exit codes as cron; the
+units treat exit 3 (coverage gaps) as success so a permanently-gapped
+org doesn't flap the unit — the gap list still arrives via alerts.
+Remove `SuccessExitStatus=3` to page on gaps instead.
+
+## AWS: scheduled Fargate task
+
+Build and push the repo-root [`Dockerfile`](../Dockerfile) image to
+ECR, then run it as an EventBridge-scheduled ECS/Fargate task:
+
+1. **Secrets:** store the API key (and webhook URL) in AWS Secrets
+   Manager, and inject them via the task definition's `secrets` block
+   so they reach the container as `MERAKI_DASHBOARD_API_KEY` /
+   `MERAKI2TF_WEBHOOK_URL` without touching the task definition in
+   plaintext:
+
+   ```json
+   {
+     "containerDefinitions": [{
+       "name": "meraki2tf",
+       "image": "111111111111.dkr.ecr.us-east-1.amazonaws.com/meraki2tf:v0.1.0",
+       "command": ["--org-id", "123456",
+                   "--dump-to", "/data/latest.jsonl.gz",
+                   "--workdir", "/data", "--fail-on-gaps"],
+       "secrets": [
+         {"name": "MERAKI_DASHBOARD_API_KEY",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:111111111111:secret:meraki2tf/api-key"},
+         {"name": "MERAKI2TF_WEBHOOK_URL",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:111111111111:secret:meraki2tf/webhook-url"}
+       ],
+       "mountPoints": [{"sourceVolume": "workdir", "containerPath": "/data"}]
+     }]
+   }
+   ```
+
+2. **Persistence:** mount an EFS volume at `/data` so snapshots (and
+   the drift baseline rotated by your command wrapper) survive between
+   runs — or skip local persistence and keep Terraform state in S3
+   (`--state-backend s3`, credentials from the task role) with
+   snapshots copied to S3 by a small post-step.
+3. **Schedule:** an EventBridge Scheduler rule per job — weekly for
+   the snapshot shape, monthly adding `--sync` — targeting the task
+   with `RunTask`. Give the task a generous timeout: discovery on a
+   large org is hours, by design.
+4. **Outcome:** alerts carry the run report; the container exit code
+   surfaces in the stopped-task event (map exit 3/5 per the table
+   above before paging on it).
+
+## GCP: Cloud Run Job
+
+Push the same image to Artifact Registry and wrap it in a Cloud Run
+Job triggered by Cloud Scheduler:
+
+```bash
+gcloud run jobs create meraki2tf-snapshot \
+  --image us-docker.pkg.dev/example-project/meraki2tf/meraki2tf:v0.1.0 \
+  --args="--org-id,123456,--dump-to,/data/latest.jsonl.gz,--workdir,/data,--fail-on-gaps" \
+  --set-secrets=MERAKI_DASHBOARD_API_KEY=meraki2tf-api-key:latest,MERAKI2TF_WEBHOOK_URL=meraki2tf-webhook:latest \
+  --task-timeout=6h --max-retries=0
+
+gcloud scheduler jobs create http meraki2tf-weekly \
+  --schedule="0 6 * * 1" --uri="https://run.googleapis.com/v2/projects/example-project/locations/us-central1/jobs/meraki2tf-snapshot:run" \
+  --oauth-service-account-email=scheduler@example-project.iam.gserviceaccount.com
+```
+
+Secrets come from Secret Manager via `--set-secrets` (never flags);
+Terraform state belongs in GCS (`--state-backend gcs`, Application
+Default Credentials from the job's service account). Cloud Run Jobs
+have no built-in persistent disk — mount a Cloud Storage volume
+(`--add-volume`/`gcsfuse`) for the snapshot + drift-baseline chain, or
+export snapshots to GCS in a wrapper step. `--max-retries=0` matters:
+a retried half-run would re-discover from scratch and double the API
+load for no benefit.
+
 ## Performance & Scale
 
 Discovery reads every configuration surface of the organization —
