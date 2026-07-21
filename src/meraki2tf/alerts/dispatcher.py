@@ -17,6 +17,12 @@ class AlertDispatcher:
     def __init__(self, notifiers: Iterable[Notifier] = ()) -> None:
         self._notifiers: list[Notifier] = list(notifiers)
         self._failed_events = 0
+        #: Stamped into every dispatched event's details so alert
+        #: consumers can attribute the event to an organization — vital
+        #: when a multi-org fan-out interleaves several organizations'
+        #: alerts on one channel. The CLI sets it per organization as
+        #: soon as the ID is known (flag value or snapshot resolution).
+        self.organization_id: str | None = None
 
     def register(self, notifier: Notifier) -> None:
         self._notifiers.append(notifier)
@@ -49,6 +55,10 @@ class AlertDispatcher:
         wants is logged so a paging-only setup knows routine events
         reach the run log alone.
         """
+        if self.organization_id is not None:
+            # setdefault: events that already carry their own value
+            # (the DR actions name their org explicitly) win.
+            event.details.setdefault("organization_id", self.organization_id)
         handlers = [
             notifier for notifier in self._notifiers
             if notifier.handles(event)

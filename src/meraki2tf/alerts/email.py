@@ -48,6 +48,16 @@ def _read_smtp_credentials() -> tuple[str, str] | None:
     return username, password
 
 
+def validate_smtp_credentials() -> None:
+    """Fail fast on a half-set AUTH pair before any work starts.
+
+    Send time still re-reads the environment (`_read_smtp_credentials`),
+    but a misconfiguration that is knowable at startup must not surface
+    only after a full discovery sweep, as a delivery failure.
+    """
+    _read_smtp_credentials()
+
+
 SmtpFactory = Callable[[str, int, float], smtplib.SMTP]
 
 

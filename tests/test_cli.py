@@ -14,6 +14,7 @@ from conftest import PIPELINE_SPEC
 from conftest import fixture_schema_document
 
 from meraki2tf import spec_resolver, terraform_runner
+from meraki2tf.alerts.email import SMTP_PASSWORD_ENV_VAR, SMTP_USERNAME_ENV_VAR
 from meraki2tf.cli import build_dispatcher, build_parser, build_provider, main
 from meraki2tf.config import API_KEY_ENV_VAR, RuntimeConfig
 from meraki2tf.openapi_parser import OpenApiParser
@@ -94,6 +95,24 @@ def test_build_dispatcher_registers_configured_channels(spec_file: Path) -> None
     dispatcher = build_dispatcher(config)
     channels = [notifier.channel for notifier in dispatcher._notifiers]
     assert channels == ["webhook", "email"]
+
+
+def test_build_dispatcher_refuses_half_set_smtp_credentials(
+    spec_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A half-set AUTH pair must refuse at startup, like --pagerduty
+    without its routing key — not after the discovery sweep, as a
+    delivery failure on every alert."""
+    monkeypatch.setenv(SMTP_USERNAME_ENV_VAR, "alert-bot")
+    monkeypatch.delenv(SMTP_PASSWORD_ENV_VAR, raising=False)
+    with pytest.raises(SystemExit) as excinfo:
+        build_dispatcher(
+            _config(
+                ["--spec", str(spec_file),
+                 "--alert-email", "netops@example.com"]
+            )
+        )
+    assert "exactly one of them is present" in str(excinfo.value)
 
 
 def test_build_provider_selects_modality(

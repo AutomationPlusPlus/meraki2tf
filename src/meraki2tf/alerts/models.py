@@ -185,7 +185,13 @@ def drift_detected(
             "Configuration drift detected; sync-mode auto-apply aborted — "
             "a human must review the diff."
             if apply_aborted
-            else "Configuration drift detected between discovery and Terraform state."
+            else (
+                "Configuration drift detected between the snapshot and "
+                "the drift baseline."
+                if origin == "snapshot-diff"
+                else "Configuration drift detected between discovery and "
+                "Terraform state."
+            )
         ),
         details={
             "diff": redact_diff(condense_diff(diff)),
