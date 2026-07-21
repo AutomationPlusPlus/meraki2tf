@@ -8,7 +8,11 @@ faults.
 
 from meraki2tf.alerts.base import Notifier
 from meraki2tf.alerts.dispatcher import AlertDispatcher
-from meraki2tf.alerts.email import EmailConfigError, EmailNotifier
+from meraki2tf.alerts.email import (
+    EmailConfigError,
+    EmailNotifier,
+    validate_smtp_credentials,
+)
 from meraki2tf.alerts.formats import WEBHOOK_FORMATS
 from meraki2tf.alerts.pagerduty import (
     PagerDutyConfigError,
@@ -63,4 +67,5 @@ __all__ = [
     "processing_fault",
     "run_success",
     "unsupported_feature_flagged",
+    "validate_smtp_credentials",
 ]

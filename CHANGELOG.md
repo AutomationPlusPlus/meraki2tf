@@ -22,6 +22,22 @@ the project adheres to [Semantic Versioning](https://semver.org/).
 - The monolithic README is split into `docs/USAGE.md`,
   `docs/DR-GUIDE.md`, and `docs/OPERATIONS.md`; the README is now a
   landing page with a documentation index.
+- Every alert now carries an `organization_id` in its details (stamped
+  by the dispatcher as soon as the organization is known), so
+  multi-org fan-out consumers can attribute interleaved events to the
+  right organization. Events that already name their organization
+  (the DR actions) keep their own value.
+- Half-set SMTP AUTH credentials (`MERAKI2TF_SMTP_USERNAME` /
+  `MERAKI2TF_SMTP_PASSWORD`) now refuse at startup — matching the
+  `--pagerduty` routing-key check — instead of surfacing after the
+  discovery sweep as a delivery failure on every alert.
+- The snapshot-diff drift alert summary now says the comparison was
+  against the drift baseline; it previously claimed a
+  Terraform-state comparison regardless of origin.
+- Confirmed-deletion state removal logs requested-vs-removed counts
+  ("Removed 1 of 2 requested resource(s) … (1 already absent)"), so
+  an address already dropped by an earlier refresh no longer makes
+  the log under-report the confirmed removals.
 
 ## [0.1.0] - 2026-07-20
 

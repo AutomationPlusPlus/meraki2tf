@@ -221,6 +221,9 @@ class PipelineOrchestrator:
             stage = "configuration discovery"
             with self._provider as provider:
                 graph = provider.fetch_network_graph(organization_id)
+            # Dump-mode runs learn their organization only here; stamp
+            # the dispatcher so every subsequent alert is attributable.
+            self._dispatcher.organization_id = graph.organization_id
             logger.info(
                 "Discovered %d asset(s) for organization %s via %s mode.",
                 graph.asset_count(), graph.organization_id, self._provider.mode,

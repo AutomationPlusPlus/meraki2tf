@@ -1378,6 +1378,31 @@ def test_remove_resources_prunes_baseline_and_state(
     )
 
 
+def test_remove_resources_reports_requested_vs_removed(
+    runner: TerraformRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The removal log must not under-count: an address already absent
+    from state (e.g. dropped by an earlier refresh) is reported, not
+    silently folded into a smaller 'Removed N' figure."""
+    runner.prepare_workspace()
+    _write_state(runner.state_path, "meraki_networks.n_1", "meraki_networks.n_2")
+    fake = FakeSubprocess(returncode=0)
+    monkeypatch.setattr(terraform_runner.subprocess, "run", fake.run)
+
+    with caplog.at_level("INFO", logger="meraki2tf.terraform_runner"):
+        runner.remove_resources({"meraki_networks.n_1", "meraki_networks.gone"})
+    assert "Removed 1 of 2 requested resource(s)" in caplog.text
+    assert "1 already absent" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level("INFO", logger="meraki2tf.terraform_runner"):
+        runner.remove_resources({"meraki_networks.n_2"})
+    assert "Removed 1 of 1 requested resource(s) from the Terraform state." in caplog.text
+    assert "already absent" not in caplog.text
+
+
 def test_remove_resources_failure_keeps_backup_for_recovery(
     runner: TerraformRunner,
     monkeypatch: pytest.MonkeyPatch,

@@ -581,6 +581,41 @@ def test_dispatcher_reports_registered_channel_count() -> None:
     assert dispatcher.channel_count == 2
 
 
+def test_drift_summary_names_the_snapshot_diff_origin() -> None:
+    """A snapshot-diff drift alert compares snapshot vs baseline; its
+    summary must not claim a Terraform-state comparison."""
+    event = drift_detected(diff="d", workspace="w", origin="snapshot-diff")
+    assert "drift baseline" in event.summary
+    assert "Terraform state" not in event.summary
+    assert event.details["origin"] == "snapshot-diff"
+
+
+def test_dispatcher_stamps_organization_context() -> None:
+    """Multi-org fan-out interleaves several organizations' alerts on
+    one channel; every dispatched event must be attributable."""
+    recorder = RecordingNotifier()
+    dispatcher = AlertDispatcher([recorder])
+    dispatcher.organization_id = "123456"
+    dispatcher.dispatch(drift_detected(diff="d", workspace="w"))
+    assert recorder.events[0].details["organization_id"] == "123456"
+
+
+def test_dispatcher_stamp_never_clobbers_an_explicit_org() -> None:
+    recorder = RecordingNotifier()
+    dispatcher = AlertDispatcher([recorder])
+    dispatcher.organization_id = "123456"
+    event = drift_detected(diff="d", workspace="w")
+    event.details["organization_id"] = "999999"
+    dispatcher.dispatch(event)
+    assert recorder.events[0].details["organization_id"] == "999999"
+
+
+def test_dispatcher_leaves_events_unstamped_without_context() -> None:
+    recorder = RecordingNotifier()
+    AlertDispatcher([recorder]).dispatch(drift_detected(diff="d", workspace="w"))
+    assert "organization_id" not in recorder.events[0].details
+
+
 def test_email_notifier_logs_partial_recipient_refusals(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

@@ -48,7 +48,9 @@ from meraki2tf.alerts import (
     restore_executed,
     routing_key_present,
     run_success,
+    validate_smtp_credentials,
     AlertDispatcher,
+    EmailConfigError,
     EmailNotifier,
     PagerDutyNotifier,
     WebhookConfigError,
@@ -561,6 +563,12 @@ def build_dispatcher(config: RuntimeConfig) -> AlertDispatcher:
             )
         dispatcher.register(PagerDutyNotifier())
     if config.alert_emails:
+        try:
+            validate_smtp_credentials()
+        except EmailConfigError as exc:
+            # Same loud-refusal rule as PagerDuty: a half-set AUTH pair
+            # would otherwise fail every send after the discovery sweep.
+            raise SystemExit(str(exc))
         dispatcher.register(
             EmailNotifier(
                 host=config.smtp_host,
@@ -694,6 +702,7 @@ def _export_snapshot(
     assert config.dump_to is not None  # guarded by the caller
     with provider as source:
         graph = source.fetch_network_graph(config.org_id)
+    dispatcher.organization_id = graph.organization_id
     drift_was_detected = False
     if config.drift_baseline is not None:
         from meraki2tf.snapshot_diff import baseline_drift, render_diff
@@ -1979,6 +1988,9 @@ def _run_org_pipeline(
     which is dispatcher-wide and applied once by the caller.
     """
     logger.info("meraki2tf starting in %s mode.", config.mode.value)
+    # Attribute even startup faults to the organization when the flag
+    # names it; dump-mode runs refine this once the snapshot resolves.
+    dispatcher.organization_id = config.org_id
     try:
         spec_parser = OpenApiParser(resolve_spec(config.spec_path))
         provider = build_provider(config, spec_parser)

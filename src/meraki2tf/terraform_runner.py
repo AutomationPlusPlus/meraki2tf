@@ -1195,7 +1195,19 @@ class TerraformRunner:
             # the state itself may carry secrets at rest).
             backup.unlink(missing_ok=True)
             self._restrict_state_permissions()
-            logger.info("Removed %d resource(s) from the Terraform state.", len(tracked))
+        untracked = len(targets) - len(tracked)
+        logger.info(
+            "Removed %d of %d requested resource(s) from the Terraform "
+            "state%s.",
+            len(tracked),
+            len(targets),
+            (
+                f" ({untracked} already absent, e.g. dropped by an "
+                "earlier refresh)"
+                if untracked
+                else ""
+            ),
+        )
 
     def _prune_baseline(self, addresses: Iterable[str]) -> None:
         """Drop the given resources' blocks from the accumulated resources.tf.
