@@ -179,6 +179,10 @@ meraki2tf --heal --from-dump vault/latest.jsonl.gz --org-id 123456
 
 # 2. Execute — recreates the missing objects; survivors are untouched:
 meraki2tf --heal --confirm --from-dump vault/latest.jsonl.gz --org-id 123456
+
+# 3. Selective heal — recreate only part of what is missing:
+meraki2tf --heal --only 'network:Branch-07' --only 'ssid:Guest*' \
+    --from-dump vault/latest.jsonl.gz --org-id 123456
 ```
 
 Notes:
@@ -197,6 +201,19 @@ Notes:
 - **Crash-resumable.** Executed writes are journaled
   (`<workdir>/heal-journal.jsonl`); re-running `--heal --confirm`
   resumes instead of duplicating creates.
+- **Selective heal (`--only`).** When only part of a deletion should
+  come back (two networks deleted, restore one; several SSIDs deleted,
+  restore some), repeatable `--only '[TYPE:]PATTERN'` selectors narrow
+  the run — a case-insensitive glob over each missing object's name or
+  ID, optionally prefixed with its type (`network:`, `ssid:`,
+  `vlan:`, …, singular or plural). A matched container brings its whole
+  missing subtree; missing objects the selection depends on (a deleted
+  parent, a referenced missing object) are auto-included and reported.
+  A selector matching nothing is refused loudly — a typo must never
+  masquerade as a successful no-op heal. Filtering only ever *shrinks*
+  the run: everything above (additive-only, preview-first, journaling)
+  applies unchanged, and the preview's re-run hint carries the same
+  `--only` selection.
 - Execution dispatches a `HEAL_EXECUTED` alert with the recreated,
   failed, skipped, and surviving counts; objects the API cannot
   recreate are reported with reasons, never silently dropped.

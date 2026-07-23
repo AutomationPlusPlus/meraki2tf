@@ -208,6 +208,7 @@ Quick reference (each flag is described in detail below):
 | `--drift-baseline PATH` | — | Prior snapshot to diff the fresh discovery against — attribute-level drift in seconds, no terraform read pass |
 | `--rebuild` | off | Disaster recovery: preview a rebuild apply of the workdir artifacts |
 | `--heal` | off | Disaster recovery: preview recreating snapshot objects missing from the same live org (additive-only) |
+| `--only [TYPE:]PATTERN` | — | Selective heal: restrict `--heal` to missing objects matching a name/ID glob (e.g. `network:Branch-07`, `ssid:Guest*`); repeatable, dependencies auto-included |
 | `--replay-gaps` | off | Disaster recovery: preview restoring objects/secrets Terraform can't rebuild, from an unsanitized snapshot |
 | `--restore` | off | Disaster recovery: preview a full-organization rebuild from a snapshot into `--target-org` |
 | `--target-org ORG_ID` | — | The (fresh/scratch) organization `--restore` writes into; never the snapshot's source org |
