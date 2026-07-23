@@ -350,6 +350,21 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     actions.add_argument(
+        "--only",
+        action="append",
+        metavar="[TYPE:]PATTERN",
+        default=None,
+        help=(
+            "Selective heal: restrict --heal to the missing objects "
+            "matching a case-insensitive glob over their name or ID, "
+            "optionally type-prefixed (e.g. --only 'network:Branch-07', "
+            "--only 'ssid:Guest*'). Repeatable (union). A matched "
+            "container selects its whole missing subtree; missing "
+            "objects the selection depends on are auto-included. A "
+            "selector matching nothing is an error."
+        ),
+    )
+    actions.add_argument(
         "--replay-gaps",
         action="store_true",
         help=(
@@ -1167,7 +1182,7 @@ def _heal(config: RuntimeConfig) -> int:
     """
     assert config.dump_path is not None  # guarded by the caller
     assert config.org_id  # guarded by the caller
-    from meraki2tf.healer import plan_heal
+    from meraki2tf.healer import HealFilterError, filter_heal_plan, plan_heal
     from meraki2tf.restorer import (
         OrgRestorer,
         RestoreJournal,
@@ -1224,6 +1239,30 @@ def _heal(config: RuntimeConfig) -> int:
     logger.info(
         "Heal plan for organization %s: %s", config.org_id, plan.summary()
     )
+    if config.only:
+        try:
+            selection = filter_heal_plan(plan, config.only)
+        except HealFilterError as exc:
+            logger.critical("%s", exc)
+            return 2
+        for raw, count in selection.selector_matches:
+            logger.info(
+                "--only %r matched %d missing object(s).", raw, count
+            )
+        if selection.auto_included:
+            logger.info(
+                "Auto-included %d missing object(s) the selection depends "
+                "on (deleted parents / referenced objects): %s",
+                len(selection.auto_included),
+                ", ".join(selection.auto_included),
+            )
+        logger.info(
+            "Skipped by --only: %d recreatable object(s), %d unrestorable, "
+            "%d at Meraki defaults.",
+            selection.excluded_actions, selection.excluded_unrestorable,
+            selection.excluded_defaults,
+        )
+        plan = selection.plan
     for item in plan.missing.unrestorable:
         logger.warning(
             "Cannot heal %s (ids=%s): %s",
@@ -1231,20 +1270,34 @@ def _heal(config: RuntimeConfig) -> int:
             item.reason,
         )
     if not plan.missing.actions:
-        logger.info(
-            "Nothing to heal: every restorable snapshot asset is still "
-            "present in the live organization."
-        )
+        if config.only:
+            logger.info(
+                "Nothing to heal within the --only selection: every "
+                "matched missing asset is unrestorable or at Meraki "
+                "defaults."
+            )
+        else:
+            logger.info(
+                "Nothing to heal: every restorable snapshot asset is "
+                "still present in the live organization."
+            )
         return 0
     logger.info(
         "Missing objects to recreate:\n%s",
         render_restore_plan(plan.missing),
     )
     if not config.confirm:
+        # The re-run hint must carry the selection: recommending a bare
+        # '--heal --confirm' after a filtered preview would escalate the
+        # write to every missing object.
+        rerun = "--heal " + "".join(
+            f"--only '{value}' " for value in config.only or ()
+        ) + "--confirm"
         logger.warning(
             "Preview only — nothing was written to Meraki. Re-run with "
-            "'--heal --confirm' to recreate the %d missing object(s) in "
-            "organization %s.", len(plan.missing.actions), config.org_id,
+            "'%s' to recreate the %d missing object(s) in "
+            "organization %s.", rerun, len(plan.missing.actions),
+            config.org_id,
         )
         return 0
     try:
@@ -1294,6 +1347,7 @@ def _heal(config: RuntimeConfig) -> int:
             executed=result.executed,
             failed=result.failed,
             skipped=result.skipped,
+            only=config.only,
         )
     )
     if result.failed:
@@ -1603,6 +1657,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         arg_parser.error("--serial-map is only valid together with --restore.")
     if config.skip_claims and not config.restore:
         arg_parser.error("--skip-claims is only valid together with --restore.")
+    if config.only and not config.heal:
+        arg_parser.error("--only is only valid together with --heal.")
     if config.wipe_org_name and not config.wipe_org:
         arg_parser.error(
             "--wipe-org-name is only valid together with --wipe-org."

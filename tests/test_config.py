@@ -374,3 +374,12 @@ def test_webhook_urls_come_from_env_var_and_dedupe(
         "https://hooks.example/b",
         "https://hooks.example/c",
     )
+
+
+def test_only_selectors_are_collected_and_deduplicated() -> None:
+    config = _config(
+        ["--heal", "--only", "network:HQ", "--only", "ssid:Guest*",
+         "--only", "network:HQ"]
+    )
+    assert config.only == ("network:HQ", "ssid:Guest*")
+    assert _config([]).only == ()

@@ -256,6 +256,7 @@ CONFIG_FILE_REFUSED_KEYS = frozenset(
     {
         "rebuild",
         "heal",
+        "only",
         "replay-gaps",
         "restore",
         "wipe-org",
@@ -478,6 +479,9 @@ class RuntimeConfig:
     #: missing from live discovery (accidental deletions). Additive-only;
     #: preview by default, --confirm executes.
     heal: bool
+    #: Selective heal: [TYPE:]PATTERN selectors restricting --heal to a
+    #: subset of the missing objects (empty = heal everything missing).
+    only: tuple[str, ...]
     #: Optional old→new device serial map (hardware-loss DR).
     serial_map: Path | None
     #: Drill mode for --restore: skip device claiming + device-scoped
@@ -568,6 +572,7 @@ class RuntimeConfig:
             restore=args.restore,
             target_org=args.target_org,
             heal=args.heal,
+            only=tuple(dict.fromkeys(args.only or ())),
             serial_map=Path(args.serial_map) if args.serial_map else None,
             skip_claims=args.skip_claims,
             wipe_org=args.wipe_org,
