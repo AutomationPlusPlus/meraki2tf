@@ -23,6 +23,7 @@ from meraki2tf.restorer import (
     WAVE_NETWORK_FEATURES,
     WAVE_NETWORKS,
     WAVE_ORG_FEATURES,
+    OrgRestorer,
     plan_restore,
     render_restore_plan,
 )
@@ -5033,3 +5034,234 @@ def test_lazy_dashboard_clients_construct_once(
     assert wiper._dashboard() is dashboard
     assert len(captured) == 2
     assert all(kw["suppress_logging"] is True for kw in captured)
+
+
+# ---------------------------------------------------------------------------
+# Unsupported-setting 400s: strip the named field(s) and retry.
+# ---------------------------------------------------------------------------
+
+
+def _settings_restorer(tmp_path: Path, section) -> OrgRestorer:
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "j.jsonl")
+    )
+    restorer._client = SimpleNamespace(
+        organizations=section, networks=section, wireless=section
+    )
+    return restorer
+
+
+def test_unsupported_setting_400_strips_named_field_and_retries(
+    tmp_path: Path,
+) -> None:
+    """'Remote status page is not supported by this network' (live
+    heal-drill finding, 2026-07-22): GET echoes carry product-type-
+    dependent fields the PUT refuses. The named field is dropped and
+    the remaining captured state restores."""
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(
+            SNMP_PATH, ("N_1",),
+            {"remoteStatusPageEnabled": True, "access": "none"},
+        )
+    )
+    plan = plan_restore(graph, parser)
+    calls: list = []
+
+    class Section(_RecordingSection):
+        def updateNetworkSnmp(self, *args, **kwargs) -> dict:
+            self._calls.append(("updateNetworkSnmp", args, kwargs))
+            if "remoteStatusPageEnabled" in kwargs:
+                raise _conflict_error(
+                    "Remote status page is not supported by this network"
+                )
+            return {}
+
+    restorer = _settings_restorer(tmp_path, Section(calls))
+    result = restorer.execute(graph, plan)
+
+    assert result.failed == ()
+    assert f"{SNMP_PATH}::N_1" in result.executed
+    attempts = [c for c in calls if c[0] == "updateNetworkSnmp"]
+    assert len(attempts) == 2
+    assert attempts[1][2] == {"access": "none"}  # field stripped, rest kept
+
+
+def test_unsupported_setting_retry_iterates_per_named_field(
+    tmp_path: Path,
+) -> None:
+    """Each retry may surface the NEXT refused field; the loop strips
+    one per round until the remainder applies."""
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(
+            SNMP_PATH, ("N_1",),
+            {"remoteStatusPageEnabled": True,
+             "namedVlans": {"enabled": True}, "access": "none"},
+        )
+    )
+    plan = plan_restore(graph, parser)
+    calls: list = []
+
+    class Section(_RecordingSection):
+        def updateNetworkSnmp(self, *args, **kwargs) -> dict:
+            self._calls.append(("updateNetworkSnmp", args, kwargs))
+            if "remoteStatusPageEnabled" in kwargs:
+                raise _conflict_error(
+                    "Remote status page is not supported by this network"
+                )
+            if "namedVlans" in kwargs:
+                raise _conflict_error(
+                    "Named VLANs are not supported for this network"
+                )
+            return {}
+
+    restorer = _settings_restorer(tmp_path, Section(calls))
+    result = restorer.execute(graph, plan)
+
+    assert result.failed == ()
+    attempts = [c for c in calls if c[0] == "updateNetworkSnmp"]
+    assert len(attempts) == 3
+    assert attempts[2][2] == {"access": "none"}
+
+
+def test_unsupported_setting_covering_whole_payload_skips(
+    tmp_path: Path,
+) -> None:
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(
+            SNMP_PATH, ("N_1",), {"remoteStatusPageEnabled": True},
+        )
+    )
+    plan = plan_restore(graph, parser)
+    calls: list = []
+
+    class Section(_RecordingSection):
+        def updateNetworkSnmp(self, *args, **kwargs) -> dict:
+            self._calls.append(("updateNetworkSnmp", args, kwargs))
+            raise _conflict_error(
+                "Remote status page is not supported by this network"
+            )
+
+    restorer = _settings_restorer(tmp_path, Section(calls))
+    result = restorer.execute(graph, plan)
+
+    assert result.failed == ()
+    (entry,) = [
+        e for e in result.skipped if e["target"] == f"{SNMP_PATH}::N_1"
+    ]
+    assert "product types do not support" in entry["reason"]
+    assert "remoteStatusPageEnabled" in entry["reason"]
+    # Nothing left to write: no retry dispatch happened.
+    assert len([c for c in calls if c[0] == "updateNetworkSnmp"]) == 1
+
+
+def test_unsupported_setting_naming_no_payload_key_still_fails(
+    tmp_path: Path,
+) -> None:
+    """A refused phrase that maps to no payload key cannot be stripped;
+    the original failure stands (no blind retry)."""
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(SNMP_PATH, ("N_1",), {"access": "none"})
+    )
+    plan = plan_restore(graph, parser)
+    calls: list = []
+
+    class Section(_RecordingSection):
+        def updateNetworkSnmp(self, *args, **kwargs) -> dict:
+            self._calls.append(("updateNetworkSnmp", args, kwargs))
+            raise _conflict_error(
+                "Remote status page is not supported by this network"
+            )
+
+    restorer = _settings_restorer(tmp_path, Section(calls))
+    result = restorer.execute(graph, plan)
+
+    ((key, reason),) = [f for f in result.failed if SNMP_PATH in f[0]]
+    assert "Remote status page" in reason
+    # Initial attempt + the standing end-of-run salvage retry — but no
+    # stripped-payload retry in between (nothing was strippable).
+    assert len([c for c in calls if c[0] == "updateNetworkSnmp"]) == 2
+
+
+def test_unsupported_setting_retry_non_400_keeps_original_error(
+    tmp_path: Path,
+) -> None:
+    """A retry that dies on a different (non-400) error stands down:
+    the original 400 is recorded, nothing loops."""
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(
+            SNMP_PATH, ("N_1",),
+            {"remoteStatusPageEnabled": True, "access": "none"},
+        )
+    )
+    plan = plan_restore(graph, parser)
+    calls: list = []
+
+    class Section(_RecordingSection):
+        def updateNetworkSnmp(self, *args, **kwargs) -> dict:
+            self._calls.append(("updateNetworkSnmp", args, kwargs))
+            if "remoteStatusPageEnabled" in kwargs:
+                raise _conflict_error(
+                    "Remote status page is not supported by this network"
+                )
+            raise RuntimeError("connection reset mid-retry")
+
+    restorer = _settings_restorer(tmp_path, Section(calls))
+    result = restorer.execute(graph, plan)
+
+    ((key, reason),) = [f for f in result.failed if SNMP_PATH in f[0]]
+    assert "Remote status page" in reason
+    # Initial 400 + one stripped retry (dies non-400, no loop) + the
+    # standing end-of-run salvage retry of the original payload.
+    assert len([c for c in calls if c[0] == "updateNetworkSnmp"]) == 3
+
+
+def test_unsupported_setting_key_matcher_edges(tmp_path: Path) -> None:
+    from meraki2tf.restorer import (
+        OrgRestorer,
+        RestoreJournal,
+        _unsupported_setting_keys,
+    )
+
+    payload = {
+        "remoteStatusPageEnabled": True,
+        "remoteStatusPage": {"authentication": None},
+        "securePort": {"enabled": False},
+        "access": "none",
+    }
+    named = _unsupported_setting_keys(
+        "networks, updateNetworkSettings - 400 Bad Request, {'errors': "
+        "['Remote status page is not supported by this network']}",
+        payload,
+    )
+    # Both spellings of the family match; unrelated keys never do.
+    assert named == ("remoteStatusPageEnabled", "remoteStatusPage")
+    assert _unsupported_setting_keys("no refusal here", payload) == ()
+    assert _unsupported_setting_keys(
+        "Named VLANs are not supported for this network", payload
+    ) == ()
+
+    # Defensive loop bound: an empty payload names nothing and the
+    # retry helper stands down immediately.
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "j.jsonl")
+    )
+    action = plan_restore(
+        _graph(FeatureConfiguration(SNMP_PATH, ("N_1",), {"access": "x"})),
+        _restore_spec(tmp_path),
+    ).actions[-1]
+    from dataclasses import replace as _replace
+
+    empty = _replace(action, payload={})
+    assert restorer._retry_without_unsupported(
+        None, empty, None, "org-123",
+        "Remote status page is not supported by this network",
+    ) is None

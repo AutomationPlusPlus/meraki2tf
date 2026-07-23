@@ -6,6 +6,16 @@ the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- Restore/heal no longer fails a whole configure write when the
+  dashboard refuses a single product-type-dependent setting ("Remote
+  status page is not supported by this network", found live in the
+  2026-07-22 selective-heal drill): the named field(s) are stripped —
+  mapped from the error phrase to payload keys by camelCase tokens, no
+  field table — and the remaining captured state is retried. Field
+  names (never values) are logged; a payload that was nothing but
+  unsupported settings becomes a skip verdict instead of a failure.
+
 ### Added
 - Selective heal: repeatable `--only '[TYPE:]PATTERN'` selectors
   restrict `--heal` to a subset of the missing objects (e.g. restore
