@@ -981,6 +981,31 @@ def test_heal_executed_severity_tracks_failures() -> None:
     assert failing.details["failed"] == [
         ["create /networks/{networkId}/groupPolicies", "HTTP 400"]
     ]
+    # A full heal carries no filter marker at all.
+    assert "only_filters" not in clean.details
+    assert "Selective heal" not in clean.summary
+
+
+def test_heal_executed_selective_run_names_its_filters() -> None:
+    """The alert must say a heal deliberately covered a subset — an
+    operator reading '1 recreated' after a 3-object deletion would
+    otherwise investigate a phantom failure."""
+    from meraki2tf.alerts import heal_executed
+
+    event = heal_executed(
+        organization_id="123456",
+        surviving=7,
+        executed=["update /networks/{networkId}/wireless/ssids/{number}"],
+        failed=[],
+        skipped=[],
+        only=["ssid:Guest*", "network:Branch-07"],
+    )
+    assert event.details["only_filters"] == [
+        "ssid:Guest*", "network:Branch-07",
+    ]
+    assert "Selective heal (--only 'ssid:Guest*', 'network:Branch-07')" in (
+        event.summary
+    )
 
 
 def test_pagerduty_open_delegates_to_urlopen(

@@ -15,18 +15,35 @@ pipeline's job (``--sync`` / ``--rebuild``), not heal's.
 
 The recovery point is the snapshot's age: anything created after the
 snapshot was taken is not in it and cannot be healed back.
+
+``--only`` narrows a heal to a selection of the missing objects (one of
+two deleted networks, some of several deleted SSIDs): see
+:func:`filter_heal_plan`. Filtering is purely subtractive — the
+selection is always a subset of the full heal plan — so every guarantee
+above carries over unchanged.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import fnmatch
+import re
+from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass, replace
+from typing import Any
 
 from meraki2tf.models import NetworkGraph
 from meraki2tf.openapi_parser import OpenApiParser
 from meraki2tf.restorer import (
     WAVE_NETWORKS,
+    RestoreAction,
     RestorePlan,
+    _GRAMMAR_KEYS,
+    _NATURAL_MATCH_KEYS,
+    _OBJ_GRP_RE,
+    _PATH_PARAM_RE,
+    _REFERENCE_KEY_RE,
     _own_identity,
+    _scope_stem,
     plan_restore,
 )
 
@@ -137,4 +154,393 @@ def plan_heal(
         identity_mappings=tuple(mappings),
         surviving_count=len(surviving),
         snapshot_asset_count=len(full.actions),
+    )
+
+
+class HealFilterError(ValueError):
+    """A ``--only`` selector is empty or matched no missing object.
+
+    Zero matches fail loudly instead of healing nothing: a typo'd
+    selector that silently selected an empty set would let the operator
+    believe the deletion was recovered when nothing was written.
+    """
+
+
+@dataclass(frozen=True)
+class HealSelection:
+    """A ``--only``-filtered heal plan, with reporting counters."""
+
+    #: The original plan with ``missing`` shrunk to the selection —
+    #: identity mappings and counters are untouched.
+    plan: HealPlan
+    #: Action keys pulled in beyond the selectors' own matches because
+    #: a selected object depends on them (its deleted parent, a missing
+    #: object its payload references) — without these the executor
+    #: would fail loudly on an unmapped reference.
+    auto_included: tuple[str, ...]
+    #: (selector, direct-match count) per ``--only`` value, in order.
+    selector_matches: tuple[tuple[str, int], ...]
+    excluded_actions: int
+    excluded_unrestorable: int
+    excluded_defaults: int
+
+
+#: ``TYPE:PATTERN`` split — only an identifier-shaped prefix counts as
+#: a TYPE, and the bare form is always tried too (see ``_Selector``).
+_SELECTOR_TYPE_RE = re.compile(r"^([A-Za-z][A-Za-z0-9]*):(.+)$", re.DOTALL)
+
+
+def _stem_plural(token: str) -> str:
+    """Lowercase, singular form of a path segment or user-typed TYPE —
+    ``groupPolicies``/``grouppolicy`` and ``ssids``/``SSID`` unify."""
+    lowered = token.lower()
+    if lowered.endswith("ies"):
+        return lowered[:-3] + "y"
+    if lowered.endswith("s") and not lowered.endswith("ss"):
+        return lowered[:-1]
+    return lowered
+
+
+@dataclass(frozen=True)
+class _Selector:
+    raw: str
+    #: The stemmed TYPE prefix, when the selector carries one.
+    type_stem: str | None
+    #: PATTERN of the typed form, compiled.
+    pattern: re.Pattern[str]
+    #: The whole raw value as one glob: an object literally named with
+    #: a colon (``Guest:Floor2``) still selectable without escaping.
+    bare: re.Pattern[str]
+
+
+def _glob(pattern: str) -> re.Pattern[str]:
+    return re.compile(fnmatch.translate(pattern), re.IGNORECASE)
+
+
+def _parse_selector(raw: str) -> _Selector:
+    if not raw.strip():
+        raise HealFilterError(
+            "--only got an empty selector; pass [TYPE:]PATTERN, e.g. "
+            "--only 'network:Branch-*'."
+        )
+    matched = _SELECTOR_TYPE_RE.match(raw)
+    type_stem = _stem_plural(matched.group(1)) if matched else None
+    pattern = _glob(matched.group(2)) if matched else _glob(raw)
+    return _Selector(
+        raw=raw, type_stem=type_stem, pattern=pattern, bare=_glob(raw)
+    )
+
+
+def _type_stems(api_path: str) -> frozenset[str]:
+    """Type stems an asset answers to, derived from its API path alone.
+
+    An item path answers to its collection segment
+    (``…/ssids/{number}`` → ``ssid``); anything else answers to every
+    literal segment after the last placeholder (``…/{networkId}/snmp``
+    → ``snmp``, the network-create collection → ``network``, the
+    device-claim endpoint → ``device`` and ``claim``).
+    """
+    segments = [s for s in api_path.split("/") if s]
+    if segments and segments[-1].startswith("{"):
+        for segment in reversed(segments[:-1]):
+            if not segment.startswith("{"):
+                return frozenset({_stem_plural(segment)})
+        return frozenset()
+    stems: list[str] = []
+    for segment in segments:
+        if segment.startswith("{"):
+            stems.clear()
+        else:
+            stems.append(_stem_plural(segment))
+    return frozenset(stems)
+
+
+def _pattern_hits(
+    pattern: re.Pattern[str], payload: Mapping[str, Any], own_id: str
+) -> bool:
+    """Does the glob name this asset — by natural identity or own ID?"""
+    for key in _NATURAL_MATCH_KEYS:
+        value = payload.get(key)
+        if isinstance(value, str) and pattern.match(value):
+            return True
+    return bool(own_id and pattern.match(own_id))
+
+
+def _selector_hits(
+    selector: _Selector,
+    api_path: str,
+    path_values: tuple[str, ...],
+    payload: Mapping[str, Any],
+) -> bool:
+    own_id = path_values[-1] if path_values else ""
+    if (
+        selector.type_stem is not None
+        and selector.type_stem in _type_stems(api_path)
+        and _pattern_hits(selector.pattern, payload, own_id)
+    ):
+        return True
+    return _pattern_hits(selector.bare, payload, own_id)
+
+
+def _path_pairs(
+    api_path: str, path_values: tuple[str, ...]
+) -> tuple[tuple[str, str], ...]:
+    """(scope stem, value) per positionally-paired path placeholder."""
+    return tuple(
+        (_scope_stem(name), value)
+        for name, value in zip(
+            _PATH_PARAM_RE.findall(api_path), path_values
+        )
+    )
+
+
+def _in_scope(
+    api_path: str,
+    path_values: tuple[str, ...],
+    anchors: Sequence[tuple[str, str, frozenset[str]]],
+) -> bool:
+    """Does the asset live under one of the anchor identities?
+
+    True when a path placeholder carries the anchor's (stem, ID) and
+    the anchor's own parent context is contained in the asset's path
+    values — the same scoped-containment rule the reference resolver
+    applies, so colliding per-network IDs never leak across networks.
+    """
+    pairs = _path_pairs(api_path, path_values)
+    values = frozenset(path_values)
+    return any(
+        (stem, ident) in pairs and context <= values
+        for stem, ident, context in anchors
+    )
+
+
+def _is_anchor(action: RestoreAction) -> bool:
+    """Does the action carry an identity children can live under?
+
+    Creates and claims mint identities; an item path's last value *is*
+    its identity even when the action merely configures a fixed slot
+    (SSID numbers). Singleton configures end at their parent's scope —
+    anchoring on them would drag the whole parent subtree in.
+    """
+    return action.kind in ("create", "claim") or action.api_path.endswith("}")
+
+
+def _anchor_of(action: RestoreAction) -> tuple[str, str, frozenset[str]]:
+    stem, ident = _own_identity(action)
+    return (stem, ident, frozenset(action.path_values[:-1]))
+
+
+def _iter_ref_values(value: Any) -> Iterator[str]:
+    items = value if isinstance(value, list) else (value,)
+    for item in items:
+        if isinstance(item, (str, int)) and not isinstance(item, bool):
+            yield str(item)
+
+
+def _payload_refs(value: Any, refs: set[tuple[str, str]]) -> None:
+    """Collect (stem, ID) cross-references out of a write payload —
+    reference-shaped keys plus the firewall-rule GRP()/OBJ() grammar."""
+    if isinstance(value, Mapping):
+        for key, inner in value.items():
+            if isinstance(key, str) and _REFERENCE_KEY_RE.search(key):
+                stem = _scope_stem(key)
+                refs.update((stem, ref) for ref in _iter_ref_values(inner))
+            _payload_refs(inner, refs)
+    elif isinstance(value, list):
+        for inner in value:
+            _payload_refs(inner, refs)
+    elif isinstance(value, str):
+        for verb, ident in _OBJ_GRP_RE.findall(value):
+            refs.add((_scope_stem(_GRAMMAR_KEYS[verb]), ident))
+
+
+def _dependencies(action: RestoreAction) -> set[tuple[str, str]]:
+    """Every (stem, ID) the action needs resolvable at execute time:
+    its parent path scopes plus its payload's cross-references."""
+    own = _own_identity(action)
+    refs = {pair for pair in _path_pairs(action.api_path, action.path_values)
+            if pair != own}
+    _payload_refs(action.payload, refs)
+    return refs
+
+
+def _zero_match_message(
+    unmatched: Sequence[str], missing: RestorePlan
+) -> str:
+    labels: list[str] = []
+    for action in missing.actions[:15]:
+        stems = "/".join(sorted(_type_stems(action.api_path))) or "asset"
+        name = next(
+            (
+                value
+                for key in _NATURAL_MATCH_KEYS
+                if isinstance(value := action.payload.get(key), str)
+            ),
+            None,
+        )
+        own_id = action.path_values[-1] if action.path_values else "?"
+        labels.append(f"{stems}:{name or own_id}")
+    available = "; ".join(labels)
+    if len(missing.actions) > 15:
+        available += f"; … and {len(missing.actions) - 15} more"
+    return (
+        "--only selector(s) "
+        + ", ".join(repr(s) for s in unmatched)
+        + " matched no missing object — the object may still exist live "
+        "(heal only recreates deletions) or the name/type may be "
+        "misspelled. Missing objects available to select: "
+        + (available or "<none>")
+    )
+
+
+def filter_heal_plan(
+    plan: HealPlan, selectors: Sequence[str]
+) -> HealSelection:
+    """Shrink a heal plan to the objects named by ``--only`` selectors.
+
+    Pure — no I/O. Three passes over ``plan.missing``:
+
+    1. **Direct match** of every selector (``[TYPE:]PATTERN`` glob over
+       natural identity and own ID); a selector matching nothing raises
+       :class:`HealFilterError`.
+    2. **Scope expansion**: everything living under a matched identity
+       joins the selection, so ``network:Branch-07`` drags the deleted
+       network's whole missing subtree along.
+    3. **Dependency closure**: missing parents and referenced missing
+       objects of the selection are auto-included (and reported), so a
+       partial selection can never dispatch an unresolvable reference.
+
+    The result is a subset of ``plan.missing`` by construction — the
+    filter can only ever shrink what heal executes.
+    """
+    parsed = [_parse_selector(raw) for raw in dict.fromkeys(selectors)]
+    actions = plan.missing.actions
+    by_key = {action.key: action for action in actions}
+
+    selected: set[str] = set()
+    kept_unrestorable: set[tuple[str, tuple[str, ...]]] = set()
+    kept_defaults: set[str] = set()
+    matches: list[tuple[str, int]] = []
+    unmatched: list[str] = []
+    for selector in parsed:
+        count = 0
+        for action in actions:
+            if _selector_hits(
+                selector, action.api_path, action.path_values, action.payload
+            ):
+                selected.add(action.key)
+                count += 1
+        for item in plan.missing.unrestorable:
+            if _selector_hits(selector, item.api_path, item.path_values, {}):
+                kept_unrestorable.add((item.api_path, item.path_values))
+                count += 1
+        for entry in plan.missing.defaults:
+            if _selector_hits(
+                selector, entry.api_path, entry.path_values, {}
+            ):
+                kept_defaults.add(entry.key)
+                count += 1
+        matches.append((selector.raw, count))
+        if count == 0:
+            unmatched.append(selector.raw)
+    if unmatched:
+        raise HealFilterError(_zero_match_message(unmatched, plan.missing))
+
+    # Scope expansion to a fixed point: children of selected identities
+    # join, and newly-joined items can be anchors themselves (a deleted
+    # network's SSID anchors that SSID's own nested surfaces).
+    while True:
+        anchors = [
+            _anchor_of(by_key[key])
+            for key in selected
+            if _is_anchor(by_key[key])
+        ]
+        grown = {
+            action.key
+            for action in actions
+            if action.key not in selected
+            and _in_scope(action.api_path, action.path_values, anchors)
+        }
+        if not grown:
+            break
+        selected |= grown
+
+    # The operator's intent ends here; unrestorable/defaults reporting
+    # follows it (dependency parents added below carry no reporting).
+    kept_unrestorable |= {
+        (item.api_path, item.path_values)
+        for item in plan.missing.unrestorable
+        if _in_scope(item.api_path, item.path_values, anchors)
+    }
+    kept_defaults |= {
+        entry.key
+        for entry in plan.missing.defaults
+        if _in_scope(entry.api_path, entry.path_values, anchors)
+    }
+
+    # Dependency closure to a fixed point: a selected object's missing
+    # parent or referenced missing object must restore too, or the
+    # executor fails on an unmapped reference. References to SURVIVORS
+    # need nothing — identity mappings resolve them in place.
+    by_identity: dict[tuple[str, str], list[RestoreAction]] = {}
+    by_value: dict[str, list[RestoreAction]] = {}
+    for action in actions:
+        # Only identity-minting actions are dependency targets: a
+        # singleton configure's "own identity" is its PARENT's scope
+        # (see the resolver's registration rule), and indexing it here
+        # would auto-include unrelated siblings of a selected object.
+        if not _is_anchor(action):
+            continue
+        stem, ident = _own_identity(action)
+        by_identity.setdefault((stem, ident), []).append(action)
+        by_value.setdefault(ident, []).append(action)
+    auto_included: list[str] = []
+    # Plan order, processed as a queue: auto_included stays deterministic
+    # regardless of set-iteration (hash-seed) order.
+    frontier = [action.key for action in actions if action.key in selected]
+    while frontier:
+        key = frontier.pop(0)
+        values = frozenset(by_key[key].path_values)
+        for stem, ident in sorted(_dependencies(by_key[key])):
+            if stem:
+                candidates = [
+                    action
+                    for action in by_identity.get((stem, ident), [])
+                    if frozenset(action.path_values[:-1]) <= values
+                ]
+            else:
+                # A bare id/ids key names no type: include only when
+                # the ID is globally unambiguous among missing objects
+                # (the resolver's flat-unique rule).
+                candidates = by_value.get(ident, [])
+                if len(candidates) != 1:
+                    continue
+            for action in candidates:
+                if action.key not in selected:
+                    selected.add(action.key)
+                    auto_included.append(action.key)
+                    frontier.append(action.key)
+
+    shrunk = RestorePlan(
+        actions=tuple(a for a in actions if a.key in selected),
+        unrestorable=tuple(
+            item
+            for item in plan.missing.unrestorable
+            if (item.api_path, item.path_values) in kept_unrestorable
+        ),
+        defaults=tuple(
+            entry
+            for entry in plan.missing.defaults
+            if entry.key in kept_defaults
+        ),
+    )
+    return HealSelection(
+        plan=replace(plan, missing=shrunk),
+        auto_included=tuple(auto_included),
+        selector_matches=tuple(matches),
+        excluded_actions=len(actions) - len(shrunk.actions),
+        excluded_unrestorable=(
+            len(plan.missing.unrestorable) - len(shrunk.unrestorable)
+        ),
+        excluded_defaults=len(plan.missing.defaults) - len(shrunk.defaults),
     )

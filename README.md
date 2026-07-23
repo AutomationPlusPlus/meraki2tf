@@ -77,7 +77,7 @@ notes: [Prerequisites & Installation](#prerequisites--installation).
 | Capture a snapshot for offline / air-gapped use | `--dump-to <path>` (add `--sanitize` to share it) | [Producing a snapshot](docs/USAGE.md#producing-a-snapshot---dump-to) |
 | Run entirely offline from a snapshot | `--from-dump <path>` | [Dump Mode](docs/USAGE.md#dump-mode-offline--air-gapped) |
 | Fast drift check between two snapshots (no terraform) | `--drift-baseline <prev>` | [Snapshot-diff drift detection](docs/USAGE.md#snapshot-diff-drift-detection---drift-baseline) |
-| Rebuild after an incident | `--rebuild` / `--heal` / `--replay-gaps` / `--restore` (each previews; add `--confirm`) | [Disaster Recovery](docs/DR-GUIDE.md#disaster-recovery) |
+| Rebuild after an incident | `--rebuild` / `--heal` / `--replay-gaps` / `--restore` (each previews; add `--confirm`; scope `--heal` with `--only`) | [Disaster Recovery](docs/DR-GUIDE.md#disaster-recovery) |
 | Stop clickops and manage Meraki as code | one `--sync` run, then own the HCL | [Transitioning to IaC](docs/DR-GUIDE.md#transitioning-to-infrastructure-as-code) |
 
 ## Project Overview

@@ -4006,3 +4006,233 @@ def test_heal_confirm_reports_failures_nonzero(
         "Heal FAILED for wireless-ssids|update|N_1,0: simulated failure"
         in console
     )
+
+
+# ---------------------------------------------------------------------------
+# Selective heal (--heal --only).
+# ---------------------------------------------------------------------------
+
+
+def _heal_dump_two_ssids(tmp_path: Path) -> Path:
+    dump = tmp_path / "heal-snapshot.json"
+    dump.write_text(
+        json.dumps(
+            {
+                "organizationId": "org-123",
+                "networks": [
+                    {"id": "N_1", "organizationId": "org-123", "name": "HQ",
+                     "productTypes": ["wireless"], "timeZone": "UTC"}
+                ],
+                "devices": [],
+                "features": [
+                    {
+                        "apiPath": (
+                            "/networks/{networkId}/wireless/ssids/{number}"
+                        ),
+                        "pathValues": ["N_1", "0"],
+                        "payload": {"number": 0, "name": "Corp"},
+                    },
+                    {
+                        "apiPath": (
+                            "/networks/{networkId}/wireless/ssids/{number}"
+                        ),
+                        "pathValues": ["N_1", "1"],
+                        "payload": {"number": 1, "name": "Guest"},
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return dump
+
+
+def test_only_without_heal_is_a_usage_error(spec_file: Path) -> None:
+    """--only silently doing nothing outside --heal would let an
+    operator believe a pipeline run was scoped; it is refused instead."""
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            ["--spec", str(spec_file), "--org-id", "org-123",
+             "--only", "network:HQ"]
+        )
+    assert excinfo.value.code == 2
+
+
+def test_heal_only_preview_filters_and_hints_the_selective_rerun(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The filtered preview reports match/skip accounting, previews only
+    the selection, and the re-run hint carries the --only selectors —
+    recommending a bare '--heal --confirm' would escalate the write to
+    every missing object."""
+    _heal_confirm_setup(monkeypatch, tmp_path)
+    dump = _heal_dump_two_ssids(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--heal", "--from-dump", str(dump),
+         "--org-id", "org-123", "--workdir", str(tmp_path / "ws"),
+         "--only", "ssid:Corp"]
+    )
+    console = capsys.readouterr().err
+    assert exit_code == 0
+    assert "--only 'ssid:Corp' matched 1 missing object(s)" in console
+    assert "Skipped by --only: 1 recreatable object(s)" in console
+    assert "Preview only" in console
+    assert "--heal --only 'ssid:Corp' --confirm" in console
+    assert "recreate the 1 missing object(s)" in console
+
+
+def test_heal_only_zero_match_exits_2(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _heal_confirm_setup(monkeypatch, tmp_path)
+    dump = _heal_dump_two_ssids(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--heal", "--from-dump", str(dump),
+         "--org-id", "org-123", "--workdir", str(tmp_path / "ws"),
+         "--only", "ssid:Nope"]
+    )
+    console = capsys.readouterr().err
+    assert exit_code == 2
+    assert "matched no missing object" in console
+
+
+def test_heal_only_confirm_executes_subset_and_alert_names_filters(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from meraki2tf import restorer as restorer_module
+
+    _heal_confirm_setup(monkeypatch, tmp_path)
+    dump = _heal_dump_two_ssids(tmp_path)
+    dispatched_plans: list[Any] = []
+
+    def succeed(self: Any, graph: Any, plan: Any) -> Any:
+        dispatched_plans.append(plan)
+        return restorer_module.RestoreResult(
+            executed=("wireless-ssids|update|N_1,0",),
+        )
+
+    monkeypatch.setattr(restorer_module.OrgRestorer, "execute", succeed)
+    delivered: list[dict[str, Any]] = []
+
+    def fake_urlopen(request: Any, timeout: float) -> FakeResponse:
+        delivered.append(json.loads(request.data.decode("utf-8")))
+        return FakeResponse()
+
+    monkeypatch.setattr("meraki2tf.alerts.webhook._open", fake_urlopen)
+    exit_code = main(
+        ["--spec", str(spec_file), "--heal", "--from-dump", str(dump),
+         "--org-id", "org-123", "--workdir", str(tmp_path / "ws"),
+         "--only", "ssid:Corp", "--confirm",
+         "--webhook-url", "https://hooks.example/dr"]
+    )
+    assert exit_code == 0
+    (plan,) = dispatched_plans
+    # Only the selected SSID reaches the executor.
+    assert [a.path_values for a in plan.actions] == [("N_1", "0")]
+    (event,) = delivered
+    assert event["event_type"] == "HEAL_EXECUTED"
+    assert event["details"]["only_filters"] == ["ssid:Corp"]
+    assert "Selective heal" in event["summary"]
+
+
+def test_heal_only_matching_solely_unrestorable_heals_nothing(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A selection covering only API-unrestorable objects is a clean
+    no-op with the verdict on the console, not a typo error."""
+    _heal_confirm_setup(monkeypatch, tmp_path)
+    dump = tmp_path / "heal-snapshot.json"
+    dump.write_text(
+        json.dumps(
+            {
+                "organizationId": "org-123",
+                "networks": [
+                    {"id": "N_1", "organizationId": "org-123", "name": "HQ",
+                     "productTypes": ["wireless"], "timeZone": "UTC"}
+                ],
+                "devices": [],
+                "features": [
+                    {
+                        "apiPath": (
+                            "/networks/{networkId}/wireless/ssids/{number}"
+                        ),
+                        "pathValues": ["N_1", "0"],
+                        "payload": {"number": 0, "name": "Corp"},
+                    },
+                    {
+                        "apiPath": "/networks/{networkId}/clients",
+                        "pathValues": ["N_1"],
+                        "payload": {"usage": 1},
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    exit_code = main(
+        ["--spec", str(spec_file), "--heal", "--from-dump", str(dump),
+         "--org-id", "org-123", "--workdir", str(tmp_path / "ws"),
+         "--only", "client:*"]
+    )
+    console = capsys.readouterr().err
+    assert exit_code == 0
+    assert "Nothing to heal within the --only selection" in console
+    assert "Cannot heal /networks/{networkId}/clients" in console
+
+
+def test_heal_only_preview_reports_auto_included_dependencies(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Selecting an SSID inside a deleted network shows the network's
+    create being pulled in — the operator sees exactly what a partial
+    heal will really write before confirming."""
+    _heal_confirm_setup(monkeypatch, tmp_path)
+    dump = tmp_path / "heal-snapshot.json"
+    dump.write_text(
+        json.dumps(
+            {
+                "organizationId": "org-123",
+                "networks": [
+                    {"id": "N_1", "organizationId": "org-123", "name": "HQ",
+                     "productTypes": ["wireless"], "timeZone": "UTC"},
+                    {"id": "N_2", "organizationId": "org-123",
+                     "name": "Annex", "productTypes": ["wireless"],
+                     "timeZone": "UTC"},
+                ],
+                "devices": [],
+                "features": [
+                    {
+                        "apiPath": (
+                            "/networks/{networkId}/wireless/ssids/{number}"
+                        ),
+                        "pathValues": ["N_2", "0"],
+                        "payload": {"number": 0, "name": "Corp"},
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    exit_code = main(
+        ["--spec", str(spec_file), "--heal", "--from-dump", str(dump),
+         "--org-id", "org-123", "--workdir", str(tmp_path / "ws"),
+         "--only", "ssid:Corp"]
+    )
+    console = capsys.readouterr().err
+    assert exit_code == 0
+    assert "Auto-included 1 missing object(s)" in console
+    assert "recreate the 2 missing object(s)" in console

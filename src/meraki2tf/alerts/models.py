@@ -352,27 +352,40 @@ def heal_executed(
     executed: Sequence[str],
     failed: Sequence[Sequence[str]],
     skipped: Sequence[Mapping[str, Any]],
+    only: Sequence[str] = (),
 ) -> AlertEvent:
     """Contract payload for a human-invoked same-org heal: accidentally
     deleted objects recreated from a snapshot, surviving objects never
-    touched. Entries are value-free action labels."""
+    touched. Entries are value-free action labels. ``only`` carries the
+    --only selectors of a selective heal, so the operator reading the
+    alert knows the run deliberately covered a subset of the missing
+    objects."""
     severity = EventSeverity.WARNING if failed else EventSeverity.INFO
+    summary = (
+        f"Heal of organization {organization_id}: {len(executed)} "
+        f"missing object(s) recreated, {len(failed)} failed, "
+        f"{len(skipped)} skipped; {surviving} surviving object(s) "
+        "untouched."
+    )
+    details: dict[str, Any] = {
+        "organization_id": organization_id,
+        "surviving_untouched": surviving,
+        "executed": list(executed),
+        "failed": [list(item) for item in failed],
+        "skipped": [dict(item) for item in skipped],
+    }
+    if only:
+        summary += (
+            " Selective heal (--only "
+            + ", ".join(repr(value) for value in only)
+            + ")."
+        )
+        details["only_filters"] = list(only)
     return AlertEvent(
         event_type=EventType.HEAL_EXECUTED,
         severity=severity,
-        summary=(
-            f"Heal of organization {organization_id}: {len(executed)} "
-            f"missing object(s) recreated, {len(failed)} failed, "
-            f"{len(skipped)} skipped; {surviving} surviving object(s) "
-            "untouched."
-        ),
-        details={
-            "organization_id": organization_id,
-            "surviving_untouched": surviving,
-            "executed": list(executed),
-            "failed": [list(item) for item in failed],
-            "skipped": [dict(item) for item in skipped],
-        },
+        summary=summary,
+        details=details,
     )
 
 

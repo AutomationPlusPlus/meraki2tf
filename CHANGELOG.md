@@ -7,6 +7,16 @@ the project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Selective heal: repeatable `--only '[TYPE:]PATTERN'` selectors
+  restrict `--heal` to a subset of the missing objects (e.g. restore
+  one of two deleted networks, or some of several deleted SSIDs).
+  Selectors are case-insensitive globs over each missing object's name
+  or ID with an optional spec-derived type prefix; a matched container
+  selects its whole missing subtree, missing dependencies (deleted
+  parents, referenced missing objects) are auto-included and reported,
+  and a selector matching nothing is refused. Filtering only ever
+  shrinks the run — additive-only, preview-first, and journaling are
+  unchanged, and the `HEAL_EXECUTED` alert names the active filters.
 - Multi-organization fan-out: `--org-id` is repeatable (config file:
   `org-ids` array). Organizations run sequentially with per-org
   sub-workdirs and state; remote backends take an `{org-id}`
