@@ -902,6 +902,40 @@ _CAPABILITY_RE = re.compile(
 #: everyone, drill or not; the template's own copy restores separately.
 _TEMPLATE_BOUND_RE = re.compile(r"(?i)on a template network")
 
+#: Dashboard 400 texts naming a *setting* the network's product types
+#: refuse ("Remote status page is not supported by this network"): GET
+#: echoes carry the field regardless, so a restored copy of the same
+#: network trips over it. The named phrase maps back to payload keys by
+#: camelCase tokens — no field table.
+_UNSUPPORTED_SETTING_RE = re.compile(
+    r"(?i)([A-Za-z0-9 _/-]+?)\s+(?:is|are) not supported\s+"
+    r"(?:by|for|on) this network"
+)
+
+_CAMEL_TOKEN_RE = re.compile(r"[A-Z]?[a-z0-9]+|[A-Z]+(?![a-z])")
+
+
+def _unsupported_setting_keys(
+    text: str, payload: Mapping[str, Any]
+) -> tuple[str, ...]:
+    """Top-level payload keys an unsupported-setting 400 text names.
+
+    A key matches a refused phrase when one token sequence is a prefix
+    of the other ("Remote status page" names both
+    ``remoteStatusPageEnabled`` and a nested ``remoteStatusPage``).
+    """
+    matched: list[str] = []
+    for phrase in _UNSUPPORTED_SETTING_RE.findall(text):
+        words = tuple(word.lower() for word in phrase.split())
+        for key in payload:
+            tokens = tuple(
+                token.lower() for token in _CAMEL_TOKEN_RE.findall(key)
+            )
+            length = min(len(words), len(tokens))
+            if length and words[:length] == tokens[:length]:
+                matched.append(key)
+    return tuple(dict.fromkeys(matched))
+
 
 class _EmptyConfigureSkip(Exception):
     """A configure payload stripped to nothing — nothing to write."""
@@ -2108,7 +2142,65 @@ class OrgRestorer:
                 "network; the setting is governed by its config "
                 "template (restored separately)",
             )
+        if action.kind == "configure":
+            outcome = self._retry_without_unsupported(
+                dashboard, action, resolver, source_org, text
+            )
+            if outcome is not None:
+                return outcome
         return ("failed", None)
+
+    def _retry_without_unsupported(
+        self,
+        dashboard: Any,
+        action: RestoreAction,
+        resolver: ReferenceResolver,
+        source_org: str,
+        text: str,
+    ) -> tuple[str, str | None] | None:
+        """Strip settings the 400 names as unsupported and retry.
+
+        Product-type-dependent fields (the remote status page on a
+        network whose types refuse it) arrive in GET echoes but are
+        rejected on write; the rest of the captured payload is still
+        restorable state. Each retry may surface another refused field,
+        so iterate — every round strips at least one key, bounding the
+        loop by the payload size. Returns None when the error names no
+        strippable field (the original failure stands); only field
+        NAMES are logged, never values.
+        """
+        remaining = dict(action.payload)
+        dropped: list[str] = []
+        current = text
+        for _ in range(len(action.payload)):
+            named = _unsupported_setting_keys(current, remaining)
+            if not named:
+                return None
+            for key in named:
+                remaining.pop(key, None)
+            dropped.extend(named)
+            if not remaining or _effectively_empty(remaining):
+                return (
+                    "skip",
+                    "every captured value is a setting this network's "
+                    "product types do not support: "
+                    + ", ".join(sorted(dropped)),
+                )
+            retry = replace(action, payload=remaining)
+            try:
+                self._dispatch(dashboard, retry, resolver, source_org)
+            except Exception as exc:  # noqa: BLE001 - iterate or stand down
+                if getattr(exc, "status", None) != 400:
+                    return None
+                current = str(exc)
+                continue
+            logger.warning(
+                "Restored %s without unsupported setting(s) %s: the "
+                "dashboard refuses them for this network's product "
+                "types.", action.key, ", ".join(sorted(dropped)),
+            )
+            return ("healed", None)
+        return None
 
     def _adopt_existing(
         self,
