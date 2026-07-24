@@ -53,6 +53,24 @@ class FakeAppliance:
     def getNetworkApplianceTrafficShaping(self, networkId: str) -> dict[str, Any]:
         return {"globalBandwidthLimits": {"limitUp": 0, "limitDown": 0}}
 
+    def getNetworkApplianceSsids(self, networkId: str) -> list[dict[str, Any]]:
+        return []
+
+
+class FakeWireless:
+    def getNetworkWirelessSsids(self, networkId: str) -> list[dict[str, Any]]:
+        return []
+
+    def getOrganizationWirelessAirMarshalSettingsByNetwork(
+        self, organizationId: str
+    ) -> dict[str, Any]:
+        # The org-scoped aggregation source for the GET-less per-network
+        # Air Marshal settings entity: enveloped, one row per network.
+        return {
+            "items": [{"networkId": "N_1", "defaultPolicy": "blocked"}],
+            "meta": {"counts": {"items": {"total": 1}}},
+        }
+
 
 class FakeNetworksSection:
     def getNetworkSyslogServers(self, networkId: str) -> list[dict[str, Any]]:
@@ -80,6 +98,7 @@ class FakeDashboard:
         self.networks = FakeNetworksSection()
         self.sensor = FakeSensor()
         self.switch = FakeSwitch()
+        self.wireless = FakeWireless()
 
 
 @pytest.fixture()
@@ -632,43 +651,71 @@ def test_live_provider_builds_graph_with_spec_driven_features(
     ]
     assert port.payload["name"] == "Uplink"
 
+    # The GET-less Air Marshal settings entity is discovered through its
+    # org-scoped byNetwork aggregation, exploded to the network-scoped
+    # canonical path with the scope identifier consumed.
+    air_marshal = by_path[
+        ("/networks/{networkId}/wireless/airMarshal/settings", ("N_1",))
+    ]
+    assert air_marshal.payload == {"defaultPolicy": "blocked"}
+
     # Folded collection aliases (/organizations/{organizationId}/networks
     # lists first-class network assets) are not re-emitted as features,
     # and the refusing sensor endpoint is skipped, not fatal. The two
     # unidentifiable VLAN elements surface as collection-path assets.
-    assert len(graph.features) == 7
+    assert len(graph.features) == 8
+
+    # The genuine 400 sensor refusal was a single scope — visibility
+    # diagnostics carry no suspects and nothing was prefiltered (the
+    # fixture spec declares no productTypes enum).
+    diagnostics = live_provider.discovery_diagnostics
+    assert diagnostics is not None
+    assert diagnostics.suspect_endpoints == ()
+    assert diagnostics.skipped_out_of_scope == 0
 
 
-def test_live_dispatch_gap_warns_once_and_skips(
+def test_live_dispatch_gap_warns_once_and_records_gap_features(
     live_provider: LiveApiDataProvider,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """An SDK missing an operation is missing DR coverage — loud, not DEBUG."""
+    """An SDK missing an operation is missing DR coverage — loud, not
+    DEBUG, and every affected scope becomes an unreadable-marker gap
+    feature instead of silently vanishing from the snapshot."""
     monkeypatch.delattr(FakeOrganizations, "getOrganizationAdmins")
     with caplog.at_level("WARNING", logger="meraki2tf.providers.live"):
         graph = live_provider.fetch_network_graph("org-123")
     admin_warnings = [
         record for record in caplog.records
-        if "cannot be dispatched" in record.message and "admins" in record.message
+        if "Upgrade the SDK" in record.message and "admins" in record.message
     ]
     assert len(admin_warnings) == 1  # warned once, not per scope/network
-    assert len(graph.features) == 6  # everything else still discovered
+    gaps = [f for f in graph.features if UNREADABLE_MARKER in f.payload]
+    assert [
+        (gap.api_path, gap.path_values) for gap in gaps
+    ] == [("/organizations/{organizationId}/admins", ("org-123",))]
+    assert "cannot be dispatched" in gaps[0].payload[UNREADABLE_MARKER]
+    # Everything else still discovered, plus the explicit gap record.
+    assert len(graph.features) == 8
 
 
-def test_try_call_skips_operations_already_known_undispatchable(
+def test_try_call_gaps_operations_already_known_undispatchable(
     live_provider: LiveApiDataProvider, spec_parser: OpenApiParser
 ) -> None:
+    """A known-undispatchable operation must gap every later scope too —
+    returning None here would leave those scopes silently absent."""
+    from meraki2tf.providers.live import _EndpointUnreadable
+
     op = next(
         o for o in spec_parser.endpoints()
         if o.operation_id == "getOrganizationAdmins"
     )
     undispatchable = {op.operation_id}
     lock, bucket, abort = _try_call_args()
-    result = live_provider._try_call(
-        op, {"organizationId": "org-123"}, undispatchable, lock, bucket, abort
-    )
-    assert result is None  # short-circuited, no dispatch attempted
+    with pytest.raises(_EndpointUnreadable, match="cannot be dispatched"):
+        live_provider._try_call(
+            op, {"organizationId": "org-123"}, undispatchable, lock, bucket, abort
+        )
 
 
 @pytest.fixture(autouse=True)
@@ -1515,11 +1562,42 @@ class _RecordingScopedDashboard:
                 outer.serial_calls.append(serial)
                 return [{"portId": "1", "name": "Uplink", "enabled": True}]
 
+        class Wireless:
+            def getNetworkWirelessSsids(
+                self, networkId: str
+            ) -> list[dict[str, Any]]:
+                outer.network_calls.append(networkId)
+                return []
+
+            def getOrganizationWirelessAirMarshalSettingsByNetwork(
+                self, organizationId: str
+            ) -> dict[str, Any]:
+                # Rows for both networks: the scoped run must keep only
+                # the selected network's row.
+                return {
+                    "items": [
+                        {"networkId": "N_1", "defaultPolicy": "blocked"},
+                        {"networkId": "N_2", "defaultPolicy": "allowed"},
+                    ],
+                    "meta": {},
+                }
+
+        class ApplianceSsids:
+            def getNetworkApplianceSsids(
+                self, networkId: str
+            ) -> list[dict[str, Any]]:
+                outer.network_calls.append(networkId)
+                return []
+
         self.organizations = Organizations()
         self.appliance = Appliance()
+        self.appliance.getNetworkApplianceSsids = (  # type: ignore[attr-defined]
+            ApplianceSsids().getNetworkApplianceSsids
+        )
         self.networks = Networks()
         self.sensor = Sensor()
         self.switch = Switch()
+        self.wireless = Wireless()
 
 
 def test_live_scoped_fetch_narrows_networks_and_devices(
@@ -1544,6 +1622,14 @@ def test_live_scoped_fetch_narrows_networks_and_devices(
     assert set(dashboard.network_calls) == {"N_2"}
     assert dashboard.serial_calls == ["Q2XY-1234-5678"]
     assert dashboard.admin_calls == 1
+    # The org-scoped aggregation returned rows for both networks; the
+    # scoped run keeps only the selected network's exploded assets.
+    air_marshal = [
+        f
+        for f in graph.features
+        if f.api_path == "/networks/{networkId}/wireless/airMarshal/settings"
+    ]
+    assert [f.path_values for f in air_marshal] == [("N_2",)]
 
 
 def test_live_scoped_fetch_id_form_tolerates_missing_network(
@@ -1623,3 +1709,319 @@ def test_snapshot_scope_property_refuses_malformed_header(
     provider = StaticJsonDataProvider(path)
     with pytest.raises(MalformedDumpError, match="scope"):
         provider.snapshot_scope
+
+
+# ---------------------------------------------------------------------------
+# Aggregation execution, product-type prefiltering, suspect endpoints
+# ---------------------------------------------------------------------------
+
+
+def test_aggregation_endpoint_unreadable_gaps_the_entity(
+    live_provider: LiveApiDataProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dead aggregation GET must gap the adopted entity's own
+    collection path so heal/deletion flows exempt it through the
+    ordinary unreadable-marker mechanism."""
+
+    def _explode(self: Any, organizationId: str) -> dict[str, Any]:
+        raise _FakeApiError(500)
+
+    monkeypatch.setattr(
+        FakeWireless,
+        "getOrganizationWirelessAirMarshalSettingsByNetwork",
+        _explode,
+    )
+    graph = live_provider.fetch_network_graph("org-123")
+    gaps = [f for f in graph.features if UNREADABLE_MARKER in f.payload]
+    assert [(g.api_path, g.path_values) for g in gaps] == [
+        ("/networks/{networkId}/wireless/airMarshal/settings", ()),
+    ]
+    assert "HTTP 500" in gaps[0].payload[UNREADABLE_MARKER]
+
+
+def test_aggregation_org_scope_refusal_is_absence_by_design(
+    live_provider: LiveApiDataProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 400/404 at org scope means the organization does not carry the
+    product family at all — genuine absence, no gap record."""
+
+    def _refuse(self: Any, organizationId: str) -> dict[str, Any]:
+        raise _FakeApiError(404)
+
+    monkeypatch.setattr(
+        FakeWireless,
+        "getOrganizationWirelessAirMarshalSettingsByNetwork",
+        _refuse,
+    )
+    graph = live_provider.fetch_network_graph("org-123")
+    assert not any(
+        f.api_path == "/networks/{networkId}/wireless/airMarshal/settings"
+        for f in graph.features
+    )
+    assert not any(UNREADABLE_MARKER in f.payload for f in graph.features)
+
+
+def _prefilter_spec(tmp_path: Path) -> OpenApiParser:
+    """Spec with a createNetwork productTypes enum plus one endpoint per
+    product family and scope kind."""
+    from conftest import _op
+
+    spec = {
+        "openapi": "3.0.1",
+        "paths": {
+            "/organizations/{organizationId}/networks": {
+                "get": _op("getOrganizationNetworks", "organizations"),
+                "post": {
+                    **_op("createOrganizationNetwork", "organizations"),
+                    "requestBody": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "properties": {
+                                        "productTypes": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "string",
+                                                "enum": [
+                                                    "appliance",
+                                                    "wireless",
+                                                    "switch",
+                                                    "camera",
+                                                ],
+                                            },
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                },
+            },
+            "/organizations/{organizationId}/devices": {
+                "get": _op("getOrganizationDevices", "organizations"),
+            },
+            "/networks/{networkId}": {
+                "get": _op("getNetwork", "networks"),
+                "put": _op("updateNetwork", "networks"),
+            },
+            "/devices/{serial}": {
+                "get": _op("getDevice", "devices"),
+                "put": _op("updateDevice", "devices"),
+            },
+            "/networks/{networkId}/appliance/settings": {
+                "get": _op("getNetworkApplianceSettings", "appliance"),
+                "put": _op("updateNetworkApplianceSettings", "appliance"),
+            },
+            "/networks/{networkId}/wireless/settings": {
+                "get": _op("getNetworkWirelessSettings", "wireless"),
+                "put": _op("updateNetworkWirelessSettings", "wireless"),
+            },
+            # 'sm' is not a productTypes value — never filtered.
+            "/networks/{networkId}/sm/targetGroups": {
+                "get": _op("getNetworkSmTargetGroups", "sm"),
+                "put": _op("updateNetworkSmTargetGroups", "sm"),
+            },
+            "/devices/{serial}/switch/routing": {
+                "get": _op("getDeviceSwitchRouting", "switch"),
+                "put": _op("updateDeviceSwitchRouting", "switch"),
+            },
+        },
+    }
+    path = tmp_path / "prefilter-spec.json"
+    path.write_text(json.dumps(spec), encoding="utf-8")
+    from meraki2tf.openapi_parser import OpenApiParser
+
+    return OpenApiParser(path)
+
+
+class _PrefilterDashboard:
+    """Two networks / three devices; records which endpoint hit which
+    scope so prefiltering is observable."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+        outer = self
+
+        class Organizations:
+            def getOrganizationNetworks(
+                self, org_id: str, total_pages: str
+            ) -> list[dict[str, Any]]:
+                return [
+                    {
+                        "id": "N_APP",
+                        "organizationId": "org-123",
+                        "name": "HQ",
+                        "productTypes": ["appliance"],
+                    },
+                    {
+                        "id": "N_UNKNOWN",
+                        "organizationId": "org-123",
+                        "name": "Legacy",
+                        "productTypes": [],
+                    },
+                ]
+
+            def getOrganizationDevices(
+                self, org_id: str, total_pages: str
+            ) -> list[dict[str, Any]]:
+                return [
+                    {"serial": "Q2SW-0000-0001", "networkId": "N_APP",
+                     "model": "MS120", "productType": "switch"},
+                    {"serial": "Q2CA-0000-0002", "networkId": "N_APP",
+                     "model": "MV12", "productType": "camera"},
+                    {"serial": "Q2NA-0000-0003", "networkId": "N_APP",
+                     "model": "MX64"},
+                ]
+
+        class Networks:
+            def getNetwork(self, networkId: str) -> dict[str, Any]:
+                outer.calls.append(("network", networkId))
+                return {"id": networkId}
+
+        class Appliance:
+            def getNetworkApplianceSettings(
+                self, networkId: str
+            ) -> dict[str, Any]:
+                outer.calls.append(("appliance", networkId))
+                return {"clientTrackingMethod": "MAC address"}
+
+        class Wireless:
+            def getNetworkWirelessSettings(
+                self, networkId: str
+            ) -> dict[str, Any]:
+                outer.calls.append(("wireless", networkId))
+                return {"meshingEnabled": False}
+
+        class Sm:
+            def getNetworkSmTargetGroups(
+                self, networkId: str
+            ) -> list[dict[str, Any]]:
+                outer.calls.append(("sm", networkId))
+                return []
+
+        class Switch:
+            def getDeviceSwitchRouting(self, serial: str) -> dict[str, Any]:
+                outer.calls.append(("switch", serial))
+                return {"enabled": True}
+
+        class Devices:
+            def getDevice(self, serial: str) -> dict[str, Any]:
+                outer.calls.append(("device", serial))
+                return {"serial": serial}
+
+        self.organizations = Organizations()
+        self.networks = Networks()
+        self.appliance = Appliance()
+        self.wireless = Wireless()
+        self.sm = Sm()
+        self.switch = Switch()
+        self.devices = Devices()
+
+
+def test_product_type_prefilter_skips_provably_out_of_scope_calls(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A wireless endpoint on an appliance-only network can only
+    400/404: skip the call, count it, and treat it exactly like the
+    refusal it would have been. Unknown product types (networks or
+    devices) never filter — under-filtering is safe, over-filtering is
+    coverage loss."""
+    monkeypatch.setenv(API_KEY_ENV_VAR, "unit-test-token")
+    provider = LiveApiDataProvider(parser=_prefilter_spec(tmp_path))
+    dashboard = _PrefilterDashboard()
+    provider._client = dashboard
+    provider.fetch_network_graph("org-123")
+
+    # The appliance-only network skipped only the wireless family call;
+    # the unknown-product network was never filtered.
+    assert ("wireless", "N_APP") not in dashboard.calls
+    assert ("appliance", "N_APP") in dashboard.calls
+    assert ("sm", "N_APP") in dashboard.calls  # 'sm' is not a product type
+    assert ("wireless", "N_UNKNOWN") in dashboard.calls
+    assert ("appliance", "N_UNKNOWN") in dashboard.calls
+    # Devices: exact productType match required; unknown never filters.
+    assert ("switch", "Q2SW-0000-0001") in dashboard.calls
+    assert ("switch", "Q2CA-0000-0002") not in dashboard.calls  # camera
+    assert ("switch", "Q2NA-0000-0003") in dashboard.calls  # unknown
+    diagnostics = provider.discovery_diagnostics
+    assert diagnostics is not None
+    # One network-level skip (wireless@N_APP) + one device-level skip.
+    assert diagnostics.skipped_out_of_scope == 2
+
+
+def test_endpoints_refused_by_every_scope_become_suspects(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Feature-not-enabled 400s stay quiet absence, but an endpoint
+    that refuses EVERY scope (>= 3 tried) is a visible diagnostic — an
+    SDK/spec skew could otherwise hide a whole surface behind
+    plausible-looking refusals."""
+    from conftest import _op
+    from meraki2tf.openapi_parser import OpenApiParser
+
+    spec = {
+        "openapi": "3.0.1",
+        "paths": {
+            "/organizations/{organizationId}/networks": {
+                "get": _op("getOrganizationNetworks", "organizations"),
+                "post": _op("createOrganizationNetwork", "organizations"),
+            },
+            "/organizations/{organizationId}/devices": {
+                "get": _op("getOrganizationDevices", "organizations"),
+            },
+            "/networks/{networkId}/alwaysRefused": {
+                "get": _op("getNetworkAlwaysRefused", "networks"),
+                "put": _op("updateNetworkAlwaysRefused", "networks"),
+            },
+            "/networks/{networkId}/sometimesRefused": {
+                "get": _op("getNetworkSometimesRefused", "networks"),
+                "put": _op("updateNetworkSometimesRefused", "networks"),
+            },
+        },
+    }
+    path = tmp_path / "suspect-spec.json"
+    path.write_text(json.dumps(spec), encoding="utf-8")
+
+    class Networks:
+        def getNetworkAlwaysRefused(self, networkId: str) -> dict[str, Any]:
+            raise _FakeApiError(400)
+
+        def getNetworkSometimesRefused(self, networkId: str) -> dict[str, Any]:
+            if networkId == "N_3":
+                return {"enabled": True}
+            raise _FakeApiError(404)
+
+    class Organizations:
+        def getOrganizationNetworks(
+            self, org_id: str, total_pages: str
+        ) -> list[dict[str, Any]]:
+            return [
+                {"id": network_id, "organizationId": "org-123",
+                 "name": network_id, "productTypes": ["appliance"]}
+                for network_id in ("N_1", "N_2", "N_3")
+            ]
+
+        def getOrganizationDevices(
+            self, org_id: str, total_pages: str
+        ) -> list[dict[str, Any]]:
+            return []
+
+    monkeypatch.setenv(API_KEY_ENV_VAR, "unit-test-token")
+    provider = LiveApiDataProvider(parser=OpenApiParser(path))
+    provider._client = types.SimpleNamespace(
+        organizations=Organizations(), networks=Networks()
+    )
+    graph = provider.fetch_network_graph("org-123")
+    diagnostics = provider.discovery_diagnostics
+    assert diagnostics is not None
+    assert [
+        (s.api_path, s.scopes_tried) for s in diagnostics.suspect_endpoints
+    ] == [("/networks/{networkId}/alwaysRefused", 3)]
+    # The mixed endpoint discovered its one available scope normally.
+    assert any(
+        f.api_path == "/networks/{networkId}/sometimesRefused"
+        and f.path_values == ("N_3",)
+        for f in graph.features
+    )
