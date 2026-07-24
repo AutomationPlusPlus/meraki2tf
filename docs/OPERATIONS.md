@@ -38,14 +38,21 @@ as missing DR coverage, not as a quietly smaller snapshot.
 | Event | Trigger |
 | --- | --- |
 | `DRIFT_DETECTED` | Real configuration drift. Two origins, distinguished by `details.origin`: `terraform-plan` (the speculative plan found add/change/destroy on tracked resources — pending imports alone don't count) and `snapshot-diff` (`--drift-baseline` comparison found added/modified/removed assets, including provider-inexpressible and secret-bearing ones). Payload carries the diff/digest, the unsupported list, `apply_aborted` (true when a `--sync` auto-apply was refused), `regenerated_addresses` (modified objects re-baselined in sync mode), and `deferred_addresses` (drift-racy pending imports pushed to the next run) |
-| `RUN_SUCCESS` | Snapshot generation (and comparison, when an API key was available) completed flawlessly. Payload carries the coverage picture: `discovered_assets`, `imports_written`, `imports_already_tracked`, `unsupported_count` plus the full `unsupported` list, `pending_imports` (imports the plan reports as not yet in state; `null` when unknown), `comparison_performed`, `resources_added_to_state` (sync mode), `coverage_percent`, `deletions_pending_confirmation`, and `unmanaged_secret_attributes` (secrets the kit cannot carry — restore manually after a rebuild) |
+| `RUN_SUCCESS` | Snapshot generation (and comparison, when an API key was available) completed flawlessly. Payload carries the coverage picture: `discovered_assets`, `imports_written`, `imports_already_tracked`, `unsupported_count` plus the full `unsupported` list, `pending_imports` (imports the plan reports as not yet in state; `null` when unknown), `comparison_performed`, `resources_added_to_state` (sync mode), `coverage_percent`, `deletions_pending_confirmation`, `unmanaged_secret_attributes` (secrets the kit cannot carry — restore manually after a rebuild), `deferred_addresses`, `reconciliation_drop_categories` (reconciliation drops aggregated by diagnostic, so a provider regression names the resource class it broke), and `partial_scope` (the covered network IDs of a `--only` run — never mistake a one-network export for a full capture) |
 | `UNSUPPORTED_FEATURE_FLAGGED` | A discovered asset cannot be mapped to a Terraform resource |
 | `DELETION_PENDING_CONFIRMATION` | Resources tracked in the DR kit were not found in Meraki (deleted?); they stay in the kit until a human confirms with `--confirm-deletions` |
 | `RESTORE_EXECUTED` | A human-invoked `--restore --confirm` rebuilt a target organization from a snapshot. Payload carries executed/failed/skipped action labels (identifiers and endpoints only — never values) |
-| `HEAL_EXECUTED` | A human-invoked `--heal --confirm` recreated snapshot objects missing from the same live organization. Payload carries the executed/failed/skipped actions plus the surviving (untouched) count — identifiers and endpoints only, never values |
+| `HEAL_EXECUTED` | A human-invoked `--heal --confirm` recreated snapshot objects missing from the same live organization. Payload carries the executed/failed/skipped actions plus the surviving (untouched) count — identifiers and endpoints only, never values. Selective heals add `only_filters`; heals from a partial (selective-backup) snapshot add `snapshot_scope`; `verified_alive_skips` counts planned actions the pre-write liveness probe found alive and skipped (additive-only held) |
 | `ORG_WIPE_EXECUTED` | A human-invoked `--wipe-org --confirm` tore down a hardware-free drill organization (networks deleted + org deleted, with any failures) |
+| `REBUILD_EXECUTED` | A human-invoked `--rebuild --confirm` ran `terraform apply` of the DR kit. INFO on success, CRITICAL on failure (the organization may be partially rebuilt) — the largest write path must reach the on-call channel either way |
 | `GAP_REPLAY_EXECUTED` | A human-invoked `--replay-gaps --confirm` wrote unsupported objects and/or secret attributes back to Meraki from a snapshot. Payload carries the executed, skipped, and failed operations (identifiers/endpoints only — never secret values) |
 | `PROCESSING_FAULT` | A critical pipeline failure (payload carries the failing stage) |
+
+Every event's details additionally carry an `organization_id` (stamped
+by the dispatcher as soon as the organization is known), so multi-org
+fan-out consumers can attribute interleaved events. Diff/detail
+payloads are value-redacted before they leave the process — attribute
+names and locators only.
 
 ## Scheduled (cron) execution
 
