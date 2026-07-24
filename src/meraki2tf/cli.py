@@ -84,6 +84,7 @@ from meraki2tf.orchestrator import (
     PreflightRefusalError,
     RunSummary,
 )
+from meraki2tf import preflight
 from meraki2tf.provider_catalog import (
     CATALOG_CACHE_FILENAME,
     CatalogError,
@@ -112,6 +113,7 @@ from meraki2tf.terraform_runner import (
     PROVIDER_FILENAME,
     TerraformError,
     TerraformRunner,
+    ensure_supported_terraform,
 )
 
 logger = logging.getLogger(__name__)
@@ -183,6 +185,29 @@ def build_parser() -> argparse.ArgumentParser:
             "Discovery helper: list every organization the "
             f"{API_KEY_ENV_VAR} key can see (ID and name) and exit — the "
             "way to find your --org-id value. Standalone and read-only."
+        ),
+    )
+    core.add_argument(
+        "--check",
+        action="store_true",
+        help=(
+            "Preflight helper: validate the given flag set without "
+            "running anything — API key validity, --org-id resolution, "
+            "terraform binary and version, provider catalog, "
+            "--drift-baseline header, workdir writability, and alert-"
+            "channel configuration. One line per check, nonzero exit on "
+            "failure. Standalone, read-only, mutates nothing."
+        ),
+    )
+    core.add_argument(
+        "--estimate",
+        action="store_true",
+        help=(
+            "Cost-preview helper: enumerate networks and devices (2-3 "
+            "API calls; zero with --from-dump) and print the expected "
+            "discovery request count plus wall-clock estimates at the "
+            "rate cap and at a degraded rate, then exit. Standalone and "
+            "read-only."
         ),
     )
     core.add_argument(
@@ -409,6 +434,18 @@ def build_parser() -> argparse.ArgumentParser:
             "Escalate --rebuild, --heal, --replay-gaps, --restore, or "
             "--wipe-org from a read-only preview to a real write against "
             "the Meraki organization."
+        ),
+    )
+    actions.add_argument(
+        "--expect-org",
+        metavar="ORG_ID",
+        default=None,
+        help=(
+            "Assertion for --rebuild and --replay-gaps: refuse to plan "
+            "or write unless the organization the action resolves to "
+            "(the workdir's kit/state for --rebuild, the snapshot's "
+            "recorded organization for --replay-gaps) equals ORG_ID. "
+            "Both actions print the resolved organization either way."
         ),
     )
     actions.add_argument(
@@ -864,6 +901,45 @@ def _rebuild(config: RuntimeConfig) -> int:
         # instead of an unhandled traceback.
         logger.critical("%s", exc)
         return 1
+    # The apply targets whatever organization the workdir's artifacts
+    # belong to — name it prominently in preview AND confirm output so
+    # the operator can verify before terraform touches anything, and
+    # let --expect-org turn that verification into a hard interlock.
+    resolved = preflight.resolve_rebuild_organization(
+        config.workdir,
+        None if config.backend.is_remote else runner.state_path,
+    )
+    if resolved is None:
+        logger.warning(
+            "Rebuild target organization: UNKNOWN — neither "
+            "coverage.json, the state, nor imports.tf in %s names an "
+            "organization. Verify the workdir belongs to the org you "
+            "intend to rebuild before confirming.",
+            config.workdir,
+        )
+    else:
+        logger.warning(
+            "Rebuild target organization: %s (resolved from %s). The "
+            "apply writes to this organization — verify it is the one "
+            "you intend to rebuild.",
+            resolved[0], resolved[1],
+        )
+    if config.expect_org is not None:
+        if resolved is None:
+            logger.critical(
+                "--expect-org %s cannot be verified: the workdir does "
+                "not name an organization. Refusing to plan or apply.",
+                config.expect_org,
+            )
+            return 2
+        if resolved[0] != config.expect_org:
+            logger.critical(
+                "--expect-org %s does not match the organization this "
+                "workdir resolves to (%s, from %s). Refusing to plan or "
+                "apply.",
+                config.expect_org, resolved[0], resolved[1],
+            )
+            return 2
     # Built before the plan, like every other guarded DR path: a
     # misconfigured channel must refuse the action up front — before a
     # secret-bearing saved plan ever lands in the workdir — and a
@@ -1577,6 +1653,24 @@ def _replay_gaps(config: RuntimeConfig) -> int:
         )
         return 2
     snapshot_org = recorded_orgs[0] if recorded_orgs else graph.organization_id
+    # Name the organization the replay will write into, prominently and
+    # before any planning output; --expect-org turns the verification
+    # into a hard interlock (same semantics as the --rebuild assertion).
+    replay_target = config.org_id or graph.organization_id
+    logger.warning(
+        "Gap replay target organization: %s (%s).",
+        replay_target,
+        "from --org-id"
+        if config.org_id
+        else "the snapshot's recorded organization",
+    )
+    if config.expect_org is not None and config.expect_org != replay_target:
+        logger.critical(
+            "--expect-org %s does not match the organization this gap "
+            "replay resolves to (%s). Refusing to plan or write.",
+            config.expect_org, replay_target,
+        )
+        return 2
     dispatcher = build_dispatcher(config)
     try:
         runner = TerraformRunner(
@@ -1796,6 +1890,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             or config.confirm or config.target_org or config.serial_map
             or config.skip_claims or config.sync or config.rebaseline
             or config.confirm_deletions or config.fail_on_gaps
+            or config.check or config.estimate or config.expect_org
         ):
             arg_parser.error(
                 "--list-orgs is a standalone discovery helper; do not "
@@ -1816,6 +1911,51 @@ def main(argv: Sequence[str] | None = None) -> int:
             "(the azurerm/s3 'key' or gcs 'prefix' setting)."
         )
 
+    if config.check and config.estimate:
+        arg_parser.error(
+            "--check and --estimate are separate standalone helpers; "
+            "run one at a time."
+        )
+    if config.check or config.estimate:
+        helper = "--check" if config.check else "--estimate"
+        if (
+            config.rebuild or config.heal or config.replay_gaps
+            or config.restore or config.wipe_org or config.wipe_org_name
+            or config.confirm or config.target_org
+            or config.serial_map is not None or config.skip_claims
+            or config.expect_org
+        ):
+            arg_parser.error(
+                f"{helper} is a standalone read-only helper; do not "
+                "combine it with disaster-recovery actions or --confirm."
+            )
+    if config.check:
+        return preflight.run_check_command(config, build_dispatcher)
+    if config.estimate:
+        if (
+            config.dump_to is not None or config.drift_baseline is not None
+            or config.sanitize or config.sync or config.rebaseline
+            or config.confirm_deletions or config.fail_on_gaps
+            or config.only
+        ):
+            arg_parser.error(
+                "--estimate previews discovery cost only; do not combine "
+                "it with pipeline, export, or scope flags."
+            )
+        if config.dump_path is None:
+            if len(config.org_ids) != 1:
+                arg_parser.error(
+                    "--estimate needs exactly one --org-id in live mode "
+                    "(or --from-dump for an offline estimate)."
+                )
+            if not api_key_present():
+                arg_parser.error(
+                    "--estimate enumerates networks and devices via the "
+                    f"dashboard API; export {API_KEY_ENV_VAR} first (or "
+                    "estimate offline with --from-dump)."
+                )
+        return preflight.run_estimate_command(config)
+
     if config.confirm and not (
         config.rebuild or config.replay_gaps or config.restore
         or config.heal or config.wipe_org
@@ -1823,6 +1963,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         arg_parser.error(
             "--confirm is only valid together with --rebuild, --replay-gaps, "
             "--restore, --heal, or --wipe-org."
+        )
+    if config.expect_org and not (config.rebuild or config.replay_gaps):
+        arg_parser.error(
+            "--expect-org is only valid together with --rebuild or "
+            "--replay-gaps."
         )
     # Orphaned mode-scoped flags are refused, never silently ignored: a
     # flag that does nothing would let an operator believe an effect
@@ -2040,7 +2185,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             "--sync, --confirm-deletions, or --rebaseline."
         )
     if config.mode is ExecutionMode.LIVE and not config.org_ids:
-        arg_parser.error("--org-id is required in live mode.")
+        arg_parser.error(
+            "--org-id is required in live mode. New here? --list-orgs "
+            "prints the organizations your API key can see, and --check "
+            "validates a full flag set before anything runs."
+        )
     if config.sanitize and config.dump_to is None:
         arg_parser.error("--sanitize requires --dump-to.")
     if config.sanitize and config.drift_baseline is not None:
@@ -2246,6 +2395,40 @@ def _run_org_pipeline(
     # Attribute even startup faults to the organization when the flag
     # names it; dump-mode runs refine this once the snapshot resolves.
     dispatcher.organization_id = config.org_id
+    # Cheap validations FIRST (adversarial-review fix): a typo'd
+    # --drift-baseline or a missing/old terraform binary must fail in
+    # seconds, not hours into the discovery sweep. Both refusals stay
+    # enforced at their point of use too (snapshot_diff.baseline_drift,
+    # the terraform runner) — this only moves the failure earlier.
+    if config.drift_baseline is not None:
+        try:
+            preflight.validate_drift_baseline(
+                config.drift_baseline, config.org_id
+            )
+        except ValueError as exc:
+            # MalformedDumpError and the sanitized/partial/org-mismatch
+            # refusals; the scheduled job needs this on its alert
+            # channels, exactly like the same failure mid-run.
+            logger.critical("%s", exc)
+            dispatcher.dispatch(
+                processing_fault(
+                    stage="drift-baseline validation", error=str(exc)
+                )
+            )
+            return 1
+    if config.dump_to is None and api_key_present():
+        # This run will plan (and in sync mode apply) through
+        # terraform; probe the binary and version now. Snapshot
+        # exports and keyless air-gapped runs never invoke terraform,
+        # so they deliberately skip the probe.
+        try:
+            ensure_supported_terraform(config.terraform_bin)
+        except TerraformError as exc:
+            logger.critical("%s", exc)
+            dispatcher.dispatch(
+                processing_fault(stage="terraform preflight", error=str(exc))
+            )
+            return 1
     try:
         spec_file = resolve_spec(config.spec_path)
         spec_parser = OpenApiParser(spec_file)
