@@ -360,3 +360,26 @@ def test_runbook_partial_scope_banner(spec_parser: OpenApiParser) -> None:
         parser=spec_parser,
     )
     assert "PARTIAL RUN" not in full
+
+
+def test_runbook_rebuild_step_is_preview_first(
+    spec_parser: OpenApiParser,
+) -> None:
+    """Step 1 must never jump straight to --rebuild --confirm: preview
+    first, verify the printed target-org line, then confirm."""
+    text = build_runbook(
+        organization_id="org-123",
+        graph=_graph(),
+        captured=(),
+        unsupported=(),
+        unmanaged_secret_attributes={},
+        parser=spec_parser,
+    )
+    steps = text.split("## How to use this document", 1)[1]
+    step_one = steps.split("2. Replay", 1)[0]
+    assert "`meraki2tf --rebuild --workdir <this directory>`" in step_one
+    assert "--rebuild --confirm" not in step_one
+    assert "preview the" in step_one
+    assert "Rebuild target organization" in step_one
+    assert "then re-run with" in step_one
+    assert "`--confirm`" in step_one

@@ -524,6 +524,17 @@ class RuntimeConfig:
     smtp_port: int
     email_from: str
     terraform_bin: str
+    #: Standalone read-only preflight: validate the flag set (API key,
+    #: org resolution, terraform, catalog, baseline, workdir, alert
+    #: channels) and exit without running the pipeline.
+    check: bool = False
+    #: Standalone read-only cost preview: expected discovery request
+    #: counts and wall-clock estimates, then exit.
+    estimate: bool = False
+    #: Assert the organization a --rebuild (workdir kit/state) or
+    #: --replay-gaps (snapshot) resolves to; a mismatch refuses the
+    #: preview and the apply alike.
+    expect_org: str | None = None
 
     @property
     def org_id(self) -> str | None:
@@ -595,6 +606,9 @@ class RuntimeConfig:
             smtp_port=args.smtp_port,
             email_from=args.email_from,
             terraform_bin=args.terraform_bin,
+            check=args.check,
+            estimate=args.estimate,
+            expect_org=args.expect_org,
         )
 
 

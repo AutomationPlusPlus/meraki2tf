@@ -221,6 +221,40 @@ def write_manifest(manifest: dict[str, Any], workdir: Path) -> tuple[Path, Path]
     return json_path, summary_path
 
 
+#: How many example locators a grouped unsupported line carries.
+_GROUP_EXAMPLE_LIMIT = 3
+
+
+def _grouped_unsupported_lines(unsupported: list[dict[str, Any]]) -> list[str]:
+    """Unsupported entries grouped by (api_path, reason) for coverage.txt.
+
+    A repeated endpoint used to print one line per object (11× the same
+    staged-upgrade path), burying distinct gaps under repetition. Each
+    group prints once with a count and up to three example locators;
+    ``coverage.json`` stays fully itemized — this only condenses the
+    human-readable twin. First-appearance order is preserved so the
+    summary tracks the manifest.
+    """
+    groups: dict[tuple[str, str], list[str]] = {}
+    for entry in unsupported:
+        # Provider diagnostics can be multi-line; one entry must stay
+        # one line so nothing reads as a separate report item.
+        reason = " ".join(str(entry["reason"]).split())
+        locator = f"ids={','.join(entry['identifiers']) or '<none>'}"
+        groups.setdefault((str(entry["api_path"]), reason), []).append(locator)
+    lines: list[str] = []
+    for (api_path, reason), locators in groups.items():
+        if len(locators) == 1:
+            lines.append(f"  - {api_path} ({locators[0]}): {reason}")
+            continue
+        examples = "; ".join(locators[:_GROUP_EXAMPLE_LIMIT])
+        overflow = len(locators) - _GROUP_EXAMPLE_LIMIT
+        suffix = f" ...and {overflow} more" if overflow > 0 else ""
+        lines.append(f"  - {api_path} ({len(locators)} objects): {reason}")
+        lines.append(f"      e.g. {examples}{suffix}")
+    return lines
+
+
 def _render_summary(manifest: dict[str, Any]) -> str:
     totals = manifest["totals"]
     lines = [
@@ -258,14 +292,7 @@ def _render_summary(manifest: dict[str, Any]) -> str:
     ]
     if unsupported:
         lines += ["", "Objects Terraform cannot rebuild (manual DR runbook):"]
-        lines += [
-            f"  - {entry['api_path']} "
-            f"(ids={','.join(entry['identifiers']) or '<none>'}): "
-            # Provider diagnostics can be multi-line; one entry must
-            # stay one line so nothing reads as a separate report item.
-            + " ".join(str(entry["reason"]).split())
-            for entry in unsupported
-        ]
+        lines += _grouped_unsupported_lines(unsupported)
     duplicate_entries = [
         entry
         for entry in manifest["objects"]

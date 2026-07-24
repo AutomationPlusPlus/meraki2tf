@@ -329,8 +329,10 @@ def test_dump_mode_end_to_end(
     # cached no-ops) and dumps the provider schema before generation; the
     # comparison stage plans and reconciliation classifies the
     # changes-present plan via show.
+    # The leading "version" call is the pre-discovery terraform probe
+    # (fail-fast on a missing/old binary before the sweep starts).
     assert [call[1] for call in terraform_calls] == [
-        "init", "providers", "plan", "show",
+        "version", "init", "providers", "plan", "show",
     ]
 
     imports = (workdir / "imports.tf").read_text(encoding="utf-8")
@@ -983,7 +985,7 @@ def test_sync_end_to_end_applies_import_only_plan(
     # The comparison stage's init is a cached no-op after the catalog
     # init.
     assert [call[1] for call in terraform_calls] == [
-        "init", "providers", "plan", "show", "apply",
+        "version", "init", "providers", "plan", "show", "apply",
     ]
     # The apply consumes the run-private verified copy of the plan.
     assert terraform_calls[-1][-1].startswith("meraki2tf-sync.tfplan.verified-")
