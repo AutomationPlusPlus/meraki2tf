@@ -2323,6 +2323,15 @@ def test_split_resource_blocks_is_heredoc_aware() -> None:
     assert template.rstrip("\n").endswith("}")
 
 
+def test_split_resource_blocks_keeps_unterminated_trailing_block() -> None:
+    """A block whose heredoc never closes has no closer; the scan must
+    stop cleanly at end-of-file and keep the block text as-is."""
+    text = 'resource "meraki_x" "a" {\n  body = <<EOT\n}\n'
+    preamble, blocks = terraform_runner._split_resource_blocks(text)
+    assert preamble == ""
+    assert blocks == {"meraki_x.a": text}
+
+
 def test_prune_baseline_is_heredoc_aware(runner: TerraformRunner) -> None:
     """Pruning a heredoc-bearing block must remove the WHOLE block —
     truncating at the heredoc's column-0 `}` left half a resource behind
@@ -2371,5 +2380,28 @@ def test_verified_copies_older_than_the_stale_window_are_swept(
     assert not recycled.exists()
     assert not odd.exists()
     assert concurrent.read_bytes() == b"live-concurrent-copy"
+    assert target.read_bytes() == b"opaque-plan"
+    target.unlink()
+
+
+def test_sweep_tolerates_a_copy_deleted_mid_scan(
+    runner: TerraformRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A concurrent sweep deleting a leftover between glob and stat must
+    not crash this run's copy creation."""
+    runner.prepare_workspace()
+    source = runner.workdir / SYNC_PLAN_FILENAME
+    source.write_bytes(b"opaque-plan")
+    ghost = runner.workdir / f"{SYNC_PLAN_FILENAME}.verified-1"
+    ghost.write_bytes(b"racing")
+    real_stat = Path.stat
+
+    def racing_stat(self: Path, **kwargs: Any) -> Any:
+        if self.name.endswith(".verified-1"):
+            raise OSError("deleted underneath")
+        return real_stat(self, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", racing_stat)
+    target = runner._exclusive_run_copy(source)
     assert target.read_bytes() == b"opaque-plan"
     target.unlink()
