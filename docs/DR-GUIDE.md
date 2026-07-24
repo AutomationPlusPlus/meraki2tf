@@ -218,6 +218,54 @@ Notes:
   failed, skipped, and surviving counts; objects the API cannot
   recreate are reported with reasons, never silently dropped.
 
+### Selective backup before risky changes (`--dump-to --only`)
+
+About to make major changes to **one** network of a large organization?
+A full-org snapshot can take hours; a scoped one takes minutes and
+gives you a same-day undo path through `--heal`:
+
+```bash
+export MERAKI_DASHBOARD_API_KEY="<your-dashboard-api-key>"
+
+# 1. Fast partial backup of just the network you are about to touch:
+meraki2tf --org-id 123456 --dump-to pre-change.jsonl.gz \
+    --only 'network:Branch-07'
+
+# 2. ...make your changes in the dashboard...
+
+# 3. If something you needed got deleted — preview, then heal it back:
+meraki2tf --heal --from-dump pre-change.jsonl.gz --org-id 123456
+meraki2tf --heal --confirm --from-dump pre-change.jsonl.gz --org-id 123456
+```
+
+How it works and what to expect:
+
+- **Scope selectors are `network:PATTERN` only** (case-insensitive
+  glob over network name or ID, repeatable, union). A selector
+  matching no network is refused with the available networks listed.
+- **What the snapshot contains:** the selected networks with their
+  features, their claimed devices with device-level features, **all
+  org-level objects** (cheap, and required so references from the
+  scoped networks stay recreatable), and every config template.
+  Unclaimed devices fall outside any network scope and are not
+  captured.
+- **Heal is scope-aware:** against a partial snapshot, `--heal`
+  narrows its live discovery to the recorded networks, so the preview
+  is as fast as the backup was. `--only` composes at heal time to
+  narrow further. The `HEAL_EXECUTED` alert and run log name the
+  partial scope.
+- **A partial snapshot is a selective backup, not a DR snapshot.**
+  It is refused by `--restore`, `--replay-gaps`, `--drift-baseline`,
+  and pipeline `--sync`/`--confirm-deletions`; the scheduled Azure
+  wrapper refuses `--only` outright so the weekly drift chain stays
+  full-organization. The coverage manifest, runbook, and RUN_SUCCESS
+  notification of a scoped run carry a loud **PARTIAL** banner naming
+  the covered networks.
+- **Caveats:** objects created *after* the backup are not in it (heal
+  cannot un-create anything — it is additive-only, so your new work is
+  safe); a device moved to another network between backup and heal is
+  reported, never silently re-claimed.
+
 ### Restoring what Terraform can't rebuild (`--replay-gaps`)
 
 `--rebuild` restores everything the Terraform provider can express. Two
