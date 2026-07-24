@@ -20,30 +20,43 @@ Security and contract notes:
 
 from __future__ import annotations
 
+import functools
 import inspect
 import itertools
 import logging
 import os
 import re
 import threading
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from meraki2tf.config import read_api_key
 from meraki2tf.models import (
     UNREADABLE_MARKER,
+    DiscoveryDiagnostics,
     FeatureConfiguration,
     MerakiDevice,
     MerakiNetwork,
     NetworkGraph,
+    SuspectEndpoint,
 )
-from meraki2tf.openapi_parser import OpenApiParser, entity_key
+from meraki2tf.openapi_parser import (
+    OpenApiParser,
+    TerraformResourceMapping,
+    entity_key,
+)
 from meraki2tf.providers.base import MerakiDataProvider
 from meraki2tf.providers.discovery import (
+    aggregation_collection_path,
+    aggregation_mappings,
     config_collection_operations,
     expand_endpoint_payload,
+    explode_aggregation_payload,
     nested_collection_operations,
+    network_product_types,
     parent_item_path,
+    product_segment,
 )
 from meraki2tf.providers.ratelimit import AdaptiveTokenBucket
 from meraki2tf.scope import LiveNetworkScope
@@ -101,6 +114,41 @@ _SCOPE_REFUSAL_HTTP_STATUSES = frozenset({400, 404})
 def _scope_label(params: dict[str, str]) -> str:
     """Human-readable scope for log/error messages, any parameter depth."""
     return ", ".join(f"{name} {value}" for name, value in params.items())
+
+
+#: An endpoint refused by every scope becomes a suspect only after this
+#: many attempts — one or two refusals are routine product mismatches.
+_SUSPECT_MINIMUM_SCOPES = 3
+
+
+class _EndpointStats:
+    """Thread-safe per-endpoint attempt/refusal tally for one discovery run.
+
+    Feature-not-enabled 400/404s are legitimate absence and stay
+    absent-by-design; this tally only surfaces the anomaly of an
+    endpoint refusing *every* scope it was tried against, as a
+    per-endpoint diagnostic in the coverage manifest.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._tried: dict[str, int] = {}
+        self._refused: dict[str, int] = {}
+
+    def record(self, path: str, refused: bool) -> None:
+        with self._lock:
+            self._tried[path] = self._tried.get(path, 0) + 1
+            if refused:
+                self._refused[path] = self._refused.get(path, 0) + 1
+
+    def suspects(self) -> tuple[SuspectEndpoint, ...]:
+        with self._lock:
+            return tuple(
+                SuspectEndpoint(api_path=path, scopes_tried=tried)
+                for path, tried in sorted(self._tried.items())
+                if tried >= _SUSPECT_MINIMUM_SCOPES
+                and self._refused.get(path, 0) == tried
+            )
 
 
 #: Session verbs a generated SDK method may call and still be
@@ -184,6 +232,10 @@ class LiveApiDataProvider(MerakiDataProvider):
         #: remain recreatable). Unclaimed devices (no network) fall
         #: outside every network scope by definition.
         self._network_scope = network_scope
+        #: Side facts of the latest discovery pass (suspect endpoints,
+        #: prefilter skip count) for the coverage manifest; ``None``
+        #: until a feature-discovery pass has run.
+        self.discovery_diagnostics: DiscoveryDiagnostics | None = None
         self._client: Any = None
         #: True when _dashboard() built the client itself (vs a test
         #: injecting one) — decides whether workers may share it.
@@ -307,9 +359,14 @@ class LiveApiDataProvider(MerakiDataProvider):
         undispatchable_lock = threading.Lock()
         bucket = AdaptiveTokenBucket()
         abort = threading.Event()
+        stats = _EndpointStats()
         features: list[FeatureConfiguration] = []
         mappings = parser.resource_mappings()
         lookup = parser.endpoint_lookup()
+        #: Valid product types per the createNetwork enum; empty when
+        #: the spec declares none (which disables prefiltering).
+        product_types = network_product_types(parser)
+        skipped_out_of_scope = 0
 
         def _folds_elsewhere(op: OperationSpec) -> bool:
             # Collections that fold into another entity list first-class
@@ -327,7 +384,8 @@ class LiveApiDataProvider(MerakiDataProvider):
             params = dict(zip(op.path_params, scope_values))
             try:
                 payload = self._try_call(
-                    op, params, undispatchable, undispatchable_lock, bucket, abort
+                    op, params, undispatchable, undispatchable_lock, bucket,
+                    abort, stats=stats,
                 )
             except _EndpointUnreadable as exc:
                 logger.warning(
@@ -347,16 +405,62 @@ class LiveApiDataProvider(MerakiDataProvider):
                 return []
             return expand_endpoint_payload(parser, op, scope_values, payload)
 
+        def _fetch_aggregation(
+            mapping: TerraformResourceMapping,
+        ) -> list[FeatureConfiguration]:
+            """One org-scoped aggregation GET, exploded per scope.
+
+            The collection source of a GET-less entity (Air Marshal,
+            RRM, uplink NAT, …): a single org-level call replaces the
+            per-network GET the API never offered. Failures gap the
+            entity's own collection path so heal/deletion flows exempt
+            it through the ordinary unreadable-marker mechanism.
+            """
+            agg_op = mapping.aggregation_get
+            assert agg_op is not None  # only adopted mappings are queued
+            params = {"organizationId": organization_id}
+            try:
+                payload = self._try_call(
+                    agg_op, params, undispatchable, undispatchable_lock,
+                    bucket, abort, stats=stats,
+                )
+            except _EndpointUnreadable as exc:
+                collection_path = aggregation_collection_path(mapping)
+                logger.warning(
+                    "Aggregation endpoint %s could not be read (%s); "
+                    "entity %s is recorded as a coverage gap — its "
+                    "objects are missing from this snapshot.",
+                    agg_op.path, exc, collection_path,
+                )
+                return [
+                    FeatureConfiguration(
+                        api_path=collection_path,
+                        path_values=(),
+                        payload={UNREADABLE_MARKER: str(exc)},
+                    )
+                ]
+            if payload is None:
+                # A 400/404 at org scope: the organization does not
+                # carry the product at all — absence by design.
+                return []
+            exploded = explode_aggregation_payload(mapping, payload)
+            if self._network_scope is not None:
+                allowed = frozenset(network.network_id for network in networks)
+                exploded = [
+                    feature
+                    for feature in exploded
+                    if not feature.path_values
+                    or feature.path_values[0] in allowed
+                ]
+            return exploded
+
         def _run_level(
-            items: list[tuple[OperationSpec, tuple[str, ...]]]
+            items: list[Callable[[], list[FeatureConfiguration]]]
         ) -> None:
             if not items:
                 return
             with ThreadPoolExecutor(max_workers=self._workers) as pool:
-                futures = [
-                    pool.submit(_fetch, op, scope_values)
-                    for op, scope_values in items
-                ]
+                futures = [pool.submit(job) for job in items]
                 try:
                     # Submission order, not completion order — discovery
                     # output stays deterministic under any pool width.
@@ -371,30 +475,75 @@ class LiveApiDataProvider(MerakiDataProvider):
                         future.cancel()
                     raise
 
-        level: list[tuple[OperationSpec, tuple[str, ...]]] = [
-            (op, (organization_id,))
-            for op in config_collection_operations(parser, "organizationId")
-            if not _folds_elsewhere(op)
-        ]
+        level: list[Callable[[], list[FeatureConfiguration]]] = []
+        #: Paths this run actually queued for querying — feeds the
+        #: nested-surface sweepability audit below.
+        level_paths: set[str] = set()
+        for op in config_collection_operations(parser, "organizationId"):
+            if not _folds_elsewhere(op):
+                level.append(functools.partial(_fetch, op, (organization_id,)))
+                level_paths.add(op.path)
         network_ops = tuple(
             op
             for op in config_collection_operations(parser)
             if not _folds_elsewhere(op)
         )
-        level.extend(
-            (op, (network.network_id,))
-            for network in networks
-            for op in network_ops
-        )
+        for network in networks:
+            for op in network_ops:
+                segment = product_segment(op)
+                if (
+                    segment in product_types
+                    and network.product_types
+                    and segment not in network.product_types
+                ):
+                    # The endpoint's product family is provably outside
+                    # this network's product types: the call could only
+                    # 400/404. Skipping it behaves exactly like that
+                    # refusal — absent-by-design, no record. Segments
+                    # that are not exact product types (sm, …) and
+                    # networks with unknown product types never filter.
+                    skipped_out_of_scope += 1
+                    continue
+                level.append(
+                    functools.partial(_fetch, op, (network.network_id,))
+                )
+                level_paths.add(op.path)
         serial_ops = tuple(
             op
             for op in config_collection_operations(parser, "serial")
             if not _folds_elsewhere(op)
         )
-        level.extend(
-            (op, (device.serial,)) for device in devices for op in serial_ops
-        )
+        for device in devices:
+            device_type = str(device.payload.get("productType") or "")
+            for op in serial_ops:
+                segment = product_segment(op)
+                if (
+                    device_type
+                    and segment in product_types
+                    and segment != device_type
+                ):
+                    # Same conservative rule per device: filter only on
+                    # an exact spec-derived product-type segment and a
+                    # known device productType.
+                    skipped_out_of_scope += 1
+                    continue
+                level.append(functools.partial(_fetch, op, (device.serial,)))
+                level_paths.add(op.path)
+        # GET-less entities adopted via an org-scoped aggregation GET
+        # (byNetwork pattern): one call each at org scope, exploded into
+        # per-scope assets. Without these the whole surface class (Air
+        # Marshal, RRM, uplink NAT, …) silently vanishes.
+        for mapping in aggregation_mappings(parser):
+            level.append(functools.partial(_fetch_aggregation, mapping))
+            level_paths.add(aggregation_collection_path(mapping))
         _run_level(level)
+        if skipped_out_of_scope:
+            logger.info(
+                "Product-type prefilter skipped %d endpoint call(s) whose "
+                "product family is outside the scope's product types "
+                "(absent-by-design, like a scope refusal).",
+                skipped_out_of_scope,
+            )
 
         # Template-held configuration (SSIDs, VLANs, firewall rules on
         # a config template) is invisible to the per-network sweep —
@@ -414,7 +563,7 @@ class LiveApiDataProvider(MerakiDataProvider):
             )
             _run_level(
                 [
-                    (op, (template_id,))
+                    functools.partial(_fetch, op, (template_id,))
                     for template_id in template_ids
                     for op in network_ops
                 ]
@@ -440,7 +589,7 @@ class LiveApiDataProvider(MerakiDataProvider):
         # count even when their scope list was empty — an org with zero
         # networks or devices has genuinely nothing there, and must not
         # manufacture phantom gap records for every nested surface.
-        queried_paths = {op.path for op, _ in level}
+        queried_paths = set(level_paths)
         queried_paths.update(op.path for op in network_ops)
         queried_paths.update(op.path for op in serial_ops)
         queried_paths.update(
@@ -451,7 +600,7 @@ class LiveApiDataProvider(MerakiDataProvider):
         for _, level_ops in itertools.groupby(
             nested_ops, key=lambda op: len(op.path_params)
         ):
-            nested_level: list[tuple[OperationSpec, tuple[str, ...]]] = []
+            nested_level: list[Callable[[], list[FeatureConfiguration]]] = []
             for op in level_ops:
                 parent = parent_item_path(op.path)
                 scopes = [
@@ -461,7 +610,10 @@ class LiveApiDataProvider(MerakiDataProvider):
                     and len(feature.path_values) == len(op.path_params)
                 ]
                 if scopes:
-                    nested_level.extend((op, values) for values in scopes)
+                    nested_level.extend(
+                        functools.partial(_fetch, op, values)
+                        for values in scopes
+                    )
                     queried_paths.add(op.path)
                     continue
                 parent_collection = parent.rsplit("/", 1)[0]
@@ -494,6 +646,19 @@ class LiveApiDataProvider(MerakiDataProvider):
                     )
                 )
             _run_level(nested_level)
+        suspects = stats.suspects()
+        if suspects:
+            logger.warning(
+                "%d endpoint(s) refused every scope they were tried "
+                "against; recorded as suspect endpoints in the coverage "
+                "manifest: %s",
+                len(suspects),
+                ", ".join(suspect.api_path for suspect in suspects),
+            )
+        self.discovery_diagnostics = DiscoveryDiagnostics(
+            suspect_endpoints=suspects,
+            skipped_out_of_scope=skipped_out_of_scope,
+        )
         return features
 
     def _try_call(
@@ -504,14 +669,19 @@ class LiveApiDataProvider(MerakiDataProvider):
         undispatchable_lock: threading.Lock,
         bucket: AdaptiveTokenBucket,
         abort: threading.Event,
+        *,
+        stats: _EndpointStats | None = None,
     ) -> Any:
         """One endpoint call; refusals are data, API failures never are.
 
         A product-type refusal for one network (400/404) is normal and
-        logged at DEBUG. An operation the installed SDK cannot dispatch at
-        all would silently drop that endpoint's assets from every scope —
-        that is missing DR coverage, so it warns once and is skipped for
-        the rest of the run. Throttles are retried under the shared AIMD
+        logged at DEBUG (and tallied in ``stats``, so an endpoint every
+        scope refuses surfaces as a suspect-endpoint diagnostic). An
+        operation the installed SDK cannot dispatch at all would
+        silently drop that endpoint's assets from every scope — that is
+        missing DR coverage, so it warns once and raises
+        _EndpointUnreadable for every scope so each one is recorded as
+        a coverage gap. Throttles are retried under the shared AIMD
         bucket's pacing (its rate cuts and global pauses grow while the
         organization budget stays saturated); a call that exhausts the
         attempt budget aborts discovery (LiveRetryExhaustedError) rather
@@ -524,7 +694,10 @@ class LiveApiDataProvider(MerakiDataProvider):
         """
         with undispatchable_lock:
             if op.operation_id in undispatchable:
-                return None
+                raise _EndpointUnreadable(
+                    "operation cannot be dispatched onto the installed "
+                    "meraki SDK"
+                )
         dashboard = self._worker_dashboard()
         throttled_attempts = 0
         while not abort.is_set():
@@ -538,12 +711,16 @@ class LiveApiDataProvider(MerakiDataProvider):
                 if fresh:
                     logger.warning(
                         "Endpoint %s cannot be dispatched onto the installed "
-                        "meraki SDK (%s); its assets will be missing from "
-                        "this snapshot. Upgrade the SDK or pin a matching "
+                        "meraki SDK (%s); its assets are recorded as "
+                        "coverage gaps — they are missing from this "
+                        "snapshot. Upgrade the SDK or pin a matching "
                         "--spec release.",
                         op.path, exc,
                     )
-                return None
+                raise _EndpointUnreadable(
+                    "operation cannot be dispatched onto the installed "
+                    f"meraki SDK ({exc})"
+                ) from exc
             except Exception as exc:
                 status = getattr(exc, "status", None)
                 if status in _THROTTLE_HTTP_STATUSES:
@@ -578,6 +755,8 @@ class LiveApiDataProvider(MerakiDataProvider):
                         "Feature endpoint %s unavailable for %s: %s",
                         op.path, _scope_label(params), exc,
                     )
+                    if stats is not None:
+                        stats.record(op.path, refused=True)
                     return None
                 # Anything else — an APIError with status 200 (a body
                 # that never parsed as JSON), an unexpected 4xx, or a
@@ -595,6 +774,8 @@ class LiveApiDataProvider(MerakiDataProvider):
                     "this endpoint"
                 ) from exc
             bucket.on_success()
+            if stats is not None:
+                stats.record(op.path, refused=False)
             return result
         return None
 

@@ -102,6 +102,31 @@ class FeatureConfiguration:
 
 
 @dataclass(frozen=True)
+class SuspectEndpoint:
+    """One endpoint that refused every scope it was tried against.
+
+    A feature-not-enabled 400/404 for one network is legitimate
+    absence; the same refusal from *every* scope (with at least a few
+    tried) is an anomaly the operator should see — an SDK/spec skew or
+    an API regression could otherwise hide a whole surface behind
+    plausible-looking refusals.
+    """
+
+    api_path: str
+    scopes_tried: int
+
+
+@dataclass(frozen=True)
+class DiscoveryDiagnostics:
+    """Side facts one live-discovery pass hands to the coverage manifest."""
+
+    suspect_endpoints: tuple[SuspectEndpoint, ...] = ()
+    #: Calls skipped because the endpoint's product segment is outside
+    #: the scope's product types — absent-by-design, like a refusal.
+    skipped_out_of_scope: int = 0
+
+
+@dataclass(frozen=True)
 class NetworkGraph:
     """The complete discovered configuration surface for one organization."""
 

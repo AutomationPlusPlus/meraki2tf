@@ -199,3 +199,276 @@ def test_terraform_name_collision_keeps_first_and_warns(
     # so its assets are audited as unsupported instead of mis-imported.
     assert mapping.paths == ("/networks/{networkId}/trafficShaping",)
     assert "/networks/{networkId}/traffic/shaping" not in parser.endpoint_lookup()
+
+
+# ---------------------------------------------------------------------------
+# Aggregation adoption: GET-less mutable entities with an org-level GET
+# ---------------------------------------------------------------------------
+
+
+def _parser_for(spec: dict, tmp_path: Path) -> OpenApiParser:
+    path = tmp_path / "agg-spec.json"
+    path.write_text(json.dumps(spec), encoding="utf-8")
+    return OpenApiParser(path)
+
+
+def _agg_schema(*item_properties: str) -> dict:
+    return {
+        "responses": {
+            "200": {
+                "content": {
+                    "application/json": {
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    name: {} for name in item_properties
+                                },
+                            },
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+
+def test_getless_put_entity_adopts_bynetwork_aggregation_get(
+    tmp_path: Path,
+) -> None:
+    """The Meraki "per-network PUT + org byNetwork GET" pattern (Air
+    Marshal, RRM, uplink NAT, ...) must yield a resource mapping whose
+    canonical addressing stays network-scoped while the aggregation GET
+    becomes the collection source — previously the whole entity class
+    silently vanished."""
+    spec = {
+        "openapi": "3.0.1",
+        "paths": {
+            "/networks/{networkId}/wireless/zigbee": {
+                "put": _op("updateNetworkWirelessZigbee", "wireless"),
+            },
+            "/organizations/{organizationId}/wireless/zigbee/byNetwork": {
+                "get": _op(
+                    "getOrganizationWirelessZigbeeByNetwork", "wireless"
+                ),
+            },
+        },
+    }
+    mappings = _parser_for(spec, tmp_path).resource_mappings()
+    mapping = mappings["meraki_networks_wireless_zigbee"]
+    assert mapping.paths == ("/networks/{networkId}/wireless/zigbee",)
+    assert mapping.id_components == ("network_id",)
+    assert mapping.aggregation_get is not None
+    assert mapping.aggregation_get.path == (
+        "/organizations/{organizationId}/wireless/zigbee/byNetwork"
+    )
+
+
+def test_pipeline_fixture_adopts_air_marshal_settings(
+    spec_parser: OpenApiParser,
+) -> None:
+    mapping = spec_parser.resource_mappings()[
+        "meraki_networks_wireless_air_marshal_settings"
+    ]
+    assert mapping.aggregation_get is not None
+    assert mapping.aggregation_get.operation_id == (
+        "getOrganizationWirelessAirMarshalSettingsByNetwork"
+    )
+    # Ordinary GET-backed entities carry no aggregation source.
+    vlans = spec_parser.resource_mappings()["meraki_networks_appliance_vlans"]
+    assert vlans.aggregation_get is None
+
+
+def test_same_tail_org_aggregation_adopted_with_scope_identifier(
+    tmp_path: Path,
+) -> None:
+    """campusGateway-clusters shape: no byNetwork suffix, but the org
+    GET's response items declare a network identifier, so the entity is
+    adopted — including its item path for per-element addressing."""
+    spec = {
+        "openapi": "3.0.1",
+        "paths": {
+            "/networks/{networkId}/campusGateway/clusters": {
+                "post": _op("createNetworkCampusGatewayCluster", "campusGateway"),
+            },
+            "/networks/{networkId}/campusGateway/clusters/{clusterId}": {
+                "put": _op("updateNetworkCampusGatewayCluster", "campusGateway"),
+            },
+            "/organizations/{organizationId}/campusGateway/clusters": {
+                "get": {
+                    **_op("getOrganizationCampusGatewayClusters", "campusGateway"),
+                    **_agg_schema("network", "clusterId", "name"),
+                },
+            },
+        },
+    }
+    mappings = _parser_for(spec, tmp_path).resource_mappings()
+    mapping = mappings["meraki_networks_campus_gateway_clusters"]
+    assert mapping.aggregation_get is not None
+    assert mapping.id_components == ("network_id", "cluster_id")
+
+
+def test_same_tail_org_aggregation_requires_scope_identifier(
+    tmp_path: Path,
+) -> None:
+    """Without a declared per-network identifier the org GET could be a
+    same-named but unrelated surface; the entity must stay unadopted
+    (it surfaces via the spec-surface write-only accounting instead)."""
+    spec = {
+        "openapi": "3.0.1",
+        "paths": {
+            "/networks/{networkId}/foo/bar": {
+                "put": _op("updateNetworkFooBar", "foo"),
+            },
+            "/organizations/{organizationId}/foo/bar": {
+                "get": {
+                    **_op("getOrganizationFooBar", "foo"),
+                    **_agg_schema("name", "value"),
+                },
+            },
+        },
+    }
+    mappings = _parser_for(spec, tmp_path).resource_mappings()
+    assert "meraki_networks_foo_bar" not in mappings
+
+
+def test_same_tail_org_aggregation_without_schema_is_not_adopted(
+    tmp_path: Path,
+) -> None:
+    spec = {
+        "openapi": "3.0.1",
+        "paths": {
+            "/networks/{networkId}/foo/bar": {
+                "put": _op("updateNetworkFooBar", "foo"),
+            },
+            "/organizations/{organizationId}/foo/bar": {
+                "get": _op("getOrganizationFooBar", "foo"),
+            },
+        },
+    }
+    mappings = _parser_for(spec, tmp_path).resource_mappings()
+    assert "meraki_networks_foo_bar" not in mappings
+
+
+def test_same_tail_aggregation_with_scalar_items_is_not_adopted(
+    tmp_path: Path,
+) -> None:
+    """An org GET listing bare scalars declares no per-item properties
+    at all — nothing to explode, so no adoption."""
+    spec = {
+        "openapi": "3.0.1",
+        "paths": {
+            "/networks/{networkId}/foo/bar": {
+                "put": _op("updateNetworkFooBar", "foo"),
+            },
+            "/organizations/{organizationId}/foo/bar": {
+                "get": {
+                    **_op("getOrganizationFooBar", "foo"),
+                    "responses": {
+                        "200": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    }
+                                }
+                            }
+                        }
+                    },
+                },
+            },
+        },
+    }
+    mappings = _parser_for(spec, tmp_path).resource_mappings()
+    assert "meraki_networks_foo_bar" not in mappings
+
+
+def test_post_only_action_entities_are_never_adopted(tmp_path: Path) -> None:
+    """RPC actions (claim, remove, blinkLeds, ...) carry no PUT; even a
+    name-matching org GET must not turn them into resources."""
+    spec = {
+        "openapi": "3.0.1",
+        "paths": {
+            "/networks/{networkId}/devices/remove": {
+                "post": _op("removeNetworkDevices", "networks"),
+            },
+            "/organizations/{organizationId}/devices/remove/byNetwork": {
+                "get": _op("getOrganizationDevicesRemoveByNetwork", "organizations"),
+            },
+        },
+    }
+    mappings = _parser_for(spec, tmp_path).resource_mappings()
+    assert "meraki_networks_devices_remove" not in mappings
+
+
+def test_device_scoped_getless_entities_are_not_adopted(
+    tmp_path: Path,
+) -> None:
+    """Only ``networks``-rooted entities follow the byNetwork pattern in
+    the published spec; a device-scoped GET-less PUT stays unadopted
+    (conservative: under-adoption surfaces as write-only accounting,
+    over-adoption would fabricate wrong per-scope assets)."""
+    spec = {
+        "openapi": "3.0.1",
+        "paths": {
+            "/devices/{serial}/cellular/geolocations": {
+                "put": _op("updateDeviceCellularGeolocations", "cellular"),
+            },
+            "/organizations/{organizationId}/cellular/geolocations/byNetwork": {
+                "get": _op(
+                    "getOrganizationCellularGeolocationsByNetwork", "cellular"
+                ),
+            },
+        },
+    }
+    mappings = _parser_for(spec, tmp_path).resource_mappings()
+    assert "meraki_devices_cellular_geolocations" not in mappings
+
+
+def test_enveloped_aggregation_schema_declares_scope_identifier(
+    tmp_path: Path,
+) -> None:
+    """The {items: [...]} envelope form of the response schema counts
+    for the same-tail scope-identifier guard too."""
+    spec = {
+        "openapi": "3.0.1",
+        "paths": {
+            "/networks/{networkId}/foo/bar": {
+                "put": _op("updateNetworkFooBar", "foo"),
+            },
+            "/organizations/{organizationId}/foo/bar": {
+                "get": {
+                    **_op("getOrganizationFooBar", "foo"),
+                    "responses": {
+                        "200": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "items": {
+                                                "type": "array",
+                                                "items": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "networkId": {},
+                                                        "value": {},
+                                                    },
+                                                },
+                                            },
+                                            "meta": {"type": "object"},
+                                        },
+                                    }
+                                }
+                            }
+                        }
+                    },
+                },
+            },
+        },
+    }
+    mappings = _parser_for(spec, tmp_path).resource_mappings()
+    mapping = mappings["meraki_networks_foo_bar"]
+    assert mapping.aggregation_get is not None

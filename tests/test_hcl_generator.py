@@ -666,3 +666,125 @@ def test_comma_bearing_id_component_is_flagged_unsupported(
     assert "comma" in reasons[("true,123",)]
     content = report.imports_file.read_text(encoding="utf-8")
     assert "true,123" not in content
+
+
+def test_duplicate_import_ids_become_explicit_records(
+    generator: HclImportGenerator, tmp_path: Path
+) -> None:
+    """A duplicated import ID is a discovered object; skipping it
+    silently would leave the coverage totals unable to account for it
+    (Cardinal Rule 2). It becomes a duplicate-id record naming its
+    primary instead."""
+    report = generator.generate(
+        _graph(networks=(_network(), _network()), devices=(), features=()),
+        tmp_path,
+    )
+    assert report.imports_written == 1
+    assert len(report.duplicates) == 1
+    duplicate = report.duplicates[0]
+    assert duplicate.api_path == "/networks/{networkId}"
+    assert duplicate.import_id == "org-123,N_1"
+    assert duplicate.identifiers == ("N_1",)
+    assert duplicate.primary_address == "meraki_network.n_1"
+    # Accounting conserves the graph: 2 discovered → 1 captured + 1 dup.
+    assert len(report.captured) + len(report.duplicates) == 2
+
+
+def test_pinned_duplicates_are_recorded_too(
+    generator: HclImportGenerator, tmp_path: Path
+) -> None:
+    """The ledger-pinned dedupe arm must account duplicates exactly like
+    the ordinal arm."""
+    (tmp_path / ADDRESS_LEDGER_FILENAME).write_text(
+        json.dumps({"addresses": {"meraki_network.n_1": "org-123,N_1"}}),
+        encoding="utf-8",
+    )
+    report = generator.generate(
+        _graph(networks=(_network(), _network()), devices=(), features=()),
+        tmp_path,
+    )
+    assert len(report.duplicates) == 1
+    assert report.duplicates[0].primary_address == "meraki_network.n_1"
+
+
+def test_force_delete_single_component_identity_trails_false(
+    tmp_path: Path, recorder: RecordingNotifier
+) -> None:
+    """Arity-1 identities have no scope prefix to slot ``false``
+    between; inserting at len-1 (= index 0) would shift the real ID out
+    of its positional slot (``false,<id>``). The literal trails
+    instead."""
+    spec = {
+        "openapi": "3.0.1",
+        "paths": {
+            "/widgets/{widgetId}": {
+                "get": {"operationId": "getWidget", "tags": ["widgets"]},
+                "put": {"operationId": "updateWidget", "tags": ["widgets"]},
+            },
+        },
+    }
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text(json.dumps(spec), encoding="utf-8")
+    catalog = ProviderCatalog(
+        resources={"meraki_widget": frozenset({"force_delete", "id"})},
+        source="fixture",
+    )
+    generator = HclImportGenerator(
+        OpenApiParser(spec_path), AlertDispatcher([recorder]), lambda: catalog
+    )
+    graph = NetworkGraph(
+        organization_id="org-123",
+        networks=(),
+        devices=(),
+        features=(FeatureConfiguration("/widgets/{widgetId}", ("W1",)),),
+    )
+    report = generator.generate(graph, tmp_path)
+    content = report.imports_file.read_text(encoding="utf-8")
+    assert report.imports_written == 1
+    assert 'id = "W1,false"' in content
+
+
+def test_write_only_endpoints_flagged_as_spec_level_gaps(
+    tmp_path: Path, recorder: RecordingNotifier
+) -> None:
+    """A PUT the API offers no read for holds configuration discovery
+    can never see; every run must say so through the same exception-
+    auditor rail as graph assets — with the spec-level count kept
+    separate so coverage totals still reconcile against the graph."""
+    from meraki2tf.hcl_generator import WRITE_ONLY_REASON
+
+    spec = {
+        "openapi": "3.0.1",
+        "paths": {
+            "/networks/{networkId}": {
+                "get": {"operationId": "getNetwork", "tags": ["networks"]},
+                "put": {"operationId": "updateNetwork", "tags": ["networks"]},
+            },
+            "/networks/{networkId}/appliance/sdwan/internetPolicies": {
+                "put": {"operationId": "updateSdwan", "tags": ["appliance"]},
+            },
+        },
+    }
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text(json.dumps(spec), encoding="utf-8")
+    generator = HclImportGenerator(
+        OpenApiParser(spec_path), AlertDispatcher([recorder]), fixture_catalog
+    )
+    graph = NetworkGraph(
+        organization_id="org-123", networks=(), devices=(), features=()
+    )
+    report = generator.generate(graph, tmp_path)
+    assert report.spec_gap_count == 1
+    assert [asset.api_path for asset in report.unsupported] == [
+        "/networks/{networkId}/appliance/sdwan/internetPolicies"
+    ]
+    assert report.unsupported[0].reason == WRITE_ONLY_REASON
+    assert report.unsupported[0].identifiers == ()
+    assert recorder.events[0].event_type is EventType.UNSUPPORTED_FEATURE_FLAGGED
+
+    # A quiet re-generation pass (heal rounds) reports but never
+    # re-alerts.
+    recorder.events.clear()
+    quiet = generator.generate(graph, tmp_path, audit=False)
+    assert quiet.spec_gap_count == 1
+    assert recorder.events == []

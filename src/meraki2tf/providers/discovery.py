@@ -20,10 +20,16 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from meraki2tf.models import UNREADABLE_MARKER, FeatureConfiguration
-from meraki2tf.openapi_parser import OpenApiParser, entity_key, is_item_path
+from meraki2tf.openapi_parser import (
+    OpenApiParser,
+    TerraformResourceMapping,
+    entity_key,
+    is_item_path,
+)
 from meraki2tf.spec.engine import OperationSpec
 
 logger = logging.getLogger(__name__)
@@ -316,6 +322,277 @@ def expand_endpoint_payload(
             )
         )
     return expanded
+
+
+def aggregation_mappings(
+    parser: OpenApiParser,
+) -> tuple[TerraformResourceMapping, ...]:
+    """Entities whose collection source is an org-scoped aggregation GET.
+
+    These are the GET-less mutable surfaces (Air Marshal, RRM, uplink
+    NAT, …) the parser adopted via the ``byNetwork`` pattern; live
+    discovery executes each aggregation once at org scope and explodes
+    the response into per-scope assets.
+    """
+    return tuple(
+        mapping
+        for mapping in parser.resource_mappings().values()
+        if mapping.aggregation_get is not None
+    )
+
+
+def aggregation_collection_path(mapping: TerraformResourceMapping) -> str:
+    """The entity's own single-scope collection path template.
+
+    Exploded aggregation rows address themselves here (or at the item
+    path below it), keeping the network-scoped path canonical exactly
+    as if the entity had its own per-network GET.
+    """
+    for path in mapping.paths:
+        if not is_item_path(path) and _path_param_count(path) == 1:
+            return path
+    # Entities exposing only item endpoints (PUT/DELETE on
+    # ``.../{id}``): the enclosing collection is the item path minus its
+    # trailing parameter.
+    return parent_item_path(mapping.paths[0]).rsplit("/", 1)[0] or mapping.paths[0]
+
+
+def _path_param_count(path: str) -> int:
+    return sum(1 for s in _path_segments(path) if s.startswith("{"))
+
+
+def _path_segments(path: str) -> list[str]:
+    return [segment for segment in path.split("/") if segment]
+
+
+def _aggregation_item_operation(
+    mapping: TerraformResourceMapping,
+) -> OperationSpec | None:
+    """The entity's own item endpoint, when its elements are addressable."""
+    for op in mapping.operations:
+        if is_item_path(op.path) and len(op.path_params) == 2:
+            return op
+    return None
+
+
+def _row_scope_value(
+    row: Mapping[str, Any], scope_param: str
+) -> tuple[str | None, str | None]:
+    """Extract one aggregation row's owning scope: ``(value, consumed_key)``.
+
+    Rows carry either the flat identifier (``networkId``/``serial``) or
+    the object form (``network: {id: …}``) — both shapes appear in the
+    published spec's byNetwork responses.
+    """
+    flat = row.get(scope_param)
+    if isinstance(flat, (str, int)) and str(flat).strip():
+        return str(flat).strip(), scope_param
+    if scope_param.endswith("Id"):
+        object_key = scope_param[: -len("Id")]
+        nested = row.get(object_key)
+        if isinstance(nested, Mapping):
+            inner = nested.get("id")
+            if isinstance(inner, (str, int)) and str(inner).strip():
+                return str(inner).strip(), object_key
+    return None, None
+
+
+def explode_aggregation_payload(
+    mapping: TerraformResourceMapping, payload: Any
+) -> list[FeatureConfiguration]:
+    """One org-scoped aggregation response → per-scope feature assets.
+
+    Each row is re-addressed at the entity's own network-scoped path
+    with the row's scope identifier consumed out of the payload — the
+    exact shape a per-network GET would have produced, which is what
+    keeps snapshots, HCL generation, and restore agnostic of how the
+    collection was sourced. Rows lacking a scope identifier are kept as
+    scope-less records so the exception auditor reports them instead of
+    dropping discovered objects (Cardinal Rule 2).
+    """
+    agg_op = mapping.aggregation_get
+    assert agg_op is not None  # only called for adopted mappings
+    collection_path = aggregation_collection_path(mapping)
+    if isinstance(payload, Mapping):
+        payload = _envelope_elements(agg_op, payload)
+    if not isinstance(payload, (list, tuple)):
+        logger.warning(
+            "Aggregation endpoint %s returned a non-collection payload; "
+            "entity %s is recorded as a coverage gap.",
+            agg_op.path, collection_path,
+        )
+        return [
+            FeatureConfiguration(
+                api_path=collection_path,
+                path_values=(),
+                payload={
+                    UNREADABLE_MARKER: (
+                        "malformed aggregation response from "
+                        f"{agg_op.path}: expected a collection"
+                    )
+                },
+            )
+        ]
+    scope_param = next(
+        (
+            segment[1:-1]
+            for segment in _path_segments(collection_path)
+            if segment.startswith("{")
+        ),
+        "networkId",
+    )
+    item_op = _aggregation_item_operation(mapping)
+    features: list[FeatureConfiguration] = []
+    for row in payload:
+        if not isinstance(row, Mapping):
+            logger.warning(
+                "Aggregation row of %s is not an object; it will be "
+                "reported as a coverage gap.", agg_op.path,
+            )
+            features.append(
+                FeatureConfiguration(
+                    api_path=collection_path,
+                    path_values=(),
+                    payload={"value": row},
+                )
+            )
+            continue
+        scope_value, consumed = _row_scope_value(row, scope_param)
+        if scope_value is None:
+            logger.warning(
+                "Aggregation row of %s carries no %s scope identifier; "
+                "it will be reported as a coverage gap.",
+                agg_op.path, scope_param,
+            )
+            features.append(
+                FeatureConfiguration(
+                    api_path=collection_path,
+                    path_values=(),
+                    payload=dict(row),
+                )
+            )
+            continue
+        remainder = {key: value for key, value in row.items() if key != consumed}
+        if item_op is not None:
+            item_id = element_id(item_op, remainder)
+            if item_id is not None:
+                features.append(
+                    FeatureConfiguration(
+                        api_path=item_op.path,
+                        path_values=(scope_value, item_id),
+                        payload=remainder,
+                    )
+                )
+                continue
+        features.append(
+            FeatureConfiguration(
+                api_path=collection_path,
+                path_values=(scope_value,),
+                payload=remainder,
+            )
+        )
+    return features
+
+
+@dataclass(frozen=True)
+class SpecSurfaces:
+    """Spec-level coverage accounting no graph object can carry.
+
+    Cardinal Rule 2 demands that even API surfaces discovery can never
+    read stay visible: configuration that is write-only in the API,
+    RPC-style action endpoints excluded by design, and read-only API
+    surfaces no tool can restore.
+    """
+
+    #: Mutable, GET-less, non-adopted entities that carry a PUT — real
+    #: configuration the API offers no way to read back.
+    write_only_paths: tuple[str, ...]
+    #: POST/DELETE-only action endpoints (blinkLeds, claim, reboot, …):
+    #: excluded from discovery by design, countable in the manifest.
+    rpc_only_paths: tuple[str, ...]
+    #: Canonical paths of GET-only entities — readable, never
+    #: restorable by any tool (SM profiles, VPP accounts, licensing, …).
+    api_read_only_paths: tuple[str, ...]
+
+
+def spec_surface_report(parser: OpenApiParser) -> SpecSurfaces:
+    """Classify every spec entity discovery does not capture."""
+    mappings = parser.resource_mappings()
+    adopted_keys = {
+        mapping.entity_key
+        for mapping in mappings.values()
+        if mapping.aggregation_get is not None
+    }
+    adopted_source_paths = {
+        mapping.aggregation_get.path
+        for mapping in mappings.values()
+        if mapping.aggregation_get is not None
+    }
+    write_only: list[str] = []
+    rpc_only: list[str] = []
+    read_only: list[str] = []
+    for key, ops in parser.entity_operations().items():
+        methods = {op.method for op in ops}
+        if "get" in methods:
+            if not (methods & _MUTATING_METHODS) and not any(
+                op.path in adopted_source_paths for op in ops
+            ):
+                read_only.append(next(op.path for op in ops if op.method == "get"))
+            continue
+        if not (methods & _MUTATING_METHODS) or key in adopted_keys:
+            continue
+        if "put" in methods:
+            write_only.append(next(op.path for op in ops if op.method == "put"))
+        else:
+            paths = [op.path for op in ops if op.method in _MUTATING_METHODS]
+            rpc_only.extend(dict.fromkeys(paths))
+    return SpecSurfaces(
+        write_only_paths=tuple(sorted(write_only)),
+        rpc_only_paths=tuple(sorted(rpc_only)),
+        api_read_only_paths=tuple(sorted(read_only)),
+    )
+
+
+def network_product_types(parser: OpenApiParser) -> frozenset[str]:
+    """Valid network product types, derived from the createNetwork enum.
+
+    The set drives conservative product-type prefiltering: a
+    network-scoped endpoint whose first path segment exactly equals one
+    of these values only applies to networks carrying that product.
+    An absent or unreadable enum yields the empty set — no filtering.
+    """
+    for op in parser.endpoints():
+        if op.method != "post" or entity_key(op.path) != (
+            "organizations", "networks",
+        ):
+            continue
+        node: Any = op.raw
+        for step in (
+            "requestBody", "content", "application/json", "schema",
+            "properties", "productTypes", "items", "enum",
+        ):
+            node = node.get(step) if isinstance(node, Mapping) else None
+        if isinstance(node, list):
+            return frozenset(
+                value for value in node if isinstance(value, str) and value
+            )
+    return frozenset()
+
+
+def product_segment(op: OperationSpec) -> str | None:
+    """The path segment immediately after the operation's scope parameter.
+
+    ``/networks/{networkId}/wireless/ssids`` → ``wireless`` (raw
+    camelCase, so it compares exactly against the createNetwork enum);
+    ``None`` when the scope parameter is the trailing segment.
+    """
+    segments = _path_segments(op.path)
+    for index, segment in enumerate(segments):
+        if segment.startswith("{"):
+            if index + 1 < len(segments) and not segments[index + 1].startswith("{"):
+                return segments[index + 1]
+            return None
+    return None
 
 
 def _whole_collection_put(parser: OpenApiParser, op: OperationSpec) -> bool:

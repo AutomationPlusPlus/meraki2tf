@@ -29,6 +29,16 @@ Derivation rules (all dynamic):
   (``network_id,vlan_id``), ready for Terraform ``import`` blocks.
 * **Resource eligibility** — an entity must expose at least one GET
   endpoint; action-only RPC paths (e.g. ``blinkLeds``) are excluded.
+* **Aggregation adoption** — a mutable network-scoped entity with *no*
+  GET of its own (Meraki's "per-network PUT" surfaces: Air Marshal,
+  RRM, warm-spare redundancy, uplink NAT, …) is adopted when the spec
+  carries an org-scoped aggregation GET for it — the same path tail
+  under ``/organizations/{organizationId}`` plus ``byNetwork``, or the
+  bare tail at org scope when its response items declare a per-network
+  scope identifier. The aggregation GET becomes the entity's collection
+  source (``aggregation_get``) while the entity keeps its own
+  network-scoped paths as the canonical addressing scheme. Without this
+  the whole surface class would silently vanish from discovery.
 """
 
 from __future__ import annotations
@@ -72,6 +82,38 @@ def is_item_path(path: str) -> bool:
     return bool(segments) and bool(_PARAM_SEGMENT.match(segments[-1]))
 
 
+#: Response-item properties that identify the per-scope owner of one
+#: aggregation row (``networkId``/``network`` for per-network surfaces,
+#: ``serial`` for per-device ones).
+_SCOPE_IDENTIFIER_PROPERTIES = frozenset({"network", "networkId", "serial"})
+
+
+def _declares_scope_identifier(op: OperationSpec) -> bool:
+    """Whether ``op``'s declared response items carry a scope identifier.
+
+    Guards bare same-tail aggregation adoption: an org-scoped GET whose
+    element schema names no per-network/per-device owner cannot be
+    exploded back into per-scope assets, so it is never adopted.
+    """
+    node: object = op.raw
+    for step in ("responses", "200", "content", "application/json", "schema"):
+        node = node.get(step) if isinstance(node, dict) else None
+    if not isinstance(node, dict):
+        return False
+    # Enveloped collections declare {items: {type: array, items: ...}};
+    # plain collections declare {type: array, items: ...} directly.
+    properties = node.get("properties")
+    if isinstance(properties, dict) and isinstance(properties.get("items"), dict):
+        node = properties["items"]
+    element = node.get("items") if isinstance(node, dict) else None
+    element_properties = (
+        element.get("properties") if isinstance(element, dict) else None
+    )
+    if not isinstance(element_properties, dict):
+        return False
+    return bool(_SCOPE_IDENTIFIER_PROPERTIES & element_properties.keys())
+
+
 @dataclass(frozen=True)
 class TerraformResourceMapping:
     """One derived Terraform resource and how to import it."""
@@ -88,6 +130,10 @@ class TerraformResourceMapping:
     paths: tuple[str, ...]
     #: Every contributing operation, in spec order.
     operations: tuple[OperationSpec, ...]
+    #: Org-scoped aggregation GET adopted as the collection source for a
+    #: GET-less mutable entity (Meraki's "per-network PUT + org-level
+    #: byNetwork GET" pattern). ``None`` for entities with their own GET.
+    aggregation_get: OperationSpec | None = None
 
 
 class OpenApiParser:
@@ -102,8 +148,13 @@ class OpenApiParser:
         """Every operation discovered in the document, in spec order."""
         return self._endpoints
 
-    def resource_mappings(self) -> dict[str, TerraformResourceMapping]:
-        """Derive all Terraform resources, keyed by provider resource name."""
+    def entity_operations(self) -> dict[tuple[str, ...], list[OperationSpec]]:
+        """Every operation, grouped by canonicalized entity key.
+
+        The complete entity universe — including GET-less action/config
+        entities that never become resource mappings — so coverage
+        accounting can classify what discovery does not capture.
+        """
         grouped = self._group_by_entity()
         canonical_keys = {
             key
@@ -113,12 +164,29 @@ class OpenApiParser:
         merged: dict[tuple[str, ...], list[OperationSpec]] = {}
         for key, ops in grouped.items():
             merged.setdefault(self._canonicalize(key, canonical_keys), []).extend(ops)
+        return merged
 
+    def resource_mappings(self) -> dict[str, TerraformResourceMapping]:
+        """Derive all Terraform resources, keyed by provider resource name."""
+        merged = self.entity_operations()
+        aggregation_sources = self._aggregation_candidates()
         mappings: dict[str, TerraformResourceMapping] = {}
         for key, ops in merged.items():
+            aggregation_get: OperationSpec | None = None
             if not any(op.method == "get" for op in ops):
-                logger.debug("Skipping non-resource entity %r (no GET endpoint)", key)
-                continue
+                aggregation_get = self._find_aggregation_get(
+                    key, ops, aggregation_sources
+                )
+                if aggregation_get is None:
+                    logger.debug(
+                        "Skipping non-resource entity %r (no GET endpoint)", key
+                    )
+                    continue
+                logger.debug(
+                    "Adopted org-scoped aggregation GET %s as the "
+                    "collection source for GET-less entity %r.",
+                    aggregation_get.path, key,
+                )
             id_components = self._id_components(ops)
             paths: list[str] = []
             for op in ops:
@@ -145,8 +213,59 @@ class OpenApiParser:
                 import_id_format=",".join(id_components),
                 paths=tuple(paths),
                 operations=tuple(ops),
+                aggregation_get=aggregation_get,
             )
         return mappings
+
+    def _aggregation_candidates(
+        self,
+    ) -> dict[tuple[str, ...], OperationSpec]:
+        """Org-scoped collection GETs by entity key — aggregation sources.
+
+        Only single-parameter ``{organizationId}`` collection GETs can
+        aggregate per-network configuration; the first such operation
+        per key wins (spec order), matching how the rest of the parser
+        resolves duplicates.
+        """
+        candidates: dict[tuple[str, ...], OperationSpec] = {}
+        for op in self._endpoints:
+            if (
+                op.method == "get"
+                and op.path_params == ("organizationId",)
+                and not is_item_path(op.path)
+            ):
+                candidates.setdefault(entity_key(op.path), op)
+        return candidates
+
+    @staticmethod
+    def _find_aggregation_get(
+        key: tuple[str, ...],
+        ops: list[OperationSpec],
+        candidates: dict[tuple[str, ...], OperationSpec],
+    ) -> OperationSpec | None:
+        """The org-scoped aggregation GET listing a GET-less entity.
+
+        Purely spec-derived: the entity must be network-scoped
+        configuration (a ``networks``-rooted key carrying a PUT — the
+        POST-only remainder is RPC actions like ``blinkLeds``), and the
+        spec must expose an org-scoped GET whose path tail matches the
+        entity's tail plus ``byNetwork`` — or the bare tail at org scope
+        (campusGateway clusters), accepted only when its response items
+        declare a per-network scope identifier, so a same-named but
+        unrelated org surface can never be adopted.
+        """
+        if not key or key[0] != "networks":
+            return None
+        if not any(op.method == "put" for op in ops):
+            return None
+        tail = key[1:]
+        by_network = candidates.get(("organizations", *tail, "by_network"))
+        if by_network is not None:
+            return by_network
+        same_tail = candidates.get(("organizations", *tail))
+        if same_tail is not None and _declares_scope_identifier(same_tail):
+            return same_tail
+        return None
 
     def endpoint_lookup(self) -> dict[str, str]:
         """Operational lookup table: API path template → Terraform resource name."""

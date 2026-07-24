@@ -11,6 +11,19 @@ workdir, listing every discovered Meraki object with a status:
   state (normal snapshot growth);
 - ``unsupported`` — Terraform cannot rebuild it (with the reason).
   This list is the manual-rebuild runbook after a disaster.
+- ``duplicate-id`` — its import ID is already carried by another
+  captured object (rebuild-covered by that primary record); explicit
+  so the totals account for every discovered object.
+
+The manifest additionally carries spec-level accounting no graph object
+can represent: write-only configuration endpoints (flagged as
+``unsupported``), RPC-only action endpoints excluded by design
+(``excluded_rpc_paths``), API surfaces that are read-only in Meraki
+itself (``api_read_only_paths``), and endpoints every scope refused
+this run (``suspect_endpoints``). Totals reconcile against the number
+of objects discovery actually produced; any mismatch is reported as
+``totals.unaccounted`` — a silent accounting hole is the worst failure
+class under Cardinal Rule 2.
 
 Payloads carry only resource identifiers and structural data — never
 credentials.
@@ -24,7 +37,8 @@ from pathlib import Path
 from typing import Any
 
 from meraki2tf.fileio import atomic_write_text
-from meraki2tf.hcl_generator import CapturedAsset, UnsupportedAsset
+from meraki2tf.hcl_generator import CapturedAsset, DuplicateAsset, UnsupportedAsset
+from meraki2tf.models import SuspectEndpoint
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +48,7 @@ COVERAGE_SUMMARY_FILENAME = "coverage.txt"
 STATUS_IMPORTED = "imported"
 STATUS_PENDING_IMPORT = "pending-import"
 STATUS_UNSUPPORTED = "unsupported"
+STATUS_DUPLICATE_ID = "duplicate-id"
 
 
 def unsupported_payload(assets: tuple[UnsupportedAsset, ...]) -> list[dict[str, Any]]:
@@ -57,6 +72,12 @@ def build_manifest(
     unmanaged_secret_attributes: dict[str, tuple[str, ...]] | None = None,
     restore_via: dict[tuple[str, tuple[str, ...]], str] | None = None,
     scope_networks: tuple[str, ...] | None = None,
+    duplicates: tuple[DuplicateAsset, ...] = (),
+    discovered_assets: int | None = None,
+    spec_gap_count: int = 0,
+    excluded_rpc_paths: tuple[str, ...] = (),
+    api_read_only_paths: tuple[str, ...] = (),
+    suspect_endpoints: tuple[SuspectEndpoint, ...] = (),
 ) -> dict[str, Any]:
     """Assemble the coverage manifest for one completed run.
 
@@ -73,6 +94,14 @@ def build_manifest(
     describes only the scoped networks, and both artifacts say so
     prominently — a plausible-looking full-coverage manifest that
     silently covered one network would violate Cardinal Rule 2.
+
+    ``discovered_assets`` is the graph's own object count
+    (``NetworkGraph.asset_count()``); the manifest reconciles it
+    against ``captured + graph unsupported + duplicates`` (spec-level
+    write-only findings, counted by ``spec_gap_count``, live in the
+    unsupported list without being graph objects). A mismatch logs a
+    WARNING and lands in ``totals.unaccounted`` — the manifest must
+    never claim full coverage while objects fell through accounting.
     """
     restore_lookup = restore_via or {}
     objects: list[dict[str, Any]] = []
@@ -96,18 +125,63 @@ def build_manifest(
         if verdict is not None:
             record["restore_via"] = verdict
         objects.append(record)
-    total = len(objects)
-    covered = len(captured)
+    for duplicate in duplicates:
+        objects.append(
+            {
+                "status": STATUS_DUPLICATE_ID,
+                "api_path": duplicate.api_path,
+                "import_id": duplicate.import_id,
+                "identifiers": list(duplicate.identifiers),
+                "primary_address": duplicate.primary_address,
+            }
+        )
+    graph_unsupported = len(unsupported) - spec_gap_count
+    accounted = len(captured) + graph_unsupported + len(duplicates)
+    total = discovered_assets if discovered_assets is not None else accounted
+    unaccounted = total - accounted
+    # A duplicate is the same underlying object as its primary captured
+    # record, so it counts as rebuild-covered — but never as silently
+    # absent.
+    covered = len(captured) + len(duplicates)
+    totals: dict[str, Any] = {
+        "discovered": total,
+        "imported": imported,
+        "pending_import": len(captured) - imported,
+        "unsupported": graph_unsupported,
+        "duplicate_id": len(duplicates),
+        "write_only_endpoints": spec_gap_count,
+    }
+    if unaccounted:
+        logger.warning(
+            "Coverage accounting mismatch: %d discovered object(s) but "
+            "%d accounted for (captured + unsupported + duplicates); "
+            "%d object(s) are unaccounted. The manifest carries "
+            "totals.unaccounted — treat coverage claims as suspect "
+            "until this is explained.",
+            total, accounted, unaccounted,
+        )
+        totals["unaccounted"] = unaccounted
     manifest: dict[str, Any] = {
         "organization_id": organization_id,
-        "totals": {
-            "discovered": total,
-            "imported": imported,
-            "pending_import": covered - imported,
-            "unsupported": len(unsupported),
-        },
+        "totals": totals,
         "coverage_percent": round(100.0 * covered / total, 2) if total else 100.0,
         "objects": objects,
+        #: Spec-derived visibility lists (Cardinal Rule 2): action
+        #: endpoints excluded by design, and API surfaces that are
+        #: read-only in Meraki itself — no tool can restore them.
+        "excluded_rpc_paths": list(excluded_rpc_paths),
+        "api_read_only_paths": list(api_read_only_paths),
+        #: Endpoints that refused every scope tried this run (≥3):
+        #: legitimate absence looks like this too, but a full-board
+        #: refusal deserves eyes — an SDK/spec skew could otherwise
+        #: hide a whole surface behind plausible 400s.
+        "suspect_endpoints": [
+            {
+                "api_path": suspect.api_path,
+                "scopes_tried": suspect.scopes_tried,
+            }
+            for suspect in suspect_endpoints
+        ],
         #: Resources tracked in the DR kit that discovery no longer sees
         #: in Meraki — awaiting human confirmation, never auto-removed.
         "deletions_pending_confirmation": list(deletions_pending),
@@ -168,8 +242,17 @@ def _render_summary(manifest: dict[str, Any]) -> str:
         f"  imported         : {totals['imported']} (tracked in Terraform state)",
         f"  pending-import   : {totals['pending_import']} (in the kit, not yet in state)",
         f"  unsupported      : {totals['unsupported']} (MANUAL rebuild required)",
+        f"  duplicate-id     : {totals.get('duplicate_id', 0)} "
+        "(covered by their primary record)",
         f"Coverage           : {manifest['coverage_percent']}%",
     ]
+    if totals.get("unaccounted"):
+        lines += [
+            "",
+            f"*** ACCOUNTING MISMATCH: {totals['unaccounted']} discovered "
+            "object(s) are unaccounted for — coverage claims are suspect "
+            "until this is explained. ***",
+        ]
     unsupported = [
         entry for entry in manifest["objects"] if entry["status"] == STATUS_UNSUPPORTED
     ]
@@ -182,6 +265,48 @@ def _render_summary(manifest: dict[str, Any]) -> str:
             # stay one line so nothing reads as a separate report item.
             + " ".join(str(entry["reason"]).split())
             for entry in unsupported
+        ]
+    duplicate_entries = [
+        entry
+        for entry in manifest["objects"]
+        if entry["status"] == STATUS_DUPLICATE_ID
+    ]
+    if duplicate_entries:
+        lines += ["", "Duplicate import IDs (covered by their primary record):"]
+        lines += [
+            f"  - {entry['api_path']} "
+            f"(ids={','.join(entry['identifiers']) or '<none>'}) "
+            f"duplicates {entry['primary_address'] or '<unknown>'}"
+            for entry in duplicate_entries
+        ]
+    suspects = manifest.get("suspect_endpoints") or []
+    if suspects:
+        lines += [
+            "",
+            "Suspect endpoints (refused by EVERY scope tried this run —",
+            "verify these are genuinely not in use):",
+        ]
+        lines += [
+            f"  - {entry['api_path']} ({entry['scopes_tried']} scope(s) tried)"
+            for entry in suspects
+        ]
+    rpc_paths = manifest.get("excluded_rpc_paths") or []
+    if rpc_paths:
+        lines += [
+            "",
+            f"{len(rpc_paths)} RPC-style action endpoint(s) are excluded "
+            "from discovery by design",
+            "(one-shot actions, not configuration) — see coverage.json "
+            "excluded_rpc_paths.",
+        ]
+    read_only = manifest.get("api_read_only_paths") or []
+    if read_only:
+        lines += [
+            "",
+            f"{len(read_only)} additional API surface(s) are read-only in "
+            "the Meraki API",
+            "(not restorable by any tool) — see coverage.json "
+            "api_read_only_paths.",
         ]
     if manifest["deletions_pending_confirmation"]:
         lines += ["", "Deletions detected in Meraki awaiting human confirmation:"]
