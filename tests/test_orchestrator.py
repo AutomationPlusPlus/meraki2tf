@@ -783,6 +783,37 @@ def test_sync_banks_imports_through_targeted_windows_when_full_plan_races(
     ]
 
 
+def test_already_imported_windows_converge_pending_to_zero(
+    tmp_path: Path,
+    api_key: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rerun over a fully-imported org: every targeted window answers
+    "No changes" because its resources are ALREADY in state, so
+    RUN_SUCCESS.pending_imports must converge to 0 — the old
+    `pending - added` arithmetic counted already-in-state window members
+    as forever-pending and the report never reached 0."""
+    monkeypatch.setattr(
+        PipelineOrchestrator, "_MATERIALIZE_CHUNK_SIZE", 1
+    )
+    orchestrator, recorder, _, runner = _orchestrator(
+        tmp_path, plan_exit=2, plan_stdout=PLAN_WITH_CHANGES, sync=True
+    )
+    # Full-plan drift that healing cannot resolve → batched windows.
+    runner.actions = {"meraki_networks.ghost": ("delete",)}
+    # targeted_plans left empty: every window replies "No changes" —
+    # terraform already tracks each member, nothing left to import.
+    summary = orchestrator.run("org-123")
+
+    assert not runner.applied
+    assert summary.resources_added_to_state == ()
+    assert summary.deferred_addresses == ()
+    assert summary.pending_imports == 0
+    success = recorder.events[-1]
+    assert success.event_type is EventType.RUN_SUCCESS
+    assert success.details["pending_imports"] == 0
+
+
 def test_targeted_window_defers_racy_import_and_retries(
     tmp_path: Path,
     api_key: None,
