@@ -267,7 +267,10 @@ def test_phone_numbers_are_pseudonymized() -> None:
             ),
         ),
     )
-    payload = sanitize_graph(graph).features[0].payload
+    # Fixed salt: the pseudonym is hex, and with a random salt a digest
+    # containing the literal substring "617" (~0.3% of runs) would make
+    # the not-in assertion flake.
+    payload = sanitize_graph(graph, salt=b"fixed-test-salt!").features[0].payload
     assert payload["phoneNumber"].startswith("phonenumber-")
     assert "617" not in payload["phoneNumber"]
 

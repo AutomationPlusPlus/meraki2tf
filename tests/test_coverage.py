@@ -172,3 +172,32 @@ def test_manifest_carries_restore_verdicts() -> None:
     assert by_path["/networks/{networkId}/clients"]["restore_via"] == (
         "unrestorable: dashboard-only"
     )
+
+
+def test_partial_scope_stamps_manifest_and_summary(tmp_path: Path) -> None:
+    """A scoped (--only) run must never leave a plausible-looking
+    full-org manifest behind (Cardinal Rule 2): both artifacts carry
+    the scope and a loud PARTIAL banner."""
+    manifest = build_manifest(
+        organization_id="org-123",
+        captured=CAPTURED,
+        unsupported=(),
+        state_addresses=frozenset(),
+        scope_networks=("N_2", "N_1"),
+    )
+    assert manifest["scope"] == {"partial": True, "networks": ["N_1", "N_2"]}
+    _, summary_path = write_manifest(manifest, tmp_path)
+    text = summary_path.read_text(encoding="utf-8")
+    assert "PARTIAL RUN" in text
+    assert "2 selected network(s)" in text
+    assert "N_1, N_2" in text
+
+
+def test_full_runs_carry_no_scope_key() -> None:
+    manifest = build_manifest(
+        organization_id="org-123",
+        captured=CAPTURED,
+        unsupported=(),
+        state_addresses=frozenset(),
+    )
+    assert "scope" not in manifest

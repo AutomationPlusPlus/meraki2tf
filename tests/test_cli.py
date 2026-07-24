@@ -3023,9 +3023,13 @@ class _StubLiveProvider:
     """Injectable stand-in for LiveApiDataProvider in heal tests."""
 
     graph: Any = None
+    #: The network_scope the heal path constructed, for assertions.
+    last_network_scope: Any = None
 
-    def __init__(self, parser: Any = None) -> None:
-        pass
+    def __init__(
+        self, parser: Any = None, *, network_scope: Any = None
+    ) -> None:
+        type(self).last_network_scope = network_scope
 
     def __enter__(self) -> "_StubLiveProvider":
         return self
@@ -4236,3 +4240,336 @@ def test_heal_only_preview_reports_auto_included_dependencies(
     assert exit_code == 0
     assert "Auto-included 1 missing object(s)" in console
     assert "recreate the 2 missing object(s)" in console
+
+
+# ---------------------------------------------------------------------------
+# Selective backup (--dump-to --only) and partial-snapshot consumers.
+
+
+def _partial_dump(tmp_path: Path, name: str = "partial.json") -> Path:
+    """A canonical partial snapshot: one scoped network + its SSID."""
+    dump = tmp_path / name
+    dump.write_text(
+        json.dumps(
+            {
+                "organizationId": "org-123",
+                "scope": {
+                    "networks": ["N_1"],
+                    "selectors": ["network:HQ"],
+                },
+                "networks": [
+                    {"id": "N_1", "organizationId": "org-123", "name": "HQ",
+                     "productTypes": ["wireless"], "timeZone": "UTC"}
+                ],
+                "devices": [],
+                "features": [
+                    {
+                        "apiPath": (
+                            "/networks/{networkId}/wireless/ssids/{number}"
+                        ),
+                        "pathValues": ["N_1", "0"],
+                        "payload": {"number": 0, "name": "Corp"},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return dump
+
+
+def test_only_requires_heal_or_dump_to(spec_file: Path) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            ["--spec", str(spec_file), "--org-id", "org-123",
+             "--only", "network:HQ"]
+        )
+    assert excinfo.value.code == 2
+
+
+def test_only_export_refuses_drift_baseline(
+    spec_file: Path, tmp_path: Path
+) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            ["--spec", str(spec_file), "--org-id", "org-123",
+             "--dump-to", str(tmp_path / "snap.json"),
+             "--drift-baseline", str(tmp_path / "base.json"),
+             "--only", "network:HQ"]
+        )
+    assert excinfo.value.code == 2
+
+
+def test_only_export_refuses_from_dump_reslicing(
+    spec_file: Path, dump_file: Path, tmp_path: Path
+) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            ["--spec", str(spec_file), "--from-dump", str(dump_file),
+             "--dump-to", str(tmp_path / "snap.json"),
+             "--only", "network:HQ"]
+        )
+    assert excinfo.value.code == 2
+
+
+def test_only_export_refuses_non_network_selectors(
+    spec_file: Path, tmp_path: Path
+) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            ["--spec", str(spec_file), "--org-id", "org-123",
+             "--dump-to", str(tmp_path / "snap.json"),
+             "--only", "ssid:Guest*"]
+        )
+    assert excinfo.value.code == 2
+
+
+def test_scoped_export_writes_partial_snapshot_and_stamps_artifacts(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from meraki2tf import cli as cli_module
+    from meraki2tf.models import MerakiNetwork, NetworkGraph
+    from meraki2tf.scope import LiveNetworkScope
+
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    _StubLiveProvider.graph = NetworkGraph(
+        organization_id="org-123",
+        networks=(
+            MerakiNetwork.from_payload(
+                {"id": "N_1", "organizationId": "org-123", "name": "HQ",
+                 "productTypes": ["wireless"], "timeZone": "UTC"}
+            ),
+        ),
+        devices=(),
+        features=(),
+    )
+    monkeypatch.setattr(cli_module, "LiveApiDataProvider", _StubLiveProvider)
+    out = tmp_path / "partial.json"
+    workdir = tmp_path / "ws"
+    exit_code = main(
+        ["--spec", str(spec_file), "--org-id", "org-123",
+         "--dump-to", str(out), "--workdir", str(workdir),
+         "--only", "network:HQ", "--only", "network:N_9*"]
+    )
+    console = capsys.readouterr().err
+    assert exit_code == 0
+    # build_provider handed the selectors to the live provider.
+    scope = _StubLiveProvider.last_network_scope
+    assert isinstance(scope, LiveNetworkScope)
+    assert scope.selectors == ("network:HQ", "network:N_9*")
+    # The snapshot records its scope (IDs from the exported graph).
+    document = json.loads(out.read_text(encoding="utf-8"))
+    assert document["scope"] == {
+        "networks": ["N_1"],
+        "selectors": ["network:HQ", "network:N_9*"],
+    }
+    assert "PARTIAL export" in console
+    # Coverage manifest and runbook are stamped, not plausible-full.
+    manifest = json.loads((workdir / "coverage.json").read_text("utf-8"))
+    assert manifest["scope"] == {"partial": True, "networks": ["N_1"]}
+    assert "PARTIAL RUN" in (workdir / "coverage.txt").read_text("utf-8")
+    assert "PARTIAL RUN" in (workdir / "runbook.md").read_text("utf-8")
+
+
+def test_scoped_export_zero_match_exits_2_without_fault_alert(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from meraki2tf import cli as cli_module
+    from meraki2tf.scope import ScopeFilterError
+
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    delivered: list[dict[str, Any]] = []
+
+    def fake_urlopen(request: Any, timeout: float) -> Any:
+        delivered.append(json.loads(request.data.decode("utf-8")))
+        return FakeResponse(200)
+
+    from meraki2tf.alerts import webhook as webhook_module
+
+    monkeypatch.setattr(webhook_module, "_open", fake_urlopen)
+
+    class ZeroMatchProvider(_StubLiveProvider):
+        def fetch_network_graph(self, organization_id: str | None = None) -> Any:
+            raise ScopeFilterError(
+                "--only selector 'network:Nowhere' matched no network"
+            )
+
+    monkeypatch.setattr(cli_module, "LiveApiDataProvider", ZeroMatchProvider)
+    exit_code = main(
+        ["--spec", str(spec_file), "--org-id", "org-123",
+         "--dump-to", str(tmp_path / "snap.json"),
+         "--webhook-url", "https://hooks.example/dr",
+         "--only", "network:Nowhere"]
+    )
+    assert exit_code == 2
+    # Operator input error, not a processing fault: no alert fired.
+    assert delivered == []
+
+
+def test_partial_from_dump_refused_with_sync(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    dump = _partial_dump(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(dump), "--sync",
+         "--workdir", str(tmp_path / "ws")]
+    )
+    assert exit_code == 2
+
+
+def test_partial_from_dump_refused_with_confirm_deletions(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _no_network(monkeypatch)
+    dump = _partial_dump(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(dump),
+         "--confirm-deletions", "--workdir", str(tmp_path / "ws")]
+    )
+    assert exit_code == 2
+
+
+def test_partial_from_dump_default_pipeline_warns_and_proceeds(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Generating a one-network kit from a selective backup is a
+    legitimate ad-hoc use — warn loudly, never refuse."""
+    _no_network(monkeypatch)
+    summary = SimpleNamespace(
+        organization_id="org-123", discovered_assets=2, imports_written=1,
+        imports_skipped_existing=0, unsupported_count=0,
+        drift_detected=False, comparison_skipped=True, pending_imports=None,
+        resources_added_to_state=(), apply_aborted=False,
+        deletions_pending=(), deletions_removed=(),
+        regenerated_addresses=(), deferred_addresses=(),
+        coverage_percent=100.0, reconciliation_dropped=(),
+        reconciliation_drop_categories={}, unmanaged_secret_attributes={},
+        normalized_addresses=(), snapshot_drift=None,
+    )
+    _stub_pipeline_summary(monkeypatch, summary)
+    dump = _partial_dump(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(dump),
+         "--workdir", str(tmp_path / "ws")]
+    )
+    console = capsys.readouterr().err
+    assert exit_code == 0
+    assert "PARTIAL export" in console
+
+
+def test_restore_refuses_partial_snapshots(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A partial snapshot cannot rebuild an organization — refused for
+    preview and confirm alike, before any planning."""
+    _no_network(monkeypatch)
+    dump = _partial_dump(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--restore", "--from-dump", str(dump),
+         "--target-org", "org-fresh-scratch"]
+    )
+    assert exit_code == 2
+    assert "PARTIAL export" in capsys.readouterr().err
+
+
+def test_replay_gaps_refuses_partial_snapshots(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _no_network(monkeypatch)
+    dump = _partial_dump(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--replay-gaps",
+         "--from-dump", str(dump), "--org-id", "org-123",
+         "--workdir", str(tmp_path / "ws")]
+    )
+    assert exit_code == 2
+    assert "PARTIAL export" in capsys.readouterr().err
+
+
+def test_heal_scopes_live_discovery_to_partial_snapshots(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Heal from a selective backup narrows its live sweep to the
+    snapshot's recorded networks — the speed the workflow exists for —
+    and stamps the preview with the partial scope."""
+    from meraki2tf import cli as cli_module
+    from meraki2tf.models import MerakiNetwork, NetworkGraph
+    from meraki2tf.scope import LiveNetworkScope
+
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    # Live discovery: the scoped network survived but its SSID did not.
+    _StubLiveProvider.graph = NetworkGraph(
+        organization_id="org-123",
+        networks=(
+            MerakiNetwork.from_payload(
+                {"id": "N_1", "organizationId": "org-123", "name": "HQ",
+                 "productTypes": ["wireless"], "timeZone": "UTC"}
+            ),
+        ),
+        devices=(),
+        features=(),
+    )
+    _StubLiveProvider.last_network_scope = None
+    monkeypatch.setattr(cli_module, "LiveApiDataProvider", _StubLiveProvider)
+    dump = _partial_dump(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--heal", "--from-dump", str(dump),
+         "--org-id", "org-123", "--workdir", str(tmp_path / "ws")]
+    )
+    console = capsys.readouterr().err
+    assert exit_code == 0
+    scope = _StubLiveProvider.last_network_scope
+    assert isinstance(scope, LiveNetworkScope)
+    assert scope.network_ids == frozenset({"N_1"})
+    assert "PARTIAL export scoped to 1 network(s)" in console
+    assert "partial snapshot: scope covers 1 network(s)" in console
+
+
+def test_heal_full_snapshots_keep_unscoped_discovery(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from meraki2tf import cli as cli_module
+    from meraki2tf.models import MerakiNetwork, NetworkGraph
+
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    _StubLiveProvider.graph = NetworkGraph(
+        organization_id="org-123",
+        networks=(
+            MerakiNetwork.from_payload(
+                {"id": "N_1", "organizationId": "org-123", "name": "HQ",
+                 "productTypes": ["wireless"], "timeZone": "UTC"}
+            ),
+        ),
+        devices=(),
+        features=(),
+    )
+    _StubLiveProvider.last_network_scope = "sentinel"
+    monkeypatch.setattr(cli_module, "LiveApiDataProvider", _StubLiveProvider)
+    exit_code = main(
+        ["--spec", str(spec_file), "--heal",
+         "--from-dump", str(_heal_dump(tmp_path)),
+         "--org-id", "org-123", "--workdir", str(tmp_path / "ws")]
+    )
+    assert exit_code == 0
+    assert _StubLiveProvider.last_network_scope is None
