@@ -54,6 +54,12 @@ the project adheres to [Semantic Versioning](https://semver.org/).
   flake8/mypy/tox/pytest/pre-commit/pip-audit toolchain (this PR).
 
 ### Fixed
+- Provider import refusals degrade instead of killing the run (#104):
+  terraform's "Cannot import non-existent remote object" diagnostic
+  (no `with <address>,` line — the address is quoted inline) now rides
+  the drop-and-report-unsupported rail, observed live with
+  byNetwork-adopted settings surfaces the provider refuses to import
+  until they are configured on the network.
 - Sanitizer and drift-diff correctness (#99): collision-free fake /24
   subnets, fingerprint-safe MAC/IPv6 anchors, and arity-safe
   `pathValues` in the sanitizer; order-significant rule lists
