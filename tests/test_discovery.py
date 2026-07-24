@@ -10,10 +10,16 @@ from meraki2tf.openapi_parser import OpenApiParser
 from meraki2tf.providers.discovery import (
     FeatureSectionMatcher,
     _collection_id_key,
+    aggregation_collection_path,
+    aggregation_mappings,
     config_collection_operations,
     element_id,
     expand_endpoint_payload,
+    explode_aggregation_payload,
     item_operation_for,
+    network_product_types,
+    product_segment,
+    spec_surface_report,
 )
 
 
@@ -537,3 +543,361 @@ def test_parent_scope_id_key_requires_a_family_nested_item(
     assert _parent_scope_id_key(shaping) is None  # not an item path
     scoped = _get_op(parser, "/organizations/{organizationId}/{scope}/{itemId}")
     assert _parent_scope_id_key(scoped) is None  # parent is a parameter
+
+
+# ---------------------------------------------------------------------------
+# Aggregation explosion: byNetwork responses back into per-scope assets
+# ---------------------------------------------------------------------------
+
+
+def _air_marshal_mapping(spec_parser: OpenApiParser) -> Any:
+    return spec_parser.resource_mappings()[
+        "meraki_networks_wireless_air_marshal_settings"
+    ]
+
+
+def test_explode_aggregation_rows_with_flat_scope_identifier(
+    spec_parser: OpenApiParser,
+) -> None:
+    mapping = _air_marshal_mapping(spec_parser)
+    features = explode_aggregation_payload(
+        mapping,
+        {
+            "items": [
+                {"networkId": "N_1", "defaultPolicy": "blocked"},
+                {"networkId": "N_2", "defaultPolicy": "allowed"},
+            ],
+            "meta": {"counts": {}},
+        },
+    )
+    assert [
+        (f.api_path, f.path_values, dict(f.payload)) for f in features
+    ] == [
+        (
+            "/networks/{networkId}/wireless/airMarshal/settings",
+            ("N_1",),
+            {"defaultPolicy": "blocked"},
+        ),
+        (
+            "/networks/{networkId}/wireless/airMarshal/settings",
+            ("N_2",),
+            {"defaultPolicy": "allowed"},
+        ),
+    ]
+
+
+def test_explode_aggregation_rows_with_object_scope_identifier(
+    spec_parser: OpenApiParser,
+) -> None:
+    """zigbee/syslog-style rows carry ``network: {id: ...}`` instead of
+    a flat networkId; the whole scope object is consumed."""
+    mapping = _air_marshal_mapping(spec_parser)
+    features = explode_aggregation_payload(
+        mapping,
+        {
+            "items": [
+                {"network": {"id": "N_1", "name": "HQ"}, "enabled": True},
+            ],
+            "meta": {},
+        },
+    )
+    assert features[0].api_path == (
+        "/networks/{networkId}/wireless/airMarshal/settings"
+    )
+    assert features[0].path_values == ("N_1",)
+    assert dict(features[0].payload) == {"enabled": True}
+
+
+def test_explode_aggregation_rows_without_scope_become_gap_records(
+    spec_parser: OpenApiParser,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A row with no scope identifier cannot be addressed, but it was
+    discovered — it must reach the exception auditor, never vanish."""
+    mapping = _air_marshal_mapping(spec_parser)
+    with caplog.at_level("WARNING"):
+        features = explode_aggregation_payload(
+            mapping,
+            {"items": [{"defaultPolicy": "blocked"}, "not-an-object"]},
+        )
+    assert [(f.api_path, f.path_values) for f in features] == [
+        ("/networks/{networkId}/wireless/airMarshal/settings", ()),
+        ("/networks/{networkId}/wireless/airMarshal/settings", ()),
+    ]
+    assert dict(features[0].payload) == {"defaultPolicy": "blocked"}
+    assert dict(features[1].payload) == {"value": "not-an-object"}
+    assert any("scope identifier" in r.message for r in caplog.records)
+
+
+def test_explode_aggregation_non_collection_payload_is_unreadable(
+    spec_parser: OpenApiParser,
+) -> None:
+    from meraki2tf.models import UNREADABLE_MARKER
+
+    mapping = _air_marshal_mapping(spec_parser)
+    features = explode_aggregation_payload(mapping, {"defaultPolicy": "x"})
+    assert len(features) == 1
+    assert features[0].path_values == ()
+    assert UNREADABLE_MARKER in features[0].payload
+
+
+def test_explode_aggregation_plain_array_payload(
+    spec_parser: OpenApiParser,
+) -> None:
+    """zigbee-style aggregations respond as a plain array, no envelope."""
+    mapping = _air_marshal_mapping(spec_parser)
+    features = explode_aggregation_payload(
+        mapping, [{"networkId": "N_1", "defaultPolicy": "blocked"}]
+    )
+    assert features[0].path_values == ("N_1",)
+
+
+def test_explode_aggregation_item_entities_address_elements(
+    tmp_path: Path,
+) -> None:
+    """Air-Marshal-rules shape: rows carry the element ID too, so they
+    explode onto the entity's own item path; a row without the element
+    ID falls back to the collection path."""
+    parser = _write_spec(
+        tmp_path,
+        {
+            "/networks/{networkId}/wireless/airMarshal/rules": {
+                "post": {"operationId": "createRule", "tags": ["wireless"]},
+            },
+            "/networks/{networkId}/wireless/airMarshal/rules/{ruleId}": {
+                "put": {"operationId": "updateRule", "tags": ["wireless"]},
+                "delete": {"operationId": "deleteRule", "tags": ["wireless"]},
+            },
+            "/organizations/{organizationId}/wireless/airMarshal/rules": {
+                "get": {
+                    "operationId": "getOrgRules",
+                    "tags": ["wireless"],
+                    "responses": {
+                        "200": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "items": {
+                                                "type": "array",
+                                                "items": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "network": {},
+                                                        "ruleId": {},
+                                                    },
+                                                },
+                                            },
+                                            "meta": {},
+                                        },
+                                    }
+                                }
+                            }
+                        }
+                    },
+                },
+            },
+        },
+    )
+    mapping = parser.resource_mappings()[
+        "meraki_networks_wireless_air_marshal_rules"
+    ]
+    features = explode_aggregation_payload(
+        mapping,
+        {
+            "items": [
+                {"network": {"id": "N_1"}, "ruleId": "R_1", "type": "block"},
+                {"network": {"id": "N_1"}, "type": "allow"},
+            ],
+            "meta": {},
+        },
+    )
+    assert [(f.api_path, f.path_values) for f in features] == [
+        (
+            "/networks/{networkId}/wireless/airMarshal/rules/{ruleId}",
+            ("N_1", "R_1"),
+        ),
+        ("/networks/{networkId}/wireless/airMarshal/rules", ("N_1",)),
+    ]
+
+
+def test_aggregation_collection_path_falls_back_to_item_parent(
+    tmp_path: Path,
+) -> None:
+    """An adopted entity exposing only item endpoints derives its
+    collection path from the item path's enclosing collection."""
+    parser = _write_spec(
+        tmp_path,
+        {
+            "/networks/{networkId}/foo/things/{thingId}": {
+                "put": {"operationId": "updateThing", "tags": ["foo"]},
+            },
+            "/organizations/{organizationId}/foo/things/byNetwork": {
+                "get": {"operationId": "getThingsByNetwork", "tags": ["foo"]},
+            },
+        },
+    )
+    mapping = parser.resource_mappings()["meraki_networks_foo_things"]
+    assert aggregation_collection_path(mapping) == (
+        "/networks/{networkId}/foo/things"
+    )
+
+
+def test_aggregation_mappings_lists_only_adopted_entities(
+    spec_parser: OpenApiParser,
+) -> None:
+    mappings = aggregation_mappings(spec_parser)
+    assert [m.terraform_name for m in mappings] == [
+        "meraki_networks_wireless_air_marshal_settings"
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Spec-surface accounting: write-only, RPC-only, read-only entities
+# ---------------------------------------------------------------------------
+
+
+def test_spec_surface_report_classifies_uncaptured_entities(
+    tmp_path: Path,
+) -> None:
+    parser = _write_spec(
+        tmp_path,
+        {
+            # Ordinary readable config entity — in none of the lists.
+            "/networks/{networkId}/appliance/trafficShaping": {
+                "get": {"operationId": "getShaping", "tags": ["appliance"]},
+                "put": {"operationId": "updateShaping", "tags": ["appliance"]},
+            },
+            # Write-only configuration: PUT with no readable counterpart.
+            "/networks/{networkId}/appliance/sdwan/internetPolicies": {
+                "put": {"operationId": "updateSdwan", "tags": ["appliance"]},
+            },
+            # RPC-only actions.
+            "/devices/{serial}/blinkLeds": {
+                "post": {"operationId": "blinkLeds", "tags": ["devices"]},
+            },
+            "/networks/{networkId}/devices/claim": {
+                "post": {"operationId": "claimDevices", "tags": ["networks"]},
+            },
+            # Read-only API surface (SM-profile style).
+            "/networks/{networkId}/sm/profiles": {
+                "get": {"operationId": "getSmProfiles", "tags": ["sm"]},
+            },
+            # Adopted byNetwork pair — neither write-only nor read-only.
+            "/networks/{networkId}/wireless/zigbee": {
+                "put": {"operationId": "updateZigbee", "tags": ["wireless"]},
+            },
+            "/organizations/{organizationId}/wireless/zigbee/byNetwork": {
+                "get": {"operationId": "getZigbeeByNetwork", "tags": ["wireless"]},
+            },
+        },
+    )
+    surfaces = spec_surface_report(parser)
+    assert surfaces.write_only_paths == (
+        "/networks/{networkId}/appliance/sdwan/internetPolicies",
+    )
+    assert surfaces.rpc_only_paths == (
+        "/devices/{serial}/blinkLeds",
+        "/networks/{networkId}/devices/claim",
+    )
+    # The zigbee aggregation source is the adopted entity's collection
+    # source, not an unrestorable read-only surface.
+    assert surfaces.api_read_only_paths == (
+        "/networks/{networkId}/sm/profiles",
+    )
+
+
+def test_spec_surface_report_on_pipeline_fixture(
+    spec_parser: OpenApiParser,
+) -> None:
+    surfaces = spec_surface_report(spec_parser)
+    assert surfaces.write_only_paths == ()
+    assert surfaces.rpc_only_paths == ()
+    assert surfaces.api_read_only_paths == ("/networks/{networkId}/clients",)
+
+
+# ---------------------------------------------------------------------------
+# Product-type derivation for conservative prefiltering
+# ---------------------------------------------------------------------------
+
+
+def test_network_product_types_derived_from_create_network_enum(
+    tmp_path: Path,
+) -> None:
+    parser = _write_spec(
+        tmp_path,
+        {
+            "/organizations/{organizationId}/networks": {
+                "get": {"operationId": "getNetworks", "tags": ["organizations"]},
+                "post": {
+                    "operationId": "createNetwork",
+                    "tags": ["organizations"],
+                    "requestBody": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "properties": {
+                                        "productTypes": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "string",
+                                                "enum": [
+                                                    "appliance",
+                                                    "wireless",
+                                                    "switch",
+                                                ],
+                                            },
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                },
+            },
+        },
+    )
+    assert network_product_types(parser) == frozenset(
+        {"appliance", "wireless", "switch"}
+    )
+
+
+def test_network_product_types_absent_enum_disables_filtering(
+    spec_parser: OpenApiParser,
+) -> None:
+    # The pipeline fixture declares no requestBody enum: conservative
+    # default is the empty set, i.e. nothing is ever prefiltered.
+    assert network_product_types(spec_parser) == frozenset()
+
+
+def test_product_segment_shapes(spec_parser: OpenApiParser) -> None:
+    by_path = {op.path: op for op in spec_parser.endpoints()}
+    assert product_segment(
+        by_path["/networks/{networkId}/wireless/ssids"]
+    ) == "wireless"
+    assert product_segment(by_path["/devices/{serial}/switch/ports"]) == "switch"
+    # Scope parameter is the trailing segment — no product family.
+    assert product_segment(by_path["/networks/{networkId}"]) is None
+    # No parameter at all (defensive).
+    from meraki2tf.spec.engine import OperationSpec
+
+    assert (
+        product_segment(
+            OperationSpec(
+                operation_id="x", method="get", path="/organizations",
+                path_params=(), tags=(),
+            )
+        )
+        is None
+    )
+    # A parameter immediately followed by another parameter.
+    assert (
+        product_segment(
+            OperationSpec(
+                operation_id="y", method="get", path="/networks/{networkId}/{oddId}",
+                path_params=("networkId", "oddId"), tags=(),
+            )
+        )
+        is None
+    )
