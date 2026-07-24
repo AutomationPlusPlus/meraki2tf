@@ -38,6 +38,7 @@ import logging
 import os
 import re
 import subprocess
+import time
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,6 +57,7 @@ from .plan_reconciler import (
     duplicate_set_values,
     enum_case_repairs,
     hcl_quote,
+    heredoc_delimiter,
     locate_duplicate_value_resources,
     plan_throttled,
     validation_failures,
@@ -184,6 +186,30 @@ _PLAN_NO_CHANGES_RE = re.compile(
 _RESOURCE_BLOCK_RE = re.compile(r'^resource\s+"(?P<type>[^"]+)"\s+"(?P<name>[^"]+)"\s*\{')
 
 
+def _block_body_end(lines: list[str], index: int) -> int:
+    """Index of the block's closing column-0 ``}`` line, heredoc-aware.
+
+    ``index`` points at the first line after the block opener. A
+    column-0 ``}`` inside a heredoc string body (terraform's generator
+    emits heredocs for webhook payloadTemplate bodies and other JSON
+    blobs) is string content, not the block closer, and honoring it
+    would truncate the block. Returns ``len(lines)`` for an
+    unterminated block.
+    """
+    delimiter: str | None = None
+    while index < len(lines):
+        line = lines[index]
+        if delimiter is None and line.startswith("}"):
+            return index
+        if delimiter is not None:
+            if line.strip() == delimiter:
+                delimiter = None
+        else:
+            delimiter = heredoc_delimiter(line)
+        index += 1
+    return index
+
+
 def _split_resource_blocks(text: str) -> tuple[str, dict[str, str]]:
     """(preamble, address → block text) for terraform-generated config.
 
@@ -217,9 +243,9 @@ def _split_resource_blocks(text: str) -> tuple[str, dict[str, str]]:
         chunk.append(line)
         if line.rstrip().endswith("{"):  # multi-line block
             index += 1
-            while index < len(lines) and not lines[index].startswith("}"):
-                chunk.append(lines[index])
-                index += 1
+            body_end = _block_body_end(lines, index)
+            chunk.extend(lines[index:body_end])
+            index = body_end
             if index < len(lines):
                 chunk.append(lines[index])
         index += 1
@@ -1024,6 +1050,12 @@ class TerraformRunner:
     #: Plan actions that mutate nothing (imports render as no-op).
     _HARMLESS_PLAN_ACTIONS = frozenset({"no-op", "read"})
 
+    #: Age (mtime) past which a leftover verified plan copy is stale no
+    #: matter what: PIDs recycle, so an unrelated live process wearing a
+    #: dead run's PID must not keep its secret-bearing copy alive
+    #: forever. Generously above any single verify+apply window.
+    _STALE_PLAN_COPY_SECONDS = 6 * 60 * 60
+
     def _exclusive_run_copy(self, source: Path) -> Path:
         """Snapshot a saved plan into a run-private, owner-only copy.
 
@@ -1034,11 +1066,23 @@ class TerraformRunner:
         later run recycling the same PID would trip the exclusive
         create — so copies whose owning process is gone are swept first,
         and a same-PID leftover (the old owner is dead by definition) is
-        replaced once.
+        replaced once. PID liveness alone is spoofable by recycling, so
+        copies older than ``_STALE_PLAN_COPY_SECONDS`` are swept
+        regardless of whether some unrelated process wears the PID now.
         """
+        now = time.time()
         for leftover in self._workdir.glob(f"{source.name}.verified-*"):
             suffix = leftover.name.rsplit("-", 1)[-1]
-            if suffix.isdigit() and not _process_alive(int(suffix)):
+            stale = suffix.isdigit() and not _process_alive(int(suffix))
+            if not stale:
+                try:
+                    age = now - leftover.stat().st_mtime
+                except OSError:
+                    # Racing deletion by a concurrent sweep: nothing
+                    # left to remove.
+                    continue
+                stale = age > self._STALE_PLAN_COPY_SECONDS
+            if stale:
                 leftover.unlink(missing_ok=True)
         target = self._workdir / f"{source.name}.verified-{os.getpid()}"
         plan_bytes = source.read_bytes()
@@ -1237,8 +1281,7 @@ class TerraformRunner:
                     index += 1
                 else:
                     index += 1
-                    while index < len(lines) and not lines[index].startswith("}"):
-                        index += 1
+                    index = _block_body_end(lines, index)
                     index += 1  # the closing brace itself
                 while index < len(lines) and not lines[index].strip():
                     index += 1  # the blank separator after the block

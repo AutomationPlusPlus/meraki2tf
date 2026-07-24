@@ -2285,3 +2285,91 @@ def test_process_alive_probe_verdicts(
         terraform_runner.os, "kill", lambda pid, sig: None
     )
     assert terraform_runner._process_alive(os.getpid()) is True
+
+
+HEREDOC_BASELINE = """\
+resource "meraki_network_webhook_payload_template" "l_1_wpt" {
+  network_id = "L_1"
+  body       = <<-EOT
+{
+"text": "**{{alertType}}**"
+}
+EOT
+  name = "custom-template"
+}
+
+resource "meraki_networks" "n_1" {
+  name = "HQ"
+}
+"""
+
+
+def test_split_resource_blocks_is_heredoc_aware() -> None:
+    """A column-0 `}` inside a heredoc string body (webhook
+    payloadTemplate bodies) is string content, not a block closer:
+    honoring it split the template block in half and corrupted the
+    absorb-merge of resources.tf."""
+    preamble, blocks = terraform_runner._split_resource_blocks(
+        HEREDOC_BASELINE
+    )
+    assert preamble == ""
+    assert set(blocks) == {
+        "meraki_network_webhook_payload_template.l_1_wpt",
+        "meraki_networks.n_1",
+    }
+    template = blocks["meraki_network_webhook_payload_template.l_1_wpt"]
+    assert '"text": "**{{alertType}}**"' in template
+    assert 'name = "custom-template"' in template  # the post-heredoc tail
+    assert template.rstrip("\n").endswith("}")
+
+
+def test_prune_baseline_is_heredoc_aware(runner: TerraformRunner) -> None:
+    """Pruning a heredoc-bearing block must remove the WHOLE block —
+    truncating at the heredoc's column-0 `}` left half a resource behind
+    and wedged every later terraform parse."""
+    runner.prepare_workspace()
+    (runner.workdir / AGGREGATED_CONFIG_FILENAME).write_text(
+        HEREDOC_BASELINE, encoding="utf-8"
+    )
+    runner._prune_baseline(["meraki_network_webhook_payload_template.l_1_wpt"])
+    text = (runner.workdir / AGGREGATED_CONFIG_FILENAME).read_text(
+        encoding="utf-8"
+    )
+    assert "payload_template" not in text
+    assert "EOT" not in text and "custom-template" not in text
+    assert 'resource "meraki_networks" "n_1"' in text  # neighbor intact
+
+
+def test_verified_copies_older_than_the_stale_window_are_swept(
+    runner: TerraformRunner,
+) -> None:
+    """PID liveness alone is spoofable by PID recycling: an unrelated
+    live process wearing a dead run's PID kept its secret-bearing plan
+    copy alive indefinitely. Copies past the mtime window are swept
+    regardless; young copies of live runs survive."""
+    import time as time_module
+
+    runner.prepare_workspace()
+    source = runner.workdir / SYNC_PLAN_FILENAME
+    source.write_bytes(b"opaque-plan")
+    # PID 1 is always alive — stands in for a recycled PID.
+    recycled = runner.workdir / f"{SYNC_PLAN_FILENAME}.verified-1"
+    recycled.write_bytes(b"stale-secret-bearing-copy")
+    ancient = time_module.time() - 7 * 60 * 60
+    os.utime(recycled, (ancient, ancient))
+    # A non-PID suffix used to be kept forever; age sweeps it too.
+    odd = runner.workdir / f"{SYNC_PLAN_FILENAME}.verified-notapid"
+    odd.write_bytes(b"stale")
+    os.utime(odd, (ancient, ancient))
+    # A young copy owned by a live process (our parent) is a concurrent
+    # run's working file and must survive the sweep.
+    concurrent = runner.workdir / f"{SYNC_PLAN_FILENAME}.verified-{os.getppid()}"
+    concurrent.write_bytes(b"live-concurrent-copy")
+
+    target = runner._exclusive_run_copy(source)
+
+    assert not recycled.exists()
+    assert not odd.exists()
+    assert concurrent.read_bytes() == b"live-concurrent-copy"
+    assert target.read_bytes() == b"opaque-plan"
+    target.unlink()

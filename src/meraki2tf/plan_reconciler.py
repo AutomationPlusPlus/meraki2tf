@@ -344,13 +344,14 @@ def apply_enum_case_repairs(
                 block = insert_ignore_changes(block, tuple(edited_attrs))
             return block
 
-        if (
-            any(
-                _edit_resource_block(path, address, edit)
-                for path in config_files
-            )
-            and edited_attrs
-        ):
+        # Evaluate EVERY file: an address present in both
+        # generated_resources.tf and resources.tf must be repaired in
+        # both, and a lazy any() would stop at the first hit.
+        edited_files = [
+            _edit_resource_block(path, address, edit)
+            for path in config_files
+        ]
+        if any(edited_files) and edited_attrs:
             repaired[address] = tuple(sorted(set(edited_attrs)))
     return repaired
 
@@ -504,10 +505,48 @@ def classify_plan(document: Any) -> ReconciliationPlan:
 # ---------------------------------------------------------------------------
 
 
+#: A heredoc opener anywhere on a line: ``<<EOT`` / ``<<-EOT``.
+#: Terraform's generator emits heredocs for multi-line strings (webhook
+#: payloadTemplate bodies, JSON blobs), whose content may well contain
+#: a ``}`` at column 0 — string data, not a block closer.
+_HEREDOC_OPENER = re.compile(r"<<-?([A-Za-z_][A-Za-z0-9_-]*)")
+
+
+def heredoc_delimiter(line: str) -> str | None:
+    """The heredoc delimiter a line opens, if any."""
+    match = _HEREDOC_OPENER.search(line)
+    return match.group(1) if match else None
+
+
+def _closing_brace_end(text: str, start: int) -> int | None:
+    """Offset just past the block-closing ``}`` line at/after ``start``.
+
+    Line-scans instead of ``text.find("\\n}\\n")`` so a column-0 ``}``
+    inside a heredoc string body does not truncate the block early.
+    """
+    length = len(text)
+    position = start
+    delimiter: str | None = None
+    while position < length:
+        newline = text.find("\n", position)
+        end = length if newline < 0 else newline
+        line = text[position:end]
+        if delimiter is not None:
+            if line.strip() == delimiter:
+                delimiter = None
+        elif line == "}":
+            return min(end + 1, length)
+        else:
+            delimiter = heredoc_delimiter(line)
+        position = end + 1
+    return None
+
+
 def _block_span(text: str, address: str) -> tuple[int, int] | None:
     """(start, end) offsets of ``resource "type" "name" { … }`` for the
     address, using terraform's emitted shape (closing brace at column 0,
-    or the one-line ``resource "t" "n" {}`` form)."""
+    or the one-line ``resource "t" "n" {}`` form). Heredoc bodies are
+    skipped while looking for the closer."""
     rtype, _, name = address.partition(".")
     opener = re.compile(
         r'^resource\s+"%s"\s+"%s"\s*\{' % (re.escape(rtype), re.escape(name)),
@@ -522,12 +561,12 @@ def _block_span(text: str, address: str) -> tuple[int, int] | None:
         # One-line block: the span is exactly its own line — searching
         # for a ``\n}\n`` closer would swallow the *next* block.
         return match.start(), (len(text) if line_end < 0 else line_end + 1)
-    close = text.find("\n}\n", match.start())
-    if close < 0:
-        if text.endswith("\n}"):
-            return match.start(), len(text)
+    close = _closing_brace_end(
+        text, line_end + 1 if line_end >= 0 else len(text)
+    )
+    if close is None:
         return None
-    return match.start(), close + len("\n}\n")
+    return match.start(), close
 
 
 def _edit_resource_block(
@@ -757,9 +796,13 @@ def apply_remediations(
                 block = insert_ignore_changes(block, remediation.secret_attrs)
             return block
 
+        # Evaluate EVERY file (list, not lazy genexpr): the address may
+        # exist in both config files and both copies must be remediated.
         edited = any(
-            _edit_resource_block(path, remediation.address, edit)
-            for path in config_files
+            [
+                _edit_resource_block(path, remediation.address, edit)
+                for path in config_files
+            ]
         )
         if not edited:
             logger.warning(
