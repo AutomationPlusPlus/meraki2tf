@@ -52,9 +52,29 @@ Every run audits Terraform coverage so you can trust the kit *before*
 you need it. The workdir always contains a machine-readable
 `coverage.json` and a human-readable `coverage.txt` listing **every**
 discovered object with a status — `imported` (in state),
-`pending-import` (in the kit, not yet in state), or `unsupported`
-(cannot be rebuilt by Terraform, with the reason) — plus totals and a
-coverage percentage. The log and the `RUN_SUCCESS` payload carry the
+`pending-import` (in the kit, not yet in state), `unsupported`
+(cannot be rebuilt by Terraform, with the reason), or `duplicate-id`
+(its import ID is already carried by another captured object, so it is
+rebuild-covered by that primary record) — plus totals and a coverage
+percentage. The totals must reconcile against exactly what discovery
+produced; any shortfall appears as `totals.unaccounted` with a loud
+`ACCOUNTING MISMATCH` banner in `coverage.txt` — treat coverage claims
+as suspect until it is explained. The manifest also carries spec-level
+visibility no per-object row can:
+
+- `suspect_endpoints` — endpoints that refused *every* scope they were
+  tried against this run (≥ 3): usually a permissions hole or an API
+  change, so verify those features are genuinely not in use;
+- `excluded_rpc_paths` — RPC-style action endpoints excluded from
+  discovery by design (one-shot actions, not configuration);
+- `api_read_only_paths` — surfaces that are read-only in the Meraki
+  API itself (much of Systems Manager, inventories, telemetry-shaped
+  reads with no write verb): not restorable by *any* tool, Terraform
+  or otherwise — know this before an incident, not during one.
+
+`coverage.txt` groups repeated unsupported gaps by (endpoint, reason)
+with example locators, so a provider regression across 500 objects
+reads as one line, not 500. The log and the `RUN_SUCCESS` payload carry the
 same picture, and each asset the provider **cannot express** is flagged
 with an `UNSUPPORTED_FEATURE_FLAGGED` alert; the full unsupported list
 also rides along on every success and drift notification — those are
@@ -223,6 +243,16 @@ Notes:
 - **Crash-resumable.** Executed writes are journaled
   (`<workdir>/heal-journal.jsonl`); re-running `--heal --confirm`
   resumes instead of duplicating creates.
+- **Additive-only is re-verified at write time.** Immediately before
+  each create, heal probes whether the object is alive *right now*;
+  anything found alive is skipped even if the discovery sweep missed
+  it (a transient 400, SDK/spec skew). The `HEAL_EXECUTED` alert
+  reports these as `verified_alive_skips` — a nonzero count means the
+  sweep undercounted survivors.
+- **Second incidents re-execute.** A journaled action whose object has
+  gone missing *again* (deleted a second time after a successful heal)
+  is re-executed rather than skipped as "already done" — the journal
+  never masks a fresh deletion.
 - **Selective heal (`--only`).** When only part of a deletion should
   come back (two networks deleted, restore one; several SSIDs deleted,
   restore some), repeatable `--only '[TYPE:]PATTERN'` selectors narrow
@@ -363,6 +393,13 @@ rewritten fails that one object loudly; children of failed parents are
 skipped with reasons. Re-running with the same journal resumes instead
 of duplicating creates. The run ends with a `RESTORE_EXECUTED` alert
 listing executed/failed/skipped (identifiers only, never values).
+
+Determinism under incident pressure: the DR write actions (`--restore`,
+`--heal`, `--replay-gaps`) **never auto-refresh the OpenAPI spec** —
+the local file is used as-is (version + sha256 logged) so preview,
+`--confirm`, and any rerun all dispatch from the same document.
+Snapshots record the spec fingerprint they were captured with, and a
+restore warns when the runtime spec skews from it.
 
 Every weekly coverage manifest also carries each asset's `restore_via`
 verdict (`create` / `configure` / `claim` / `unrestorable: <reason>`),

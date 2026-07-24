@@ -88,7 +88,11 @@ notes: [Prerequisites & Installation](#prerequisites--installation).
 
 | Your goal | Invocation | Where it's documented |
 | --- | --- | --- |
+| Validate my flags/key/terraform before a long run | `--check` (add it to the exact flag set) | [`--check`](docs/USAGE.md#parameters-in-detail) |
+| Preview how long discovery will take | `--estimate` | [`--estimate`](docs/USAGE.md#parameters-in-detail) |
 | One-shot export of my org to Terraform | `meraki2tf --org-id <id>` | [Live Mode](docs/USAGE.md#live-mode-cloud-streaming) |
+| Terraform for just one network (trial / single-site onboarding) | add `--only 'network:NAME'` | [Scoped pipeline runs](docs/USAGE.md#parameters-in-detail) |
+| Compare a branch network against a golden site | `--diff-networks 'Golden' 'Branch-07'` | [`--diff-networks`](docs/USAGE.md#parameters-in-detail) |
 | Scheduled DR job that also materializes Terraform state | add `--sync` | [Scheduled DR automation](docs/DR-GUIDE.md#scheduled-dr-automation---sync) |
 | Capture a snapshot for offline / air-gapped use | `--dump-to <path>` (add `--sanitize` to share it) | [Producing a snapshot](docs/USAGE.md#producing-a-snapshot---dump-to) |
 | Run entirely offline from a snapshot | `--from-dump <path>` | [Dump Mode](docs/USAGE.md#dump-mode-offline--air-gapped) |

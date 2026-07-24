@@ -187,9 +187,17 @@ meraki2tf --from-dump snapshots/this-week.jsonl.gz \
 Noise control is spec-driven: only attributes that appear in a PUT/POST
 request schema are compared ("if you can't write it, it isn't
 configuration"), identity-keyed lists compare order-insensitively while
-bare arrays (firewall rules) stay ordered, and an attribute that
+bare arrays (firewall rules, port-forwarding rules — where order is
+match precedence) stay ordered, and an attribute that
 appears fleet-wide across every modified asset of one endpoint is
-suppressed as a Meraki API rollout rather than operator drift.
+suppressed as a Meraki API rollout rather than operator drift. A pure
+reordering of an order-significant list is reported as an explicit
+`<order changed>` entry (with the item count), never as a full value
+dump. Guardrails: a baseline captured from a **different
+organization** is refused (repointing a schedule at another org
+restarts the drift chain instead of producing one giant false alert),
+as are sanitized and partial (`--only`) snapshots — and `--check`
+validates all of this from the baseline header in seconds.
 
 ## Configuration Options
 
@@ -199,16 +207,22 @@ Quick reference (each flag is described in detail below):
 | --- | --- | --- |
 | `--version` | — | Print the installed meraki2tf version and exit |
 | `--list-orgs` | — | List every organization the API key can see (ID + name) and exit — the way to find `--org-id` |
+| `--check` | — | Standalone preflight: validate the whole flag set (key, org, terraform, catalog, baseline, workdir, alert channels) in seconds — one PASS/FAIL/SKIP line per check, nonzero exit on failure, mutates nothing |
+| `--estimate` | — | Standalone cost preview: expected discovery request count + wall-clock estimates (2-3 API calls live; zero with `--from-dump`) |
 | `--config PATH` | — | TOML file of recurring settings (CLI > file > default); DR actions, confirmations, and credentials refused |
 | `--org-id` | — | Organization to discover (required in live mode); repeat for sequential multi-org fan-out |
-| `--spec PATH` | `./spec3.json` | Meraki OpenAPI JSON document; auto-downloaded/refreshed from GitHub |
+| `--spec PATH` | `./spec3.json` | Meraki OpenAPI JSON document; auto-downloaded/refreshed from GitHub (DR write actions never auto-refresh — see [OpenAPI spec resolution](#openapi-spec-resolution)) |
 | `--from-dump PATH` | — | Offline snapshot; switches to dump mode |
 | `--dump-to PATH` | — | Export discovery output as a snapshot instead of running Terraform |
 | `--sanitize` | off | Redact secrets/identity in the `--dump-to` snapshot |
-| `--drift-baseline PATH` | — | Prior snapshot to diff the fresh discovery against — attribute-level drift in seconds, no terraform read pass |
+| `--drift-baseline PATH` | — | Prior snapshot to diff the fresh discovery against — attribute-level drift in seconds, no terraform read pass; a baseline from a different organization (or a sanitized/partial one) is refused |
+| `--discovery-checkpoint PATH` | — | Resumable discovery: journal every completed API call (0600 JSONL, `.gz` supported); an aborted sweep resumes on the next run, a completed run deletes the journal. Valid on `--dump-to` exports and live pipeline runs |
+| `--diff-networks A B` | — | Standalone golden-config comparison of two networks (live or `--from-dump`); attribute names only, never values |
+| `--diff-out PATH` | — | Also write the `--diff-networks` report to PATH as JSON |
 | `--rebuild` | off | Disaster recovery: preview a rebuild apply of the workdir artifacts |
 | `--heal` | off | Disaster recovery: preview recreating snapshot objects missing from the same live org (additive-only) |
-| `--only [TYPE:]PATTERN` | — | Selective scope, repeatable. With `--heal`: restrict the heal to missing objects matching a name/ID glob (e.g. `network:Branch-07`, `ssid:Guest*`); dependencies auto-included. With `--dump-to`: selective backup — scope discovery to the matching networks (`network:PATTERN` only) and write a partial snapshot (usable by `--heal`; refused by `--restore`/`--replay-gaps`/`--drift-baseline`) |
+| `--only [TYPE:]PATTERN` | — | Selective scope, repeatable. With `--heal`: restrict the heal to missing objects matching a name/ID glob (e.g. `network:Branch-07`, `ssid:Guest*`); dependencies auto-included. With `--dump-to`: selective backup — scope discovery to the matching networks (`network:PATTERN` only) and write a partial snapshot (usable by `--heal`; refused by `--restore`/`--replay-gaps`/`--drift-baseline`). On a default live pipeline run: scoped kit generation — discovery, kit, and plan cover only the matching networks (`network:PATTERN` only), artifacts are stamped PARTIAL, out-of-scope state is never touched, and deletion review is skipped |
+| `--expect-org ORG_ID` | — | Target assertion for `--rebuild`/`--replay-gaps`: refuse to plan or write unless the resolved organization equals ORG_ID (both actions print the resolved org either way) |
 | `--replay-gaps` | off | Disaster recovery: preview restoring objects/secrets Terraform can't rebuild, from an unsanitized snapshot |
 | `--restore` | off | Disaster recovery: preview a full-organization rebuild from a snapshot into `--target-org` |
 | `--target-org ORG_ID` | — | The (fresh/scratch) organization `--restore` writes into; never the snapshot's source org |
@@ -289,6 +303,29 @@ exit. Read-only (one `getOrganizations` call), touches nothing on disk,
 and refuses to be combined with any other mode or target flag. This is
 the fastest way to find the `--org-id` value.
 
+**`--check`** — standalone preflight: validate an entire flag set in
+seconds, before committing to a multi-hour sweep. Checks the API key
+(and that it can see each `--org-id`), the terraform binary and its
+version, the provider identity catalog, the `--drift-baseline` header
+(organization match, unsanitized, full-org), workdir writability, and
+the alert-channel configuration — one `PASS`/`FAIL`/`SKIP` line per
+check, nonzero exit on any failure. Read-only and side-effect-free: no
+workdir writes, no `terraform init`, nothing touched in Meraki.
+Combine it with the exact flags your scheduled job will use:
+
+```bash
+meraki2tf --org-id 123456 --sync --state-backend s3 \
+  --backend-config bucket=example-terraform-state \
+  --backend-config key=org.tfstate --check
+```
+
+**`--estimate`** — standalone cost preview: enumerate networks and
+devices (2-3 API calls live; zero when combined with `--from-dump`)
+and print the expected discovery request count plus wall-clock
+estimates at the rate cap and at a degraded (throttled) rate, then
+exit. Run it before pointing the tool at a large organization — see
+[Performance & Scale](OPERATIONS.md#performance--scale).
+
 **`--config PATH`** — TOML file of recurring settings; see
 [Config file](#config-file---config) above.
 
@@ -344,12 +381,67 @@ in the snapshot written by `--dump-to`. Deterministic; structural IDs
 stay internally consistent so the sanitized snapshot remains fully
 processable.
 
+**`--discovery-checkpoint PATH`** — make the multi-hour discovery
+sweep resumable. Every completed API call's outcome is appended to a
+JSONL journal (`.gz` supported) the moment it finishes; an aborted run
+(throttle exhaustion, Ctrl-C, crash, reboot) leaves the journal
+behind, and the next run with the same flag skips the completed calls
+and replays their outcomes — a resumed graph is identical to an
+uninterrupted run's. A run that completes deletes its journal. The
+journal holds raw API payloads (secrets), so it is created 0600 like
+the unsanitized snapshot, and its header records the organization ID
+and spec sha256 — a stale or foreign checkpoint refuses loudly rather
+than splicing the wrong outcomes in. Valid on `--dump-to` exports and
+live pipeline runs (the recipes in
+[OPERATIONS](OPERATIONS.md#scheduled-cron-execution) use it).
+
+**`--diff-networks PATTERN_A PATTERN_B`** — standalone golden-config
+comparison: "does Branch-07 match the golden site?" without terraform
+and without mutating anything. Each pattern is a case-insensitive glob
+over network name or ID and must match exactly one network (zero or
+several matches refuse loudly, listing candidates); the two networks'
+discovered configuration is compared through the snapshot-diff engine
+(spec-normalized writable fields, identity-keyed lists as sets,
+order-significant lists with explicit order-change reporting). The
+report carries **attribute names and locators only — never values**,
+so it is safe to paste into tickets and CI logs. Device-scoped
+features (serials differ by definition), org-scoped features (shared
+by both), and unreadable capture gaps are excluded and counted as
+notes. Works live (`--org-id`) and offline (`--from-dump`); add
+**`--diff-out PATH`** to also write the report as JSON.
+
+```bash
+meraki2tf --org-id 123456 --diff-networks 'Golden-Site' 'Branch-07' \
+  --diff-out conformance.json
+```
+
 **`--rebuild`** — disaster-recovery action: run `terraform init` +
 `terraform plan` over the artifacts already in `--workdir` and show
 what an apply would do. Read-only on its own; requires
 `MERAKI_DASHBOARD_API_KEY` and a workdir populated by a previous run.
 Cannot be combined with `--from-dump`/`--dump-to`. See
 [Disaster Recovery](DR-GUIDE.md#disaster-recovery).
+
+**`--expect-org ORG_ID`** — a target assertion for `--rebuild` and
+`--replay-gaps`: both actions print the organization they resolve to
+(the workdir's kit/state for `--rebuild`, the snapshot's recorded
+organization for `--replay-gaps`) before doing anything, and with this
+flag they **refuse to plan or write** unless that resolved
+organization equals ORG_ID. Wire it into any script that wraps a DR
+action so a stale workdir or the wrong snapshot cannot aim a write at
+the wrong tenant.
+
+**`--only 'network:PATTERN'` (default pipeline run)** — scoped kit
+generation for a subset of networks (the single-site onboarding case):
+discovery, the generated kit, and the speculative plan cover only the
+matching networks (`network:PATTERN` selectors, repeatable, union).
+Scope safety: artifacts (coverage manifest, runbook, `RUN_SUCCESS`)
+are stamped **PARTIAL** with the covered networks; the plan/apply is
+targeted at the captured addresses so out-of-scope state is never
+touched; and deletion review is skipped entirely — a scoped run cannot
+distinguish "deleted" from "out of scope", so `--confirm-deletions`,
+`--rebaseline`, and `--drift-baseline` are refused alongside it.
+Review deletions on a full-organization run.
 
 **`--heal`** — disaster-recovery action: recreate snapshot objects that
 are missing from the live organization (accidental deletions) — the
@@ -507,6 +599,13 @@ pinned binary or `tofu`):
 meraki2tf --org-id 123456 --terraform-bin /opt/terraform-1.9/terraform
 ```
 
+Terraform **≥ 1.5.0** is required (the kit rides on `import` blocks):
+runs that will plan probe the binary's version up front and fail in
+seconds instead of hours into a sweep, and the generated `provider.tf`
+pins `required_version = ">= 1.5.0"` so a manual rebuild with an old
+CLI fails the constraint loudly instead of choking on the syntax
+mid-plan.
+
 **`-v` / `--verbose`** — DEBUG logging with logger origins and full
 terraform output, including the complete drift diff. Credentials are
 redacted at every level, so verbose is safe for shared logs.
@@ -637,6 +736,16 @@ You normally never manage the spec by hand:
   spec is used as-is with a warning; if there is no local copy either,
   the run fails with a clear error — pre-stage `spec3.json` for
   fully offline environments.
+- **DR write actions never auto-refresh.** `--restore`, `--heal`, and
+  `--replay-gaps` use the local spec file exactly as it is (its
+  version and sha256 are logged), so a mid-incident rerun is
+  deterministic — the dispatch table cannot change under your feet
+  between the preview and the `--confirm`. With no local spec at all,
+  a one-time download happens and the file is kept for reruns.
+- **Snapshots record their spec.** Every `--dump-to` export stamps the
+  spec's version and sha256 into the snapshot header; a later restore
+  warns when its runtime spec skews from the one the snapshot was
+  captured with.
 
 ### Logging & secret isolation
 

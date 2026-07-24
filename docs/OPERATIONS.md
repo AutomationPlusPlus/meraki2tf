@@ -275,6 +275,22 @@ discovery sweep. Prefer `.jsonl.gz` snapshots at this scale, and give
 schedulers a generous timeout — completeness matters more than speed
 for a DR safety net.
 
+Operating a long sweep:
+
+- **Preview the cost first** — `meraki2tf --org-id 123456 --estimate`
+  prints the expected request count and wall-clock estimates (at the
+  rate cap and at a degraded rate) from 2-3 enumeration calls.
+- **Liveness is visible** — discovery emits one INFO progress line at
+  most every ~30 s (items done/total for the running level, overall
+  count, the current effective request rate, and a rough ETA), so a
+  working sweep and a hung one look different in the log; the line is
+  an ordinary record and renders in `--log-format json` too.
+- **Aborts are resumable** — pass `--discovery-checkpoint PATH` so an
+  aborted sweep (throttle exhaustion, reboot) resumes from its journal
+  instead of restarting from zero; a completed run deletes the
+  journal. The journal carries raw payloads (secrets) and is written
+  0600.
+
 ## Troubleshooting & FAQ
 
 **The run finished but no plan/drift comparison happened.**
@@ -289,11 +305,18 @@ Install Terraform (≥ 1.5) and make sure it is on `PATH`, or point at a
 specific binary with `--terraform-bin /path/to/terraform` (OpenTofu
 works too).
 
-**`meraki2tf could not start: …` right after launch.**
+**`Pipeline fault during configuration discovery: …` early in a live
+run.**
 Usually a bad `--org-id` or an API key without access to that
-organization. Run `meraki2tf --list-orgs` to see exactly which
-organization IDs your key can reach; the failed run exits 1 and
-dispatches a `PROCESSING_FAULT` alert.
+organization: the very first discovery calls
+(`getOrganizationNetworks`) fail with the SDK's 404 error text, the
+run logs `Pipeline fault during configuration discovery: …` followed
+by `Pipeline failed during configuration discovery: …`, exits 1, and
+dispatches a `PROCESSING_FAULT` alert (stage `configuration
+discovery`). Remediation: `meraki2tf --list-orgs` prints exactly which
+organization IDs your key can reach, and `meraki2tf --org-id <id>
+--check` validates the key/org pair (and the rest of your flag set) in
+seconds before you schedule anything.
 
 **Resource names look right but import IDs seem off / resources are
 missing.**
