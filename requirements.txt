@@ -1,10 +1,5 @@
-# Approved dependencies only — see CLAUDE.md Dependency Escalation Policy.
-# Runtime closure with hashes for unattended workers: requirements-lock.txt.
+# Runtime dependencies only — approved per the CLAUDE.md Dependency
+# Escalation Policy. The development toolchain (linting, typing, tests)
+# lives in requirements-dev.txt; the hash-pinned runtime closure for
+# unattended workers is requirements-lock.txt.
 meraki>=3.0,<5
-pre-commit
-flake8
-mypy
-tox
-pytest
-pytest-cov
-pip-audit

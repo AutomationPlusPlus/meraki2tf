@@ -179,8 +179,11 @@ cd meraki2tf
 python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
-pip install -r requirements.txt
+pip install -r requirements.txt      # runtime deps (the meraki SDK)
 pip install -e .
+
+# Contributors additionally install the dev toolchain:
+pip install -r requirements-dev.txt
 ```
 
 **Reproducible worker installs** — unattended schedulers should pin
@@ -230,7 +233,7 @@ contract is [`CLAUDE.md`](CLAUDE.md).
 
 ```bash
 # One-time setup (inside the venv)
-pip install -r requirements.txt
+pip install -r requirements-dev.txt   # flake8, mypy, tox, pytest, pre-commit, pip-audit
 pre-commit install          # hygiene + flake8 + mypy on every commit
 
 # The full gate — lint, strict typing, tests with coverage
