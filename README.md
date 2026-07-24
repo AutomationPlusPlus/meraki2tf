@@ -188,6 +188,9 @@ pip install -e .
 
 # Contributors additionally install the dev toolchain:
 pip install -r requirements-dev.txt
+
+# Optional: bash flag completion
+source deploy/completion/meraki2tf.bash
 ```
 
 **Reproducible worker installs** — unattended schedulers should pin

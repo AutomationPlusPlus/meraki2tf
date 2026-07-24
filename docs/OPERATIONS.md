@@ -145,6 +145,20 @@ units treat exit 3 (coverage gaps) as success so a permanently-gapped
 org doesn't flap the unit — the gap list still arrives via alerts.
 Remove `SuccessExitStatus=3` to page on gaps instead.
 
+## Shell completion
+
+A static bash completion script (flag names; ordinary filename
+completion for values) ships at
+[`deploy/completion/meraki2tf.bash`](../deploy/completion/meraki2tf.bash):
+
+```bash
+source deploy/completion/meraki2tf.bash                     # current shell
+sudo cp deploy/completion/meraki2tf.bash /etc/bash_completion.d/meraki2tf
+```
+
+It is hand-maintained and CI-pinned against the real argument parser,
+so it always matches the installed flag set.
+
 ## Snapshot retention & archival
 
 The recipes above (cron, systemd, and the Azure wrapper's rotation)
