@@ -46,6 +46,7 @@ from meraki2tf.providers.discovery import (
     parent_item_path,
 )
 from meraki2tf.providers.ratelimit import AdaptiveTokenBucket
+from meraki2tf.scope import LiveNetworkScope
 from meraki2tf.spec.engine import OperationSpec
 
 logger = logging.getLogger(__name__)
@@ -170,8 +171,19 @@ class LiveApiDataProvider(MerakiDataProvider):
 
     mode = "live"
 
-    def __init__(self, parser: OpenApiParser | None = None) -> None:
+    def __init__(
+        self,
+        parser: OpenApiParser | None = None,
+        *,
+        network_scope: LiveNetworkScope | None = None,
+    ) -> None:
         self._parser = parser
+        #: When set, discovery covers only the matching networks and
+        #: their devices; org-level surfaces and the config-template
+        #: sweep stay in scope (references from scoped networks must
+        #: remain recreatable). Unclaimed devices (no network) fall
+        #: outside every network scope by definition.
+        self._network_scope = network_scope
         self._client: Any = None
         #: True when _dashboard() built the client itself (vs a test
         #: injecting one) — decides whether workers may share it.
@@ -234,6 +246,18 @@ class LiveApiDataProvider(MerakiDataProvider):
                 organization_id, total_pages="all"
             )
         )
+        if self._network_scope is not None:
+            total_networks, total_devices = len(networks), len(devices)
+            networks = self._network_scope.apply(networks)
+            selected_ids = frozenset(n.network_id for n in networks)
+            devices = tuple(
+                d for d in devices if d.network_id in selected_ids
+            )
+            logger.info(
+                "Scoped discovery: %d of %d network(s) and %d of %d "
+                "device(s) selected; org-level surfaces remain in scope.",
+                len(networks), total_networks, len(devices), total_devices,
+            )
         features = tuple(
             self._discover_features(dashboard, organization_id, networks, devices)
         )

@@ -75,8 +75,33 @@ def _wants_v2(path: Path) -> bool:
     return any(name.endswith(suffix) for suffix in _V2_SUFFIXES)
 
 
+def _scope_header(
+    graph: NetworkGraph,
+    scope_selectors: tuple[str, ...] | None,
+    sanitized: bool,
+) -> dict[str, Any] | None:
+    """The header's ``scope`` object for a partial (``--only``) export.
+
+    Network IDs come from the graph actually being written, so a
+    sanitized export records pseudonymized IDs automatically. The raw
+    selector strings are omitted from sanitized snapshots — they can
+    carry real network names, an identity leak in a shareable artifact.
+    """
+    if scope_selectors is None:
+        return None
+    scope: dict[str, Any] = {
+        "networks": [network.network_id for network in graph.networks],
+    }
+    if not sanitized:
+        scope["selectors"] = list(scope_selectors)
+    return scope
+
+
 def write_snapshot(
-    graph: NetworkGraph, path: Path, sanitized: bool = False
+    graph: NetworkGraph,
+    path: Path,
+    sanitized: bool = False,
+    scope_selectors: tuple[str, ...] | None = None,
 ) -> Path:
     """Write the canonical snapshot for later ``--from-dump`` runs.
 
@@ -94,6 +119,12 @@ def write_snapshot(
     compressed when the name says so. At 200k-object scale the v1
     pretty-printed document costs gigabytes and three in-memory copies;
     v2 streams one small line at a time and compresses ~10-20×.
+
+    ``scope_selectors`` marks a **partial** export (``--dump-to`` with
+    ``--only``): the document gains a ``scope`` header naming the
+    covered networks, so downstream consumers can honor, stamp, or
+    refuse it — a partial snapshot must never read as a full-org
+    capture (see :mod:`meraki2tf.scope`).
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     # Write-then-rename: the snapshot is the org's only rebuild source
@@ -110,13 +141,18 @@ def write_snapshot(
     os.close(fd)
     tmp = Path(tmp_name)
     restrict_to_owner(tmp)
+    scope = _scope_header(graph, scope_selectors, sanitized)
     try:
         if _wants_v2(path):
-            _write_snapshot_v2(graph, path, tmp, sanitized=sanitized)
+            _write_snapshot_v2(
+                graph, path, tmp, sanitized=sanitized, scope=scope
+            )
         else:
             document = graph_to_snapshot(graph)
             if sanitized:
                 document["sanitized"] = True
+            if scope is not None:
+                document["scope"] = scope
             with tmp.open("w", encoding="utf-8") as handle:
                 handle.write(json.dumps(document, indent=2) + "\n")
                 handle.flush()
@@ -173,7 +209,11 @@ def _warn_kind_collision(
 
 
 def _write_snapshot_v2(
-    graph: NetworkGraph, path: Path, target: Path, sanitized: bool = False
+    graph: NetworkGraph,
+    path: Path,
+    target: Path,
+    sanitized: bool = False,
+    scope: dict[str, Any] | None = None,
 ) -> None:
     # Format selection keys on the *final* path's name; bytes land in
     # the temporary file the caller renames into place.
@@ -183,6 +223,8 @@ def _write_snapshot_v2(
     }
     if sanitized:
         header["sanitized"] = True
+    if scope is not None:
+        header["scope"] = scope
     with target.open("wb") as raw:
         if path.name.lower().endswith(".gz"):
             # The gzip layer must be CLOSED before the fsync below: the

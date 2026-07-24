@@ -224,6 +224,14 @@ class PipelineOrchestrator:
             # Dump-mode runs learn their organization only here; stamp
             # the dispatcher so every subsequent alert is attributable.
             self._dispatcher.organization_id = graph.organization_id
+            # A partial (--only) snapshot input stamps every artifact
+            # of this run — the manifest/runbook then describe a scope,
+            # not the organization (Cardinal Rule 2). Live providers
+            # carry no snapshot_scope.
+            partial = getattr(self._provider, "snapshot_scope", None)
+            scope_networks = (
+                tuple(partial.network_ids) if partial is not None else None
+            )
             logger.info(
                 "Discovered %d asset(s) for organization %s via %s mode.",
                 graph.asset_count(), graph.organization_id, self._provider.mode,
@@ -442,6 +450,7 @@ class PipelineOrchestrator:
                 deletions_pending=deletions_pending,
                 unmanaged_secret_attributes=unmanaged_secrets,
                 restore_via=restore_via,
+                scope_networks=scope_networks,
             )
             write_manifest(manifest, self._runner.workdir)
             coverage_percent = float(manifest["coverage_percent"])
@@ -455,6 +464,7 @@ class PipelineOrchestrator:
                 unsupported=report.unsupported,
                 unmanaged_secret_attributes=unmanaged_secrets,
                 parser=self._generator.parser,
+                scope_networks=scope_networks,
             )
 
             logger.info(
@@ -478,6 +488,7 @@ class PipelineOrchestrator:
                     unmanaged_secret_attributes=unmanaged_secrets,
                     deferred_addresses=deferred,
                     reconciliation_drop_categories=recon_drop_categories,
+                    partial_scope=scope_networks or (),
                 )
             )
             return RunSummary(

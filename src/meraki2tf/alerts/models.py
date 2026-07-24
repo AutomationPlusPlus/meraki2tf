@@ -221,6 +221,7 @@ def run_success(
     unmanaged_secret_attributes: Mapping[str, Sequence[str]] | None = None,
     deferred_addresses: Sequence[str] = (),
     reconciliation_drop_categories: Mapping[str, int] | None = None,
+    partial_scope: Sequence[str] = (),
 ) -> AlertEvent:
     """Contract payload for a flawless snapshot-generation run.
 
@@ -234,15 +235,22 @@ def run_success(
     many imports are still pending aggregation into state (None when
     unknown). Reconciliation drops additionally arrive aggregated by
     diagnostic title, so a provider regression names the resource class
-    it broke.
+    it broke. ``partial_scope`` carries the covered network IDs of a
+    partial (``--only``) run, so the receiver can never mistake a
+    one-network export for a full-organization capture.
     """
+    summary = (
+        f"meraki2tf run completed cleanly; {imports_written} import block(s) "
+        f"generated, {len(resources_added_to_state)} resource(s) added to state."
+    )
+    if partial_scope:
+        summary += (
+            f" PARTIAL run scoped to {len(partial_scope)} network(s)."
+        )
     return AlertEvent(
         event_type=EventType.RUN_SUCCESS,
         severity=EventSeverity.INFO,
-        summary=(
-            f"meraki2tf run completed cleanly; {imports_written} import block(s) "
-            f"generated, {len(resources_added_to_state)} resource(s) added to state."
-        ),
+        summary=summary,
         details={
             "imports_written": imports_written,
             "drift_was_detected": drift_was_detected,
@@ -268,6 +276,7 @@ def run_success(
             "reconciliation_drop_categories": dict(
                 reconciliation_drop_categories or {}
             ),
+            "partial_scope": list(partial_scope),
         },
     )
 
@@ -353,13 +362,16 @@ def heal_executed(
     failed: Sequence[Sequence[str]],
     skipped: Sequence[Mapping[str, Any]],
     only: Sequence[str] = (),
+    snapshot_scope: Sequence[str] = (),
 ) -> AlertEvent:
     """Contract payload for a human-invoked same-org heal: accidentally
     deleted objects recreated from a snapshot, surviving objects never
     touched. Entries are value-free action labels. ``only`` carries the
     --only selectors of a selective heal, so the operator reading the
     alert knows the run deliberately covered a subset of the missing
-    objects."""
+    objects. ``snapshot_scope`` carries the covered network IDs when
+    the heal ran from a partial (selective-backup) snapshot — the
+    counts then describe that scope, not the organization."""
     severity = EventSeverity.WARNING if failed else EventSeverity.INFO
     summary = (
         f"Heal of organization {organization_id}: {len(executed)} "
@@ -381,6 +393,12 @@ def heal_executed(
             + ")."
         )
         details["only_filters"] = list(only)
+    if snapshot_scope:
+        summary += (
+            f" Healed from a PARTIAL snapshot scoped to "
+            f"{len(snapshot_scope)} network(s)."
+        )
+        details["snapshot_scope"] = list(snapshot_scope)
     return AlertEvent(
         event_type=EventType.HEAL_EXECUTED,
         severity=severity,

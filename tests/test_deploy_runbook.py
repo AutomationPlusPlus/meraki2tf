@@ -715,3 +715,20 @@ def test_upload_blob_refuses_artifacts_over_the_single_put_guard(
     with pytest.raises(OSError, match="single-shot Put Blob guard"):
         runbook.upload_blob("st", "c", "runs/x/big.bin", artifact, "tok")
     assert called == []
+
+
+def test_split_extra_args_refuses_only_in_both_spellings() -> None:
+    """--only would export a PARTIAL snapshot and the rotation would
+    feed it to the next run as --drift-baseline — scheduled runs refuse
+    it outright."""
+    import pytest
+
+    for extra in (["--only", "network:HQ"], ["--only=network:HQ"]):
+        with pytest.raises(RuntimeError, match="refused in scheduled runs"):
+            runbook.split_extra_args(extra)
+
+
+def test_split_extra_args_other_flags_unaffected_by_refusal_list() -> None:
+    export_args, sync_args = runbook.split_extra_args(["--sanitize"])
+    assert export_args == ["--sanitize"]
+    assert sync_args == []

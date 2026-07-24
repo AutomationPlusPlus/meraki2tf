@@ -677,3 +677,64 @@ def test_only_directly_matching_a_defaults_entry_keeps_it(
         entry.path_values for entry in selection.plan.missing.defaults
     } == {("N_1",), ("N_2",)}  # N_1 via scope, N_2 via direct match
     assert selection.excluded_defaults == 0
+
+
+def test_partial_snapshot_universe_ignores_out_of_scope_live_assets(
+    tmp_path: Path,
+) -> None:
+    """A selective-backup snapshot narrows the heal universe to its own
+    assets: live objects outside the scope are never examined, never
+    classified, and can never be touched — heal stays additive-only and
+    partial-safe by construction."""
+    parser = _heal_spec(tmp_path)
+    partial_snapshot = NetworkGraph(
+        organization_id="org-123",
+        networks=(_network("N_1", "HQ"),),
+        devices=(),
+        features=(
+            FeatureConfiguration(SNMP_PATH, ("N_1",), {"access": "none"}),
+        ),
+    )
+    # Live: the scoped network lost its SNMP config; an out-of-scope
+    # network N_9 (absent from the snapshot) is thriving.
+    live = NetworkGraph(
+        organization_id="org-123",
+        networks=(_network("N_1", "HQ"), _network("N_9", "Elsewhere")),
+        devices=(),
+        features=(
+            FeatureConfiguration(SNMP_PATH, ("N_9",), {"access": "users"}),
+        ),
+    )
+    plan = plan_heal(partial_snapshot, live, parser)
+    missing_keys = {action.key for action in plan.missing.actions}
+    assert missing_keys == {f"{SNMP_PATH}::N_1"}
+    assert plan.snapshot_asset_count == 2  # N_1's create + its SNMP
+    assert not any("N_9" in key for key in missing_keys)
+
+
+def test_partial_snapshot_whole_scope_deleted_heals_full_subtree(
+    tmp_path: Path,
+) -> None:
+    """The maximal selective-backup heal: the scoped network itself was
+    deleted live — its create and every child come back."""
+    parser = _heal_spec(tmp_path)
+    partial_snapshot = NetworkGraph(
+        organization_id="org-123",
+        networks=(_network("N_1", "HQ"),),
+        devices=(),
+        features=(
+            FeatureConfiguration(SNMP_PATH, ("N_1",), {"access": "none"}),
+        ),
+    )
+    live = NetworkGraph(
+        organization_id="org-123", networks=(), devices=(), features=()
+    )
+    plan = plan_heal(partial_snapshot, live, parser)
+    kinds = sorted(
+        (action.api_path, action.kind) for action in plan.missing.actions
+    )
+    assert (
+        "/organizations/{organizationId}/networks", "create"
+    ) in kinds
+    assert (SNMP_PATH, "configure") in kinds
+    assert plan.surviving_count == 0

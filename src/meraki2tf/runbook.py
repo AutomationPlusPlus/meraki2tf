@@ -273,8 +273,15 @@ def build_runbook(
     unsupported: tuple[UnsupportedAsset, ...],
     unmanaged_secret_attributes: Mapping[str, tuple[str, ...]],
     parser: OpenApiParser,
+    scope_networks: tuple[str, ...] | None = None,
 ) -> str:
-    """Render the manual-rebuild runbook markdown for this run."""
+    """Render the manual-rebuild runbook markdown for this run.
+
+    ``scope_networks`` marks a partial (``--only``) run: the runbook is
+    the post-disaster manual-rebuild list, so a silently-narrowed copy
+    is the worst artifact to leave behind — it opens with a banner
+    naming the covered networks instead.
+    """
     payloads = payload_index(graph)
     ops = write_operations(parser)
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -285,6 +292,17 @@ def build_runbook(
         f"Generated {generated_at} by meraki2tf. Regenerated on every run —",
         "always use the copy from the latest snapshot.",
         "",
+    ]
+    if scope_networks is not None:
+        lines += [
+            "> **PARTIAL RUN** — this runbook covers ONLY "
+            f"{len(scope_networks)} selected network(s): "
+            f"{', '.join(sorted(scope_networks)) or '<none>'}. It does",
+            "> NOT describe the organization's full rebuild surface;",
+            "> do not use it as the DR runbook after an org-wide loss.",
+            "",
+        ]
+    lines += [
         "## How to use this document",
         "",
         "1. Restore Terraform-managed resources first:",
@@ -371,6 +389,7 @@ def write_runbook(
     unsupported: tuple[UnsupportedAsset, ...],
     unmanaged_secret_attributes: Mapping[str, tuple[str, ...]],
     parser: OpenApiParser,
+    scope_networks: tuple[str, ...] | None = None,
 ) -> Path:
     """Write ``runbook.md`` into the workdir and return its path."""
     path = workdir / RUNBOOK_FILENAME
@@ -383,6 +402,7 @@ def write_runbook(
             unsupported=unsupported,
             unmanaged_secret_attributes=unmanaged_secret_attributes,
             parser=parser,
+            scope_networks=scope_networks,
         ),
     )
     secret_rows = _secret_sources(

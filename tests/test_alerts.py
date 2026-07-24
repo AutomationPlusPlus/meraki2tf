@@ -129,6 +129,7 @@ def test_run_success_payload_contract() -> None:
         "reconciliation_drop_categories": {
             "Invalid Attribute Value Match": 2
         },
+        "partial_scope": [],
     }
     assert "1 resource(s) added to state" in run_success(
         imports_written=4,
@@ -1028,3 +1029,44 @@ def test_pagerduty_open_delegates_to_urlopen(
     assert pagerduty_module._open(request, timeout=5.0) is sentinel
     assert captured["request"] is request
     assert captured["timeout"] == 5.0
+
+
+def test_run_success_partial_scope_marks_summary_and_details() -> None:
+    event = run_success(
+        imports_written=1,
+        drift_was_detected=False,
+        workspace="w",
+        discovered_assets=3,
+        imports_already_tracked=0,
+        unsupported=[],
+        pending_imports=None,
+        comparison_performed=False,
+        partial_scope=("N_1", "N_2"),
+    )
+    assert "PARTIAL run scoped to 2 network(s)" in event.summary
+    assert event.to_payload()["details"]["partial_scope"] == ["N_1", "N_2"]
+
+
+def test_heal_executed_names_partial_snapshot_scope() -> None:
+    from meraki2tf.alerts import heal_executed
+
+    event = heal_executed(
+        organization_id="org-123",
+        surviving=5,
+        executed=["networks|create|N_1"],
+        failed=[],
+        skipped=[],
+        snapshot_scope=("N_1",),
+    )
+    assert "PARTIAL snapshot scoped to 1 network(s)" in event.summary
+    assert event.to_payload()["details"]["snapshot_scope"] == ["N_1"]
+
+    unscoped = heal_executed(
+        organization_id="org-123",
+        surviving=5,
+        executed=[],
+        failed=[],
+        skipped=[],
+    )
+    assert "PARTIAL" not in unscoped.summary
+    assert "snapshot_scope" not in unscoped.to_payload()["details"]

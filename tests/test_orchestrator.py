@@ -1758,3 +1758,42 @@ def test_manifest_includes_restore_verdicts(
     # StubGenerator's assets aren't in the stub graph, so no verdicts
     # attach — the column is present only where the planner has one.
     assert "objects" in manifest
+
+
+def test_partial_snapshot_scope_stamps_manifest_runbook_and_alert(
+    tmp_path: Path, api_key: None
+) -> None:
+    """A partial (--only) --from-dump input must stamp every artifact
+    of the pipeline run — manifest, runbook, and RUN_SUCCESS — so a
+    one-network kit can never read as full-org coverage."""
+    import json as _json
+
+    from meraki2tf.scope import SnapshotScope
+
+    class PartialProvider(StubProvider):
+        @property
+        def snapshot_scope(self) -> SnapshotScope:
+            return SnapshotScope(network_ids=("N_1",))
+
+    recorder = RecordingNotifier()
+    runner = StubRunner(tmp_path, plan_exit=0)
+    orchestrator = PipelineOrchestrator(
+        provider=PartialProvider(),
+        generator=StubGenerator(),  # type: ignore[arg-type]
+        runner=runner,  # type: ignore[arg-type]
+        dispatcher=AlertDispatcher([recorder]),
+    )
+    orchestrator.run("org-123")
+
+    success = next(
+        e for e in recorder.events if e.event_type is EventType.RUN_SUCCESS
+    )
+    assert success.details["partial_scope"] == ["N_1"]
+    assert "PARTIAL run scoped to 1 network(s)" in success.summary
+    manifest = _json.loads(
+        (runner.workdir / "coverage.json").read_text(encoding="utf-8")
+    )
+    assert manifest["scope"] == {"partial": True, "networks": ["N_1"]}
+    assert "PARTIAL RUN" in (
+        runner.workdir / "runbook.md"
+    ).read_text(encoding="utf-8")

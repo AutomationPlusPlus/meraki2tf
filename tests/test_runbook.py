@@ -332,3 +332,31 @@ def test_runbook_secrets_derive_from_payloads_in_airgapped_runs(
     assert "Secret attributes to restore (1 resource(s))" in text
     assert "`community_string`" in text
     assert "s3cret" not in text
+
+
+def test_runbook_partial_scope_banner(spec_parser: OpenApiParser) -> None:
+    """The runbook is the post-disaster manual-rebuild list; a silently
+    narrowed copy is the worst artifact to leave behind — a partial
+    run's runbook opens with a banner naming the covered networks."""
+    scoped = build_runbook(
+        organization_id="org-123",
+        graph=_graph(),
+        captured=(),
+        unsupported=(),
+        unmanaged_secret_attributes={},
+        parser=spec_parser,
+        scope_networks=("N_2", "N_1"),
+    )
+    assert "PARTIAL RUN" in scoped
+    assert "2 selected network(s)" in scoped
+    assert "N_1, N_2" in scoped
+
+    full = build_runbook(
+        organization_id="org-123",
+        graph=_graph(),
+        captured=(),
+        unsupported=(),
+        unmanaged_secret_attributes={},
+        parser=spec_parser,
+    )
+    assert "PARTIAL RUN" not in full

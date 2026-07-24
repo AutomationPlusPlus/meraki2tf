@@ -468,3 +468,16 @@ def test_volatile_strip_leaves_non_mapping_products_untouched() -> None:
         "products": {"appliance": "unavailable"},
     }
     assert _strip_volatile_subtrees(FIRMWARE_PATH, payload) == payload
+
+
+def test_baseline_drift_refuses_partial_baselines(tmp_path: Path) -> None:
+    """A partial (--only) baseline covers only its scoped networks, so
+    every out-of-scope asset would falsely register as added — a
+    phantom drift storm. Refuse outright."""
+    from meraki2tf.snapshot_diff import PartialBaselineError
+
+    graph = _graph(_vlan("10", name="Data"))
+    baseline = tmp_path / "partial-baseline.json"
+    write_snapshot(graph, baseline, scope_selectors=("network:HQ",))
+    with pytest.raises(PartialBaselineError, match="PARTIAL export"):
+        baseline_drift(graph, baseline, parser=None)

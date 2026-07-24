@@ -235,6 +235,11 @@ _SYNC_ONLY_FLAGS = frozenset({"--confirm-deletions", "--rebaseline"})
 #: govern the job's exit code, and an exit-3 export would otherwise
 #: short-circuit the sync stage of a --with-terraform run.
 _FINAL_STAGE_FLAGS = frozenset({"--fail-on-gaps"})
+#: Flags refused outright in scheduled runs: --only would export a
+#: PARTIAL snapshot, and the rotation machinery would then feed it to
+#: the next run as --drift-baseline — silently poisoning the drift
+#: chain. Selective backup is an interactive-only workflow.
+_REFUSED_FLAGS = frozenset({"--only"})
 
 
 def split_extra_args(
@@ -245,6 +250,7 @@ def split_extra_args(
     Stage-specific flags go to exactly the stage that accepts them;
     everything else (alerting, spec, backend flags, …) goes to both.
     Both ``--flag VALUE`` and ``--flag=VALUE`` spellings are handled.
+    Flags in :data:`_REFUSED_FLAGS` abort the job outright.
     """
     export_args: list[str] = []
     sync_args: list[str] = []
@@ -253,6 +259,13 @@ def split_extra_args(
     while index < len(extra_args):
         token = extra_args[index]
         flag = _flag_name(token)
+        if flag in _REFUSED_FLAGS:
+            raise RuntimeError(
+                f"extra_args flag '{flag}' is refused in scheduled runs: "
+                "the weekly snapshot must cover the full organization "
+                "(a partial export would poison the auto-rotated drift "
+                "baseline). Run selective backups interactively."
+            )
         separator = "=" in token
         if flag in _EXPORT_ONLY_FLAGS:
             export_args.append(token)

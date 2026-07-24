@@ -1436,3 +1436,190 @@ def test_live_dispatch_refuses_methods_that_are_not_verifiably_read_only(
     )
     with pytest.raises(LiveDispatchError, match="not verifiably read-only"):
         live_provider._call(dashboard, op, organizationId="123456")
+
+
+class _RecordingScopedDashboard:
+    """Two networks / three devices; records which scopes were queried."""
+
+    def __init__(self) -> None:
+        self.network_calls: list[str] = []
+        self.serial_calls: list[str] = []
+        self.admin_calls = 0
+        outer = self
+
+        class Organizations:
+            def getOrganizationNetworks(
+                self, org_id: str, total_pages: str
+            ) -> list[dict[str, Any]]:
+                return [
+                    dict(NETWORK_PAYLOAD),
+                    {
+                        "id": "N_2",
+                        "organizationId": "org-123",
+                        "name": "Branch-07",
+                        "productTypes": ["appliance"],
+                    },
+                ]
+
+            def getOrganizationDevices(
+                self, org_id: str, total_pages: str
+            ) -> list[dict[str, Any]]:
+                return [
+                    dict(DEVICE_PAYLOAD),
+                    {
+                        "serial": "Q2XY-1234-5678",
+                        "networkId": "N_2",
+                        "model": "MX64",
+                        "name": "branch-edge",
+                    },
+                    # Unclaimed: outside every network scope.
+                    {"serial": "Q2ZZ-0000-0000", "networkId": "",
+                     "model": "MR36", "name": "spare"},
+                ]
+
+            def getOrganizationAdmins(
+                self, organizationId: str
+            ) -> list[dict[str, Any]]:
+                outer.admin_calls += 1
+                return [{"id": "A_1", "email": "ops@example.com"}]
+
+        class Appliance:
+            def getNetworkApplianceVlans(self, networkId: str) -> list[Any]:
+                outer.network_calls.append(networkId)
+                return [{"id": 10, "name": "Data"}]
+
+            def getNetworkApplianceTrafficShaping(
+                self, networkId: str
+            ) -> dict[str, Any]:
+                outer.network_calls.append(networkId)
+                return {"globalBandwidthLimits": {"limitUp": 1, "limitDown": 1}}
+
+        class Networks:
+            def getNetworkSyslogServers(
+                self, networkId: str
+            ) -> list[dict[str, Any]]:
+                outer.network_calls.append(networkId)
+                return [{"host": "10.0.0.1"}]
+
+        class Sensor:
+            def getNetworkSensorRelationships(
+                self, networkId: str
+            ) -> list[dict[str, Any]]:
+                outer.network_calls.append(networkId)
+                return []
+
+        class Switch:
+            def getDeviceSwitchPorts(
+                self, serial: str
+            ) -> list[dict[str, Any]]:
+                outer.serial_calls.append(serial)
+                return [{"portId": "1", "name": "Uplink", "enabled": True}]
+
+        self.organizations = Organizations()
+        self.appliance = Appliance()
+        self.networks = Networks()
+        self.sensor = Sensor()
+        self.switch = Switch()
+
+
+def test_live_scoped_fetch_narrows_networks_and_devices(
+    monkeypatch: pytest.MonkeyPatch, spec_parser: OpenApiParser
+) -> None:
+    from meraki2tf.scope import LiveNetworkScope
+
+    monkeypatch.setenv(API_KEY_ENV_VAR, "unit-test-token")
+    provider = LiveApiDataProvider(
+        parser=spec_parser,
+        network_scope=LiveNetworkScope(selectors=("network:Branch-*",)),
+    )
+    dashboard = _RecordingScopedDashboard()
+    provider._client = dashboard
+    graph = provider.fetch_network_graph("org-123")
+    assert [n.network_id for n in graph.networks] == ["N_2"]
+    # Devices narrow to the selected networks; unclaimed devices fall
+    # outside every network scope.
+    assert [d.serial for d in graph.devices] == ["Q2XY-1234-5678"]
+    # Network-scoped ops ran only for the selected network, serial ops
+    # only for its device, and org-level ops still ran (once).
+    assert set(dashboard.network_calls) == {"N_2"}
+    assert dashboard.serial_calls == ["Q2XY-1234-5678"]
+    assert dashboard.admin_calls == 1
+
+
+def test_live_scoped_fetch_id_form_tolerates_missing_network(
+    monkeypatch: pytest.MonkeyPatch, spec_parser: OpenApiParser
+) -> None:
+    from meraki2tf.scope import LiveNetworkScope
+
+    monkeypatch.setenv(API_KEY_ENV_VAR, "unit-test-token")
+    provider = LiveApiDataProvider(
+        parser=spec_parser,
+        network_scope=LiveNetworkScope(
+            network_ids=frozenset({"N_2", "N_deleted"})
+        ),
+    )
+    provider._client = _RecordingScopedDashboard()
+    graph = provider.fetch_network_graph("org-123")
+    assert [n.network_id for n in graph.networks] == ["N_2"]
+
+
+def test_live_scoped_fetch_zero_match_selector_raises(
+    monkeypatch: pytest.MonkeyPatch, spec_parser: OpenApiParser
+) -> None:
+    from meraki2tf.scope import LiveNetworkScope, ScopeFilterError
+
+    monkeypatch.setenv(API_KEY_ENV_VAR, "unit-test-token")
+    provider = LiveApiDataProvider(
+        parser=spec_parser,
+        network_scope=LiveNetworkScope(selectors=("network:Warehouse*",)),
+    )
+    provider._client = _RecordingScopedDashboard()
+    with pytest.raises(ScopeFilterError, match="Warehouse"):
+        provider.fetch_network_graph("org-123")
+
+
+def test_snapshot_scope_property_absent_on_legacy_snapshots(
+    dump_file: Path,
+) -> None:
+    assert StaticJsonDataProvider(dump_file).snapshot_scope is None
+
+
+def test_snapshot_scope_property_reads_v1_and_v2(tmp_path: Path) -> None:
+    from meraki2tf.models import MerakiNetwork
+    from meraki2tf.snapshot import write_snapshot
+
+    graph = NetworkGraph(
+        organization_id="org-123",
+        networks=(
+            MerakiNetwork(
+                network_id="N_1", organization_id="org-123",
+                name="HQ", product_types=("appliance",),
+            ),
+        ),
+        devices=(),
+        features=(),
+    )
+    for name in ("scoped.json", "scoped.jsonl"):
+        path = tmp_path / name
+        write_snapshot(graph, path, scope_selectors=("network:HQ",))
+        scope = StaticJsonDataProvider(path).snapshot_scope
+        assert scope is not None, name
+        assert scope.network_ids == ("N_1",)
+        assert scope.selectors == ("network:HQ",)
+
+
+def test_snapshot_scope_property_refuses_malformed_header(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "bad-scope.jsonl"
+    path.write_text(
+        json.dumps(
+            {"meraki2tfSnapshot": 2, "organizationId": "org-123",
+             "scope": {"networks": "N_1"}}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    provider = StaticJsonDataProvider(path)
+    with pytest.raises(MalformedDumpError, match="scope"):
+        provider.snapshot_scope

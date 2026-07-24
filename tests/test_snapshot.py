@@ -349,3 +349,44 @@ def test_sanitized_marker_round_trips_in_both_formats(tmp_path: Path) -> None:
     for name in ("plain.json", "plain.jsonl"):
         path = write_snapshot(graph, tmp_path / name)
         assert StaticJsonDataProvider(path).snapshot_sanitized is False
+
+
+def test_scope_header_round_trips_in_both_formats(tmp_path: Path) -> None:
+    """A partial (--only) export must be distinguishable from a full
+    capture: restore/replay/drift-baseline refuse it, heal narrows to
+    it."""
+    graph = _payload_graph()
+    for name in ("scoped.json", "scoped.jsonl"):
+        path = write_snapshot(
+            graph, tmp_path / name, scope_selectors=("network:HQ*",)
+        )
+        scope = StaticJsonDataProvider(path).snapshot_scope
+        assert scope is not None, name
+        assert scope.network_ids == tuple(
+            network.network_id for network in graph.networks
+        )
+        assert scope.selectors == ("network:HQ*",)
+    for name in ("full.json", "full.jsonl"):
+        path = write_snapshot(graph, tmp_path / name)
+        assert StaticJsonDataProvider(path).snapshot_scope is None
+
+
+def test_sanitized_scope_omits_raw_selectors(tmp_path: Path) -> None:
+    """Raw --only selectors can carry real network names — an identity
+    leak in the shareable sanitized artifact. The recorded network IDs
+    come from the graph being written (already pseudonymized)."""
+    graph = _payload_graph()
+    for name in ("scoped-sanitized.json", "scoped-sanitized.jsonl"):
+        path = write_snapshot(
+            graph,
+            tmp_path / name,
+            sanitized=True,
+            scope_selectors=("network:Real-Branch-Name",),
+        )
+        assert "Real-Branch-Name" not in path.read_text(encoding="utf-8")
+        scope = StaticJsonDataProvider(path).snapshot_scope
+        assert scope is not None
+        assert scope.selectors == ()
+        assert scope.network_ids == tuple(
+            network.network_id for network in graph.networks
+        )

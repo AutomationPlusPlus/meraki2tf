@@ -17,6 +17,20 @@ the project adheres to [Semantic Versioning](https://semver.org/).
   unsupported settings becomes a skip verdict instead of a failure.
 
 ### Added
+- Selective backup: `--dump-to … --only 'network:PATTERN'` scopes live
+  discovery to the matching networks (name/ID glob, repeatable, union)
+  and writes a **partial** snapshot in minutes instead of hours — the
+  pre-change safety net for risky edits to one network. The snapshot
+  records its scope in the header; org-level objects and config
+  templates stay captured so references remain recreatable. `--heal`
+  honors the scope (its live discovery narrows to the recorded
+  networks, and the `HEAL_EXECUTED` alert names the partial scope),
+  while `--restore`, `--replay-gaps`, `--drift-baseline`, pipeline
+  `--sync`/`--confirm-deletions`, and the scheduled Azure wrapper all
+  refuse partial snapshots — a selective backup can never masquerade
+  as a full-organization capture. Coverage manifest, runbook, and
+  RUN_SUCCESS notifications of scoped runs carry a PARTIAL banner
+  naming the covered networks (Cardinal Rule 2).
 - Selective heal: repeatable `--only '[TYPE:]PATTERN'` selectors
   restrict `--heal` to a subset of the missing objects (e.g. restore
   one of two deleted networks, or some of several deleted SSIDs).
