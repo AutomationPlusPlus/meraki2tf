@@ -221,6 +221,10 @@ class PipelineOrchestrator:
             stage = "configuration discovery"
             with self._provider as provider:
                 graph = provider.fetch_network_graph(organization_id)
+            # Live discovery hands back side facts (suspect endpoints,
+            # prefilter skips) for the coverage manifest; dump providers
+            # have none.
+            diagnostics = getattr(self._provider, "discovery_diagnostics", None)
             # Dump-mode runs learn their organization only here; stamp
             # the dispatcher so every subsequent alert is attributable.
             self._dispatcher.organization_id = graph.organization_id
@@ -442,6 +446,7 @@ class PipelineOrchestrator:
             restore_via = restore_verdicts(
                 plan_restore(graph, self._generator.parser)
             )
+            surfaces = self._generator.spec_surfaces()
             manifest = build_manifest(
                 organization_id=graph.organization_id,
                 captured=report.captured,
@@ -451,6 +456,16 @@ class PipelineOrchestrator:
                 unmanaged_secret_attributes=unmanaged_secrets,
                 restore_via=restore_via,
                 scope_networks=scope_networks,
+                duplicates=report.duplicates,
+                discovered_assets=graph.asset_count(),
+                spec_gap_count=report.spec_gap_count,
+                excluded_rpc_paths=surfaces.rpc_only_paths,
+                api_read_only_paths=surfaces.api_read_only_paths,
+                suspect_endpoints=(
+                    diagnostics.suspect_endpoints
+                    if diagnostics is not None
+                    else ()
+                ),
             )
             write_manifest(manifest, self._runner.workdir)
             coverage_percent = float(manifest["coverage_percent"])
@@ -496,7 +511,14 @@ class PipelineOrchestrator:
                 discovered_assets=graph.asset_count(),
                 imports_written=report.imports_written,
                 imports_skipped_existing=report.skipped_existing,
-                unsupported_count=len(report.unsupported),
+                # Discovered objects Terraform cannot rebuild. Spec-level
+                # write-only findings are permanent API facts, not run
+                # findings — counting them here would wedge the
+                # --fail-on-gaps scheduler gate at exit 3 forever; they
+                # stay visible in the manifest, runbook, and alerts.
+                unsupported_count=(
+                    len(report.unsupported) - report.spec_gap_count
+                ),
                 drift_detected=drift,
                 comparison_skipped=comparison_skipped,
                 pending_imports=pending_imports,

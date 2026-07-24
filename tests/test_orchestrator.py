@@ -12,6 +12,7 @@ from meraki2tf.config import API_KEY_ENV_VAR
 from meraki2tf.coverage import COVERAGE_JSON_FILENAME, COVERAGE_SUMMARY_FILENAME
 from meraki2tf.hcl_generator import CapturedAsset, GenerationReport, UnsupportedAsset
 from meraki2tf.models import FeatureConfiguration, NetworkGraph
+from meraki2tf.providers.discovery import SpecSurfaces
 from meraki2tf.orchestrator import (
     PENDING_DELETIONS_FILENAME,
     PipelineError,
@@ -84,6 +85,13 @@ class StubGenerator:
         self.calls: list[tuple[frozenset[str], bool]] = []
         #: suppress_addresses per generate() invocation.
         self.suppressed: list[frozenset[str]] = []
+
+    def spec_surfaces(self) -> SpecSurfaces:
+        return SpecSurfaces(
+            write_only_paths=(),
+            rpc_only_paths=(),
+            api_read_only_paths=(),
+        )
 
     def generate(
         self,
@@ -1346,11 +1354,17 @@ def test_coverage_manifest_written_every_run(tmp_path: Path, api_key: None) -> N
         (tmp_path / COVERAGE_JSON_FILENAME).read_text(encoding="utf-8")
     )
     assert manifest["organization_id"] == "org-123"
+    # The stub generator fabricates 3 objects over an *empty* stub
+    # graph — the manifest must reconcile against the graph count and
+    # surface the difference instead of silently trusting either side.
     assert manifest["totals"] == {
-        "discovered": 3,
+        "discovered": 0,
         "imported": 1,
         "pending_import": 1,
         "unsupported": 1,
+        "duplicate_id": 0,
+        "write_only_endpoints": 0,
+        "unaccounted": -3,
     }
     statuses = {
         entry.get("address", entry["api_path"]): entry["status"]

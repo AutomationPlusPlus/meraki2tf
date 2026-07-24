@@ -76,7 +76,7 @@ from meraki2tf.config import (
 from meraki2tf.coverage import build_manifest, unsupported_payload, write_manifest
 from meraki2tf.hcl_generator import HclImportGenerator
 from meraki2tf.logging_setup import configure_logging
-from meraki2tf.models import NetworkGraph
+from meraki2tf.models import DiscoveryDiagnostics, NetworkGraph
 from meraki2tf.openapi_parser import OpenApiParser
 from meraki2tf.orchestrator import (
     PipelineError,
@@ -650,6 +650,7 @@ def _export_coverage(
     dispatcher: AlertDispatcher,
     drift_was_detected: bool,
     scope_networks: tuple[str, ...] | None = None,
+    diagnostics: DiscoveryDiagnostics | None = None,
 ) -> dict[str, Any]:
     """Coverage manifest + RUN_SUCCESS for a snapshot-export run.
 
@@ -679,6 +680,7 @@ def _export_coverage(
     unmanaged_secrets = secret_attribute_union(
         report.captured, {}, payload_index(graph)
     )
+    surfaces = generator.spec_surfaces()
     manifest = build_manifest(
         organization_id=graph.organization_id,
         captured=report.captured,
@@ -689,6 +691,14 @@ def _export_coverage(
         unmanaged_secret_attributes=unmanaged_secrets,
         restore_via=restore_verdicts(plan_restore(graph, parser)),
         scope_networks=scope_networks,
+        duplicates=report.duplicates,
+        discovered_assets=graph.asset_count(),
+        spec_gap_count=report.spec_gap_count,
+        excluded_rpc_paths=surfaces.rpc_only_paths,
+        api_read_only_paths=surfaces.api_read_only_paths,
+        suspect_endpoints=(
+            diagnostics.suspect_endpoints if diagnostics is not None else ()
+        ),
     )
     config.workdir.mkdir(parents=True, exist_ok=True)
     write_manifest(manifest, config.workdir)
@@ -802,6 +812,7 @@ def _export_snapshot(
             if config.only
             else None
         ),
+        diagnostics=getattr(source, "discovery_diagnostics", None),
     )
     if config.fail_on_gaps:
         return _coverage_gap_exit(int(manifest["totals"]["unsupported"]))
