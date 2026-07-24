@@ -103,6 +103,45 @@ def test_validation_failures_without_resource_blocks_is_empty() -> None:
     assert validation_failures("Error: Unable to find API key\n\nboom\n") == {}
 
 
+IMPORT_REFUSAL_STDERR = """\
+Error: Cannot import non-existent remote object
+
+While attempting to import an existing object to
+"meraki_wireless_air_marshal_settings.l_1", the provider
+detected that no object exists with the given id. Only pre-existing objects
+can be imported; check that the id is correct and that it is associated with
+the provider's configured region or endpoint, or use "terraform apply" to
+create a new remote object for this resource.
+
+Error: Cannot import non-existent remote object
+
+While attempting to import an existing object to
+"meraki_appliance_traffic_shaping_vpn_exclusions.l_2", the
+provider detected that no object exists with the given id.
+"""
+
+
+def test_validation_failures_parses_import_refusals() -> None:
+    # terraform's import-refusal diagnostic carries no "with <addr>,"
+    # line — the address is quoted inline, wrapped by the formatter.
+    failures = validation_failures(IMPORT_REFUSAL_STDERR)
+    assert set(failures) == {
+        "meraki_wireless_air_marshal_settings.l_1",
+        "meraki_appliance_traffic_shaping_vpn_exclusions.l_2",
+    }
+    reason = failures["meraki_wireless_air_marshal_settings.l_1"]
+    assert reason.startswith("Cannot import non-existent remote object")
+    assert "never been configured" in reason
+
+
+def test_validation_failures_mixes_refusals_with_validation_errors() -> None:
+    failures = validation_failures(VALIDATION_STDERR + IMPORT_REFUSAL_STDERR)
+    assert len(failures) == 4
+    categories = drop_reason_categories(failures)
+    assert categories["Cannot import non-existent remote object"] == 2
+    assert categories["Invalid Attribute Value Match"] == 2
+
+
 THROTTLED_STDERR = """\
 Error: Client Error
 
