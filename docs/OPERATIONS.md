@@ -30,12 +30,18 @@ plus a monthly terraform rehearsal:
 ```cron
 # Every Monday 06:00 — export this week's snapshot, diff it against last
 # week's, alert on drift and coverage gaps. Snapshot-only: no terraform.
+# --drift-baseline is passed only when a previous snapshot exists, so
+# the very first run (no baseline yet) succeeds unedited; the
+# --discovery-checkpoint journal lets an aborted multi-hour sweep
+# resume on the next run instead of restarting.
 0 6 * * 1 cd /opt/meraki2tf && . .venv/bin/activate && \
   { [ ! -f snapshots/latest.jsonl.gz ] || mv -f snapshots/latest.jsonl.gz snapshots/previous.jsonl.gz; } && \
   MERAKI_DASHBOARD_API_KEY=$(cat /etc/meraki2tf/token) \
   MERAKI2TF_WEBHOOK_URL=$(cat /etc/meraki2tf/webhook-url) \
   meraki2tf --org-id 123456 --spec ./openapi.json --fail-on-gaps \
-  --dump-to snapshots/latest.jsonl.gz --drift-baseline snapshots/previous.jsonl.gz \
+  --dump-to snapshots/latest.jsonl.gz \
+  --discovery-checkpoint snapshots/checkpoint.jsonl.gz \
+  $([ -f snapshots/previous.jsonl.gz ] && echo "--drift-baseline snapshots/previous.jsonl.gz") \
   >> /var/log/meraki2tf.log 2>&1
 
 # The 1st of every month 03:00 — terraform rehearsal: regenerate the kit
@@ -45,12 +51,19 @@ plus a monthly terraform rehearsal:
   MERAKI2TF_WEBHOOK_URL=$(cat /etc/meraki2tf/webhook-url) \
   meraki2tf --org-id 123456 --spec ./openapi.json --sync \
   >> /var/log/meraki2tf.log 2>&1
+
+# Optional retention (see "Snapshot retention & archival" below): keep
+# dated copies beyond the latest/previous pair and prune old ones.
+15 6 * * 1 cd /opt/meraki2tf && umask 077 && mkdir -p snapshots/archive && \
+  { [ ! -f snapshots/latest.jsonl.gz ] || cp -p snapshots/latest.jsonl.gz "snapshots/archive/$(date +\%Y-\%m-\%d).jsonl.gz"; } && \
+  find snapshots/archive -name '*.jsonl.gz' -mtime +400 -delete
 ```
 
-On the very first weekly run there is no previous snapshot yet — omit
-`--drift-baseline` for that run (a missing baseline file is an error,
-not a silent skip). On Azure, the deployment wrapper does this snapshot
-rotation for you (see below).
+The `$([ -f … ] && echo …)` guard is the same first-run-safe shape the
+systemd unit uses: a missing baseline file is an error, not a silent
+skip, so the flag must only appear once a previous snapshot exists. On
+Azure, the deployment wrapper does this snapshot rotation for you (see
+below).
 
 Create the token (and webhook-URL) files owner-only so no other local
 account can read the org-admin key or the bearer-token-bearing webhook
@@ -77,19 +90,59 @@ ready-made wrapper runbook in
 
 Ready-made hardened units live in
 [`deploy/systemd/`](../deploy/systemd/): a weekly snapshot
-service+timer pair (with automatic `--drift-baseline` rotation and a
-first-run-safe baseline check) and a monthly `--sync` terraform
-rehearsal pair. Both run as a dedicated system user, read the API key
-and webhook URL from a root-owned 0600 `EnvironmentFile`, and confine
-writes to `/var/lib/meraki2tf` (`ProtectSystem=strict`). The setup
-steps (user, directories, secret file, `systemctl enable --now`) are
-in the header of
+service+timer pair (with automatic `--drift-baseline` rotation, a
+first-run-safe baseline check, and a `--discovery-checkpoint` journal
+so an aborted sweep resumes on the next timer run) and a monthly
+`--sync` terraform rehearsal pair. Both run as a dedicated system
+user, read the API key and webhook URL from a root-owned 0600
+`EnvironmentFile`, confine writes to `/var/lib/meraki2tf`
+(`ProtectSystem=strict`), and set `TimeoutStartSec=infinity`
+explicitly so no manager default can SIGTERM a multi-hour sweep. Each
+unit header marks the **mandatory edits** (the placeholder `--org-id`
+and the install paths) and carries a commented optional retention step
+(see below). The setup steps (user, directories, secret file,
+`systemctl enable --now`) are in the header of
 [`meraki2tf-snapshot.service`](../deploy/systemd/meraki2tf-snapshot.service).
 
 Timer-driven jobs report through the same exit codes as cron; the
 units treat exit 3 (coverage gaps) as success so a permanently-gapped
 org doesn't flap the unit — the gap list still arrives via alerts.
 Remove `SuccessExitStatus=3` to page on gaps instead.
+
+## Snapshot retention & archival
+
+The recipes above (cron, systemd, and the Azure wrapper's rotation)
+keep exactly two generations on disk: `latest` and `previous`. That is
+enough for the drift chain, but it is a thin DR margin — two bad runs
+in a row, or a corruption that goes unnoticed for a week, leave
+nothing to restore from. Add a retention step:
+
+- **Dated local copies + pruning** — after each successful export,
+  copy the snapshot to a dated name and prune old copies (both recipe
+  sets carry this as a commented optional step):
+
+  ```bash
+  umask 077 && mkdir -p snapshots/archive
+  cp -p snapshots/latest.jsonl.gz "snapshots/archive/$(date +%Y-%m-%d).jsonl.gz"
+  find snapshots/archive -name '*.jsonl.gz' -mtime +400 -delete
+  ```
+
+  Keep copies owner-only (`umask 077` / `cp -p`): unsanitized
+  snapshots carry secret values.
+- **Off-box copies** — a snapshot on the machine that runs the job
+  dies with that machine. Ship the dated copies somewhere that
+  survives the disaster you are protecting against: `rclone copy
+  snapshots/archive remote:meraki2tf/`, `scp` to a backup host, or
+  object storage with a lifecycle rule (the Azure wrapper already
+  archives every run's snapshot to Blob Storage under a dated
+  prefix). Apply the same at-rest access control you would give a
+  password vault.
+- **How much to keep** — at minimum, enough history to reach back
+  past your detection lag: 13 monthly + 5 weekly copies is a sane
+  default (`-mtime +400` above approximates it). The Terraform state
+  deserves the same treatment when you use the local backend; remote
+  backends (`--state-backend azurerm/s3/gcs`) get durability and
+  versioning from the storage service.
 
 ## AWS: scheduled Fargate task
 

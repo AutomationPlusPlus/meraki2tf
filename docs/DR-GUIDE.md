@@ -28,7 +28,10 @@ Each run leaves a complete rebuild kit in `--workdir`:
 | `meraki2tf.tfstate` | terraform (`--sync` runs, `--rebuild --confirm`, or a manual apply) | State tracking, once the resources are adopted (local backend; a remote `--state-backend` keeps state in its own store instead) |
 
 Back up the workdir (and ideally a `--dump-to` snapshot) somewhere that
-survives the disaster you are protecting against.
+survives the disaster you are protecting against — dated copies,
+pruning, and off-box shipping are covered in
+[Snapshot retention & archival](OPERATIONS.md#snapshot-retention--archival);
+the scheduling recipes carry it as a ready-made optional step.
 
 ### Knowing what is (and isn't) covered
 
