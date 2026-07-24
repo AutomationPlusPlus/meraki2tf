@@ -86,6 +86,33 @@ _VALIDATION_ERROR_RE = re.compile(
     re.MULTILINE,
 )
 
+#: Terraform's import-refusal diagnostic. Unlike validation errors it
+#: never emits a ``with <address>,`` line — the address is quoted
+#: inline ("While attempting to import an existing object to
+#: "<address>", …"), so it needs its own parser or the failure
+#: bypasses the drop-and-report-unsupported rail and kills the run.
+#: Observed live with spec-adopted settings surfaces (byNetwork
+#: aggregation rows) the provider cannot import until the surface has
+#: been explicitly configured on that network.
+_IMPORT_REFUSAL_RE = re.compile(
+    r"^Error: (?P<title>Cannot import non-existent remote object)\n"
+    r"\n"
+    r"(?:(?!Error: ).*\n)*?"
+    r".*attempting to import an existing object to\s*\n?"
+    r"\s*\"(?P<address>[A-Za-z0-9_.\[\]-]+)\",",
+    re.MULTILINE,
+)
+
+#: Operator-facing reason for an import the provider refused because
+#: no remote object answers the id. Leads with the diagnostic title so
+#: ``drop_reason_categories`` buckets every such address together.
+_IMPORT_REFUSAL_DETAIL = (
+    "the provider reports no remote object behind this import id — "
+    "typically a settings surface that has never been configured for "
+    "this scope; it is dropped from this run's kit and will import "
+    "once it exists."
+)
+
 #: Top-level resource block opener exactly as terraform emits it.
 _RESOURCE_BLOCK_RE = re.compile(
     r'^resource\s+"(?P<type>[^"]+)"\s+"(?P<name>[^"]+)"\s*\{'
@@ -156,6 +183,11 @@ def validation_failures(diagnostics: str) -> dict[str, str]:
             reason = f"{reason}: {detail}"
         # first error per address wins; later duplicates add nothing
         failures.setdefault(address, reason)
+    for match in _IMPORT_REFUSAL_RE.finditer(diagnostics):
+        failures.setdefault(
+            match["address"],
+            f"{match['title']}: {_IMPORT_REFUSAL_DETAIL}",
+        )
     return failures
 
 
