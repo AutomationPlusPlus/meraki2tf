@@ -64,7 +64,9 @@ Discovered objects : 412
 Coverage           : 98.5%
 ```
 
-From there, `cd generated && terraform init && terraform plan` — or let
+From there, `cd generated && terraform init && terraform plan` (running
+terraform by hand needs `export MERAKI_API_KEY=…` — the provider reads
+its own variable, not `MERAKI_DASHBOARD_API_KEY`) — or let
 the tool keep running on a schedule as a DR safety net. Full install
 notes: [Prerequisites & Installation](#prerequisites--installation).
 

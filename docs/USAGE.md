@@ -645,5 +645,9 @@ logger origins and full terraform output. A mandatory redaction filter
 scrubs `Authorization` / `X-Cisco-Meraki-API-Key` header values and the
 raw token from **every** log record, so verbose mode never compromises
 credentials. The generated `provider.tf` is credential-free: the
-Terraform provider reads `MERAKI_DASHBOARD_API_KEY` from the process
-environment itself.
+`CiscoDevNet/meraki` Terraform provider reads its own `MERAKI_API_KEY`
+environment variable (not `MERAKI_DASHBOARD_API_KEY`). meraki2tf
+bridges the two automatically for every terraform subprocess it spawns;
+when you run `terraform` by hand in the workdir, `export
+MERAKI_API_KEY="$MERAKI_DASHBOARD_API_KEY"` (or set it directly)
+yourself.

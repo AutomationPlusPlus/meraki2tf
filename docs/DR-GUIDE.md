@@ -127,10 +127,14 @@ meraki2tf --rebuild --confirm --workdir ./generated
 
 `--rebuild` alone is always a dry run (`terraform plan`); nothing is
 touched until you add `--confirm`. Prefer doing it by hand? The workdir
-is a plain Terraform root module:
+is a plain Terraform root module — but note that the
+`CiscoDevNet/meraki` provider reads its credential from
+`MERAKI_API_KEY`, not `MERAKI_DASHBOARD_API_KEY` (meraki2tf bridges
+the two only for the terraform subprocesses it spawns itself):
 
 ```bash
 cd ./generated
+export MERAKI_API_KEY="$MERAKI_DASHBOARD_API_KEY"   # the provider's own variable
 terraform init
 terraform plan     # inspect
 terraform apply    # rebuild
@@ -150,7 +154,9 @@ Terraform cannot import something that is gone. Adjust the kit first:
    Terraform **creates** instead of imports.
 3. Start from an empty state (delete/relocate `meraki2tf.tfstate` if
    the old one references destroyed resources).
-4. `terraform init && terraform plan && terraform apply`.
+4. `export MERAKI_API_KEY=…` (the provider's own credential variable —
+   see the note above), then
+   `terraform init && terraform plan && terraform apply`.
 
 > **Greenfield caveat:** `resources.tf` captures IDs as
 > literal strings (organization ID, `network_id = "N_…"`, serials).

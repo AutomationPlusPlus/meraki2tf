@@ -153,6 +153,10 @@ Meraki is never touched.
   client-construction time, passed into the SDK, and never retained.
 - `SecretRedactionFilter` scrubs `Authorization` /
   `X-Cisco-Meraki-API-Key` values from every log record at every level.
-- The generated `provider.tf` is credential-free — the Terraform
-  provider reads the same environment variable itself.
+- The generated `provider.tf` is credential-free — the
+  `CiscoDevNet/meraki` provider reads its own `MERAKI_API_KEY`
+  variable, which `terraform_runner` bridges from
+  `MERAKI_DASHBOARD_API_KEY` for every terraform subprocess it spawns
+  (an explicitly set `MERAKI_API_KEY` always wins). Manual terraform
+  runs in the workdir must export `MERAKI_API_KEY` themselves.
 - Alert payloads carry resource identifiers and structural data only.
