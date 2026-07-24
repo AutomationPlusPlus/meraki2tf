@@ -6,7 +6,90 @@ the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- Operator preflight (#102): `--check` validates an entire flag set in
+  seconds — API key, `--org-id` resolution, terraform binary and
+  version, provider catalog, `--drift-baseline` header, workdir
+  writability, alert-channel configuration — one PASS/FAIL/SKIP line
+  per check, nonzero exit on failure, mutating nothing; `--estimate`
+  prints the expected discovery request count and wall-clock estimates
+  (2-3 API calls live, zero offline); `--expect-org` pins `--rebuild`
+  and `--replay-gaps` to a named organization (both actions print the
+  resolved org either way); and the pipeline runs the cheap
+  validations (baseline header, terraform version probe) *before* the
+  discovery sweep instead of failing hours into it.
+- Discovery progress and resume (#103): the multi-hour sweep emits one
+  INFO progress line at most every ~30 s (items done/total, overall
+  count, effective request rate, rough ETA — renders in JSON logs
+  too), and `--discovery-checkpoint PATH` journals every completed
+  call (0600 JSONL, `.gz` supported; org-ID + spec-sha guarded,
+  torn-tail tolerant) so an aborted sweep resumes instead of
+  restarting; a completed run deletes its journal.
+- Scoped pipeline runs (#103): `--only 'network:PATTERN'` on a default
+  live pipeline run generates the kit and plan for just the matching
+  networks — artifacts stamped PARTIAL with the covered networks,
+  plan/apply targeted at the captured addresses so out-of-scope state
+  is never touched, deletion review skipped (and
+  `--confirm-deletions`/`--rebaseline`/`--drift-baseline` refused
+  alongside it).
+- Cross-network conformance diff (#103): `--diff-networks A B`
+  (optionally `--diff-out report.json`) compares two networks'
+  configuration through the snapshot-diff engine, live or offline —
+  attribute names and locators only, never values.
+- Coverage integrity (#100): GET-less mutable surfaces (Air Marshal,
+  RRM, uplink NAT, …) are adopted via their org-scoped byNetwork
+  aggregation GETs and exploded into per-network assets; network
+  endpoints are prefiltered by product type derived from the
+  createNetwork enum (an absent enum disables filtering); the
+  manifest gains a `duplicate-id` status, spec-level fields
+  (`excluded_rpc_paths`, `api_read_only_paths`, `suspect_endpoints`)
+  and reconciled totals with `totals.unaccounted` (loud ACCOUNTING
+  MISMATCH banner); write-only spec endpoints are flagged
+  unsupported; `coverage.txt` groups repeated unsupported gaps by
+  endpoint + reason.
+- Bash flag completion at `deploy/completion/meraki2tf.bash`,
+  CI-pinned against the real argument parser, with README/OPERATIONS
+  pointers (this PR).
+- A development requirements file (`requirements-dev.txt`) with the
+  flake8/mypy/tox/pytest/pre-commit/pip-audit toolchain (this PR).
+
 ### Fixed
+- Sanitizer and drift-diff correctness (#99): collision-free fake /24
+  subnets, fingerprint-safe MAC/IPv6 anchors, and arity-safe
+  `pathValues` in the sanitizer; order-significant rule lists
+  (firewall, port forwarding) report explicit `<order changed>`
+  entries instead of value dumps; rollout suppression is
+  population-gated; response envelopes are normalized before
+  comparison; a drift baseline captured from a different organization
+  is refused; workspace surgery is heredoc-aware with exhaustive
+  multi-file edits and an aged plan-copy sweep; `pending_imports`
+  converges to 0 once chunk windows are fully imported.
+- DR write hardening (#101): every dynamically resolved SDK method's
+  verbs are source-verified before a DR write dispatches (put/post
+  only, delete never — fail-closed); restore/heal probe object
+  liveness at execution time, so a second incident after a successful
+  heal re-executes journaled actions whose object is missing again,
+  while heal skips anything verified alive (additive-only held even
+  when the sweep undercounted survivors; reported as
+  `verified_alive_skips`); throttled writes never enter the
+  reference-deadlock breaker; DR write actions never auto-refresh the
+  OpenAPI spec (deterministic mid-incident reruns), snapshot headers
+  record the spec version + sha256, and restores warn on spec skew;
+  the pending-deletions record is written atomically.
+- Terraform is version-probed up front and the generated kit pins
+  `required_version = ">= 1.5.0"`; the runbook's rebuild step is
+  preview-first (#102).
+- Documentation now matches actual behavior (this PR): the generated
+  kit authenticates via the provider's `MERAKI_API_KEY` (bridged from
+  `MERAKI_DASHBOARD_API_KEY` only for tool-spawned terraform — manual
+  runs must export it); the cron recipe passes `--drift-baseline`
+  conditionally so the first run succeeds unedited; the bad-org-id
+  troubleshooting entry quotes the real failure shape and points at
+  `--list-orgs`/`--check`; the coverage badge matches the 100% CI
+  gate; the `--wipe-org` "cannot target production" claim is scoped
+  honestly (a device-less org is protected only by the exact-name
+  second factor); the architecture module map covers every module and
+  the alert table lists all 10 events (REBUILD_EXECUTED was missing).
 - Restore/heal no longer fails a whole configure write when the
   dashboard refuses a single product-type-dependent setting ("Remote
   status page is not supported by this network", found live in the
@@ -53,6 +136,17 @@ the project adheres to [Semantic Versioning](https://semver.org/).
   `docs/OPERATIONS.md`.
 
 ### Changed
+- `requirements.txt` is runtime-only (the meraki SDK pin); the dev
+  toolchain moved to `requirements-dev.txt` — install docs updated,
+  CI/tox/Docker were never wired through it (this PR).
+- systemd units: explicit `TimeoutStartSec=infinity` (no manager
+  default can SIGTERM a multi-hour sweep), mandatory-edit markers on
+  the placeholder `--org-id`/paths, `--discovery-checkpoint` on the
+  snapshot unit, and commented optional retention steps; new
+  OPERATIONS sections cover snapshot retention/archival and the
+  API-key permission model (read-only admin suffices for every read
+  path), and the DR guide opens with an incident-to-action decision
+  matrix (this PR).
 - The monolithic README is split into `docs/USAGE.md`,
   `docs/DR-GUIDE.md`, and `docs/OPERATIONS.md`; the README is now a
   landing page with a documentation index.
