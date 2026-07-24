@@ -32,6 +32,7 @@ from meraki2tf.alerts import AlertDispatcher, unsupported_feature_flagged
 from meraki2tf.models import UNREADABLE_MARKER, NetworkGraph
 from meraki2tf.openapi_parser import OpenApiParser, snake_case
 from meraki2tf.provider_catalog import ProviderCatalog
+from meraki2tf.providers.discovery import SpecSurfaces, spec_surface_report
 from meraki2tf.resource_matcher import MatchedResource, path_matches
 
 logger = logging.getLogger(__name__)
@@ -94,6 +95,32 @@ class UnsupportedAsset:
     identifiers: tuple[str, ...]
 
 
+#: Exception-auditor reason for spec-level write-only configuration
+#: endpoints (a PUT with no readable counterpart anywhere in the spec).
+WRITE_ONLY_REASON = (
+    "write-only endpoint: the API offers no way to read this "
+    "configuration back, so any objects behind it are invisible to "
+    "discovery and must be verified manually."
+)
+
+
+@dataclass(frozen=True)
+class DuplicateAsset:
+    """One asset whose import ID another captured asset already carries.
+
+    The object is rebuild-covered by its primary record, but silently
+    dropping the duplicate would leave the coverage totals unable to
+    account for every discovered object — so it becomes an explicit
+    record instead.
+    """
+
+    api_path: str
+    import_id: str
+    identifiers: tuple[str, ...]
+    #: The resource address the shared import ID resolves to.
+    primary_address: str
+
+
 @dataclass(frozen=True)
 class CapturedAsset:
     """One asset Terraform can rebuild, resolved to its resource address."""
@@ -127,6 +154,13 @@ class GenerationReport:
     #: without being absent from Meraki, so the deletion detector must
     #: not treat state-tracked resources of these types as deleted.
     unreadable_types: frozenset[str] = frozenset()
+    #: Assets whose import ID another captured asset already carries;
+    #: explicit records so coverage totals reconcile against the graph.
+    duplicates: tuple[DuplicateAsset, ...] = ()
+    #: How many ``unsupported`` entries are spec-level findings (write-
+    #: only endpoints) rather than discovered graph objects — the
+    #: coverage reconciliation must not expect them in the graph count.
+    spec_gap_count: int = 0
 
     @property
     def captured_addresses(self) -> frozenset[str]:
@@ -150,6 +184,7 @@ class HclImportGenerator:
         #: be prepared/initialized first — construction time is too early.
         self._catalog_provider = catalog_provider
         self._matches: dict[str, MatchedResource | None] | None = None
+        self._surfaces: SpecSurfaces | None = None
 
     @property
     def parser(self) -> OpenApiParser:
@@ -162,6 +197,17 @@ class HclImportGenerator:
         if self._matches is None:
             self._matches = path_matches(self._parser, self._catalog_provider())
         return self._matches
+
+    def spec_surfaces(self) -> SpecSurfaces:
+        """Spec-level surface classification, computed once per run.
+
+        Shared with the coverage manifest so the write-only records the
+        exception auditor emits and the manifest's RPC/read-only lists
+        derive from the same document.
+        """
+        if self._surfaces is None:
+            self._surfaces = spec_surface_report(self._parser)
+        return self._surfaces
 
     def generate(
         self,
@@ -198,8 +244,12 @@ class HclImportGenerator:
         #: address → import ID, so identical assets dedupe while distinct
         #: assets whose IDs sanitize to the same label get disambiguated.
         seen_addresses: dict[str, str] = {}
+        #: import ID → the address that first claimed it, so a duplicate
+        #: record can name its primary.
+        primary_by_id: dict[str, str] = {}
         captured: list[CapturedAsset] = []
         unsupported: list[UnsupportedAsset] = []
+        duplicates: list[DuplicateAsset] = []
         skipped_existing = 0
 
         unreadable_types: set[str] = set()
@@ -293,9 +343,25 @@ class HclImportGenerator:
                 base, import_id, seen_addresses, ledger, pins
             )
             if address is None:
-                logger.debug("Skipping duplicate import of id %s", import_id)
+                # Not silently skipped: a duplicate is a discovered
+                # object, and the coverage totals must account for every
+                # one of them (Cardinal Rule 2).
+                logger.debug(
+                    "Import id %s is a duplicate of %s; recorded as a "
+                    "duplicate-id coverage entry.",
+                    import_id, primary_by_id.get(import_id, "<unknown>"),
+                )
+                duplicates.append(
+                    DuplicateAsset(
+                        api_path=candidate.api_path,
+                        import_id=import_id,
+                        identifiers=candidate.id_values,
+                        primary_address=primary_by_id.get(import_id, ""),
+                    )
+                )
                 continue
             seen_addresses[address] = import_id
+            primary_by_id.setdefault(import_id, address)
             already_tracked = address in existing_addresses
             captured.append(
                 CapturedAsset(
@@ -321,6 +387,21 @@ class HclImportGenerator:
                 f'  id = "{self._quote_hcl(import_id)}"\n}}\n'
             )
 
+        # Spec-level gaps: write-only configuration endpoints (a PUT the
+        # API offers no read for) hold objects discovery can never see.
+        # They are flagged through the same exception-auditor path as
+        # graph assets so alerts, the manifest, and the runbook all
+        # carry them (Cardinal Rule 2).
+        spec_gaps = tuple(
+            self._flag(
+                ImportCandidate(api_path=path, id_values=()),
+                WRITE_ONLY_REASON,
+                audit=audit,
+            )
+            for path in self.spec_surfaces().write_only_paths
+        )
+        unsupported.extend(spec_gaps)
+
         imports_file = workdir / IMPORTS_FILENAME
         imports_file.write_text(
             _FILE_HEADER + "\n" + "\n".join(blocks), encoding="utf-8"
@@ -333,8 +414,10 @@ class HclImportGenerator:
         )
         logger.info(
             "Wrote %d import block(s) to %s (%d already in state, "
-            "%d unsupported asset(s) flagged).",
+            "%d unsupported asset(s) flagged, %d duplicate import "
+            "ID(s) recorded).",
             len(blocks), imports_file, skipped_existing, len(unsupported),
+            len(duplicates),
         )
         return GenerationReport(
             imports_file=imports_file,
@@ -343,6 +426,8 @@ class HclImportGenerator:
             skipped_existing=skipped_existing,
             captured=tuple(captured),
             unreadable_types=frozenset(unreadable_types),
+            duplicates=tuple(duplicates),
+            spec_gap_count=len(spec_gaps),
         )
 
     @staticmethod
@@ -360,7 +445,19 @@ class HclImportGenerator:
         """
         components = list(candidate.id_values)
         if match.has_force_delete:
-            components.insert(len(components) - 1, "false")
+            if len(components) >= 2:
+                # Provider convention (network group policies):
+                # ``<scope_id>,<force_delete>,<id>`` — the literal sits
+                # between the scope IDs and the trailing item ID.
+                components.insert(len(components) - 1, "false")
+            else:
+                # A single-component identity has no scope prefix to
+                # slot between; ``insert(len-1)`` would land the
+                # literal *first* (``false,<id>``), shifting the real
+                # ID out of its positional slot. Trail it instead,
+                # matching the provider's whole-collection variants
+                # where ``force_delete`` follows every path component.
+                components.append("false")
         if match.needs_org_prefix:
             components.insert(0, organization_id)
         return tuple(components)
