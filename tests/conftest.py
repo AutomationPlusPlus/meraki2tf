@@ -42,6 +42,23 @@ APPLIANCE_SSIDS_SCHEMA: dict[str, Any] = {
     },
 }
 
+#: Enveloped org-scoped aggregation response for the GET-less Air
+#: Marshal settings entity (Meraki's "per-network PUT + org byNetwork
+#: GET" pattern).
+AIR_MARSHAL_BY_NETWORK_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"networkId": {}, "defaultPolicy": {}},
+            },
+        },
+        "meta": {"type": "object"},
+    },
+}
+
 
 #: Minimized spec mirroring real Meraki OpenAPI structure: canonical
 #: network/device entities, an org-scoped network collection, a nested
@@ -123,6 +140,18 @@ PIPELINE_SPEC: dict[str, Any] = {
             "put": _op("updateOrganizationAdmin", "organizations"),
             "delete": _op("deleteOrganizationAdmin", "organizations"),
         },
+        # GET-less mutable entity adopted via its org-scoped byNetwork
+        # aggregation GET (the Air Marshal / RRM / uplink NAT pattern).
+        "/networks/{networkId}/wireless/airMarshal/settings": {
+            "put": _op("updateNetworkWirelessAirMarshalSettings", "wireless"),
+        },
+        "/organizations/{organizationId}/wireless/airMarshal/settings/byNetwork": {
+            "get": _op(
+                "getOrganizationWirelessAirMarshalSettingsByNetwork",
+                "wireless",
+                response_schema=AIR_MARSHAL_BY_NETWORK_SCHEMA,
+            ),
+        },
     },
 }
 
@@ -172,6 +201,7 @@ FIXTURE_CATALOG_RESOURCES: dict[str, list[str]] = {
     "meraki_appliance_ssid": ["network_id", "number"],
     "meraki_switch_port": ["port_id", "serial"],
     "meraki_organization_admin": ["id", "organization_id"],
+    "meraki_wireless_air_marshal_settings": ["network_id"],
 }
 
 
