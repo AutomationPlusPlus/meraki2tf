@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import fnmatch
 import re
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -70,6 +70,11 @@ def parse_network_selectors(
     return tuple(parsed)
 
 
+def describe_networks(networks: Sequence[MerakiNetwork]) -> str:
+    """Capped ``name (id)`` listing for selector diagnostics."""
+    return _available_networks(networks)
+
+
 def _available_networks(networks: Sequence[MerakiNetwork]) -> str:
     listed = [
         f"{network.name} ({network.network_id})"
@@ -108,6 +113,31 @@ def filter_networks(
     return tuple(
         network for network in networks if network.network_id in selected
     )
+
+
+def scoped_plan_targets(captured_addresses: Iterable[str]) -> tuple[str, ...]:
+    """Deterministic ``-target`` set for a scoped (``--only``) plan.
+
+    A scoped pipeline run's terraform comparison must cover exactly the
+    resources the scoped discovery captured: an untargeted plan would
+    read — and propose creates/updates/destroys for — every
+    out-of-scope resource the accumulated kit and state carry, turning
+    "scope one site" into "touch the whole kit". Targeting also makes
+    the sync-mode saved plan in-scope by construction, so the guarded
+    import-only apply can only ever import in-scope resources.
+
+    An empty set refuses loudly: terraform silently degenerates an
+    empty ``-target`` list into a FULL plan, which is exactly the
+    out-of-scope exposure targeting exists to prevent.
+    """
+    targets = tuple(sorted(captured_addresses))
+    if not targets:
+        raise ScopeFilterError(
+            "--only scoped discovery captured no Terraform-addressable "
+            "resources, so the scoped plan has no targets; an untargeted "
+            "plan would cover out-of-scope resources and is refused."
+        )
+    return targets
 
 
 @dataclass(frozen=True)

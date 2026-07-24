@@ -3101,8 +3101,18 @@ class _StubLiveProvider:
     #: The network_scope the heal path constructed, for assertions.
     last_network_scope: Any = None
 
+    #: Mirrors the real provider's post-fetch scope declaration; the
+    #: stub never sets it (tests inject a StaticJson-shaped graph).
+    snapshot_scope: Any = None
+
     def __init__(
-        self, parser: Any = None, *, network_scope: Any = None
+        self,
+        parser: Any = None,
+        *,
+        network_scope: Any = None,
+        checkpoint_path: Any = None,
+        spec_sha256: Any = None,
+        progress_clock: Any = None,
     ) -> None:
         type(self).last_network_scope = network_scope
 
@@ -3671,7 +3681,9 @@ def test_multi_org_fan_out_builds_per_org_kits(
     )
     monkeypatch.setattr(
         "meraki2tf.cli.build_provider",
-        lambda config, parser: StaticJsonDataProvider(dump_file, parser=parser),
+        lambda config, parser, spec_file=None: StaticJsonDataProvider(
+            dump_file, parser=parser
+        ),
     )
     workdir = tmp_path / "orgs"
 
@@ -4126,12 +4138,12 @@ def _heal_dump_two_ssids(tmp_path: Path) -> Path:
     return dump
 
 
-def test_only_without_heal_is_a_usage_error(spec_file: Path) -> None:
-    """--only silently doing nothing outside --heal would let an
-    operator believe a pipeline run was scoped; it is refused instead."""
+def test_only_with_dr_actions_is_a_usage_error(spec_file: Path) -> None:
+    """--only silently doing nothing on a DR action would let an
+    operator believe the write was scoped; it is refused instead."""
     with pytest.raises(SystemExit) as excinfo:
         main(
-            ["--spec", str(spec_file), "--org-id", "org-123",
+            ["--spec", str(spec_file), "--rebuild",
              "--only", "network:HQ"]
         )
     assert excinfo.value.code == 2
@@ -4353,11 +4365,15 @@ def _partial_dump(tmp_path: Path, name: str = "partial.json") -> Path:
     return dump
 
 
-def test_only_requires_heal_or_dump_to(spec_file: Path) -> None:
+def test_scoped_pipeline_only_accepts_network_selectors(
+    spec_file: Path,
+) -> None:
+    """A scoped pipeline run takes network:PATTERN selectors only — an
+    ssid:/untyped selector must refuse up front, before discovery."""
     with pytest.raises(SystemExit) as excinfo:
         main(
             ["--spec", str(spec_file), "--org-id", "org-123",
-             "--only", "network:HQ"]
+             "--only", "ssid:Guest*"]
         )
     assert excinfo.value.code == 2
 
@@ -4648,3 +4664,357 @@ def test_heal_full_snapshots_keep_unscoped_discovery(
     )
     assert exit_code == 0
     assert _StubLiveProvider.last_network_scope is None
+
+
+# ------------------------------------------------- scoped pipeline runs
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--confirm-deletions"],
+        ["--rebaseline"],
+        ["--org-id", "234567"],
+        ["--drift-baseline", "base.json"],
+    ],
+)
+def test_scoped_pipeline_refuses_unsafe_companions(
+    spec_file: Path, extra: list[str]
+) -> None:
+    """--only on a pipeline run refuses deletion confirmation (a scoped
+    run cannot tell deleted from out-of-scope), rebaseline (would
+    discard out-of-scope config), multi-org, and drift baselines."""
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            ["--spec", str(spec_file), "--org-id", "123456",
+             "--only", "network:HQ", *extra]
+        )
+    assert excinfo.value.code == 2
+
+
+def test_scoped_pipeline_refuses_from_dump_reslicing(
+    spec_file: Path, dump_file: Path
+) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            ["--spec", str(spec_file), "--from-dump", str(dump_file),
+             "--only", "network:HQ"]
+        )
+    assert excinfo.value.code == 2
+
+
+def test_scoped_pipeline_run_scopes_discovery_and_stamps_artifacts(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The single-site onboarding case: a default live run with --only
+    scopes discovery, warns PARTIAL, and stamps the artifacts."""
+    from meraki2tf import cli as cli_module
+    from meraki2tf.models import MerakiNetwork, NetworkGraph
+    from meraki2tf.scope import LiveNetworkScope, SnapshotScope
+
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    monkeypatch.setattr(
+        terraform_runner.subprocess,
+        "run",
+        lambda command, **kwargs: SimpleNamespace(
+            returncode=0, stdout="", stderr=""
+        ),
+    )
+
+    class ScopedStub(_StubLiveProvider):
+        mode = "live"
+
+        def fetch_network_graph(
+            self, organization_id: str | None = None
+        ) -> Any:
+            # Mirrors the real provider: a scoped fetch declares its
+            # partial scope for the pipeline to stamp.
+            self.snapshot_scope = SnapshotScope(
+                network_ids=("N_1",), selectors=("network:HQ",)
+            )
+            return type(self).graph
+
+    ScopedStub.graph = NetworkGraph(
+        organization_id="org-123",
+        networks=(
+            MerakiNetwork.from_payload(
+                {"id": "N_1", "organizationId": "org-123", "name": "HQ",
+                 "productTypes": ["appliance"]}
+            ),
+        ),
+        devices=(),
+        features=(),
+    )
+    monkeypatch.setattr(cli_module, "LiveApiDataProvider", ScopedStub)
+    workdir = tmp_path / "ws"
+    exit_code = main(
+        ["--spec", str(spec_file), "--org-id", "123456",
+         "--workdir", str(workdir), "--only", "network:HQ"]
+    )
+    console = capsys.readouterr().err
+    assert exit_code == 0
+    assert "PARTIAL run" in console
+    scope = ScopedStub.last_network_scope
+    assert isinstance(scope, LiveNetworkScope)
+    assert scope.selectors == ("network:HQ",)
+    manifest = json.loads((workdir / "coverage.json").read_text("utf-8"))
+    assert manifest["scope"] == {"partial": True, "networks": ["N_1"]}
+
+
+# ------------------------------------------------ discovery checkpoint
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--from-dump", "snap.json", "--discovery-checkpoint", "c.jsonl"],
+        ["--heal", "--discovery-checkpoint", "c.jsonl"],
+        ["--org-id", "123456", "--org-id", "234567",
+         "--discovery-checkpoint", "c.jsonl"],
+    ],
+)
+def test_discovery_checkpoint_refused_outside_live_sweeps(
+    spec_file: Path, argv: list[str]
+) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--spec", str(spec_file), *argv])
+    assert excinfo.value.code == 2
+
+
+def test_build_provider_wires_checkpoint_path_and_spec_sha(
+    spec_file: Path, spec_parser: OpenApiParser, tmp_path: Path
+) -> None:
+    from meraki2tf.spec_resolver import spec_fingerprint
+
+    checkpoint = tmp_path / "sweep.ckpt.jsonl"
+    provider = build_provider(
+        _config(
+            ["--spec", str(spec_file), "--org-id", "123456",
+             "--discovery-checkpoint", str(checkpoint)]
+        ),
+        spec_parser,
+        spec_file,
+    )
+    assert isinstance(provider, LiveApiDataProvider)
+    assert provider._checkpoint_path == checkpoint
+    assert provider._spec_sha256 == spec_fingerprint(spec_file)[1]
+
+
+@pytest.mark.parametrize("export", [True, False])
+def test_mismatched_checkpoint_exits_2_without_fault_alert(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    export: bool,
+) -> None:
+    """A stale/foreign checkpoint is an operator input error on both
+    the export and pipeline paths: exit 2, no PROCESSING_FAULT."""
+    from meraki2tf.providers.discovery_checkpoint import DiscoveryCheckpoint
+
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    delivered: list[dict[str, Any]] = []
+
+    def fake_urlopen(request: Any, timeout: float) -> Any:
+        delivered.append(json.loads(request.data.decode("utf-8")))
+        return FakeResponse()
+
+    from meraki2tf.alerts import webhook as webhook_module
+
+    monkeypatch.setattr(webhook_module, "_open", fake_urlopen)
+    checkpoint = tmp_path / "sweep.ckpt.jsonl"
+    DiscoveryCheckpoint(checkpoint, "999999", "other-sha").close()
+    argv = [
+        "--spec", str(spec_file), "--org-id", "123456",
+        "--workdir", str(tmp_path / "ws"),
+        "--discovery-checkpoint", str(checkpoint),
+        "--webhook-url", "https://hooks.example/dr",
+    ]
+    if export:
+        argv += ["--dump-to", str(tmp_path / "snap.json")]
+    exit_code = main(argv)
+    assert exit_code == 2
+    assert delivered == []
+    assert checkpoint.exists()  # never destroyed by a refusal
+
+
+# ------------------------------------------------------ --diff-networks
+
+
+def _diff_dump(tmp_path: Path) -> Path:
+    dump = tmp_path / "diff-snapshot.json"
+    document = {
+        "organizationId": "org-123",
+        "networks": [
+            {"id": "N_1", "organizationId": "org-123", "name": "HQ",
+             "productTypes": ["appliance"]},
+            {"id": "N_2", "organizationId": "org-123", "name": "Branch",
+             "productTypes": ["appliance"]},
+        ],
+        "devices": [],
+        "features": [
+            {
+                "apiPath": "/networks/{networkId}/appliance/trafficShaping",
+                "pathValues": ["N_1"],
+                "payload": {"globalBandwidthLimits": {"limitUp": 0}},
+            },
+            {
+                "apiPath": "/networks/{networkId}/appliance/trafficShaping",
+                "pathValues": ["N_2"],
+                "payload": {"globalBandwidthLimits": {"limitUp": 512}},
+            },
+            {
+                "apiPath": "/networks/{networkId}/appliance/vlans/{vlanId}",
+                "pathValues": ["N_1", "10"],
+                "payload": {"id": 10, "name": "Data"},
+            },
+        ],
+    }
+    dump.write_text(json.dumps(document), encoding="utf-8")
+    return dump
+
+
+def test_diff_networks_offline_reports_and_writes_json(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _no_network(monkeypatch)
+    diff_out = tmp_path / "reports" / "diff.json"
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(_diff_dump(tmp_path)),
+         "--diff-networks", "HQ", "Branch", "--diff-out", str(diff_out)]
+    )
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "Cross-network configuration diff: HQ (N_1) vs Branch (N_2)" in out
+    assert "globalBandwidthLimits" in out
+    assert "only in HQ (N_1)" in out and "(10)" in out
+    payload = json.loads(diff_out.read_text(encoding="utf-8"))
+    assert payload["modified"][0]["attributes"] == [
+        {"name": "globalBandwidthLimits", "orderChanged": False}
+    ]
+    # Names and locators only — never configuration values.
+    assert "512" not in diff_out.read_text(encoding="utf-8")
+
+
+def test_diff_networks_ambiguous_or_same_pattern_exits_2(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _no_network(monkeypatch)
+    dump = _diff_dump(tmp_path)
+    assert main(
+        ["--spec", str(spec_file), "--from-dump", str(dump),
+         "--diff-networks", "N_*", "Branch"]
+    ) == 2
+    assert main(
+        ["--spec", str(spec_file), "--from-dump", str(dump),
+         "--diff-networks", "HQ", "N_1"]
+    ) == 2
+
+
+def test_diff_networks_unreadable_snapshot_exits_1(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _no_network(monkeypatch)
+    assert main(
+        ["--spec", str(spec_file), "--from-dump", str(tmp_path / "no.json"),
+         "--diff-networks", "HQ", "Branch"]
+    ) == 1
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        # Orphaned --diff-out (house rule: no silently ignored flags).
+        ["--org-id", "123456", "--diff-out", "d.json"],
+        # Standalone mode: no pipeline/DR companions.
+        ["--org-id", "123456", "--diff-networks", "A", "B", "--sync"],
+        ["--org-id", "123456", "--diff-networks", "A", "B",
+         "--only", "network:HQ"],
+        # One organization at most.
+        ["--org-id", "123456", "--org-id", "234567",
+         "--diff-networks", "A", "B"],
+        # Live mode needs an --org-id.
+        ["--diff-networks", "A", "B"],
+    ],
+)
+def test_diff_networks_usage_errors(
+    spec_file: Path, argv: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--spec", str(spec_file), *argv])
+    assert excinfo.value.code == 2
+
+
+def test_diff_networks_live_requires_api_key(
+    spec_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            ["--spec", str(spec_file), "--org-id", "123456",
+             "--diff-networks", "A", "B"]
+        )
+    assert excinfo.value.code == 2
+
+
+def test_diff_networks_live_scopes_discovery_to_both_patterns(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from meraki2tf import cli as cli_module
+    from meraki2tf.providers import StaticJsonDataProvider as _Static
+    from meraki2tf.scope import LiveNetworkScope
+
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    dump = _diff_dump(tmp_path)
+
+    class DiffLiveStub(_StubLiveProvider):
+        def fetch_network_graph(
+            self, organization_id: str | None = None
+        ) -> Any:
+            with _Static(dump) as source:
+                return source.fetch_network_graph(organization_id)
+
+    monkeypatch.setattr(cli_module, "LiveApiDataProvider", DiffLiveStub)
+    exit_code = main(
+        ["--spec", str(spec_file), "--org-id", "org-123",
+         "--diff-networks", "HQ", "Branch"]
+    )
+    assert exit_code == 0
+    scope = DiffLiveStub.last_network_scope
+    assert isinstance(scope, LiveNetworkScope)
+    assert scope.selectors == ("HQ", "Branch")
+    assert "Cross-network configuration diff" in capsys.readouterr().out
+
+
+def test_diff_networks_live_zero_match_exits_2(
+    spec_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from meraki2tf import cli as cli_module
+    from meraki2tf.scope import ScopeFilterError
+
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+
+    class ZeroMatch(_StubLiveProvider):
+        def fetch_network_graph(
+            self, organization_id: str | None = None
+        ) -> Any:
+            raise ScopeFilterError("selector 'Nowhere' matched no network")
+
+    monkeypatch.setattr(cli_module, "LiveApiDataProvider", ZeroMatch)
+    assert main(
+        ["--spec", str(spec_file), "--org-id", "123456",
+         "--diff-networks", "Nowhere", "AlsoNowhere"]
+    ) == 2
