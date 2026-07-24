@@ -306,7 +306,10 @@ def build_runbook(
         "## How to use this document",
         "",
         "1. Restore Terraform-managed resources first:",
-        "   `meraki2tf --rebuild --confirm --workdir <this directory>`.",
+        "   `meraki2tf --rebuild --workdir <this directory>` (preview the",
+        "   plan and verify the printed 'Rebuild target organization'",
+        "   line names the org you intend to rebuild), then re-run with",
+        "   `--confirm` to execute the apply.",
         "2. Replay the objects below from the unsanitized snapshot:",
         "   `meraki2tf --replay-gaps --from-dump <snapshot.json> --org-id "
         "<org>` (preview), then add `--confirm` to write.",
