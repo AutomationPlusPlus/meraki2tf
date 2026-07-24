@@ -1681,3 +1681,101 @@ def test_item_verification_unwraps_envelope_listings(
     assert failed == ()
     assert len(executed) == 1
     assert section.calls[0]["networkId"] == "N_9"
+
+
+# ------------------------------------------------- spec verb verification
+
+
+def _mislabeled_delete(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    """A spec-mislabeled destroyer: self._session.delete(url)."""
+    raise AssertionError("a mislabeled SDK method must never be called")
+
+
+def _as_meraki_method(func: Any) -> Any:
+    clone = types.FunctionType(
+        func.__code__, func.__globals__, func.__name__,
+        func.__defaults__, func.__closure__,
+    )
+    clone.__module__ = "meraki.api.networks"
+    return clone
+
+
+def test_call_refuses_spec_mislabeled_write_methods(
+    monkeypatch: pytest.MonkeyPatch, spec_parser: OpenApiParser
+) -> None:
+    """A poisoned spec could route a PUT-labeled replay to a deleting
+    SDK method; the resolved method's source is verified first."""
+    dashboard = types.SimpleNamespace(
+        appliance=types.SimpleNamespace(
+            updateNetworkApplianceVlan=_as_meraki_method(_mislabeled_delete),
+        )
+    )
+    stub = types.ModuleType("meraki")
+    stub.DashboardAPI = lambda **kwargs: dashboard  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "meraki", stub)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "unit-test-key")
+
+    action = _vlan_action(spec_parser)
+    with pytest.raises(ReplayDispatchError, match="put/post"):
+        GapReplayer()._call(
+            action.operation, {"networkId": "N_9", "vlanId": "10"},
+            {"name": "Data"},
+        )
+
+
+def test_item_scope_verification_refuses_non_read_only_lookup(
+    monkeypatch: pytest.MonkeyPatch, spec_parser: OpenApiParser
+) -> None:
+    """The item-ID read-back must never call a lookup that is not
+    verifiably a read — refusal, exactly like an absent lookup."""
+    dashboard = types.SimpleNamespace(
+        appliance=types.SimpleNamespace(
+            getNetworkApplianceVlans=_as_meraki_method(_mislabeled_delete),
+        )
+    )
+    stub = types.ModuleType("meraki")
+    stub.DashboardAPI = lambda **kwargs: dashboard  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "meraki", stub)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "unit-test-key")
+
+    replayer = GapReplayer()
+    with pytest.raises(ReplayDispatchError, match="not verifiably read-only"):
+        replayer._verify_item_scope(
+            _vlan_action(spec_parser), {"networkId": "N_9", "vlanId": "10"}
+        )
+
+
+def test_already_present_refuses_non_read_only_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+    spec_parser: OpenApiParser,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The presence lookup proceeds with the create (never calling the
+    unverifiable method) instead of invoking it."""
+    import logging as _logging
+
+    dashboard = types.SimpleNamespace(
+        organizations=types.SimpleNamespace(
+            getOrganizationNetworks=_as_meraki_method(_mislabeled_delete),
+        )
+    )
+    stub = types.ModuleType("meraki")
+    stub.DashboardAPI = lambda **kwargs: dashboard  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "meraki", stub)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "unit-test-key")
+
+    create = _lookup_op(spec_parser, "createOrganizationNetwork")
+    action = ReplayAction(
+        kind="object",
+        api_path="/organizations/{organizationId}/networks",
+        path_values=("org-123",),
+        payload={"name": "HQ"},
+        operation=create,
+        lookup=_lookup_op(spec_parser, "getOrganizationNetworks"),
+    )
+    with caplog.at_level(_logging.WARNING):
+        present = GapReplayer()._already_present(
+            action, {"organizationId": "org-999"}
+        )
+    assert present is False
+    assert "not verifiably read-only" in caplog.text

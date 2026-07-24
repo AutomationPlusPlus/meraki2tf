@@ -68,6 +68,11 @@ from meraki2tf.replayer import (
 )
 from meraki2tf.runbook import write_operations
 from meraki2tf.sanitizer import SECRET_KEY_PATTERN
+from meraki2tf.sdk_verify import (
+    READ_ONLY_SESSION_VERBS,
+    WRITE_SESSION_VERBS,
+    method_matches_verbs,
+)
 from meraki2tf.spec.engine import OperationSpec
 
 logger = logging.getLogger(__name__)
@@ -457,6 +462,13 @@ class ForeignScopeError(RuntimeError):
     snapshot — dispatching it would write into a live organization or
     onto live hardware the restore does not own, so the action is
     refused outright (never deferred, never passed through)."""
+
+
+class SpecVerbMismatchError(RuntimeError):
+    """The spec routed this write to an SDK method whose own source
+    performs session verbs outside put/post — a stale or tampered spec
+    could relabel a *deleting* method as this asset's PUT, so the
+    dispatch is refused outright (fail closed, per-object)."""
 
 
 #: Policy-object grammar embedded in firewall rule strings, and the
@@ -2505,6 +2517,14 @@ class OrgRestorer:
             raise RuntimeError(
                 f"Meraki SDK exposes no method for {op.operation_id!r}"
             )
+        if not method_matches_verbs(method, WRITE_SESSION_VERBS):
+            raise SpecVerbMismatchError(
+                f"SDK method {op.operation_id!r} resolved for this "
+                f"{op.method.upper()} does not verifiably perform only "
+                "put/post session calls; refusing to dispatch — the "
+                "spec and the installed SDK disagree on what this "
+                "operation does"
+            )
         if action.kind == "create":
             # Write-ahead: recorded after reference rewriting (so a
             # deferral leaves no trace) but before the API call, so a
@@ -2595,6 +2615,16 @@ class OrgRestorer:
             else None
         )
         if method is None:
+            return None
+        if not method_matches_verbs(method, READ_ONLY_SESSION_VERBS):
+            # A lookup that is not verifiably a read must never be
+            # called: proceeding without adoption is safe (worst case
+            # one duplicate-create failure), calling a mislabeled
+            # mutating method is not.
+            logger.warning(
+                "Adoption lookup %r for %s is not verifiably read-only; "
+                "proceeding without it.", op.operation_id, action.key,
+            )
             return None
         self._bucket.acquire()
         try:

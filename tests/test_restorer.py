@@ -5265,3 +5265,95 @@ def test_unsupported_setting_key_matcher_edges(tmp_path: Path) -> None:
         None, empty, None, "org-123",
         "Remote status page is not supported by this network",
     ) is None
+
+
+# ------------------------------------------------- spec verb verification
+
+
+def _mislabeled_delete(*args: object, **kwargs: object) -> dict:
+    """A spec-mislabeled destroyer: self._session.delete(url)."""
+    raise AssertionError("a mislabeled SDK method must never be called")
+
+
+def _as_meraki_method(func):  # noqa: ANN001, ANN201
+    clone = __import__("types").FunctionType(
+        func.__code__, func.__globals__, func.__name__,
+        func.__defaults__, func.__closure__,
+    )
+    clone.__module__ = "meraki.api.networks"
+    return clone
+
+
+def test_dispatch_refuses_spec_mislabeled_write_methods(
+    tmp_path: Path,
+) -> None:
+    """A poisoned/skewed spec could route a PUT-labeled entry to a
+    deleting SDK method; the resolved method's source is verified and
+    the action fails closed instead of dispatching."""
+    import types as _types
+
+    from meraki2tf.models import NetworkGraph as _NetworkGraph
+
+    parser = _restore_spec(tmp_path)
+    graph = _NetworkGraph(
+        organization_id="org-123",
+        networks=(
+            MerakiNetwork.from_payload(
+                {"id": "N_1", "organizationId": "org-123", "name": "HQ",
+                 "productTypes": ["appliance"]}
+            ),
+        ),
+        devices=(),
+        features=(
+            FeatureConfiguration(SNMP_PATH, ("N_1",), {"access": "none"}),
+        ),
+    )
+    plan = plan_restore(graph, parser)
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    calls: list = []
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "journal.jsonl")
+    )
+    restorer._client = _types.SimpleNamespace(
+        organizations=_RecordingSection(calls),
+        networks=_types.SimpleNamespace(
+            updateNetworkSnmp=_as_meraki_method(_mislabeled_delete),
+        ),
+    )
+    result = restorer.execute(graph, plan)
+    ((key, reason),) = [f for f in result.failed if SNMP_PATH in f[0]]
+    assert "put/post" in reason and "refusing to dispatch" in reason
+    # The mislabeled method never fired (its body would AssertionError),
+    # and the legitimate network create still went through.
+    assert any(c[0] == "createOrganizationNetwork" for c in calls)
+
+
+def test_adoption_lookup_refuses_non_read_only_methods(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A lookup GET that is not verifiably a read is never called; the
+    executor proceeds without adoption (worst case one duplicate-create
+    failure) instead of invoking a mislabeled mutating method."""
+    import types as _types
+
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(GP_ITEM, ("N_1", "100"), {"name": "kiosk"}),
+    )
+    plan = plan_restore(graph, parser)
+    gp_create = next(a for a in plan.actions if a.api_path == GP_ITEM)
+    restorer, calls = _executor(tmp_path)
+    restorer._client.networks = _types.SimpleNamespace(
+        getNetworkGroupPolicies=_as_meraki_method(_mislabeled_delete),
+    )
+    from meraki2tf.restorer import ReferenceResolver
+
+    resolver = ReferenceResolver(graph)
+    resolver.record("network", "N_1", "L_NEW")
+    with caplog.at_level(logging.WARNING):
+        listing = restorer._list_collection(
+            restorer._client, gp_create, resolver, "org-123"
+        )
+    assert listing is None
+    assert "not verifiably read-only" in caplog.text
