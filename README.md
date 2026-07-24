@@ -143,7 +143,12 @@ is flagged through the exception auditor instead of silently dropped.
   workdir fetches it; with an older (or not-yet-initialized) provider the
   tool falls back to a bundled v1.12.2 identity catalog, which can drift
   from what your workdir actually runs
-- A Meraki dashboard API key (live mode only)
+- A Meraki dashboard API key (live mode only). A **read-only org admin
+  key suffices** for every scheduled/read path — discovery is GET-only
+  and source-verified; full access is needed only to *execute* the five
+  human-invoked `--confirm` DR actions. Endpoints the key cannot read
+  surface as coverage gaps, never as silently-absent features — see
+  [API-key permission model](docs/OPERATIONS.md#api-key-permission-model)
 - The Meraki OpenAPI spec — fetched from GitHub automatically; only
   air-gapped runs need a local copy pre-staged (see
   [OpenAPI spec resolution](docs/USAGE.md#openapi-spec-resolution))

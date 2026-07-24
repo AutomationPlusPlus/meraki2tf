@@ -1,8 +1,37 @@
 # Operations
 
-Running meraki2tf on a schedule: alert events, cron/exit-code
-wiring, performance at scale, and troubleshooting. Part of the
-[meraki2tf](../README.md) docs.
+Running meraki2tf on a schedule: API-key permissions, alert events,
+cron/exit-code wiring, performance at scale, and troubleshooting.
+Part of the [meraki2tf](../README.md) docs.
+
+## API-key permission model
+
+A **read-only organization admin** key is all every scheduled and
+ad-hoc read path needs — the default pipeline, `--sync` (its applies
+only write local/backend Terraform *state*; Meraki is never mutated),
+`--dump-to`, `--drift-baseline`, `--list-orgs`, `--check`,
+`--estimate`, `--diff-networks`, and every DR-action *preview*.
+Discovery is GET-only by construction, and defensively so: before
+dispatching any dynamically resolved SDK method, its source is
+verified to only ever perform reads — a method that cannot be proven
+read-only is refused (fail-closed), so even a tampered OpenAPI spec
+cannot trick a scheduled run into a write. Run your weekly/monthly
+jobs on a read-only key.
+
+**Full-access is needed only for the five human-invoked `--confirm`
+executions** (`--rebuild`, `--heal`, `--replay-gaps`, `--restore`,
+`--wipe-org` — and for `terraform apply` run by hand in the workdir).
+Keeping a separate full-access key offline until an incident is a
+reasonable posture; the previews of all five actions work on the
+read-only key.
+
+Scope expectations: endpoints the key cannot read (401/403 — e.g. a
+key scoped below org-wide, or camera/SM feature scopes withheld) are
+**never** silently treated as "feature not in use". Each one surfaces
+as a coverage gap in `coverage.json`, and an endpoint refused by every
+scope it was tried against is additionally listed under
+`suspect_endpoints` in the manifest — so a permissions hole shows up
+as missing DR coverage, not as a quietly smaller snapshot.
 
 ## Alerting events
 
