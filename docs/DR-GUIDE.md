@@ -13,6 +13,19 @@ Terraform, and when a major incident hits, rebuild from the latest
 artifacts. Normal runs are **strictly read-only** toward Meraki — no
 `terraform apply` ever happens during the pipeline.
 
+### Which recovery action do I need?
+
+Every action below is **preview-first**: the flag alone shows exactly
+what would happen and writes nothing; only adding `--confirm` executes.
+
+| Symptom | Command | Prerequisites | What it will NOT do |
+| --- | --- | --- | --- |
+| Single objects accidentally deleted; the org is still alive | `--heal --from-dump <snapshot> --org-id <id>` (narrow with `--only`) | Unsanitized snapshot; `--org-id` must equal the snapshot's source org; API key (even the preview discovers live) | Never modifies surviving objects (additive-only); cannot un-modify settings or restore objects created after the snapshot |
+| Settings were modified/mangled; you want Terraform to reapply the kit to the same org | `--rebuild --workdir <kit>` (pin the target with `--expect-org`) | A workdir populated by a previous run; API key | Cannot recreate *deleted* objects (their `import {}` blocks fail — that is `--heal`'s job); does not restore unsupported objects or secrets |
+| After a rebuild, the pieces Terraform can't carry are still missing (unsupported objects, secret values) | `--replay-gaps --from-dump <snapshot>` | Unsanitized full snapshot; API key with `--confirm`; run *after* `--rebuild --confirm` | Does not touch anything Terraform already rebuilt; skips (and reports) entries a sanitized snapshot masked |
+| The organization is lost entirely | `--restore --from-dump <snapshot> --target-org <new-org>` | Unsanitized full snapshot; a fresh/scratch `--target-org` (the source org is refused); `--serial-map` if hardware was replaced | Never writes into the snapshot's source org; cannot claim hardware still claimed elsewhere (use `--skip-claims` for drills) |
+| A finished drill org needs tearing down | `--wipe-org <id> --wipe-org-name "<exact name>"` | Org must hold **zero** claimed devices; exact name as second factor | Refuses any org with claimed devices; never usable from a scheduler |
+
 ### What a run produces
 
 Each run leaves a complete rebuild kit in `--workdir`:
