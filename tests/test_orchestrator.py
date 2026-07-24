@@ -1889,3 +1889,156 @@ def test_partial_snapshot_scope_stamps_manifest_runbook_and_alert(
     assert "PARTIAL RUN" in (
         runner.workdir / "runbook.md"
     ).read_text(encoding="utf-8")
+
+
+class ScopedProvider(StubProvider):
+    """Provider declaring a partial scope, like a --only live run."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        from meraki2tf.scope import SnapshotScope
+
+        self.snapshot_scope = SnapshotScope(
+            network_ids=("N_1",), selectors=("network:HQ",)
+        )
+
+
+def _scoped_orchestrator(
+    tmp_path: Path,
+    generator: StubGenerator | None = None,
+    sync: bool = False,
+    plan_exit: int = 0,
+    plan_stdout: str = "~ delta",
+) -> tuple[PipelineOrchestrator, RecordingNotifier, StubRunner]:
+    recorder = RecordingNotifier()
+    runner = StubRunner(tmp_path, plan_exit=plan_exit, plan_stdout=plan_stdout)
+    orchestrator = PipelineOrchestrator(
+        provider=ScopedProvider(),
+        generator=generator or StubGenerator(),  # type: ignore[arg-type]
+        runner=runner,  # type: ignore[arg-type]
+        dispatcher=AlertDispatcher([recorder]),
+        sync=sync,
+    )
+    return orchestrator, recorder, runner
+
+
+def test_scoped_run_never_flags_out_of_scope_state_as_deleted(
+    tmp_path: Path, api_key: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    """CRITICAL scope-safety property: state-tracked resources the
+    scoped discovery never looked at are out-of-scope, not deleted —
+    no DELETION_PENDING alert, no pending-deletions record, and the
+    plan is targeted at exactly the captured (in-scope) addresses so
+    terraform never reads or proposes anything for the rest."""
+    orchestrator, recorder, runner = _scoped_orchestrator(tmp_path)
+    runner.state_addresses = {
+        "meraki_networks.n_1",
+        "meraki_legacy.out_of_scope",
+    }
+    with caplog.at_level(logging.INFO):
+        summary = orchestrator.run("org-123")
+    assert summary.deletions_pending == ()
+    assert summary.deletions_removed == ()
+    assert [e.event_type for e in recorder.events] == [EventType.RUN_SUCCESS]
+    assert not (tmp_path / PENDING_DELETIONS_FILENAME).exists()
+    assert runner.removed == []
+    assert "out-of-scope" in caplog.text
+    assert "meraki_legacy.out_of_scope" in caplog.text
+    # The plan covered exactly the captured in-scope addresses.
+    assert runner.plan_targets == [
+        ("meraki_devices.q2ab", "meraki_networks.n_1")
+    ]
+
+
+def test_scoped_run_leaves_a_prior_deletion_review_record_untouched(
+    tmp_path: Path, api_key: None
+) -> None:
+    """A full run's alerted-deletions record must survive a scoped run
+    unchanged: the scoped run reviewed nothing, so it may neither
+    clear nor rewrite what the operator was asked to review."""
+    seed = _seed_alerted_deletions(tmp_path, ["meraki_full.reviewed"])
+    before = seed.read_text(encoding="utf-8")
+    orchestrator, _recorder, _runner = _scoped_orchestrator(tmp_path)
+    orchestrator.run("org-123")
+    assert seed.read_text(encoding="utf-8") == before
+
+
+def test_scoped_keyless_run_skips_review_and_comparison(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    orchestrator, _recorder, runner = _scoped_orchestrator(tmp_path)
+    runner.state_addresses = {"meraki_legacy.out_of_scope"}
+    summary = orchestrator.run("org-123")
+    assert summary.comparison_skipped
+    assert summary.deletions_pending == ()
+    assert runner.plan_calls == []
+
+
+def test_sync_scoped_regen_replan_stays_targeted_when_pending_is_empty(
+    tmp_path: Path, api_key: None
+) -> None:
+    """A scoped sync replan must never degenerate into an untargeted
+    full plan: when regeneration leaves nothing pending (everything is
+    tracked or reconciliation-dropped), the fallback targets the
+    captured in-scope set instead of None."""
+    generator = StubGenerator(addresses=("meraki_a.a", "meraki_b.b"))
+    orchestrator, recorder, runner = _scoped_orchestrator(
+        tmp_path, generator=generator, sync=True,
+        plan_exit=2, plan_stdout=PLAN_WITH_CHANGES,
+    )
+    runner.state_addresses = {"meraki_b.b"}
+    runner.reconciliation_dropped = {"meraki_a.a": "provider rejects it"}
+    runner.plans = [
+        (2, PLAN_WITH_CHANGES),
+        (0, "No changes. Your infrastructure matches the configuration."),
+    ]
+    runner.actions_queue = [{"meraki_a.a": ("update",)}]
+
+    summary = orchestrator.run("org-123")
+
+    assert not summary.apply_aborted
+    assert summary.regenerated_addresses == ("meraki_a.a",)
+    # Both plans — the initial one and the post-regeneration replan
+    # whose pending set was empty — stayed targeted at the captured
+    # in-scope addresses; None (a full untargeted plan) never appears.
+    assert runner.plan_targets == [
+        ("meraki_a.a", "meraki_b.b"),
+        ("meraki_a.a", "meraki_b.b"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    ["scope", "checkpoint"],
+)
+def test_operator_input_errors_refuse_without_a_fault_alert(
+    tmp_path: Path, refusal: str
+) -> None:
+    from meraki2tf.providers.discovery_checkpoint import (
+        CheckpointMismatchError,
+    )
+    from meraki2tf.scope import ScopeFilterError
+
+    exc: Exception = (
+        ScopeFilterError("--only selector 'network:X' matched no network")
+        if refusal == "scope"
+        else CheckpointMismatchError("checkpoint records organization 999")
+    )
+
+    class RefusingProvider(StubProvider):
+        def fetch_network_graph(
+            self, organization_id: str | None = None
+        ) -> NetworkGraph:
+            raise exc
+
+    recorder = RecordingNotifier()
+    orchestrator = PipelineOrchestrator(
+        provider=RefusingProvider(),
+        generator=StubGenerator(),  # type: ignore[arg-type]
+        runner=StubRunner(tmp_path),  # type: ignore[arg-type]
+        dispatcher=AlertDispatcher([recorder]),
+    )
+    with pytest.raises(PreflightRefusalError):
+        orchestrator.run("org-123")
+    assert recorder.events == []

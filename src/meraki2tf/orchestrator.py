@@ -65,6 +65,8 @@ from meraki2tf.runbook import (
     secret_attribute_union,
     write_runbook,
 )
+from meraki2tf.providers.discovery_checkpoint import CheckpointMismatchError
+from meraki2tf.scope import ScopeFilterError, scoped_plan_targets
 from meraki2tf.terraform_runner import (
     ImportGuardViolation,
     ReconciledPlanResult,
@@ -309,9 +311,30 @@ class PipelineOrchestrator:
             unsupported_details = unsupported_payload(report.unsupported)
 
             stage = "deletion review"
-            deletions_pending, deletions_removed = self._review_deletions(
-                existing, report
-            )
+            deletions_pending: tuple[str, ...]
+            deletions_removed: tuple[str, ...]
+            if scope_networks is not None:
+                # A scoped (--only) run discovers only its networks, so
+                # absence from this run's capture proves nothing about
+                # deletion: out-of-scope state stays untouched — never
+                # flagged, alerted, or removed — and the pending-
+                # deletions review record of full runs is left as-is.
+                deletions_pending, deletions_removed = (), ()
+                out_of_scope = tuple(
+                    sorted(existing - report.captured_addresses)
+                )
+                if out_of_scope:
+                    logger.info(
+                        "Scoped run: deletion review skipped; %d state-"
+                        "tracked resource(s) not captured this run are "
+                        "out-of-scope (or scope-undetermined), not "
+                        "missing: %s",
+                        len(out_of_scope), ", ".join(out_of_scope),
+                    )
+            else:
+                deletions_pending, deletions_removed = (
+                    self._review_deletions(existing, report)
+                )
 
             drift = False
             pending_imports: int | None = None
@@ -340,7 +363,17 @@ class PipelineOrchestrator:
                 self._runner.init()
 
                 stage = "state comparison"
-                plan = self._runner.plan_with_generation(save_plan=self._sync)
+                # A scoped run plans exactly the captured (in-scope)
+                # addresses: out-of-scope kit/state resources are never
+                # read, drifted, or (in sync mode) imported/mutated.
+                scope_targets = (
+                    scoped_plan_targets(report.captured_addresses)
+                    if scope_networks is not None
+                    else None
+                )
+                plan = self._runner.plan_with_generation(
+                    save_plan=self._sync, targets=scope_targets
+                )
                 stage = "plan reconciliation audit"
                 report, unsupported_details = self._report_reconciliation(
                     plan, report
@@ -375,7 +408,8 @@ class PipelineOrchestrator:
                             deferred,
                             apply_aborted,
                         ) = self._handle_sync_drift(
-                            plan, graph, report, unsupported_details
+                            plan, graph, report, unsupported_details,
+                            scoped=scope_networks is not None,
                         )
                         # regeneration re-plans, so reconciliation may
                         # have dropped/suppressed again — re-audit.
@@ -538,6 +572,12 @@ class PipelineOrchestrator:
             )
         except PreflightRefusalError:
             raise  # an expected refusal, not a fault — no alert, no traceback
+        except (ScopeFilterError, CheckpointMismatchError) as exc:
+            # Operator input errors surfaced mid-startup (a --only
+            # selector matching no network, a stale/foreign discovery
+            # checkpoint): refuse cleanly like the other preflights —
+            # nothing broke, so no PROCESSING_FAULT alert.
+            raise PreflightRefusalError(str(exc)) from exc
         except Exception as exc:
             # The one-line ERROR is the operator-facing record; the
             # traceback is debugging detail — a gracefully-handled
@@ -775,6 +815,7 @@ class PipelineOrchestrator:
         graph: NetworkGraph,
         report: GenerationReport,
         unsupported_details: list[dict[str, Any]],
+        scoped: bool = False,
     ) -> tuple[
         ReconciledPlanResult,
         GenerationReport,
@@ -886,12 +927,25 @@ class PipelineOrchestrator:
                 audit=False,
                 suppress_addresses=frozenset(plan.dropped),
             )
+            # Regeneration just returned the modified addresses to
+            # pending, so the set is normally non-empty; `or None`
+            # makes the degenerate full replan an explicit choice —
+            # except on a scoped run, where an untargeted replan would
+            # pull out-of-scope kit/state into the saved plan: there
+            # the fallback stays targeted at the captured (in-scope)
+            # set instead.
+            replan_targets: tuple[str, ...] | None = self._pending_targets(
+                report, plan
+            )
+            if not replan_targets:
+                replan_targets = (
+                    scoped_plan_targets(report.captured_addresses)
+                    if scoped
+                    else None
+                )
             plan = self._runner.plan_with_generation(
                 save_plan=True,
-                # Regeneration just returned the modified addresses to
-                # pending, so the set is normally non-empty; `or None`
-                # makes the degenerate full replan an explicit choice.
-                targets=self._pending_targets(report, plan) or None,
+                targets=replan_targets,
             ).merged_with_earlier(plan)
             regenerated.extend(modified)
             if not plan.has_drift:

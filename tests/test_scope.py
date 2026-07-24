@@ -7,9 +7,11 @@ from meraki2tf.scope import (
     LiveNetworkScope,
     ScopeFilterError,
     SnapshotScope,
+    describe_networks,
     filter_networks,
     glob_pattern,
     parse_network_selectors,
+    scoped_plan_targets,
 )
 
 
@@ -138,3 +140,23 @@ def test_live_scope_id_form_tolerates_deleted_networks() -> None:
     scope = LiveNetworkScope(network_ids=frozenset({"N_1", "N_gone"}))
     assert [n.network_id for n in scope.apply(NETWORKS)] == ["N_1"]
     assert scope.apply(()) == ()
+
+
+def test_describe_networks_lists_name_and_id() -> None:
+    assert describe_networks(list(NETWORKS[:2])) == (
+        "Branch-07 (N_1); Branch-08 (N_2)"
+    )
+
+
+def test_scoped_plan_targets_sorts_deterministically() -> None:
+    assert scoped_plan_targets({"meraki_b.b", "meraki_a.a"}) == (
+        "meraki_a.a",
+        "meraki_b.b",
+    )
+
+
+def test_scoped_plan_targets_refuses_an_empty_set() -> None:
+    """An empty -target list silently degenerates into a FULL terraform
+    plan — the exact out-of-scope exposure targeting exists to prevent."""
+    with pytest.raises(ScopeFilterError, match="no targets"):
+        scoped_plan_targets(())
