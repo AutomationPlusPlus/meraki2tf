@@ -16,9 +16,11 @@ Noise control is spec-driven, per the project contract:
   fleet rollouts that add new read-only response fields therefore never
   page anyone.
 * **Identity-keyed collections compare as sets** — arrays of objects
-  carrying an identity key (``id``/``serial``/``number``/``name``)
-  compare order-insensitively; bare arrays (firewall rules, whose order
-  *is* the configuration) stay ordered.
+  carrying a true identity key (``id``/``serial``/``number``) compare
+  order-insensitively; everything else — bare arrays and lists whose
+  items merely carry a ``name`` (port-forwarding rules, one-to-many NAT
+  rules, where order is match precedence) — stays ordered. A pure
+  reordering is reported as an order change, never a full value dump.
 * **Population-wide key additions are suppressed — but reported.** A
   brand-new attribute appearing across every modified asset of one
   endpoint is *probably* a fleet/API rollout, not an operator change —
@@ -52,11 +54,28 @@ NETWORK_PSEUDO_PATH = "/networks/{networkId}"
 DEVICE_PSEUDO_PATH = "/devices/{serial}"
 
 #: Payload keys that identify one element of an identity-keyed list.
-_ELEMENT_IDENTITY_KEYS = ("id", "serial", "number", "name")
+#: Deliberately excludes ``name``: rule lists whose items merely carry a
+#: name (portForwardingRules, oneToManyNatRules) are order-significant —
+#: reordering changes firewall match precedence — so treating them as
+#: multisets silenced exactly the drift the module exists to report.
+_ELEMENT_IDENTITY_KEYS = ("id", "serial", "number")
 
-#: A key-addition seen on at least this many assets of one endpoint —
-#: and on *every* modified asset of that endpoint — is an API rollout.
+#: A key-addition is treated as an API rollout only when it hits at
+#: least this many modified assets of one endpoint, on *every* modified
+#: asset of that endpoint, AND those modified assets cover (nearly) the
+#: endpoint's whole population — see ``_ROLLOUT_MIN_COVERAGE``.
 _ROLLOUT_MIN_ASSETS = 10
+
+#: Fraction of ALL assets of a path that must be modified before a
+#: key-addition can be suppressed as a rollout. A genuine operator bulk
+#: edit setting a previously-null field on 10 of 200 objects must NOT
+#: be suppressed to a name-only note; a Meraki fleet rollout touches
+#: essentially every asset of the endpoint.
+_ROLLOUT_MIN_COVERAGE = 0.9
+
+#: Marker naming a pure reordering of an order-significant list; used
+#: in place of a full before/after dump to keep the alert digest quiet.
+ORDER_CHANGED = "<order changed>"
 
 
 class SanitizedBaselineError(ValueError):
@@ -67,6 +86,17 @@ class SanitizedBaselineError(ValueError):
     real organization and the whole org would falsely register as
     added+removed — a drift-alert storm that buries real drift. Drift
     baselines must be the unsanitized snapshot.
+    """
+
+
+class BaselineOrgMismatchError(ValueError):
+    """The drift baseline was captured from a different organization.
+
+    Diffing two organizations against each other reports every asset as
+    added+removed — an alert storm, never meaningful drift. The org-id
+    override the baseline fetch applies would silently mask the
+    mismatch, so the baseline's own recorded organization is checked
+    first and a mismatch refuses loudly, naming both IDs.
     """
 
 
@@ -193,7 +223,10 @@ def diff_graphs(
                     changed=changed,
                 )
             )
-    survivors, suppressed = _suppress_rollouts(modified)
+    population: dict[str, int] = {}
+    for api_path, _values in after:
+        population[api_path] = population.get(api_path, 0) + 1
+    survivors, suppressed = _suppress_rollouts(modified, population)
     return SnapshotDiff(
         added=added,
         removed=removed,
@@ -212,7 +245,11 @@ def baseline_drift(
     Refuses a sanitized baseline outright
     (:class:`SanitizedBaselineError`): diffing pseudonyms against real
     identifiers is never meaningful. A partial (``--only``) baseline is
-    refused the same way (:class:`PartialBaselineError`).
+    refused the same way (:class:`PartialBaselineError`), as is a
+    baseline recorded from a different organization
+    (:class:`BaselineOrgMismatchError`) — the org-id override below
+    would otherwise mask the mismatch and report the whole org as
+    added+removed.
     """
     from meraki2tf.providers.dump import StaticJsonDataProvider
 
@@ -232,6 +269,15 @@ def baseline_drift(
             f"(--only, {len(scope.network_ids)} network(s)): every asset "
             "outside its scope would falsely register as added. Point "
             "--drift-baseline at a full-organization snapshot."
+        )
+    recorded = provider.recorded_organization_ids
+    if recorded and graph.organization_id not in recorded:
+        raise BaselineOrgMismatchError(
+            f"Drift baseline {baseline_path} was captured from "
+            f"organization {', '.join(recorded)}, but this run discovered "
+            f"organization {graph.organization_id}: every asset would "
+            "falsely register as added+removed. Point --drift-baseline "
+            "at a snapshot of the same organization."
         )
     baseline = provider.fetch_network_graph(graph.organization_id)
     return diff_graphs(baseline, graph, parser)
@@ -350,18 +396,24 @@ def _payload_changes(
         return (
             {}
             if _values_equal(before, after)
-            else {"<payload>": (before, after)}
+            else {"<payload>": _change_entry(before, after)}
         )
     before_items = _collection_items(before)
     after_items = _collection_items(after)
-    if before_items is not None and after_items is not None:
+    if before_items is not None or after_items is not None:
         # Whole-collection assets are stored under the invented `items`
         # envelope, which never appears in a write schema (the write
         # body names its sole array property, e.g. `_json`) — filtering
         # by writable fields would silence ALL drift on this class.
-        if _values_equal(before_items, after_items):
+        # Each side unwraps independently: when only one side carries
+        # the envelope (a capture-format change, a hand-edited
+        # snapshot), skipping this branch would filter every attribute
+        # out and make ALL drift on the asset invisible.
+        before_value = before_items if before_items is not None else before
+        after_value = after_items if after_items is not None else after
+        if _values_equal(before_value, after_value):
             return {}
-        return {"items": (before_items, after_items)}
+        return {"items": _change_entry(before_value, after_value)}
     changed: dict[str, tuple[Any, Any]] = {}
     for key in sorted(set(before) | set(after)):
         if writable is not None and key not in writable:
@@ -369,8 +421,30 @@ def _payload_changes(
         old_value = before.get(key)
         new_value = after.get(key)
         if not _values_equal(old_value, new_value):
-            changed[key] = (old_value, new_value)
+            changed[key] = _change_entry(old_value, new_value)
     return changed
+
+
+def _change_entry(before: Any, after: Any) -> tuple[Any, Any]:
+    """The ``(previous, current)`` record for one detected change.
+
+    An order-significant list whose elements are merely reordered (same
+    multiset, different sequence — firewall match precedence changed)
+    is reported as an explicit order change instead of a full
+    before/after dump: the drift is real and must alert, but the values
+    are identical and would only bloat the digest.
+    """
+    if (
+        isinstance(before, list)
+        and isinstance(after, list)
+        and len(before) == len(after)
+        and _canonical_multiset(before) == _canonical_multiset(after)
+    ):
+        return (
+            ORDER_CHANGED,
+            f"{ORDER_CHANGED}: {len(before)} item(s) reordered",
+        )
+    return (before, after)
 
 
 def _values_equal(before: Any, after: Any) -> bool:
@@ -407,6 +481,7 @@ def _canonical_multiset(items: list[Any]) -> dict[str, int]:
 
 def _suppress_rollouts(
     modified: list[AssetDiff],
+    population: Mapping[str, int],
 ) -> tuple[list[AssetDiff], tuple[SuppressedRollout, ...]]:
     """Withhold pure key-additions that hit every modified asset of a path.
 
@@ -417,6 +492,14 @@ def _suppress_rollouts(
     shape, so every suppression is returned as a
     :class:`SuppressedRollout` record (names and counts only) and must
     reach the alert digest — suppressed never means silent.
+
+    ``population`` maps each api_path to how many assets of that path
+    the current graph carries in total. A rollout must cover (nearly)
+    the whole population, not merely ``_ROLLOUT_MIN_ASSETS`` modified
+    assets: a bulk edit touching 10 of 200 objects is operator drift
+    and must survive with full attribute detail. A path absent from the
+    map counts as population-unknown and gates on the modified count
+    alone.
     """
     per_path: dict[str, list[AssetDiff]] = {}
     for diff in modified:
@@ -425,7 +508,12 @@ def _suppress_rollouts(
     suppressed: list[SuppressedRollout] = []
     for api_path, diffs in per_path.items():
         rollout_keys = set()
-        if len(diffs) >= _ROLLOUT_MIN_ASSETS:
+        fleet_wide = (
+            len(diffs) >= _ROLLOUT_MIN_ASSETS
+            and len(diffs)
+            >= _ROLLOUT_MIN_COVERAGE * population.get(api_path, 0)
+        )
+        if fleet_wide:
             candidate_keys = set().union(*(set(d.changed) for d in diffs))
             for key in candidate_keys:
                 if all(

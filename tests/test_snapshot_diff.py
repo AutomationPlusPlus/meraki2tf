@@ -328,7 +328,7 @@ def test_population_wide_key_additions_are_suppressed_but_recorded() -> None:
         AssetDiff(VLAN_PATH, ("N_1", "real"),
                   {"newField": (None, "x"), "name": ("a", "b")})
     )
-    survivors, suppressed = _suppress_rollouts(diffs)
+    survivors, suppressed = _suppress_rollouts(diffs, {VLAN_PATH: 13})
     (kept,) = survivors
     assert kept.path_values == ("N_1", "real")
     assert set(kept.changed) == {"name"}
@@ -343,7 +343,7 @@ def test_small_populations_are_never_treated_as_rollouts() -> None:
         AssetDiff(VLAN_PATH, ("N_1", str(i)), {"newField": (None, "x")})
         for i in range(3)
     ]
-    assert _suppress_rollouts(diffs) == (diffs, ())
+    assert _suppress_rollouts(diffs, {VLAN_PATH: 3}) == (diffs, ())
 
 
 def test_rollout_only_diffs_still_trigger_the_alert_path() -> None:
@@ -481,3 +481,112 @@ def test_baseline_drift_refuses_partial_baselines(tmp_path: Path) -> None:
     write_snapshot(graph, baseline, scope_selectors=("network:HQ",))
     with pytest.raises(PartialBaselineError, match="PARTIAL export"):
         baseline_drift(graph, baseline, parser=None)
+
+
+def test_baseline_drift_refuses_cross_org_baselines(tmp_path: Path) -> None:
+    """A baseline captured from a DIFFERENT organization would report
+    everything as added+removed; the org-id override in the baseline
+    fetch silently masks the mismatch, so it must be refused loudly —
+    naming both IDs — before the override, like the sanitized and
+    partial refusals."""
+    from meraki2tf.snapshot_diff import BaselineOrgMismatchError
+
+    baseline_graph = _graph(_vlan("10", name="Data"))  # org-123
+    baseline = tmp_path / "foreign-baseline.json"
+    write_snapshot(baseline_graph, baseline)
+    current = NetworkGraph(
+        organization_id="org-456", networks=(), devices=(),
+        features=(FeatureConfiguration(VLAN_PATH, ("N_9", "10"), {}),),
+    )
+    with pytest.raises(BaselineOrgMismatchError) as excinfo:
+        baseline_drift(current, baseline, parser=None)
+    assert "org-123" in str(excinfo.value)
+    assert "org-456" in str(excinfo.value)
+
+
+def test_name_only_keyed_rule_lists_stay_order_sensitive() -> None:
+    """Rule lists whose items merely carry a `name` (portForwardingRules,
+    oneToManyNatRules) are order-significant: reordering changes firewall
+    match precedence and MUST register as drift — reported specifically
+    as an order change, never a full before/after value dump."""
+    from meraki2tf.snapshot_diff import ORDER_CHANGED
+
+    rules = [{"name": "a", "publicPort": "80"}, {"name": "b", "publicPort": "443"}]
+    previous = _graph(_vlan("10", portForwardingRules=list(rules)))
+    current = _graph(_vlan("10", portForwardingRules=list(reversed(rules))))
+    (mod,) = diff_graphs(previous, current).modified
+    assert mod.changed == {
+        "portForwardingRules": (
+            ORDER_CHANGED, f"{ORDER_CHANGED}: 2 item(s) reordered"
+        )
+    }
+    # An id-keyed list reordering stays order-insensitive (no drift).
+    assert diff_graphs(
+        _graph(_vlan("10", opts=[{"id": "a"}, {"id": "b"}])),
+        _graph(_vlan("10", opts=[{"id": "b"}, {"id": "a"}])),
+    ).is_empty
+
+
+def test_reordered_root_and_envelope_lists_report_order_changes() -> None:
+    from meraki2tf.snapshot_diff import ORDER_CHANGED, _payload_changes
+
+    entry = _payload_changes(["a", "b"], ["b", "a"], None)["<payload>"]
+    assert entry[0] == ORDER_CHANGED and "2 item(s) reordered" in entry[1]
+    envelope_before = {"items": [{"name": "x"}, {"name": "y"}], "meta": {}}
+    envelope_after = {"items": [{"name": "y"}, {"name": "x"}], "meta": {}}
+    entry = _payload_changes(envelope_before, envelope_after, None)["items"]
+    assert entry[0] == ORDER_CHANGED
+
+
+def test_envelope_mismatch_between_sides_is_still_drift() -> None:
+    """When only ONE side wraps its collection in the {items, meta}
+    envelope (capture-format change, hand-edited snapshot), each side
+    must unwrap independently — otherwise the writable filter silences
+    ALL drift on the asset."""
+    from meraki2tf.snapshot_diff import _payload_changes
+
+    enveloped = {"items": [{"name": "rule-1"}], "meta": {"counts": {}}}
+    plain = {"defaultRulesEnabled": True}
+    writable = frozenset({"defaultRulesEnabled"})
+    changed = _payload_changes(enveloped, plain, writable)
+    assert changed == {"items": ([{"name": "rule-1"}], plain)}
+    changed = _payload_changes(plain, enveloped, writable)
+    assert changed == {"items": (plain, [{"name": "rule-1"}])}
+    # Equal content behind one-sided envelopes is still no drift.
+    assert _payload_changes(
+        {"items": [1, 2], "meta": {}}, {"items": [1, 2]}, writable
+    ) == {}
+
+
+def test_partial_bulk_edits_are_never_suppressed_as_rollouts() -> None:
+    """A genuine operator bulk edit setting a previously-null field on
+    10+ objects — but nowhere near the whole population — must keep its
+    full attribute detail: only (near-)population-wide additions can be
+    an API rollout."""
+    previous = _graph(*[_vlan(str(i), name=f"v{i}") for i in range(200)])
+    current = _graph(
+        *[
+            _vlan(str(i), name=f"v{i}", newField="set-by-bulk-edit")
+            if i < 12
+            else _vlan(str(i), name=f"v{i}")
+            for i in range(200)
+        ]
+    )
+    diff = diff_graphs(previous, current)
+    assert diff.suppressed_rollouts == ()
+    assert len(diff.modified) == 12
+    assert all("newField" in mod.changed for mod in diff.modified)
+
+
+def test_unknown_population_gates_on_modified_count_alone() -> None:
+    """Direct callers without a population map (unit fixtures) keep the
+    modified-count threshold: unknown population must not disable
+    suppression outright."""
+    diffs = [
+        AssetDiff(VLAN_PATH, ("N_1", str(i)), {"newField": (None, "x")})
+        for i in range(12)
+    ]
+    survivors, suppressed = _suppress_rollouts(diffs, {})
+    assert survivors == []
+    (rollout,) = suppressed
+    assert rollout.asset_count == 12
