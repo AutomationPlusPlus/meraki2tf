@@ -19,12 +19,15 @@ Only standard-library networking (``urllib.request``) is used.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
 import urllib.request
 from pathlib import Path
 from typing import Any
+
+from meraki2tf.fileio import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -136,7 +139,28 @@ def fetch_latest_spec(url: str = SPEC_REMOTE_URL) -> dict[str, Any]:
     return _parse_spec(_download(url), url)
 
 
-def resolve_spec(spec_path: Path | None, remote_url: str = SPEC_REMOTE_URL) -> Path:
+def spec_fingerprint(path: Path) -> tuple[str | None, str]:
+    """``(info.version, sha256 hex digest)`` of a spec file on disk.
+
+    The pair identifies exactly which document a run executed against:
+    DR write actions log it, and snapshot exports stamp it into the
+    snapshot header so a later restore can warn about spec skew.
+    """
+    raw = path.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    try:
+        version = _version_of(_parse_spec(raw.decode("utf-8"), str(path)))
+    except (UnicodeDecodeError, SpecResolutionError):
+        version = None
+    return version, digest
+
+
+def resolve_spec(
+    spec_path: Path | None,
+    remote_url: str = SPEC_REMOTE_URL,
+    *,
+    refresh: bool = True,
+) -> Path:
     """Materialize the OpenAPI spec to run against and return its path.
 
     ``spec_path`` is ``None`` when ``--spec`` was omitted: the tool then
@@ -146,9 +170,34 @@ def resolve_spec(spec_path: Path | None, remote_url: str = SPEC_REMOTE_URL) -> P
     a downgrade) is never overwritten; a version difference against the
     latest release only logs a warning and the run continues on the
     user's file. A missing file is downloaded fresh in either mode.
+
+    ``refresh=False`` is the DR write-action mode (``--restore``,
+    ``--heal``, ``--replay-gaps``): an existing local spec is used
+    exactly as it is — no network check, no chance of the mutable
+    remote tip swapping the dispatch table under a live write run — and
+    the file's version + sha256 are logged so the run's exact spec is
+    on record. Only a completely missing file still downloads (there is
+    nothing local to be deterministic about).
     """
     user_supplied = spec_path is not None
     path = spec_path if spec_path is not None else Path(DEFAULT_SPEC_FILENAME)
+
+    if not refresh and path.exists():
+        version, digest = spec_fingerprint(path)
+        logger.info(
+            "DR write action: using the %s spec %s as-is (version %s, "
+            "sha256 %s); write actions never auto-refresh the spec.",
+            "user-supplied" if user_supplied else "local",
+            path, version or "unknown", digest,
+        )
+        return path
+    if not refresh:
+        logger.warning(
+            "Spec %s does not exist; downloading the latest release once "
+            "(DR write actions otherwise never fetch the spec — keep the "
+            "downloaded file, or pass --spec, for deterministic reruns).",
+            path,
+        )
 
     if path.exists():
         local_version = _local_version(path)
@@ -185,7 +234,9 @@ def resolve_spec(spec_path: Path | None, remote_url: str = SPEC_REMOTE_URL) -> P
                 "object; keeping the local %s.", remote_url, path,
             )
             return path
-        path.write_text(remote_text, encoding="utf-8")
+        # Atomic replace: a crash or full disk mid-write must never
+        # leave a truncated dispatch table where the good spec was.
+        atomic_write_text(path, remote_text)
         logger.info(
             "Refreshed spec %s from GitHub: %s -> %s.",
             path, local_version or "unknown", remote_version or "unknown",
@@ -200,6 +251,6 @@ def resolve_spec(spec_path: Path | None, remote_url: str = SPEC_REMOTE_URL) -> P
             f"Spec from {remote_url} carries no 'paths' object; refusing "
             "to write it."
         )
-    path.write_text(remote_text, encoding="utf-8")
+    atomic_write_text(path, remote_text)
     logger.info("Downloaded latest spec release to %s.", path)
     return path

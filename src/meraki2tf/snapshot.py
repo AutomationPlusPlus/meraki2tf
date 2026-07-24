@@ -102,6 +102,8 @@ def write_snapshot(
     path: Path,
     sanitized: bool = False,
     scope_selectors: tuple[str, ...] | None = None,
+    spec_version: str | None = None,
+    spec_sha256: str | None = None,
 ) -> Path:
     """Write the canonical snapshot for later ``--from-dump`` runs.
 
@@ -125,6 +127,11 @@ def write_snapshot(
     covered networks, so downstream consumers can honor, stamp, or
     refuse it — a partial snapshot must never read as a full-org
     capture (see :mod:`meraki2tf.scope`).
+
+    ``spec_version``/``spec_sha256`` record the OpenAPI document the
+    discovery ran against (optional header fields, ignored by older
+    readers): a later ``--restore``/``--heal`` compares them against
+    its own runtime spec and warns about skew before writing.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     # Write-then-rename: the snapshot is the org's only rebuild source
@@ -145,7 +152,8 @@ def write_snapshot(
     try:
         if _wants_v2(path):
             _write_snapshot_v2(
-                graph, path, tmp, sanitized=sanitized, scope=scope
+                graph, path, tmp, sanitized=sanitized, scope=scope,
+                spec_version=spec_version, spec_sha256=spec_sha256,
             )
         else:
             document = graph_to_snapshot(graph)
@@ -153,6 +161,10 @@ def write_snapshot(
                 document["sanitized"] = True
             if scope is not None:
                 document["scope"] = scope
+            if spec_version is not None:
+                document["specVersion"] = spec_version
+            if spec_sha256 is not None:
+                document["specSha256"] = spec_sha256
             with tmp.open("w", encoding="utf-8") as handle:
                 handle.write(json.dumps(document, indent=2) + "\n")
                 handle.flush()
@@ -214,6 +226,8 @@ def _write_snapshot_v2(
     target: Path,
     sanitized: bool = False,
     scope: dict[str, Any] | None = None,
+    spec_version: str | None = None,
+    spec_sha256: str | None = None,
 ) -> None:
     # Format selection keys on the *final* path's name; bytes land in
     # the temporary file the caller renames into place.
@@ -225,6 +239,10 @@ def _write_snapshot_v2(
         header["sanitized"] = True
     if scope is not None:
         header["scope"] = scope
+    if spec_version is not None:
+        header["specVersion"] = spec_version
+    if spec_sha256 is not None:
+        header["specSha256"] = spec_sha256
     with target.open("wb") as raw:
         if path.name.lower().endswith(".gz"):
             # The gzip layer must be CLOSED before the fsync below: the

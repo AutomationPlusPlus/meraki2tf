@@ -353,3 +353,97 @@ def test_garbled_remote_body_falls_back_to_the_local_spec(
         assert resolve_spec(path) == path
     assert path.read_text(encoding="utf-8") == original
     assert any("using local" in record.message for record in caplog.records)
+
+
+# --------------------------------------- DR (no-refresh) mode & fingerprint
+
+
+def test_no_refresh_uses_the_local_spec_without_any_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """DR write actions run on exactly the spec on disk: no fetch, no
+    clobber, and the version + sha256 they used is on record."""
+    import hashlib
+
+    path = tmp_path / "spec3.json"
+    _write_spec(path, "1.44.0")
+    original = path.read_text(encoding="utf-8")
+
+    def never(url: str) -> str:
+        raise AssertionError("a DR run must never fetch the spec")
+
+    monkeypatch.setattr(spec_resolver, "_download", never)
+    with caplog.at_level(logging.INFO, logger="meraki2tf.spec_resolver"):
+        assert resolve_spec(path, refresh=False) == path
+    assert path.read_text(encoding="utf-8") == original
+    digest = hashlib.sha256(original.encode("utf-8")).hexdigest()
+    record = next(
+        r.getMessage()
+        for r in caplog.records
+        if "never auto-refresh" in r.getMessage()
+    )
+    assert "1.44.0" in record and digest in record
+    assert "user-supplied" in record
+
+
+def test_no_refresh_with_the_tool_owned_default_names_it_local(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_spec(tmp_path / DEFAULT_SPEC_FILENAME, "1.44.0")
+    monkeypatch.setattr(
+        spec_resolver, "_download",
+        lambda url: (_ for _ in ()).throw(AssertionError("no fetch")),
+    )
+    with caplog.at_level(logging.INFO, logger="meraki2tf.spec_resolver"):
+        resolve_spec(None, refresh=False)
+    record = next(
+        r.getMessage()
+        for r in caplog.records
+        if "never auto-refresh" in r.getMessage()
+    )
+    assert "local spec" in record
+
+
+def test_no_refresh_with_a_missing_spec_bootstraps_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Nothing local to be deterministic about: the one case a DR run
+    still downloads, loudly."""
+    path = tmp_path / "spec3.json"
+    requested = _patch_remote(monkeypatch, json.dumps(_spec("1.60.0")))
+    with caplog.at_level(logging.WARNING, logger="meraki2tf.spec_resolver"):
+        assert resolve_spec(path, refresh=False) == path
+    assert requested  # downloaded exactly because nothing existed
+    assert json.loads(path.read_text(encoding="utf-8"))["info"][
+        "version"
+    ] == "1.60.0"
+    assert any(
+        "otherwise never fetch" in r.getMessage() for r in caplog.records
+    )
+
+
+def test_spec_fingerprint_reports_version_and_sha256(tmp_path: Path) -> None:
+    import hashlib
+
+    from meraki2tf.spec_resolver import spec_fingerprint
+
+    path = tmp_path / "spec3.json"
+    _write_spec(path, "1.52.0")
+    version, digest = spec_fingerprint(path)
+    assert version == "1.52.0"
+    assert digest == hashlib.sha256(path.read_bytes()).hexdigest()
+
+    # Unparseable documents still fingerprint (version unknown): the
+    # sha256 identifies the bytes either way.
+    garbled = tmp_path / "garbled.json"
+    garbled.write_bytes(b"\xff\xfenot-json")
+    g_version, g_digest = spec_fingerprint(garbled)
+    assert g_version is None
+    assert g_digest == hashlib.sha256(garbled.read_bytes()).hexdigest()

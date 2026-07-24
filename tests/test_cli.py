@@ -2016,6 +2016,79 @@ def _restore_dump(tmp_path: Path) -> Path:
 def test_restore_requires_snapshot_and_target(spec_file: Path) -> None:
     with pytest.raises(SystemExit):
         main(["--spec", str(spec_file), "--restore"])
+
+
+def test_dr_actions_never_fetch_the_spec(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A DR write action runs on exactly the spec on disk — the mutable
+    remote tip must never swap the dispatch table under a write run."""
+
+    def never(url: str) -> str:
+        raise AssertionError("a DR action must never fetch the spec")
+
+    monkeypatch.setattr(spec_resolver, "_download", never)
+    dump = _restore_dump(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--restore", "--from-dump", str(dump),
+         "--target-org", "org-999", "--workdir", str(tmp_path / "ws")]
+    )
+    assert exit_code == 0
+    console = capsys.readouterr().err
+    assert "never auto-refresh the spec" in console
+
+
+def test_warn_snapshot_spec_skew(
+    spec_file: Path,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from meraki2tf.cli import _warn_snapshot_spec_skew
+    from meraki2tf.spec_resolver import spec_fingerprint
+
+    def snapshot_with(**extra: Any) -> StaticJsonDataProvider:
+        doc = {
+            "organizationId": "123456",
+            "networks": [], "devices": [], "features": [],
+            **extra,
+        }
+        path = tmp_path / f"snap-{len(extra)}-{extra.get('specSha256', 'x')[:6]}.json"
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        return StaticJsonDataProvider(path)
+
+    version, digest = spec_fingerprint(spec_file)
+
+    with caplog.at_level(logging.WARNING, logger="meraki2tf.cli"):
+        # Version skew warns.
+        _warn_snapshot_spec_skew(
+            snapshot_with(specVersion="0.9", specSha256="ff" * 32),
+            spec_file, "--restore",
+        )
+    assert "may classify assets differently" in caplog.text
+    caplog.clear()
+
+    with caplog.at_level(logging.WARNING, logger="meraki2tf.cli"):
+        # Same version, different bytes (mutable master tip) warns too.
+        _warn_snapshot_spec_skew(
+            snapshot_with(specSha256="ee" * 32), spec_file, "--heal"
+        )
+    assert "may classify assets differently" in caplog.text
+    caplog.clear()
+
+    with caplog.at_level(logging.WARNING, logger="meraki2tf.cli"):
+        # Matching fingerprint: silence.
+        stamped = {"specSha256": digest}
+        if version is not None:
+            stamped["specVersion"] = version
+        _warn_snapshot_spec_skew(
+            snapshot_with(**stamped), spec_file, "--restore"
+        )
+        # Pre-stamping snapshots: nothing to compare, silence.
+        _warn_snapshot_spec_skew(snapshot_with(), spec_file, "--restore")
+    assert "may classify assets differently" not in caplog.text
     with pytest.raises(SystemExit):
         main(
             ["--spec", str(spec_file), "--restore",

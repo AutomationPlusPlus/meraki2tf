@@ -142,6 +142,8 @@ def _load_snapshot_document(path: "Path") -> Any:
                 "organizationId": head.get("organizationId"),
                 "sanitized": bool(head.get("sanitized")),
                 "scope": head.get("scope"),
+                "specVersion": head.get("specVersion"),
+                "specSha256": head.get("specSha256"),
                 "networks": networks,
                 "devices": devices,
                 "features": features,
@@ -236,6 +238,20 @@ class StaticJsonDataProvider(MerakiDataProvider):
                 f"Snapshot {self._path} carries a malformed 'scope' "
                 f"header: {exc}"
             ) from exc
+
+    @property
+    def snapshot_spec_version(self) -> str | None:
+        """``info.version`` of the spec the export ran against, if the
+        snapshot recorded it (older snapshots did not — ``None``)."""
+        value = self._document.get("specVersion")
+        return str(value) if value else None
+
+    @property
+    def snapshot_spec_sha256(self) -> str | None:
+        """sha256 of the spec document the export ran against, if
+        recorded (older snapshots: ``None``)."""
+        value = self._document.get("specSha256")
+        return str(value) if value else None
 
     @property
     def recorded_organization_ids(self) -> tuple[str, ...]:
