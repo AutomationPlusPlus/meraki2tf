@@ -56,6 +56,7 @@ def build_manifest(
     deletions_pending: tuple[str, ...] = (),
     unmanaged_secret_attributes: dict[str, tuple[str, ...]] | None = None,
     restore_via: dict[tuple[str, tuple[str, ...]], str] | None = None,
+    scope_networks: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """Assemble the coverage manifest for one completed run.
 
@@ -66,6 +67,12 @@ def build_manifest(
     (``create``/``configure``/``claim`` or an ``unrestorable: reason``)
     so the manifest answers both questions: will Terraform import it,
     and will the API rebuild it.
+
+    ``scope_networks`` marks a **partial** run (``--only`` selective
+    backup, or a partial ``--from-dump`` input): the manifest then
+    describes only the scoped networks, and both artifacts say so
+    prominently — a plausible-looking full-coverage manifest that
+    silently covered one network would violate Cardinal Rule 2.
     """
     restore_lookup = restore_via or {}
     objects: list[dict[str, Any]] = []
@@ -91,7 +98,7 @@ def build_manifest(
         objects.append(record)
     total = len(objects)
     covered = len(captured)
-    return {
+    manifest: dict[str, Any] = {
         "organization_id": organization_id,
         "totals": {
             "discovered": total,
@@ -113,6 +120,12 @@ def build_manifest(
             )
         },
     }
+    if scope_networks is not None:
+        manifest["scope"] = {
+            "partial": True,
+            "networks": sorted(scope_networks),
+        }
+    return manifest
 
 
 def write_manifest(manifest: dict[str, Any], workdir: Path) -> tuple[Path, Path]:
@@ -138,6 +151,18 @@ def _render_summary(manifest: dict[str, Any]) -> str:
     totals = manifest["totals"]
     lines = [
         f"meraki2tf coverage report — organization {manifest['organization_id']}",
+    ]
+    scope = manifest.get("scope")
+    if scope:
+        networks = scope.get("networks", [])
+        lines += [
+            "",
+            "*** PARTIAL RUN — this manifest covers ONLY "
+            f"{len(networks)} selected network(s); it does NOT "
+            "describe the organization's full coverage. ***",
+            f"Scoped networks: {', '.join(networks) or '<none>'}",
+        ]
+    lines += [
         "",
         f"Discovered objects : {totals['discovered']}",
         f"  imported         : {totals['imported']} (tracked in Terraform state)",

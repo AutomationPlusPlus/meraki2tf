@@ -70,6 +70,16 @@ class SanitizedBaselineError(ValueError):
     """
 
 
+class PartialBaselineError(ValueError):
+    """The drift baseline is a partial (``--only``) snapshot.
+
+    A partial baseline covers only its scoped networks, so every asset
+    outside the scope would falsely register as **added** — a phantom
+    drift storm that buries real drift. Drift baselines must be
+    full-organization snapshots; selective backups are for ``--heal``.
+    """
+
+
 @dataclass(frozen=True)
 class AssetDiff:
     """One modified asset with its attribute-level changes."""
@@ -201,7 +211,8 @@ def baseline_drift(
 
     Refuses a sanitized baseline outright
     (:class:`SanitizedBaselineError`): diffing pseudonyms against real
-    identifiers is never meaningful.
+    identifiers is never meaningful. A partial (``--only``) baseline is
+    refused the same way (:class:`PartialBaselineError`).
     """
     from meraki2tf.providers.dump import StaticJsonDataProvider
 
@@ -213,6 +224,14 @@ def baseline_drift(
             "pseudonyms, so every asset would falsely register as "
             "added/removed. Point --drift-baseline at the unsanitized "
             "snapshot."
+        )
+    scope = provider.snapshot_scope
+    if scope is not None:
+        raise PartialBaselineError(
+            f"Drift baseline {baseline_path} is a PARTIAL export "
+            f"(--only, {len(scope.network_ids)} network(s)): every asset "
+            "outside its scope would falsely register as added. Point "
+            "--drift-baseline at a full-organization snapshot."
         )
     baseline = provider.fetch_network_graph(graph.organization_id)
     return diff_graphs(baseline, graph, parser)

@@ -101,6 +101,11 @@ from meraki2tf.providers import (
     StaticJsonDataProvider,
 )
 from meraki2tf.sanitizer import load_or_create_salt, sanitize_graph
+from meraki2tf.scope import (
+    LiveNetworkScope,
+    ScopeFilterError,
+    parse_network_selectors,
+)
 from meraki2tf.snapshot import write_snapshot
 from meraki2tf.spec_resolver import resolve_spec
 from meraki2tf.terraform_runner import (
@@ -355,13 +360,17 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="[TYPE:]PATTERN",
         default=None,
         help=(
-            "Selective heal: restrict --heal to the missing objects "
-            "matching a case-insensitive glob over their name or ID, "
-            "optionally type-prefixed (e.g. --only 'network:Branch-07', "
-            "--only 'ssid:Guest*'). Repeatable (union). A matched "
-            "container selects its whole missing subtree; missing "
-            "objects the selection depends on are auto-included. A "
-            "selector matching nothing is an error."
+            "Selective scope, repeatable (union); a selector matching "
+            "nothing is an error. With --heal: restrict the heal to the "
+            "missing objects matching a case-insensitive glob over "
+            "their name or ID, optionally type-prefixed (e.g. --only "
+            "'network:Branch-07', --only 'ssid:Guest*'); a matched "
+            "container selects its whole missing subtree, and missing "
+            "objects the selection depends on are auto-included. With "
+            "--dump-to: selective backup — restrict discovery to the "
+            "matching networks (network:PATTERN selectors only) and "
+            "write a partial snapshot usable by --heal but refused by "
+            "--restore, --replay-gaps, and --drift-baseline."
         ),
     )
     actions.add_argument(
@@ -607,6 +616,14 @@ def build_dispatcher(config: RuntimeConfig) -> AlertDispatcher:
 def build_provider(config: RuntimeConfig, parser: OpenApiParser) -> MerakiDataProvider:
     if config.dump_path is not None:
         return StaticJsonDataProvider(config.dump_path, parser=parser)
+    if config.dump_to is not None and config.only:
+        # Selective backup: restrict live discovery to the selected
+        # networks (org-level surfaces stay in scope). Export-only —
+        # heal builds its own scoped provider from the snapshot header.
+        return LiveApiDataProvider(
+            parser=parser,
+            network_scope=LiveNetworkScope(selectors=config.only),
+        )
     return LiveApiDataProvider(parser=parser)
 
 
@@ -632,6 +649,7 @@ def _export_coverage(
     parser: OpenApiParser,
     dispatcher: AlertDispatcher,
     drift_was_detected: bool,
+    scope_networks: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """Coverage manifest + RUN_SUCCESS for a snapshot-export run.
 
@@ -670,6 +688,7 @@ def _export_coverage(
         state_addresses=frozenset(),
         unmanaged_secret_attributes=unmanaged_secrets,
         restore_via=restore_verdicts(plan_restore(graph, parser)),
+        scope_networks=scope_networks,
     )
     config.workdir.mkdir(parents=True, exist_ok=True)
     write_manifest(manifest, config.workdir)
@@ -684,6 +703,7 @@ def _export_coverage(
         unsupported=report.unsupported,
         unmanaged_secret_attributes=unmanaged_secrets,
         parser=parser,
+        scope_networks=scope_networks,
     )
     logger.info(
         "Snapshot export complete; dispatching RUN_SUCCESS notification. "
@@ -702,6 +722,7 @@ def _export_coverage(
             comparison_performed=False,
             coverage_percent=float(manifest["coverage_percent"]),
             unmanaged_secret_attributes=unmanaged_secrets,
+            partial_scope=scope_networks or (),
         )
     )
     return manifest
@@ -718,6 +739,14 @@ def _export_snapshot(
     with provider as source:
         graph = source.fetch_network_graph(config.org_id)
     dispatcher.organization_id = graph.organization_id
+    if config.only:
+        logger.warning(
+            "PARTIAL export: --only scoped discovery to %d network(s); "
+            "the snapshot is a selective backup (usable by --heal), NOT "
+            "a DR snapshot of the organization — --restore, "
+            "--replay-gaps, and --drift-baseline will refuse it.",
+            len(graph.networks),
+        )
     drift_was_detected = False
     if config.drift_baseline is not None:
         from meraki2tf.snapshot_diff import baseline_drift, render_diff
@@ -756,9 +785,23 @@ def _export_snapshot(
             "written owner-only (0600) — store it like a password file, and "
             "use --sanitize for any copy that leaves the DR vault."
         )
-    write_snapshot(graph, config.dump_to, sanitized=config.sanitize)
+    write_snapshot(
+        graph,
+        config.dump_to,
+        sanitized=config.sanitize,
+        scope_selectors=tuple(config.only) if config.only else None,
+    )
     manifest = _export_coverage(
-        raw_graph, config, parser, dispatcher, drift_was_detected
+        raw_graph,
+        config,
+        parser,
+        dispatcher,
+        drift_was_detected,
+        scope_networks=(
+            tuple(n.network_id for n in raw_graph.networks)
+            if config.only
+            else None
+        ),
     )
     if config.fail_on_gaps:
         return _coverage_gap_exit(int(manifest["totals"]["unsupported"]))
@@ -998,6 +1041,19 @@ def _restore(config: RuntimeConfig) -> int:
             len(recorded),
         )
         return 2
+    restore_scope = provider.snapshot_scope
+    if restore_scope is not None:
+        # A partial snapshot cannot rebuild an organization: objects
+        # outside its scope were never captured, so references to them
+        # would carry dead source-org IDs into the target. Refused for
+        # preview and confirm alike.
+        logger.critical(
+            "This snapshot is a PARTIAL export (--only, %d network(s)); "
+            "--restore rebuilds a whole organization and requires a "
+            "full snapshot. Selective backups are for same-org --heal.",
+            len(restore_scope.network_ids),
+        )
+        return 2
     # The interlock must refuse every recorded source org, not just the
     # first (which is all graph.organization_id can carry).
     source_org_ids = recorded | {graph.organization_id}
@@ -1227,8 +1283,28 @@ def _heal(config: RuntimeConfig) -> int:
             "organization, use --restore --target-org."
         )
         return 2
+    heal_scope = provider.snapshot_scope
+    live_scope: LiveNetworkScope | None = None
+    if heal_scope is not None:
+        # A partial (selective-backup) snapshot heals only its scope, so
+        # live discovery narrows to the same networks — the heal preview
+        # then costs what the scoped export did, not a full-org sweep.
+        # plan_heal needs no change: both universes cover the scoped
+        # networks plus org-level surfaces, and missing = snapshot-not-
+        # in-live stays correct. The ID form never errors on zero
+        # matches (a fully-deleted scoped network is the maximal heal).
+        logger.info(
+            "Snapshot is a PARTIAL export scoped to %d network(s); live "
+            "discovery and the heal plan cover only that scope.",
+            len(heal_scope.network_ids),
+        )
+        live_scope = LiveNetworkScope(
+            network_ids=frozenset(heal_scope.network_ids)
+        )
     try:
-        with LiveApiDataProvider(parser=spec_parser) as live_source:
+        with LiveApiDataProvider(
+            parser=spec_parser, network_scope=live_scope
+        ) as live_source:
             live = live_source.fetch_network_graph(config.org_id)
     except Exception as exc:
         logger.critical(
@@ -1293,11 +1369,17 @@ def _heal(config: RuntimeConfig) -> int:
         rerun = "--heal " + "".join(
             f"--only '{value}' " for value in config.only or ()
         ) + "--confirm"
+        scope_note = (
+            f" (partial snapshot: scope covers "
+            f"{len(heal_scope.network_ids)} network(s))"
+            if heal_scope is not None
+            else ""
+        )
         logger.warning(
             "Preview only — nothing was written to Meraki. Re-run with "
             "'%s' to recreate the %d missing object(s) in "
-            "organization %s.", rerun, len(plan.missing.actions),
-            config.org_id,
+            "organization %s%s.", rerun, len(plan.missing.actions),
+            config.org_id, scope_note,
         )
         return 0
     try:
@@ -1335,10 +1417,16 @@ def _heal(config: RuntimeConfig) -> int:
         logger.warning("Heal skipped %s: %s", entry["target"], entry["reason"])
     logger.info(
         "Heal of %s complete: %d recreated, %d failed, %d skipped, "
-        "%d surviving object(s) untouched (journal: %s).",
+        "%d surviving object(s) untouched (journal: %s)%s.",
         config.org_id, len(result.executed), len(result.failed),
         len(result.skipped), plan.surviving_count,
         config.workdir / "heal-journal.jsonl",
+        (
+            f" (partial snapshot: scope covers "
+            f"{len(heal_scope.network_ids)} network(s))"
+            if heal_scope is not None
+            else ""
+        ),
     )
     dispatcher.dispatch(
         heal_executed(
@@ -1348,6 +1436,11 @@ def _heal(config: RuntimeConfig) -> int:
             failed=result.failed,
             skipped=result.skipped,
             only=config.only,
+            snapshot_scope=(
+                tuple(heal_scope.network_ids)
+                if heal_scope is not None
+                else ()
+            ),
         )
     )
     if result.failed:
@@ -1374,6 +1467,18 @@ def _replay_gaps(config: RuntimeConfig) -> int:
     except Exception as exc:
         logger.critical("Gap replay could not load the snapshot: %s", exc)
         return 1
+    replay_scope = provider.snapshot_scope
+    if replay_scope is not None:
+        # Gap replay is the post-restore full-org step; replaying a
+        # subset would report "gaps replayed" when most were never
+        # captured. Refused for preview and confirm alike.
+        logger.critical(
+            "This snapshot is a PARTIAL export (--only, %d network(s)); "
+            "--replay-gaps replays the whole organization's gap surface "
+            "and requires a full snapshot.",
+            len(replay_scope.network_ids),
+        )
+        return 2
     if provider.snapshot_sanitized:
         logger.warning(
             "This snapshot is SANITIZED: secret values are redaction "
@@ -1657,8 +1762,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         arg_parser.error("--serial-map is only valid together with --restore.")
     if config.skip_claims and not config.restore:
         arg_parser.error("--skip-claims is only valid together with --restore.")
-    if config.only and not config.heal:
-        arg_parser.error("--only is only valid together with --heal.")
+    if config.only and not (config.heal or config.dump_to is not None):
+        arg_parser.error(
+            "--only is only valid together with --heal (selective "
+            "recovery) or --dump-to (selective backup)."
+        )
+    if config.only and config.dump_to is not None and not config.heal:
+        # (--heal + --dump-to is itself refused in the heal branch.)
+        if config.dump_path is not None:
+            arg_parser.error(
+                "--only with --dump-to scopes LIVE discovery; re-slicing "
+                "an existing --from-dump snapshot is not supported. "
+                "Export the scoped snapshot directly from the live "
+                "organization."
+            )
+        if config.drift_baseline is not None:
+            arg_parser.error(
+                "--only cannot be combined with --drift-baseline: a "
+                "scoped discovery diffed against a full baseline would "
+                "register every out-of-scope network as removed. Keep "
+                "the drift chain full-organization."
+            )
+        try:
+            parse_network_selectors(config.only)
+        except ScopeFilterError as exc:
+            arg_parser.error(str(exc))
     if config.wipe_org_name and not config.wipe_org:
         arg_parser.error(
             "--wipe-org-name is only valid together with --wipe-org."
@@ -2059,6 +2187,13 @@ def _run_org_pipeline(
                 return _export_snapshot(
                     provider, config, spec_parser, dispatcher
                 )
+            except ScopeFilterError as exc:
+                # Operator input error (a --only selector matched no
+                # network), not a processing fault: fail loudly with
+                # the available networks, no alert — mirroring the
+                # HealFilterError handling in _heal.
+                logger.critical("%s", exc)
+                return 2
             except Exception as exc:
                 logger.critical("Snapshot export failed: %s", exc)
                 dispatcher.dispatch(
@@ -2067,6 +2202,31 @@ def _run_org_pipeline(
                     )
                 )
                 return 1
+        partial_scope = (
+            provider.snapshot_scope
+            if isinstance(provider, StaticJsonDataProvider)
+            else None
+        )
+        if partial_scope is not None:
+            if config.sync or config.confirm_deletions:
+                # A partial snapshot fed to state materialization or
+                # deletion confirmation would present every
+                # out-of-scope resource as deleted — poisoning the DR
+                # kit and state with mass phantom removals.
+                logger.critical(
+                    "The --from-dump snapshot is a PARTIAL export "
+                    "(--only, %d network(s)); --sync and "
+                    "--confirm-deletions require a full-organization "
+                    "snapshot.",
+                    len(partial_scope.network_ids),
+                )
+                return 2
+            logger.warning(
+                "The --from-dump snapshot is a PARTIAL export (--only, "
+                "%d network(s)): the kit and coverage manifest describe "
+                "only that scope, not the organization.",
+                len(partial_scope.network_ids),
+            )
         runner = TerraformRunner(
             config.workdir,
             executable=config.terraform_bin,
