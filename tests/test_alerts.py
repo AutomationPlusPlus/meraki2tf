@@ -1070,3 +1070,28 @@ def test_heal_executed_names_partial_snapshot_scope() -> None:
     )
     assert "PARTIAL" not in unscoped.summary
     assert "snapshot_scope" not in unscoped.to_payload()["details"]
+
+
+def test_heal_executed_reports_verified_alive_skips_distinctly() -> None:
+    from meraki2tf.alerts import heal_executed
+
+    event = heal_executed(
+        organization_id="org-123",
+        surviving=5,
+        executed=[],
+        failed=[],
+        skipped=[{"target": "a::1", "reason": "alive at execution time"}],
+        verified_alive=1,
+    )
+    assert "verified alive at execution time" in event.summary
+    assert event.to_payload()["details"]["verified_alive_skips"] == 1
+
+    plain = heal_executed(
+        organization_id="org-123",
+        surviving=5,
+        executed=[],
+        failed=[],
+        skipped=[],
+    )
+    assert "verified alive" not in plain.summary
+    assert "verified_alive_skips" not in plain.to_payload()["details"]

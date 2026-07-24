@@ -1251,6 +1251,7 @@ def _heal(config: RuntimeConfig) -> int:
     assert config.org_id  # guarded by the caller
     from meraki2tf.healer import HealFilterError, filter_heal_plan, plan_heal
     from meraki2tf.restorer import (
+        HEAL_VERIFIED_ALIVE_REASON,
         OrgRestorer,
         RestoreJournal,
         RestoreJournalMismatchError,
@@ -1451,6 +1452,14 @@ def _heal(config: RuntimeConfig) -> int:
                 tuple(heal_scope.network_ids)
                 if heal_scope is not None
                 else ()
+            ),
+            # Distinct reporting for pre-write verification skips: a
+            # nonzero count means live discovery undercounted survivors
+            # and the additive-only guard caught it at write time.
+            verified_alive=sum(
+                1
+                for entry in result.skipped
+                if entry["reason"] == HEAL_VERIFIED_ALIVE_REASON
             ),
         )
     )

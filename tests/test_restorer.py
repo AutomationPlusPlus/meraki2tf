@@ -656,11 +656,18 @@ def test_executor_resumes_from_the_journal(tmp_path: Path) -> None:
     first = restorer.execute(graph, plan)
     assert len(first.executed) == 2  # network + device claim
 
-    # Fresh executor, same journal: everything already restored.
+    # Fresh executor, same journal: everything still present in the
+    # target (the liveness probe finds the restored network), so the
+    # resume skips every completed action without writing anything.
     from meraki2tf.restorer import OrgRestorer
 
     calls2: list = []
-    section = _RecordingSection(calls2)
+    section = _RecordingSection(
+        calls2,
+        responses={
+            "getOrganizationNetworks": [{"id": "L_NEW", "name": "HQ"}],
+        },
+    )
     again = OrgRestorer(
         "org-TARGET", RestoreJournal(tmp_path / "journal.jsonl")
     )
@@ -669,7 +676,8 @@ def test_executor_resumes_from_the_journal(tmp_path: Path) -> None:
     )
     second = again.execute(graph, plan)
     assert second.executed == ()
-    assert calls2 == []
+    # Probe reads only — no write (create/claim/update) was dispatched.
+    assert {c[0] for c in calls2} <= {"getOrganizationNetworks"}
     assert all("already restored" in e["reason"] for e in second.skipped)
 
 
@@ -4196,13 +4204,22 @@ def test_resume_recovers_mapping_for_done_but_unmapped_create(
     ]
     journal_path.write_text("\n".join(lines) + "\n")
 
-    restorer2, calls2 = _executor(tmp_path)
+    restorer2, calls2 = _executor(
+        tmp_path,
+        responses={
+            "getOrganizationNetworks": [{"id": "L_NEW", "name": "HQ"}],
+            "getNetworkGroupPolicies": [{"id": "900", "name": "kiosk"}],
+            "getNetworkWirelessSsid": {"number": 0, "name": "Corp"},
+        },
+    )
     restorer2._journal = RestoreJournal(journal_path)
     result = restorer2.execute(graph, plan)
 
     assert result.failed == ()
     # The resume looked the existing policy up by name…
     assert any(c[0] == "getNetworkGroupPolicies" for c in calls2)
+    # …recovered its mapping into the journal…
+    assert RestoreJournal(journal_path).id_map.get("100") == "900"
     # …and no object was re-created or re-configured.
     assert not any(c[0] == "createNetworkGroupPolicy" for c in calls2)
 
@@ -4392,7 +4409,7 @@ def test_additive_only_adoption_never_aligns_surviving_content(
             self._calls.append(("createNetworkApplianceVlan", args, kwargs))
             raise _conflict_error("Vlan has already been taken")
 
-    section = Section(calls)
+    section = Section(calls, responses={"getOrganizationNetworks": []})
     restorer = OrgRestorer(
         "org-TARGET", RestoreJournal(tmp_path / "j.jsonl"),
         skip_claims=True, additive_only=True,
@@ -4465,7 +4482,7 @@ def test_additive_only_adoption_log_never_claims_alignment(
             self._calls.append(("createNetworkApplianceVlan", args, kwargs))
             raise _conflict_error("Vlan has already been taken")
 
-    section = Section(calls)
+    section = Section(calls, responses={"getOrganizationNetworks": []})
     restorer = OrgRestorer(
         "org-TARGET", RestoreJournal(tmp_path / "j.jsonl"),
         skip_claims=True, additive_only=True,
@@ -5470,3 +5487,679 @@ def test_adoption_lookup_refuses_non_read_only_methods(
         )
     assert listing is None
     assert "not verifiably read-only" in caplog.text
+
+
+# ------------------------------------ liveness probes & second incidents
+
+
+def _identity_preset() -> tuple:
+    """Heal-style identity mapping for the surviving network N_1."""
+    return (("network", "N_1", "N_1", ()),)
+
+
+def _heal_executor(  # noqa: ANN201
+    tmp_path: Path,
+    section,  # noqa: ANN001
+    journal_name: str = "heal.jsonl",
+    preset: tuple | None = None,
+):
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    restorer = OrgRestorer(
+        "org-123", RestoreJournal(tmp_path / journal_name),
+        preset_mappings=(
+            _identity_preset() if preset is None else preset
+        ),
+        additive_only=True,
+    )
+    restorer._client = SimpleNamespace(
+        organizations=section, networks=section, wireless=section
+    )
+    return restorer
+
+
+def _snmp_plan(tmp_path: Path):  # noqa: ANN201
+    from meraki2tf.restorer import RestorePlan
+
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(SNMP_PATH, ("N_1",), {"access": "none"})
+    )
+    full = plan_restore(graph, parser)
+    snmp = next(a for a in full.actions if a.api_path == SNMP_PATH)
+    return graph, snmp, RestorePlan(actions=(snmp,))
+
+
+def test_heal_pre_write_verification_skips_alive_settings(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Fix for the additive-only break: a silent discovery gap makes a
+    live singleton classify as 'missing'; the pre-write read finds it
+    alive and heal must skip instead of PUTting the stale snapshot."""
+    from meraki2tf.restorer import HEAL_VERIFIED_ALIVE_REASON
+
+    graph, snmp, plan = _snmp_plan(tmp_path)
+    calls: list = []
+    section = _RecordingSection(
+        calls, responses={"getNetworkSnmp": {"access": "full"}}
+    )
+    restorer = _heal_executor(tmp_path, section)
+    with caplog.at_level(logging.WARNING, logger="meraki2tf.restorer"):
+        result = restorer.execute(graph, plan)
+    assert result.executed == () and result.failed == ()
+    assert result.skipped == (
+        {"target": snmp.key, "reason": HEAL_VERIFIED_ALIVE_REASON},
+    )
+    assert not any(c[0] == "updateNetworkSnmp" for c in calls)
+    assert "verified ALIVE" in caplog.text
+
+
+def test_heal_pre_write_verification_uncertain_is_not_a_license(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    from meraki2tf.restorer import HEAL_VERIFY_UNCERTAIN_PREFIX
+
+    graph, snmp, plan = _snmp_plan(tmp_path)
+    calls: list = []
+
+    class Section(_RecordingSection):
+        def getNetworkSnmp(self, *args, **kwargs) -> dict:
+            raise RuntimeError("read failed mid-probe")
+
+    restorer = _heal_executor(tmp_path, Section(calls))
+    with caplog.at_level(logging.WARNING, logger="meraki2tf.restorer"):
+        result = restorer.execute(graph, plan)
+    assert result.executed == () and result.failed == ()
+    ((entry,),) = (result.skipped,)
+    assert entry["reason"].startswith(HEAL_VERIFY_UNCERTAIN_PREFIX)
+    assert not any(c[0] == "updateNetworkSnmp" for c in calls)
+    assert "not a license to write" in caplog.text
+
+
+def test_heal_refuses_unverifiable_surfaces(tmp_path: Path) -> None:
+    """No usable GET → additive-only cannot be proven → the action is
+    refused and reported, never written blind."""
+    from meraki2tf.restorer import RestorePlan
+
+    spec = {
+        "openapi": "3.0.0", "info": {"title": "t", "version": "1"},
+        "paths": {
+            "/organizations/{organizationId}/networks": {
+                "get": _op("getOrganizationNetworks", "organizations"),
+                "post": _op("createOrganizationNetwork", "organizations"),
+            },
+            "/networks/{networkId}/devices/claim": {
+                "post": _op("claimNetworkDevices", "networks"),
+            },
+            SNMP_PATH: {
+                "put": _op("updateNetworkSnmp", "networks"),
+            },
+        },
+    }
+    path = tmp_path / "no-get-spec.json"
+    path.write_text(json.dumps(spec), encoding="utf-8")
+    parser = OpenApiParser(path)
+    graph = _graph(
+        FeatureConfiguration(SNMP_PATH, ("N_1",), {"access": "none"})
+    )
+    snmp = next(
+        a
+        for a in plan_restore(graph, parser).actions
+        if a.api_path == SNMP_PATH
+    )
+    calls: list = []
+    restorer = _heal_executor(tmp_path, _RecordingSection(calls))
+    result = restorer.execute(graph, RestorePlan(actions=(snmp,)))
+    assert result.executed == ()
+    ((key, reason),) = result.failed
+    assert key == snmp.key
+    assert "additive-only heal refuses" in reason
+    assert not any(c[0] == "updateNetworkSnmp" for c in calls)
+
+
+def test_heal_refuses_non_read_only_probe_methods(tmp_path: Path) -> None:
+    """The liveness probe never calls a method that is not verifiably a
+    read — the surface is refused as unverifiable instead."""
+    from types import SimpleNamespace
+
+    graph, snmp, plan = _snmp_plan(tmp_path)
+    calls: list = []
+    section = _RecordingSection(calls)
+    restorer = _heal_executor(tmp_path, section)
+    restorer._client = SimpleNamespace(
+        organizations=section,
+        networks=SimpleNamespace(
+            getNetworkSnmp=_as_meraki_method(_mislabeled_delete),
+        ),
+    )
+    result = restorer.execute(graph, plan)
+    ((key, reason),) = result.failed
+    assert "additive-only heal refuses" in reason
+
+
+def test_heal_unverifiable_claim_poisons_its_children(
+    tmp_path: Path,
+) -> None:
+    """An unverifiable create/claim fails AND holds its subtree back,
+    exactly like any other failed parent."""
+    parser = _restore_spec(tmp_path)  # no devices GET: claims unverifiable
+    graph = _graph(
+        FeatureConfiguration(
+            PORT_ITEM, ("Q2AB-CDEF-GHIJ", "1"), {"portId": "1", "name": "up"}
+        )
+    )
+    full = plan_restore(graph, parser)
+    from meraki2tf.restorer import RestorePlan
+
+    actions = tuple(a for a in full.actions if a.wave != WAVE_NETWORKS)
+    calls: list = []
+    restorer = _heal_executor(tmp_path, _RecordingSection(calls))
+    result = restorer.execute(graph, RestorePlan(actions=actions))
+    ((key, reason),) = result.failed
+    assert "devices/claim" in key and "additive-only heal refuses" in reason
+    assert any(
+        "parent object Q2AB-CDEF-GHIJ failed" in entry["reason"]
+        for entry in result.skipped
+    )
+    assert not any(c[0] == "updateDeviceSwitchPort" for c in calls)
+
+
+def test_heal_alive_network_create_adopts_its_identity_mapping(
+    tmp_path: Path,
+) -> None:
+    """A 'missing' network the probe finds alive: skipped, identity
+    mapping adopted, and its children heal into the survivor."""
+    from meraki2tf.restorer import HEAL_VERIFIED_ALIVE_REASON, RestoreJournal
+
+    class Missing404(Exception):
+        status = 404
+
+    calls: list = []
+
+    class Section(_RecordingSection):
+        def getNetworkWirelessSsid(self, *args, **kwargs) -> dict:
+            raise Missing404("404 not found")
+
+    parser = _restore_spec(tmp_path)
+    graph = NetworkGraph(
+        organization_id="org-123",
+        networks=(
+            MerakiNetwork.from_payload(
+                {"id": "N_1", "organizationId": "org-123", "name": "HQ",
+                 "productTypes": ["wireless"]}
+            ),
+        ),
+        devices=(),
+        features=(
+            FeatureConfiguration(
+                SSID_ITEM, ("N_1", "0"), {"number": 0, "name": "Corp"}
+            ),
+        ),
+    )
+    plan = plan_restore(graph, parser)
+    section = Section(
+        calls,
+        responses={
+            "getOrganizationNetworks": [{"id": "N_1", "name": "HQ"}],
+        },
+    )
+    restorer = _heal_executor(tmp_path, section, preset=())
+    result = restorer.execute(graph, plan)
+    assert result.failed == ()
+    assert any(
+        e["reason"] == HEAL_VERIFIED_ALIVE_REASON for e in result.skipped
+    )
+    assert not any(c[0] == "createOrganizationNetwork" for c in calls)
+    ssid = next(c for c in calls if c[0] == "updateNetworkWirelessSsid")
+    assert ssid[1] == ("N_1", "0")
+    assert RestoreJournal(tmp_path / "heal.jsonl").id_map.get("N_1") == "N_1"
+
+
+def test_heal_second_incident_reexecutes_despite_completed_journal(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Healed Monday, deleted again Friday: Friday's heal must re-write
+    the object instead of reporting 'already restored (journal)'."""
+    from meraki2tf.restorer import RestoreJournal
+
+    graph, snmp, plan = _snmp_plan(tmp_path)
+    journal = RestoreJournal(tmp_path / "heal.jsonl")
+    journal.bind(target="org-123", source="org-123")
+    journal.record_done(snmp.key)  # Monday's heal
+
+    class Missing404(Exception):
+        status = 404
+
+    calls: list = []
+
+    class Section(_RecordingSection):
+        def getNetworkSnmp(self, *args, **kwargs) -> dict:
+            self._calls.append(("getNetworkSnmp", args, kwargs))
+            raise Missing404("404 not found")
+
+    restorer = _heal_executor(tmp_path, Section(calls))
+    with caplog.at_level(logging.WARNING, logger="meraki2tf.restorer"):
+        result = restorer.execute(graph, plan)
+    assert result.executed == (snmp.key,)
+    assert any(c[0] == "updateNetworkSnmp" for c in calls)
+    assert "re-executing (new incident)" in caplog.text
+    # The 404 answer was cached: the journal probe and the pre-write
+    # verification shared one paced read.
+    assert len([c for c in calls if c[0] == "getNetworkSnmp"]) == 1
+
+
+def test_heal_journaled_object_still_present_keeps_the_resume_skip(
+    tmp_path: Path,
+) -> None:
+    from meraki2tf.restorer import RestoreJournal
+
+    graph, snmp, plan = _snmp_plan(tmp_path)
+    journal = RestoreJournal(tmp_path / "heal.jsonl")
+    journal.bind(target="org-123", source="org-123")
+    journal.record_done(snmp.key)
+    calls: list = []
+    section = _RecordingSection(
+        calls, responses={"getNetworkSnmp": {"access": "none"}}
+    )
+    restorer = _heal_executor(tmp_path, section)
+    result = restorer.execute(graph, plan)
+    assert result.executed == ()
+    assert all("already restored" in e["reason"] for e in result.skipped)
+    assert not any(c[0] == "updateNetworkSnmp" for c in calls)
+
+
+def test_heal_alive_create_adopts_the_survivor_mapping(
+    tmp_path: Path,
+) -> None:
+    """A create the probe finds alive is skipped, but its mapping is
+    recorded so children rewire to the survivor."""
+    from meraki2tf.restorer import (
+        HEAL_VERIFIED_ALIVE_REASON,
+        RestoreJournal,
+        RestorePlan,
+    )
+
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(
+            GP_ITEM, ("N_1", "100"), {"groupPolicyId": "100", "name": "kiosk"}
+        ),
+        FeatureConfiguration(
+            SSID_ITEM, ("N_1", "0"),
+            {"number": 0, "name": "Corp", "groupPolicyId": "100"},
+        ),
+    )
+    full = plan_restore(graph, parser)
+    actions = tuple(
+        a for a in full.actions if a.api_path in (GP_ITEM, SSID_ITEM)
+    )
+
+    class Missing404(Exception):
+        status = 404
+
+    calls: list = []
+
+    class Section(_RecordingSection):
+        def getNetworkWirelessSsid(self, *args, **kwargs) -> dict:
+            raise Missing404("404 not found")
+
+    section = Section(
+        calls,
+        responses={
+            # The 'missing' policy is in fact alive with its identity.
+            "getNetworkGroupPolicies": [{"id": "100", "name": "kiosk"}],
+        },
+    )
+    restorer = _heal_executor(tmp_path, section)
+    result = restorer.execute(graph, RestorePlan(actions=actions))
+    gp_key = next(a.key for a in actions if a.api_path == GP_ITEM)
+    assert any(
+        e["target"] == gp_key
+        and e["reason"] == HEAL_VERIFIED_ALIVE_REASON
+        for e in result.skipped
+    )
+    # The SSID healed and its reference resolved through the adopted
+    # identity mapping — never dropped, never re-created.
+    ssid = next(c for c in calls if c[0] == "updateNetworkWirelessSsid")
+    assert ssid[2]["groupPolicyId"] == "100"
+    assert not any(c[0] == "createNetworkGroupPolicy" for c in calls)
+    assert RestoreJournal(tmp_path / "heal.jsonl").id_map.get("100") == "100"
+
+
+def test_heal_children_of_a_recreated_parent_skip_the_probe(
+    tmp_path: Path,
+) -> None:
+    """A child scoped under a parent THIS run minted cannot predate it:
+    its liveness probe short-circuits (a freshly recreated network's
+    default settings must never read as 'survivors')."""
+    parser = _restore_spec(tmp_path)
+    graph = NetworkGraph(
+        organization_id="org-123",
+        networks=(
+            MerakiNetwork.from_payload(
+                {"id": "N_1", "organizationId": "org-123", "name": "HQ",
+                 "productTypes": ["wireless"]}
+            ),
+        ),
+        devices=(),
+        features=(
+            FeatureConfiguration(
+                SSID_ITEM, ("N_1", "0"), {"number": 0, "name": "Corp"}
+            ),
+        ),
+    )
+    plan = plan_restore(graph, parser)
+    calls: list = []
+    section = _RecordingSection(
+        calls, responses={"getOrganizationNetworks": []}
+    )
+    # The network was deleted, so heal presets no identity for it —
+    # its create is part of the plan.
+    restorer = _heal_executor(tmp_path, section, preset=())
+    result = restorer.execute(graph, plan)
+    assert result.failed == ()
+    assert any(c[0] == "createOrganizationNetwork" for c in calls)
+    assert any(c[0] == "updateNetworkWirelessSsid" for c in calls)
+    # The SSID's own GET was never consulted: the parent was minted.
+    assert not any(c[0] == "getNetworkWirelessSsid" for c in calls)
+
+
+def test_restore_resume_second_incident_recreates_the_subtree(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A network journaled as restored but deleted from the target
+    since: the resume re-creates it (and re-claims its device) instead
+    of skipping forever on Monday's journal."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    parser = _restore_spec(tmp_path)
+    graph = _graph()
+    plan = plan_restore(graph, parser)
+    restorer, _calls = _executor(tmp_path)
+    assert len(restorer.execute(graph, plan).executed) == 2
+
+    calls2: list = []
+    section = _RecordingSection(
+        calls2, responses={"getOrganizationNetworks": []}
+    )
+    again = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "journal.jsonl"),
+        serial_map={"Q2AB-CDEF-GHIJ": "Q9ZZ-NEWW-HWSN"},
+    )
+    again._client = SimpleNamespace(
+        organizations=section, networks=section
+    )
+    with caplog.at_level(logging.WARNING, logger="meraki2tf.restorer"):
+        second = again.execute(graph, plan)
+    assert len(second.executed) == 2
+    assert any(c[0] == "createOrganizationNetwork" for c in calls2)
+    claim = next(c for c in calls2 if c[0] == "claimNetworkDevices")
+    assert claim[1] == ("L_NEW",)
+    assert claim[2] == {"serials": ["Q9ZZ-NEWW-HWSN"]}
+    assert "re-executing (new incident)" in caplog.text
+    # The stale mapping was retired durably: a reload sees exactly one
+    # live mapping for the old network ID.
+    reloaded = RestoreJournal(tmp_path / "journal.jsonl")
+    rows = [row for row in reloaded.mappings if row[1] == "N_1"]
+    assert rows == [("network", "N_1", "L_NEW", ())]
+
+
+def test_restore_resume_with_unreadable_probe_keeps_the_skip(
+    tmp_path: Path,
+) -> None:
+    """An unreadable liveness probe is not proof of absence: the resume
+    keeps the conservative journal skip (the pre-hardening behavior)
+    instead of re-creating potential duplicates."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    parser = _restore_spec(tmp_path)
+    graph = _graph()
+    plan = plan_restore(graph, parser)
+    restorer, _calls = _executor(tmp_path)
+    assert len(restorer.execute(graph, plan).executed) == 2
+
+    calls2: list = []
+    section = _RecordingSection(calls2)  # collection GETs answer {}
+    again = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "journal.jsonl")
+    )
+    again._client = SimpleNamespace(
+        organizations=section, networks=section
+    )
+    second = again.execute(graph, plan)
+    assert second.executed == ()
+    assert all("already restored" in e["reason"] for e in second.skipped)
+    assert not any(c[0] == "createOrganizationNetwork" for c in calls2)
+
+
+def test_second_incident_reclaims_missing_devices(tmp_path: Path) -> None:
+    """A journaled claim whose device is no longer in the target's
+    network re-claims; one still present keeps the resume skip."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    spec = {
+        "openapi": "3.0.0", "info": {"title": "d", "version": "1"},
+        "paths": {
+            "/organizations/{organizationId}/networks": {
+                "get": _op("getOrganizationNetworks", "organizations"),
+                "post": _op("createOrganizationNetwork", "organizations"),
+            },
+            "/networks/{networkId}/devices": {
+                "get": _op("getNetworkDevices", "networks"),
+            },
+            "/networks/{networkId}/devices/claim": {
+                "post": _op("claimNetworkDevices", "networks"),
+            },
+        },
+    }
+    path = tmp_path / "devices-spec.json"
+    path.write_text(json.dumps(spec), encoding="utf-8")
+    parser = OpenApiParser(path)
+    graph = _graph()
+    plan = plan_restore(graph, parser)
+    restorer, _calls = _executor(tmp_path)
+    assert restorer.execute(graph, plan).failed == ()
+
+    def resume(listings: list) -> tuple:  # noqa: ANN001
+        calls: list = []
+        section = _RecordingSection(
+            calls,
+            responses={
+                "getOrganizationNetworks": [{"id": "L_NEW", "name": "HQ"}],
+                "getNetworkDevices": listings,
+            },
+        )
+        again = OrgRestorer(
+            "org-TARGET", RestoreJournal(tmp_path / "journal.jsonl"),
+            serial_map={"Q2AB-CDEF-GHIJ": "Q9ZZ-NEWW-HWSN"},
+        )
+        again._client = SimpleNamespace(
+            organizations=section, networks=section
+        )
+        return again.execute(graph, plan), calls
+
+    removed, calls_removed = resume([])
+    claim_key = next(a.key for a in plan.actions if a.kind == "claim")
+    assert claim_key in removed.executed
+    assert any(c[0] == "claimNetworkDevices" for c in calls_removed)
+
+    present, calls_present = resume([{"serial": "Q9ZZ-NEWW-HWSN"}])
+    assert present.executed == ()
+    assert not any(c[0] == "claimNetworkDevices" for c in calls_present)
+
+
+def test_classify_probe_shapes(tmp_path: Path) -> None:
+    from dataclasses import replace as _replace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(GP_ITEM, ("N_1", "100"), {"name": "kiosk"}),
+        FeatureConfiguration(SNMP_PATH, ("N_1",), {"access": "none"}),
+    )
+    plan = plan_restore(graph, parser)
+    gp = next(a for a in plan.actions if a.api_path == GP_ITEM)
+    snmp = next(a for a in plan.actions if a.api_path == SNMP_PATH)
+    claim = next(a for a in plan.actions if a.kind == "claim")
+    heal = OrgRestorer(
+        "org-123", RestoreJournal(tmp_path / "a.jsonl"), additive_only=True
+    )
+    rest = OrgRestorer(
+        "org-T", RestoreJournal(tmp_path / "b.jsonl"),
+        serial_map={"Q2AB-CDEF-GHIJ": "Q9ZZ-NEWW-HWSN"},
+    )
+
+    # Claims match by (mapped) serial; a non-list answer is uncertain.
+    assert rest._classify_probe(claim, {"nope": 1}) == ("uncertain", None)
+    assert rest._classify_probe(
+        claim, [{"serial": "Q9ZZ-NEWW-HWSN"}]
+    ) == ("alive", None)
+    assert rest._classify_probe(claim, []) == ("absent", None)
+
+    # Creates: heal trusts retained identity; items envelopes unwrap.
+    assert heal._classify_probe(
+        gp, {"items": [{"id": "100", "name": "x"}]}
+    ) == ("alive", "100")
+    # Restore matches by natural key; ambiguity is never guessed.
+    assert rest._classify_probe(
+        gp, [{"id": "900", "name": "kiosk"}]
+    ) == ("alive", "900")
+    assert rest._classify_probe(
+        gp, [{"id": "a", "name": "kiosk"}, {"id": "b", "name": "kiosk"}]
+    ) == ("uncertain", None)
+    assert rest._classify_probe(
+        gp, [{"id": "1", "name": "other"}]
+    ) == ("absent", None)
+    # Keyless payloads: heal can still prove absence (same-org IDs);
+    # restore only trusts a client-assigned ID hit.
+    bare = _replace(gp, payload={"content": "x"})
+    assert heal._classify_probe(bare, [{"id": "999"}]) == ("absent", None)
+    assert rest._classify_probe(bare, [{"id": "999"}]) == ("uncertain", None)
+    assert rest._classify_probe(bare, [{"id": "100"}]) == ("alive", "100")
+
+    # Configures: empty/none answers are absence, content is life.
+    assert rest._classify_probe(snmp, None) == ("absent", None)
+    assert rest._classify_probe(snmp, {}) == ("absent", None)
+    assert rest._classify_probe(snmp, {"access": "full"}) == ("alive", None)
+    assert rest._classify_probe(snmp, []) == ("absent", None)
+    assert rest._classify_probe(snmp, "weird") == ("uncertain", None)
+
+
+def test_probe_liveness_edges(tmp_path: Path) -> None:
+    from dataclasses import replace as _replace
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import ReferenceResolver
+
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(SNMP_PATH, ("N_1",), {"access": "none"})
+    )
+    plan = plan_restore(graph, parser)
+    snmp = next(a for a in plan.actions if a.api_path == SNMP_PATH)
+    gp_lookup = next(
+        a for a in plan.actions if a.wave == WAVE_NETWORKS
+    )
+    restorer, calls = _executor(tmp_path)
+    resolver = ReferenceResolver(graph)
+    resolver.record("network", "N_1", "L_NEW")
+    dash = restorer._client
+
+    # Minted-parent bypass.
+    restorer._minted.add(("network", "N_1"))
+    assert restorer._probe_liveness(dash, snmp, resolver, "org-123") == (
+        "absent", None,
+    )
+    restorer._minted.clear()
+
+    # No GET in the spec / no SDK method for it.
+    bare = _replace(snmp, lookup=None)
+    assert restorer._probe_liveness(dash, bare, resolver, "org-123") == (
+        "unverifiable", None,
+    )
+    hollow = SimpleNamespace(networks=SimpleNamespace())
+    assert restorer._probe_liveness(hollow, snmp, resolver, "org-123") == (
+        "unverifiable", None,
+    )
+
+    # Unresolvable scope: the dispatch path owns deferral.
+    fresh = ReferenceResolver(graph)
+    assert restorer._probe_liveness(dash, snmp, fresh, "org-123") == (
+        "proceed", None,
+    )
+
+    # Non-404 read failures are uncertain and never cached.
+    class Boom:
+        @staticmethod
+        def getNetworkSnmp(*args: object, **kwargs: object) -> dict:
+            raise RuntimeError("boom")
+
+    boom_dash = SimpleNamespace(networks=Boom())
+    assert restorer._probe_liveness(
+        boom_dash, snmp, resolver, "org-123"
+    ) == ("uncertain", None)
+
+    # Successful reads are cached per resolved scope, and paginated
+    # readers are asked for every page.
+    class Pager:
+        reads = 0
+
+        @staticmethod
+        def getNetworkSnmp(
+            network_id: str, total_pages: str = "1"
+        ) -> dict:
+            Pager.reads += 1
+            assert total_pages == "all"
+            return {"access": "full"}
+
+    pager_dash = SimpleNamespace(networks=Pager())
+    assert restorer._probe_liveness(
+        pager_dash, snmp, resolver, "org-123"
+    ) == ("alive", None)
+    assert restorer._probe_liveness(
+        pager_dash, snmp, resolver, "org-123"
+    ) == ("alive", None)
+    assert Pager.reads == 1
+    assert gp_lookup.lookup is not None  # network create carries its GET
+
+
+def test_restore_journal_unmap_round_trips(tmp_path: Path) -> None:
+    from meraki2tf.restorer import RestoreJournal
+
+    path = tmp_path / "journal.jsonl"
+    journal = RestoreJournal(path)
+    journal.record_mapping("old-1", "new-1", scope="network", context=("P",))
+    journal.record_mapping("old-1", "new-2", scope="network")
+    journal.record_unmap("old-1", "new-1", scope="network")
+    assert journal.id_map == {"old-1": "new-2"}
+    assert journal.mappings == [("network", "old-1", "new-2", ())]
+
+    reloaded = RestoreJournal(path)
+    assert reloaded.id_map == {"old-1": "new-2"}
+    assert reloaded.mappings == [("network", "old-1", "new-2", ())]
+
+    journal.record_unmap("old-1", "new-2", scope="network")
+    assert journal.id_map == {}
+    assert journal.mappings == []
+    assert RestoreJournal(path).mappings == []
+
+
+def test_resolver_recorded_targets() -> None:
+    from meraki2tf.models import NetworkGraph as _NetworkGraph
+    from meraki2tf.restorer import ReferenceResolver
+
+    resolver = ReferenceResolver(_NetworkGraph("org-123", (), (), ()))
+    resolver.record("network", "N_1", "A")
+    resolver.record("network", "N_1", "A", ("ctx",))
+    resolver.record("network", "N_1", "B")
+    assert resolver.recorded_targets("network", "N_1") == ("A", "B")
+    assert resolver.recorded_targets("vlan", "9") == ()
