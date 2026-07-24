@@ -333,3 +333,69 @@ def test_spec_level_gaps_and_diagnostics_render(tmp_path: Path) -> None:
     assert "1 additional API surface(s) are read-only in" in text
     assert "api_read_only_paths" in text
     assert "internetPolicies" in text  # the manual-rebuild list carries it
+
+
+def test_summary_groups_repeated_unsupported_gaps(tmp_path: Path) -> None:
+    """Repeated (api_path, reason) gaps print once with a count and up
+    to three example locators; coverage.json stays fully itemized."""
+    staged = "/networks/{networkId}/firmwareUpgrades/staged/stages"
+    repeated = tuple(
+        UnsupportedAsset(
+            api_path=staged,
+            reason="Whole-list stage collections cannot round-trip.",
+            identifiers=(f"N_{index}",),
+        )
+        for index in range(1, 6)
+    )
+    same_path_other_reason = UnsupportedAsset(
+        api_path=staged,
+        reason="A different reason keeps its own group.",
+        identifiers=("N_9",),
+    )
+    manifest = build_manifest(
+        organization_id="org-123",
+        captured=(),
+        unsupported=(*repeated, same_path_other_reason, *UNSUPPORTED),
+        state_addresses=frozenset(),
+    )
+    _, summary_path = write_manifest(manifest, tmp_path)
+    text = summary_path.read_text(encoding="utf-8")
+    assert f"  - {staged} (5 objects): Whole-list stage" in text
+    assert "e.g. ids=N_1; ids=N_2; ids=N_3 ...and 2 more" in text
+    # The distinct-reason entry and the singleton keep per-object form.
+    assert f"  - {staged} (ids=N_9): A different reason" in text
+    assert "  - /networks/{networkId}/mystery (ids=N_1): No Terraform" in text
+    # Exactly one grouped line for the repeated gap, not five.
+    assert text.count("Whole-list stage collections") == 1
+    # coverage.json remains fully itemized (one entry per object).
+    itemized = [
+        entry
+        for entry in manifest["objects"]
+        if entry["status"] == STATUS_UNSUPPORTED
+        and entry["api_path"] == staged
+    ]
+    assert len(itemized) == 6
+
+
+def test_summary_group_without_overflow_lists_all_examples(
+    tmp_path: Path,
+) -> None:
+    duo = tuple(
+        UnsupportedAsset(
+            api_path="/networks/{networkId}/mystery",
+            reason="same reason",
+            identifiers=(f"N_{index}",),
+        )
+        for index in (1, 2)
+    )
+    manifest = build_manifest(
+        organization_id="org-123",
+        captured=(),
+        unsupported=duo,
+        state_addresses=frozenset(),
+    )
+    _, summary_path = write_manifest(manifest, tmp_path)
+    text = summary_path.read_text(encoding="utf-8")
+    assert "(2 objects): same reason" in text
+    assert "e.g. ids=N_1; ids=N_2" in text
+    assert "...and" not in text

@@ -461,10 +461,8 @@ def _check_workdir(config: RuntimeConfig) -> CheckResult:
         )
     ancestor = resolved
     while not ancestor.exists():
-        parent = ancestor.parent
-        if parent == ancestor:
-            break
-        ancestor = parent
+        # Terminates at the filesystem root, which always exists.
+        ancestor = ancestor.parent
     if ancestor.is_dir() and os.access(ancestor, os.W_OK | os.X_OK):
         return CheckResult(
             "workdir",
