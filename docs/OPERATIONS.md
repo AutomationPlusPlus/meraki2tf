@@ -1,22 +1,58 @@
 # Operations
 
-Running meraki2tf on a schedule: alert events, cron/exit-code
-wiring, performance at scale, and troubleshooting. Part of the
-[meraki2tf](../README.md) docs.
+Running meraki2tf on a schedule: API-key permissions, alert events,
+cron/exit-code wiring, performance at scale, and troubleshooting.
+Part of the [meraki2tf](../README.md) docs.
+
+## API-key permission model
+
+A **read-only organization admin** key is all every scheduled and
+ad-hoc read path needs — the default pipeline, `--sync` (its applies
+only write local/backend Terraform *state*; Meraki is never mutated),
+`--dump-to`, `--drift-baseline`, `--list-orgs`, `--check`,
+`--estimate`, `--diff-networks`, and every DR-action *preview*.
+Discovery is GET-only by construction, and defensively so: before
+dispatching any dynamically resolved SDK method, its source is
+verified to only ever perform reads — a method that cannot be proven
+read-only is refused (fail-closed), so even a tampered OpenAPI spec
+cannot trick a scheduled run into a write. Run your weekly/monthly
+jobs on a read-only key.
+
+**Full-access is needed only for the five human-invoked `--confirm`
+executions** (`--rebuild`, `--heal`, `--replay-gaps`, `--restore`,
+`--wipe-org` — and for `terraform apply` run by hand in the workdir).
+Keeping a separate full-access key offline until an incident is a
+reasonable posture; the previews of all five actions work on the
+read-only key.
+
+Scope expectations: endpoints the key cannot read (401/403 — e.g. a
+key scoped below org-wide, or camera/SM feature scopes withheld) are
+**never** silently treated as "feature not in use". Each one surfaces
+as a coverage gap in `coverage.json`, and an endpoint refused by every
+scope it was tried against is additionally listed under
+`suspect_endpoints` in the manifest — so a permissions hole shows up
+as missing DR coverage, not as a quietly smaller snapshot.
 
 ## Alerting events
 
 | Event | Trigger |
 | --- | --- |
 | `DRIFT_DETECTED` | Real configuration drift. Two origins, distinguished by `details.origin`: `terraform-plan` (the speculative plan found add/change/destroy on tracked resources — pending imports alone don't count) and `snapshot-diff` (`--drift-baseline` comparison found added/modified/removed assets, including provider-inexpressible and secret-bearing ones). Payload carries the diff/digest, the unsupported list, `apply_aborted` (true when a `--sync` auto-apply was refused), `regenerated_addresses` (modified objects re-baselined in sync mode), and `deferred_addresses` (drift-racy pending imports pushed to the next run) |
-| `RUN_SUCCESS` | Snapshot generation (and comparison, when an API key was available) completed flawlessly. Payload carries the coverage picture: `discovered_assets`, `imports_written`, `imports_already_tracked`, `unsupported_count` plus the full `unsupported` list, `pending_imports` (imports the plan reports as not yet in state; `null` when unknown), `comparison_performed`, `resources_added_to_state` (sync mode), `coverage_percent`, `deletions_pending_confirmation`, and `unmanaged_secret_attributes` (secrets the kit cannot carry — restore manually after a rebuild) |
+| `RUN_SUCCESS` | Snapshot generation (and comparison, when an API key was available) completed flawlessly. Payload carries the coverage picture: `discovered_assets`, `imports_written`, `imports_already_tracked`, `unsupported_count` plus the full `unsupported` list, `pending_imports` (imports the plan reports as not yet in state; `null` when unknown), `comparison_performed`, `resources_added_to_state` (sync mode), `coverage_percent`, `deletions_pending_confirmation`, `unmanaged_secret_attributes` (secrets the kit cannot carry — restore manually after a rebuild), `deferred_addresses`, `reconciliation_drop_categories` (reconciliation drops aggregated by diagnostic, so a provider regression names the resource class it broke), and `partial_scope` (the covered network IDs of a `--only` run — never mistake a one-network export for a full capture) |
 | `UNSUPPORTED_FEATURE_FLAGGED` | A discovered asset cannot be mapped to a Terraform resource |
 | `DELETION_PENDING_CONFIRMATION` | Resources tracked in the DR kit were not found in Meraki (deleted?); they stay in the kit until a human confirms with `--confirm-deletions` |
 | `RESTORE_EXECUTED` | A human-invoked `--restore --confirm` rebuilt a target organization from a snapshot. Payload carries executed/failed/skipped action labels (identifiers and endpoints only — never values) |
-| `HEAL_EXECUTED` | A human-invoked `--heal --confirm` recreated snapshot objects missing from the same live organization. Payload carries the executed/failed/skipped actions plus the surviving (untouched) count — identifiers and endpoints only, never values |
+| `HEAL_EXECUTED` | A human-invoked `--heal --confirm` recreated snapshot objects missing from the same live organization. Payload carries the executed/failed/skipped actions plus the surviving (untouched) count — identifiers and endpoints only, never values. Selective heals add `only_filters`; heals from a partial (selective-backup) snapshot add `snapshot_scope`; `verified_alive_skips` counts planned actions the pre-write liveness probe found alive and skipped (additive-only held) |
 | `ORG_WIPE_EXECUTED` | A human-invoked `--wipe-org --confirm` tore down a hardware-free drill organization (networks deleted + org deleted, with any failures) |
+| `REBUILD_EXECUTED` | A human-invoked `--rebuild --confirm` ran `terraform apply` of the DR kit. INFO on success, CRITICAL on failure (the organization may be partially rebuilt) — the largest write path must reach the on-call channel either way |
 | `GAP_REPLAY_EXECUTED` | A human-invoked `--replay-gaps --confirm` wrote unsupported objects and/or secret attributes back to Meraki from a snapshot. Payload carries the executed, skipped, and failed operations (identifiers/endpoints only — never secret values) |
 | `PROCESSING_FAULT` | A critical pipeline failure (payload carries the failing stage) |
+
+Every event's details additionally carry an `organization_id` (stamped
+by the dispatcher as soon as the organization is known), so multi-org
+fan-out consumers can attribute interleaved events. Diff/detail
+payloads are value-redacted before they leave the process — attribute
+names and locators only.
 
 ## Scheduled (cron) execution
 
@@ -30,12 +66,18 @@ plus a monthly terraform rehearsal:
 ```cron
 # Every Monday 06:00 — export this week's snapshot, diff it against last
 # week's, alert on drift and coverage gaps. Snapshot-only: no terraform.
+# --drift-baseline is passed only when a previous snapshot exists, so
+# the very first run (no baseline yet) succeeds unedited; the
+# --discovery-checkpoint journal lets an aborted multi-hour sweep
+# resume on the next run instead of restarting.
 0 6 * * 1 cd /opt/meraki2tf && . .venv/bin/activate && \
   { [ ! -f snapshots/latest.jsonl.gz ] || mv -f snapshots/latest.jsonl.gz snapshots/previous.jsonl.gz; } && \
   MERAKI_DASHBOARD_API_KEY=$(cat /etc/meraki2tf/token) \
   MERAKI2TF_WEBHOOK_URL=$(cat /etc/meraki2tf/webhook-url) \
   meraki2tf --org-id 123456 --spec ./openapi.json --fail-on-gaps \
-  --dump-to snapshots/latest.jsonl.gz --drift-baseline snapshots/previous.jsonl.gz \
+  --dump-to snapshots/latest.jsonl.gz \
+  --discovery-checkpoint snapshots/checkpoint.jsonl.gz \
+  $([ -f snapshots/previous.jsonl.gz ] && echo "--drift-baseline snapshots/previous.jsonl.gz") \
   >> /var/log/meraki2tf.log 2>&1
 
 # The 1st of every month 03:00 — terraform rehearsal: regenerate the kit
@@ -45,12 +87,19 @@ plus a monthly terraform rehearsal:
   MERAKI2TF_WEBHOOK_URL=$(cat /etc/meraki2tf/webhook-url) \
   meraki2tf --org-id 123456 --spec ./openapi.json --sync \
   >> /var/log/meraki2tf.log 2>&1
+
+# Optional retention (see "Snapshot retention & archival" below): keep
+# dated copies beyond the latest/previous pair and prune old ones.
+15 6 * * 1 cd /opt/meraki2tf && umask 077 && mkdir -p snapshots/archive && \
+  { [ ! -f snapshots/latest.jsonl.gz ] || cp -p snapshots/latest.jsonl.gz "snapshots/archive/$(date +\%Y-\%m-\%d).jsonl.gz"; } && \
+  find snapshots/archive -name '*.jsonl.gz' -mtime +400 -delete
 ```
 
-On the very first weekly run there is no previous snapshot yet — omit
-`--drift-baseline` for that run (a missing baseline file is an error,
-not a silent skip). On Azure, the deployment wrapper does this snapshot
-rotation for you (see below).
+The `$([ -f … ] && echo …)` guard is the same first-run-safe shape the
+systemd unit uses: a missing baseline file is an error, not a silent
+skip, so the flag must only appear once a previous snapshot exists. On
+Azure, the deployment wrapper does this snapshot rotation for you (see
+below).
 
 Create the token (and webhook-URL) files owner-only so no other local
 account can read the org-admin key or the bearer-token-bearing webhook
@@ -77,19 +126,73 @@ ready-made wrapper runbook in
 
 Ready-made hardened units live in
 [`deploy/systemd/`](../deploy/systemd/): a weekly snapshot
-service+timer pair (with automatic `--drift-baseline` rotation and a
-first-run-safe baseline check) and a monthly `--sync` terraform
-rehearsal pair. Both run as a dedicated system user, read the API key
-and webhook URL from a root-owned 0600 `EnvironmentFile`, and confine
-writes to `/var/lib/meraki2tf` (`ProtectSystem=strict`). The setup
-steps (user, directories, secret file, `systemctl enable --now`) are
-in the header of
+service+timer pair (with automatic `--drift-baseline` rotation, a
+first-run-safe baseline check, and a `--discovery-checkpoint` journal
+so an aborted sweep resumes on the next timer run) and a monthly
+`--sync` terraform rehearsal pair. Both run as a dedicated system
+user, read the API key and webhook URL from a root-owned 0600
+`EnvironmentFile`, confine writes to `/var/lib/meraki2tf`
+(`ProtectSystem=strict`), and set `TimeoutStartSec=infinity`
+explicitly so no manager default can SIGTERM a multi-hour sweep. Each
+unit header marks the **mandatory edits** (the placeholder `--org-id`
+and the install paths) and carries a commented optional retention step
+(see below). The setup steps (user, directories, secret file,
+`systemctl enable --now`) are in the header of
 [`meraki2tf-snapshot.service`](../deploy/systemd/meraki2tf-snapshot.service).
 
 Timer-driven jobs report through the same exit codes as cron; the
 units treat exit 3 (coverage gaps) as success so a permanently-gapped
 org doesn't flap the unit — the gap list still arrives via alerts.
 Remove `SuccessExitStatus=3` to page on gaps instead.
+
+## Shell completion
+
+A static bash completion script (flag names; ordinary filename
+completion for values) ships at
+[`deploy/completion/meraki2tf.bash`](../deploy/completion/meraki2tf.bash):
+
+```bash
+source deploy/completion/meraki2tf.bash                     # current shell
+sudo cp deploy/completion/meraki2tf.bash /etc/bash_completion.d/meraki2tf
+```
+
+It is hand-maintained and CI-pinned against the real argument parser,
+so it always matches the installed flag set.
+
+## Snapshot retention & archival
+
+The recipes above (cron, systemd, and the Azure wrapper's rotation)
+keep exactly two generations on disk: `latest` and `previous`. That is
+enough for the drift chain, but it is a thin DR margin — two bad runs
+in a row, or a corruption that goes unnoticed for a week, leave
+nothing to restore from. Add a retention step:
+
+- **Dated local copies + pruning** — after each successful export,
+  copy the snapshot to a dated name and prune old copies (both recipe
+  sets carry this as a commented optional step):
+
+  ```bash
+  umask 077 && mkdir -p snapshots/archive
+  cp -p snapshots/latest.jsonl.gz "snapshots/archive/$(date +%Y-%m-%d).jsonl.gz"
+  find snapshots/archive -name '*.jsonl.gz' -mtime +400 -delete
+  ```
+
+  Keep copies owner-only (`umask 077` / `cp -p`): unsanitized
+  snapshots carry secret values.
+- **Off-box copies** — a snapshot on the machine that runs the job
+  dies with that machine. Ship the dated copies somewhere that
+  survives the disaster you are protecting against: `rclone copy
+  snapshots/archive remote:meraki2tf/`, `scp` to a backup host, or
+  object storage with a lifecycle rule (the Azure wrapper already
+  archives every run's snapshot to Blob Storage under a dated
+  prefix). Apply the same at-rest access control you would give a
+  password vault.
+- **How much to keep** — at minimum, enough history to reach back
+  past your detection lag: 13 monthly + 5 weekly copies is a sane
+  default (`-mtime +400` above approximates it). The Terraform state
+  deserves the same treatment when you use the local backend; remote
+  backends (`--state-backend azurerm/s3/gcs`) get durability and
+  versioning from the storage service.
 
 ## AWS: scheduled Fargate task
 
@@ -186,6 +289,22 @@ discovery sweep. Prefer `.jsonl.gz` snapshots at this scale, and give
 schedulers a generous timeout — completeness matters more than speed
 for a DR safety net.
 
+Operating a long sweep:
+
+- **Preview the cost first** — `meraki2tf --org-id 123456 --estimate`
+  prints the expected request count and wall-clock estimates (at the
+  rate cap and at a degraded rate) from 2-3 enumeration calls.
+- **Liveness is visible** — discovery emits one INFO progress line at
+  most every ~30 s (items done/total for the running level, overall
+  count, the current effective request rate, and a rough ETA), so a
+  working sweep and a hung one look different in the log; the line is
+  an ordinary record and renders in `--log-format json` too.
+- **Aborts are resumable** — pass `--discovery-checkpoint PATH` so an
+  aborted sweep (throttle exhaustion, reboot) resumes from its journal
+  instead of restarting from zero; a completed run deletes the
+  journal. The journal carries raw payloads (secrets) and is written
+  0600.
+
 ## Troubleshooting & FAQ
 
 **The run finished but no plan/drift comparison happened.**
@@ -200,11 +319,18 @@ Install Terraform (≥ 1.5) and make sure it is on `PATH`, or point at a
 specific binary with `--terraform-bin /path/to/terraform` (OpenTofu
 works too).
 
-**`meraki2tf could not start: …` right after launch.**
+**`Pipeline fault during configuration discovery: …` early in a live
+run.**
 Usually a bad `--org-id` or an API key without access to that
-organization. Run `meraki2tf --list-orgs` to see exactly which
-organization IDs your key can reach; the failed run exits 1 and
-dispatches a `PROCESSING_FAULT` alert.
+organization: the very first discovery calls
+(`getOrganizationNetworks`) fail with the SDK's 404 error text, the
+run logs `Pipeline fault during configuration discovery: …` followed
+by `Pipeline failed during configuration discovery: …`, exits 1, and
+dispatches a `PROCESSING_FAULT` alert (stage `configuration
+discovery`). Remediation: `meraki2tf --list-orgs` prints exactly which
+organization IDs your key can reach, and `meraki2tf --org-id <id>
+--check` validates the key/org pair (and the rest of your flag set) in
+seconds before you schedule anything.
 
 **Resource names look right but import IDs seem off / resources are
 missing.**

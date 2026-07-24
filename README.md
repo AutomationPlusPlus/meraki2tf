@@ -3,7 +3,7 @@
 [![Python 3.11–3.14](https://img.shields.io/badge/python-3.11%20%E2%80%93%203.14-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Terraform](https://img.shields.io/badge/terraform-CiscoDevNet%2Fmeraki-844FBA?logo=terraform&logoColor=white)](https://registry.terraform.io/providers/CiscoDevNet/meraki)
 [![CI](https://github.com/AutomationPlusPlus/meraki2tf/actions/workflows/ci.yml/badge.svg)](https://github.com/AutomationPlusPlus/meraki2tf/actions/workflows/ci.yml)
-[![Coverage](https://img.shields.io/badge/coverage-%E2%89%A598%25%20(CI--gated)-success)](#contributor-architecture)
+[![Coverage](https://img.shields.io/badge/coverage-100%25%20(CI--gated)-success)](#contributor-architecture)
 [![Typing: mypy strict](https://img.shields.io/badge/typing-mypy%20strict-blue)](#contributor-architecture)
 [![License: AGPL v3](https://img.shields.io/badge/license-AGPL%20v3-blue)](LICENSE)
 
@@ -64,15 +64,35 @@ Discovered objects : 412
 Coverage           : 98.5%
 ```
 
-From there, `cd generated && terraform init && terraform plan` — or let
+From there, `cd generated && terraform init && terraform plan` (running
+terraform by hand needs `export MERAKI_API_KEY=…` — the provider reads
+its own variable, not `MERAKI_DASHBOARD_API_KEY`) — or let
 the tool keep running on a schedule as a DR safety net. Full install
 notes: [Prerequisites & Installation](#prerequisites--installation).
+
+> **Before you point this at a large production organization:**
+> completeness is the design goal, and it costs reads — a full sweep is
+> roughly one GET per (object × surface), paced under Meraki's shared
+> 10 req/s org budget, which means **hours** on a big org (see
+> [Performance & Scale](docs/OPERATIONS.md#performance--scale)). Try
+> the cheap path first:
+>
+> ```bash
+> meraki2tf --org-id 123456 --check      # validate key/org/terraform/flags — seconds
+> meraki2tf --org-id 123456 --estimate   # request count + wall-clock preview — 2-3 API calls
+> meraki2tf --org-id 123456 --only 'network:Branch-07'   # scoped trial run, one network
+> # or a scoped snapshot: --dump-to trial.jsonl.gz --only 'network:Branch-07'
+> ```
 
 ## Which mode do I want?
 
 | Your goal | Invocation | Where it's documented |
 | --- | --- | --- |
+| Validate my flags/key/terraform before a long run | `--check` (add it to the exact flag set) | [`--check`](docs/USAGE.md#parameters-in-detail) |
+| Preview how long discovery will take | `--estimate` | [`--estimate`](docs/USAGE.md#parameters-in-detail) |
 | One-shot export of my org to Terraform | `meraki2tf --org-id <id>` | [Live Mode](docs/USAGE.md#live-mode-cloud-streaming) |
+| Terraform for just one network (trial / single-site onboarding) | add `--only 'network:NAME'` | [Scoped pipeline runs](docs/USAGE.md#parameters-in-detail) |
+| Compare a branch network against a golden site | `--diff-networks 'Golden' 'Branch-07'` | [`--diff-networks`](docs/USAGE.md#parameters-in-detail) |
 | Scheduled DR job that also materializes Terraform state | add `--sync` | [Scheduled DR automation](docs/DR-GUIDE.md#scheduled-dr-automation---sync) |
 | Capture a snapshot for offline / air-gapped use | `--dump-to <path>` (add `--sanitize` to share it) | [Producing a snapshot](docs/USAGE.md#producing-a-snapshot---dump-to) |
 | Run entirely offline from a snapshot | `--from-dump <path>` | [Dump Mode](docs/USAGE.md#dump-mode-offline--air-gapped) |
@@ -110,7 +130,9 @@ additive-only, survivors untouched),
 separate `--target-org`, never the source), and
 [`--wipe-org --confirm`](docs/DR-GUIDE.md#restore-drills-and-cleaning-up-after-them)
 (drill-org teardown — refused outright for any organization holding
-claimed devices, so it physically cannot target production).
+claimed devices, which shields any org with hardware; a *device-less*
+production org — licensing-only or Systems-Manager-only — is protected
+only by the exact-name second factor, so name drill orgs distinctly).
 Every scheduled/automated run stays strictly read-only toward Meraki.
 
 **Why dynamic OpenAPI spec parsing?** The Meraki API surface changes
@@ -141,7 +163,12 @@ is flagged through the exception auditor instead of silently dropped.
   workdir fetches it; with an older (or not-yet-initialized) provider the
   tool falls back to a bundled v1.12.2 identity catalog, which can drift
   from what your workdir actually runs
-- A Meraki dashboard API key (live mode only)
+- A Meraki dashboard API key (live mode only). A **read-only org admin
+  key suffices** for every scheduled/read path — discovery is GET-only
+  and source-verified; full access is needed only to *execute* the five
+  human-invoked `--confirm` DR actions. Endpoints the key cannot read
+  surface as coverage gaps, never as silently-absent features — see
+  [API-key permission model](docs/OPERATIONS.md#api-key-permission-model)
 - The Meraki OpenAPI spec — fetched from GitHub automatically; only
   air-gapped runs need a local copy pre-staged (see
   [OpenAPI spec resolution](docs/USAGE.md#openapi-spec-resolution))
@@ -156,8 +183,14 @@ cd meraki2tf
 python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
-pip install -r requirements.txt
+pip install -r requirements.txt      # runtime deps (the meraki SDK)
 pip install -e .
+
+# Contributors additionally install the dev toolchain:
+pip install -r requirements-dev.txt
+
+# Optional: bash flag completion
+source deploy/completion/meraki2tf.bash
 ```
 
 **Reproducible worker installs** — unattended schedulers should pin
@@ -181,7 +214,12 @@ docker run --rm -e MERAKI_DASHBOARD_API_KEY \
 
 (The Azure-specific image with the runbook wrapper entrypoint lives at
 `deploy/azure/Dockerfile`.) Releases are tagged (`vX.Y.Z`) and listed
-in [`CHANGELOG.md`](CHANGELOG.md) — pin a tag for production use.
+in [`CHANGELOG.md`](CHANGELOG.md). Honest pinning advice: development
+moves faster than tagging right now, and the latest tag can trail
+`main` by a significant feature set (see the `[Unreleased]` section of
+the changelog). For production use, pin a specific `main` commit SHA
+you have validated — or wait for the next tag (a v0.2.0 rollup is
+expected) if you need a blessed point.
 
 ## Documentation
 
@@ -202,7 +240,7 @@ contract is [`CLAUDE.md`](CLAUDE.md).
 
 ```bash
 # One-time setup (inside the venv)
-pip install -r requirements.txt
+pip install -r requirements-dev.txt   # flake8, mypy, tox, pytest, pre-commit, pip-audit
 pre-commit install          # hygiene + flake8 + mypy on every commit
 
 # The full gate — lint, strict typing, tests with coverage

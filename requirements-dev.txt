@@ -1,0 +1,11 @@
+# Development/CI toolchain — approved dependencies only, per the
+# CLAUDE.md Dependency Escalation Policy (no poetry/ruff/uv, ever).
+# Runtime dependencies live in requirements.txt.
+-r requirements.txt
+pre-commit
+flake8
+mypy
+tox
+pytest
+pytest-cov
+pip-audit

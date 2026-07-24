@@ -13,6 +13,12 @@
 #
 # Assumes meraki2tf is installed in a venv at /opt/meraki2tf/.venv
 # (see the README's reproducible-install section).
+#
+# >>> MANDATORY EDITS before enabling this unit <<<
+#   * --org-id 123456 in ExecStart is a PLACEHOLDER — replace it with
+#     your organization ID (find it with `meraki2tf --list-orgs`).
+#   * The paths (/opt/meraki2tf/.venv, /var/lib/meraki2tf,
+#     /etc/meraki2tf/env) must match your install locations.
 
 [Unit]
 Description=meraki2tf weekly DR snapshot (read-only toward Meraki)
@@ -26,13 +32,32 @@ User=meraki2tf
 Group=meraki2tf
 WorkingDirectory=/var/lib/meraki2tf
 EnvironmentFile=/etc/meraki2tf/env
+# A full discovery sweep is deliberately slow (one GET per object x
+# surface; hours on a large organization). Never let a start timeout
+# SIGTERM it: Type=oneshot disables the start timeout on current
+# systemd, but some distributions/manager configs apply
+# DefaultTimeoutStartSec (~90 s) anyway — make it explicit. Use a
+# generous bound like 12h if your policy forbids "infinity".
+TimeoutStartSec=infinity
 # Rotate last week's snapshot into the drift baseline. On the very
 # first run there is no baseline yet — the export shape below handles
 # that by only passing --drift-baseline when previous.jsonl.gz exists.
 ExecStartPre=/bin/sh -c 'if [ -f snapshots/latest.jsonl.gz ]; then mv -f snapshots/latest.jsonl.gz snapshots/previous.jsonl.gz; fi'
+# --discovery-checkpoint makes the multi-hour sweep resumable: an
+# aborted run (throttle exhaustion, reboot, OOM) leaves the journal
+# behind and the next timer run resumes instead of restarting from
+# zero; a completed run deletes it. The journal holds raw API payloads
+# (secrets) and is written 0600, like the unsanitized snapshot.
 ExecStart=/bin/sh -c '/opt/meraki2tf/.venv/bin/meraki2tf --org-id 123456 \
     --dump-to snapshots/latest.jsonl.gz --fail-on-gaps \
+    --discovery-checkpoint snapshots/checkpoint.jsonl.gz \
     $([ -f snapshots/previous.jsonl.gz ] && echo "--drift-baseline snapshots/previous.jsonl.gz")'
+# Optional retention: the rotation above keeps only latest+previous —
+# two bad runs in a row leave nothing to restore from. Uncomment to
+# keep dated archive copies and prune them after ~13 months; ship the
+# archive off-box too (rclone/scp/Blob) — see docs/OPERATIONS.md,
+# "Snapshot retention & archival".
+#ExecStartPost=/bin/sh -c 'mkdir -p snapshots/archive && cp -p snapshots/latest.jsonl.gz "snapshots/archive/$(date +%%Y-%%m-%%d).jsonl.gz" && find snapshots/archive -name "*.jsonl.gz" -mtime +400 -delete'
 # Exit 3 = coverage gaps (expected on orgs with known unsupported
 # objects); the alert already carries the list. Treat it as success so
 # the unit does not flap; remove it to page on gaps instead.
