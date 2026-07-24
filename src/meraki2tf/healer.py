@@ -25,7 +25,6 @@ above carries over unchanged.
 
 from __future__ import annotations
 
-import fnmatch
 import re
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -33,6 +32,7 @@ from typing import Any
 
 from meraki2tf.models import NetworkGraph
 from meraki2tf.openapi_parser import OpenApiParser
+from meraki2tf.scope import glob_pattern
 from meraki2tf.restorer import (
     WAVE_NETWORKS,
     RestoreAction,
@@ -213,10 +213,6 @@ class _Selector:
     bare: re.Pattern[str]
 
 
-def _glob(pattern: str) -> re.Pattern[str]:
-    return re.compile(fnmatch.translate(pattern), re.IGNORECASE)
-
-
 def _parse_selector(raw: str) -> _Selector:
     if not raw.strip():
         raise HealFilterError(
@@ -225,9 +221,9 @@ def _parse_selector(raw: str) -> _Selector:
         )
     matched = _SELECTOR_TYPE_RE.match(raw)
     type_stem = _stem_plural(matched.group(1)) if matched else None
-    pattern = _glob(matched.group(2)) if matched else _glob(raw)
+    pattern = glob_pattern(matched.group(2)) if matched else glob_pattern(raw)
     return _Selector(
-        raw=raw, type_stem=type_stem, pattern=pattern, bare=_glob(raw)
+        raw=raw, type_stem=type_stem, pattern=pattern, bare=glob_pattern(raw)
     )
 
 

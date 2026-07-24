@@ -75,6 +75,7 @@ from meraki2tf.providers.discovery import (
     FeatureSectionMatcher,
     expand_endpoint_payload,
 )
+from meraki2tf.scope import SnapshotScope
 from meraki2tf.spec.engine import OperationSpec
 
 logger = logging.getLogger(__name__)
@@ -135,9 +136,12 @@ def _load_snapshot_document(path: "Path") -> Any:
                     "be corrupted.",
                     path, dropped,
                 )
+            # Known header keys only — a new v2 header field must be
+            # added here too, or it silently vanishes on read.
             return {
                 "organizationId": head.get("organizationId"),
                 "sanitized": bool(head.get("sanitized")),
+                "scope": head.get("scope"),
                 "networks": networks,
                 "devices": devices,
                 "features": features,
@@ -210,6 +214,28 @@ class StaticJsonDataProvider(MerakiDataProvider):
         are vacuous and its secret values are redaction markers.
         """
         return bool(self._document.get("sanitized"))
+
+    @property
+    def snapshot_scope(self) -> SnapshotScope | None:
+        """The partial-export scope the snapshot declares, if any.
+
+        A scoped snapshot (``--dump-to`` with ``--only``) covers only
+        the listed networks plus org-level surfaces. ``None`` means a
+        full-organization capture. A malformed ``scope`` header refuses
+        loudly — it must never silently read as "full", or a partial
+        snapshot would pass every full-org guard (restore, replay,
+        drift baseline, sync).
+        """
+        raw = self._document.get("scope")
+        if raw is None:
+            return None
+        try:
+            return SnapshotScope.from_header(raw)
+        except ValueError as exc:
+            raise MalformedDumpError(
+                f"Snapshot {self._path} carries a malformed 'scope' "
+                f"header: {exc}"
+            ) from exc
 
     @property
     def recorded_organization_ids(self) -> tuple[str, ...]:
