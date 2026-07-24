@@ -1207,3 +1207,145 @@ def test_catalog_uris_survive_under_identity_shaped_keys() -> None:
     )
     payload = sanitize_graph(graph, salt=b"fixed").features[0].payload
     assert payload["name"] == "meraki:contentFiltering/category/C7"
+
+
+def _bare_sanitizer(salt: bytes = b"0123456789abcdef") -> _GraphSanitizer:
+    return _GraphSanitizer(NetworkGraph("org-123", (), (), ()), salt)
+
+
+def test_fake_networks_never_collide_across_distinct_real_subnets() -> None:
+    """Two real /24s whose digest-derived first choice collides must map
+    to DIFFERENT fake /24s: a silent merge breaks restore drills with
+    subnet-overlap errors. The colliding head probes deterministically
+    to the next free network; the first-seen head keeps the
+    digest-derived choice the format has always used."""
+    sanitizer = _bare_sanitizer()
+
+    def start_index(head: str) -> int:
+        first, second = sanitizer._digest_bytes(head)[:2]
+        return (first % 254) * 254 + (second % 254)
+
+    seen: dict[int, str] = {}
+    collision: tuple[str, str] | None = None
+    for third in range(5000):
+        head = f"172.{third // 250}.{third % 250}"
+        index = start_index(head)
+        if index in seen:
+            collision = (seen[index], head)
+            break
+        seen[index] = head
+    assert collision is not None  # birthday odds guarantee one by ~600
+    first_head, second_head = collision
+    fake_first = sanitizer._fake_ip(f"{first_head}.9", "")
+    fake_second = sanitizer._fake_ip(f"{second_head}.9", "")
+    # First-seen head keeps the legacy digest-derived network.
+    a, b = sanitizer._digest_bytes(first_head)[:2]
+    assert fake_first == f"10.{a % 254 + 1}.{b % 254 + 1}.9"
+    # The collider landed on a different fake /24 (no silent merge)...
+    assert fake_first.rsplit(".", 1)[0] != fake_second.rsplit(".", 1)[0]
+    # ... and both heads map consistently within the pass.
+    assert (
+        sanitizer._fake_ip(f"{first_head}.44", "").rsplit(".", 1)[0]
+        == fake_first.rsplit(".", 1)[0]
+    )
+    assert (
+        sanitizer._fake_ip(f"{second_head}.44", "").rsplit(".", 1)[0]
+        == fake_second.rsplit(".", 1)[0]
+    )
+
+
+def test_fake_network_probe_wraps_past_the_end_of_the_space() -> None:
+    """Linear probing wraps modulo the 254x254 space instead of running
+    off its end when the digest-derived start sits near the top."""
+    sanitizer = _bare_sanitizer()
+    head = "192.0.2"
+    first, second = sanitizer._digest_bytes(head)[:2]
+    start = (first % 254) * 254 + (second % 254)
+    space = 254 * 254
+    sanitizer._used_fake_networks.update(
+        (start + offset) % space for offset in range(space - 1)
+    )
+    free = (start + space - 1) % space
+    fake = sanitizer._fake_ip("192.0.2.4", "")
+    assert fake == f"10.{free // 254 + 1}.{free % 254 + 1}.4"
+
+
+def test_fake_network_space_exhaustion_raises_a_clear_error() -> None:
+    """Past 64,516 distinct real /24s a fresh fake network cannot exist;
+    reusing one would merge two real subnets, so refuse loudly."""
+    from meraki2tf.sanitizer import SanitizeError
+
+    sanitizer = _bare_sanitizer()
+    sanitizer._used_fake_networks.update(range(254 * 254))
+    with pytest.raises(SanitizeError, match="exhausted"):
+        sanitizer._fake_ip("10.1.2.3", "")
+
+
+def test_x509_fingerprints_survive_while_real_macs_still_sanitize() -> None:
+    """A 20-group colon-hex x509 SHA-1 fingerprint (SAML IdP payloads)
+    is not a MAC and not an IPv6 address; rewriting windows inside it
+    breaks drill validation. Exactly-six-group strings still map."""
+    fingerprint = (
+        "99:88:77:66:55:44:33:22:11:00:aa:bb:cc:dd:ee:ff:12:34:56:78"
+    )
+    graph = NetworkGraph(
+        "org-123", (), (),
+        (
+            FeatureConfiguration(
+                "/organizations/{organizationId}/saml/idps/{idpId}",
+                ("654321", "IDP_1"),
+                {
+                    "x509certSha1Fingerprint": fingerprint,
+                    "bssid": "aa:bb:cc:dd:ee:ff",
+                    "comment": "gateway at aa:bb:cc:dd:ee:ff.",
+                    "ip": "2001:0db8:1111:2222:3333:4444:5555:6666",
+                },
+            ),
+        ),
+    )
+    payload = sanitize_graph(graph, salt=b"fixed").features[0].payload
+    assert payload["x509certSha1Fingerprint"] == fingerprint
+    # Standalone six-group MACs still become fake locally-administered
+    # MACs, including ones embedded in free text with punctuation.
+    assert payload["bssid"].startswith("02:")
+    assert "aa:bb:cc:dd:ee:ff" not in payload["comment"]
+    assert "02:" in payload["comment"]
+    # Full 8-group IPv6 addresses still pseudonymize into 2001:db8::/32.
+    assert payload["ip"].startswith("2001:db8:")
+    assert "3333" not in payload["ip"]
+
+
+def test_extra_path_values_are_pseudonymized_never_leaked(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A snapshot feature carrying more pathValues than its api_path has
+    placeholders (hand-edited/foreign snapshots) must not pass the extra
+    values through VERBATIM into a file stamped sanitized: unmatched
+    values take the generic pseudonym path, and the arity mismatch is
+    logged as a warning."""
+    graph = NetworkGraph(
+        "org-123", (), (),
+        (
+            FeatureConfiguration(
+                "/networks/{networkId}/appliance/vlans",
+                ("N_1", "LEAKY-EXTRA-VALUE", "10", ""),
+                {"items": []},
+            ),
+            # Fewer values than placeholders warns too and must not crash.
+            FeatureConfiguration(
+                "/networks/{networkId}/appliance/vlans/{vlanId}",
+                ("N_1",),
+                {"name": "Data"},
+            ),
+        ),
+    )
+    with caplog.at_level("WARNING", logger="meraki2tf.sanitizer"):
+        sanitized = sanitize_graph(graph, salt=b"fixed")
+    feature = sanitized.features[0]
+    assert feature.path_values[0] == "net-0001"
+    assert feature.path_values[1].startswith("id-")
+    assert "LEAKY-EXTRA-VALUE" not in feature.path_values
+    assert feature.path_values[2] == "10"  # short numerics stay structure
+    assert feature.path_values[3] == ""
+    warnings = [record.message for record in caplog.records]
+    assert sum("path value(s) for" in message for message in warnings) == 2

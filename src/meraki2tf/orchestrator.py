@@ -1030,6 +1030,7 @@ class PipelineOrchestrator:
         )
         added: list[str] = []
         deferred: list[str] = []
+        skipped_members: list[str] = []
         skipped = 0
         for index, chunk in enumerate(chunk_list, start=1):
             chunk_added = self._apply_targeted_chunk(
@@ -1037,6 +1038,7 @@ class PipelineOrchestrator:
             )
             if chunk_added is None:
                 skipped += 1
+                skipped_members.extend(chunk)
                 continue
             added.extend(chunk_added)
         if skipped:
@@ -1045,12 +1047,20 @@ class PipelineOrchestrator:
                 "run; their imports stay pending and import on the next run.",
                 skipped,
             )
+        # Genuinely still pending = deferred resources (they import on
+        # the next run) plus every member of a skipped window. Members
+        # of a COMPLETED window that were neither imported nor deferred
+        # were already in state — their plan proposed nothing for them —
+        # and counting them (the old `pending - added` arithmetic) kept
+        # RUN_SUCCESS.pending_imports from ever converging to 0 on a
+        # fully-imported organization.
+        still_pending = len(dict.fromkeys((*deferred, *skipped_members)))
         logger.info(
             "Batched materialization added %d resource(s) to state "
             "(%d deferred, %d still pending).",
-            len(added), len(deferred), len(pending) - len(added),
+            len(added), len(deferred), still_pending,
         )
-        return tuple(added), tuple(deferred), len(pending) - len(added)
+        return tuple(added), tuple(deferred), still_pending
 
     def _apply_targeted_chunk(
         self,

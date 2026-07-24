@@ -978,3 +978,119 @@ def test_reopen_one_line_block_leaves_braceless_lines_alone() -> None:
 
     braceless = 'resource "meraki_networks" "oneliner"'
     assert _reopen_one_line_block(braceless) == braceless
+
+
+HEREDOC_BLOCK = """\
+resource "meraki_network_webhook_payload_template" "l_1_wpt" {
+  network_id = "L_1"
+  body       = <<-EOT
+{
+"text": "**{{alertType}}**"
+}
+EOT
+  name = "custom-template"
+}
+"""
+
+
+def test_block_span_is_heredoc_aware(tmp_path: Path) -> None:
+    """A column-0 `}` inside a heredoc string body (terraform's
+    generator emits heredocs for webhook payloadTemplate bodies and
+    JSON blobs) is string content — honoring it truncated the block
+    early, leaving its tail behind."""
+    config = tmp_path / "resources.tf"
+    config.write_text(HEREDOC_BLOCK + "\n" + BLOCK, encoding="utf-8")
+    assert drop_resource_blocks(
+        (config,), {"meraki_network_webhook_payload_template.l_1_wpt"}
+    ) == 1
+    text = config.read_text(encoding="utf-8")
+    assert text == BLOCK  # whole heredoc block removed, neighbor intact
+    assert "EOT" not in text and "custom-template" not in text
+
+
+def test_edits_inside_heredoc_blocks_keep_the_tail(tmp_path: Path) -> None:
+    """Remediating a heredoc-bearing block must treat the whole block —
+    attributes after the heredoc included — as one span."""
+    config = tmp_path / "resources.tf"
+    config.write_text(HEREDOC_BLOCK, encoding="utf-8")
+    plan = ReconciliationPlan(
+        remediations=(
+            ResourceRemediation(
+                address="meraki_network_webhook_payload_template.l_1_wpt",
+                secret_attrs=("shared_secret",),
+            ),
+        )
+    )
+    ignored, _ = apply_remediations(tmp_path, plan, ("resources.tf",))
+    assert ignored == {
+        "meraki_network_webhook_payload_template.l_1_wpt": ("shared_secret",)
+    }
+    text = config.read_text(encoding="utf-8")
+    assert "ignore_changes = [shared_secret]" in text
+    assert text.count('resource "meraki_network_webhook_payload_template"') == 1
+    assert 'name = "custom-template"' in text  # the post-heredoc tail
+
+
+def test_unterminated_heredoc_block_is_left_alone(tmp_path: Path) -> None:
+    """A heredoc that never closes swallows the rest of the file; the
+    block has no closer and must be skipped, not truncated."""
+    config = tmp_path / "resources.tf"
+    config.write_text(
+        'resource "meraki_x" "a" {\n  body = <<EOT\n}\n', encoding="utf-8"
+    )
+    assert drop_resource_blocks((config,), {"meraki_x.a"}) == 0
+
+
+def test_remediations_edit_every_file_holding_the_address(
+    tmp_path: Path,
+) -> None:
+    """An address present in BOTH generated_resources.tf and
+    resources.tf must be remediated in both — a lazy any() stopped at
+    the first file and left the other copy un-edited."""
+    generated = tmp_path / "generated_resources.tf"
+    aggregated = tmp_path / "resources.tf"
+    generated.write_text(BLOCK, encoding="utf-8")
+    aggregated.write_text(BLOCK, encoding="utf-8")
+    plan = ReconciliationPlan(
+        remediations=(
+            ResourceRemediation(
+                address="meraki_network_snmp.l_1",
+                secret_attrs=("community_string",),
+            ),
+        )
+    )
+    ignored, _ = apply_remediations(
+        tmp_path, plan, ("generated_resources.tf", "resources.tf")
+    )
+    assert ignored == {"meraki_network_snmp.l_1": ("community_string",)}
+    for path in (generated, aggregated):
+        assert "ignore_changes = [community_string]" in path.read_text(
+            encoding="utf-8"
+        )
+
+
+def test_enum_repairs_edit_every_file_holding_the_address(
+    tmp_path: Path,
+) -> None:
+    generated = tmp_path / "generated_resources.tf"
+    aggregated = tmp_path / "resources.tf"
+    generated.write_text(FIRMWARE_CASE_BLOCK, encoding="utf-8")
+    aggregated.write_text(FIRMWARE_CASE_BLOCK, encoding="utf-8")
+    repaired = apply_enum_case_repairs(
+        tmp_path,
+        {
+            "meraki_network_firmware_upgrades.l_1": {
+                "upgrade_window_day_of_week": "mon"
+            }
+        },
+        ("generated_resources.tf", "resources.tf"),
+    )
+    assert repaired == {
+        "meraki_network_firmware_upgrades.l_1": (
+            "upgrade_window_day_of_week",
+        )
+    }
+    for path in (generated, aggregated):
+        text = path.read_text(encoding="utf-8")
+        assert 'upgrade_window_day_of_week = "mon"' in text
+        assert '"Mon"' not in text

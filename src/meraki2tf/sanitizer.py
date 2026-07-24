@@ -71,6 +71,17 @@ logger = logging.getLogger(__name__)
 
 REDACTED = "**REDACTED**"
 
+
+class SanitizeError(RuntimeError):
+    """Sanitization cannot proceed without corrupting the output.
+
+    Raised when the fake-address space is exhausted: silently reusing a
+    fake ``10.x.y.0/24`` for a second real /24 would merge two subnets
+    in the sanitized snapshot and break restore drills with overlap
+    errors — a wrong snapshot is worse than no snapshot.
+    """
+
+
 #: Payload keys whose string values are credentials. Public because the
 #: DR runbook and gap replayer must agree with the sanitizer on what
 #: counts as a secret (redact in artifacts, restore from the dump).
@@ -119,12 +130,24 @@ _EMAIL_VALUE = re.compile(r"[\w.+-]+@[\w-]+(\.[\w-]+)+")
 #: (`example.com./x`, `host:8080`, `hooks.example.com/T0/SECRET`).
 _FQDN_VALUE = re.compile(r"(?=[^/]*[A-Za-z])[\w*-]+(\.[\w*-]+)+\.?(:\d+)?(/\S*)?")
 _IPV4_VALUE = re.compile(r"(\d{1,3}\.){3}\d{1,3}(?P<prefix>/\d{1,2})?")
-_MAC_VALUE = re.compile(r"([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}")
+#: Exactly six colon-hex groups. Longer colon-hex runs are not MACs —
+#: an x509 SHA-1 fingerprint (SAML IdP payloads) is twenty groups, and
+#: rewriting six-group windows inside it into fake MACs mangles the
+#: fingerprint — so a further ``hex-pair:`` on either side disqualifies
+#: the match.
+_MAC_VALUE = re.compile(
+    r"(?<![0-9A-Fa-f]{2}:)([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}(?!:[0-9A-Fa-f]{2})"
+)
 #: Full 8-group form, or any `::`-compressed form (a MAC has neither
-#: eight groups nor a `::`, so the two shapes never collide).
+#: eight groups nor a `::`, so the two shapes never collide). The
+#: 8-group form is anchored like ``_MAC_VALUE``: an eight-group window
+#: inside a twenty-group x509 fingerprint is not an address either. The
+#: guards are single-char (no adjacent hex or colon at all) because the
+#: elastic ``{1,4}`` group width would otherwise backtrack around a
+#: pair-shaped guard.
 _IPV6_VALUE = re.compile(
     r"(?i)(?:"
-    r"(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}"
+    r"(?<![0-9a-f:])(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}(?![0-9a-f:])"
     r"|(?:[0-9a-f]{1,4}:)+:(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4})*)?"
     r"|::(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4})*)?"
     r")(?P<prefix>/\d{1,3})?"
@@ -250,10 +273,18 @@ def _walk_mappings(node: Any) -> Iterator[Mapping[str, Any]]:
 class _GraphSanitizer:
     """One sanitization pass; holds the consistent structural-ID map."""
 
+    #: Distinct fake ``10.x.y`` /24 networks available to
+    #: :meth:`_fake_ip` (both octets span 1-254; see its comment).
+    _FAKE_NETWORK_SPACE = 254 * 254
+
     def __init__(self, graph: NetworkGraph, salt: bytes) -> None:
         self._salt = salt
         self._id_map: dict[str, str] = {}
         self._counters: dict[str, int] = {}
+        #: real /24 head → fake ``10.x.y`` head, collision-free within
+        #: this pass (see :meth:`_fake_network_head`).
+        self._fake_networks: dict[str, str] = {}
+        self._used_fake_networks: set[int] = set()
         # Meraki built-in payload templates ("type": "included") carry
         # vendor names, not customer identity, and those names must
         # survive verbatim EVERYWHERE — on the template object itself
@@ -285,7 +316,31 @@ class _GraphSanitizer:
         # (vlanId 10, SSID number 3) are structure, not identity.
         for feature in graph.features:
             placeholders = _PATH_PARAM.findall(feature.api_path)
-            for name, value in zip(placeholders, feature.path_values):
+            if len(placeholders) != len(feature.path_values):
+                # zip() would silently truncate, and any value left
+                # unregistered here later passes through VERBATIM into
+                # a file stamped `"sanitized": true`. Reachable via
+                # hand-edited/foreign snapshots (the dump provider
+                # accepts any-length pathValues).
+                logger.warning(
+                    "Feature %s carries %d path value(s) for %d path "
+                    "placeholder(s); unmatched values are pseudonymized "
+                    "generically.",
+                    feature.api_path,
+                    len(feature.path_values),
+                    len(placeholders),
+                )
+            for index, value in enumerate(feature.path_values):
+                if index >= len(placeholders):
+                    # No placeholder to classify the extra value, so the
+                    # generic pseudonym path is the safe direction
+                    # (over-redaction, never a leak). Short numerics
+                    # stay structure: registering a bare "10" would
+                    # rewrite every VLAN id in every payload.
+                    if value and not _is_structural_number(value):
+                        self._assign(value, "id")
+                    continue
+                name = placeholders[index]
                 prefix = _PATH_PARAM_PREFIXES.get(name.lower())
                 if prefix:
                     self._assign(value, prefix)
@@ -351,6 +406,43 @@ class _GraphSanitizer:
         except ValueError:
             return fake + prefix
 
+    def _fake_network_head(self, head: str) -> str:
+        """The fake ``10.x.y`` network for one real /24 head.
+
+        The first candidate is the digest-derived pair this format has
+        always used, but the space holds only 254×254 = 64,516 /24s —
+        birthday collisions reach ~50% around 300 distinct subnets, and
+        a collision silently merges two real subnets in the sanitized
+        snapshot (restore drills then fail with subnet overlaps; compare
+        the 64-bit rationale on :meth:`_pseudonym`). So claimed networks
+        are tracked per pass and a colliding head probes linearly from
+        its digest-derived index to the next free /24 — deterministic
+        for a given salt and encounter order, and memoized so the same
+        real head always maps to the same fake within one pass.
+        """
+        existing = self._fake_networks.get(head)
+        if existing is not None:
+            return existing
+        if len(self._used_fake_networks) >= self._FAKE_NETWORK_SPACE:
+            raise SanitizeError(
+                "Fake IPv4 network space exhausted: the snapshot carries "
+                f"more than {self._FAKE_NETWORK_SPACE} distinct real /24 "
+                "prefixes, which cannot be pseudonymized into 10.x.y.0/24 "
+                "networks without merging two real subnets."
+            )
+        first, second = self._digest_bytes(head)[:2]
+        start = (first % 254) * 254 + (second % 254)
+        for offset in range(self._FAKE_NETWORK_SPACE):
+            index = (start + offset) % self._FAKE_NETWORK_SPACE
+            if index not in self._used_fake_networks:
+                self._used_fake_networks.add(index)
+                fake = f"10.{index // 254 + 1}.{index % 254 + 1}"
+                self._fake_networks[head] = fake
+                return fake
+        raise AssertionError(  # pragma: no cover - capacity checked above
+            "free fake network not found despite available capacity"
+        )
+
     def _fake_ip(self, value: str, prefix: str) -> str:
         # The fake network part is keyed on the real /24 prefix and the
         # host octet is preserved, so addresses that share a real /24
@@ -363,8 +455,7 @@ class _GraphSanitizer:
         # for real leftovers.
         address = value[: len(value) - len(prefix)] if prefix else value
         head, _, host = address.rpartition(".")
-        octets = [byte % 254 + 1 for byte in self._digest_bytes(head)[:2]]
-        fake = f"10.{octets[0]}.{octets[1]}.{host}"
+        fake = f"{self._fake_network_head(head)}.{host}"
         return self._masked(fake, prefix) if prefix else fake
 
     def _fake_mac(self, value: str) -> str:
