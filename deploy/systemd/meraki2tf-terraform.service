@@ -3,6 +3,12 @@
 # meraki2tf-snapshot.service for the account/EnvironmentFile setup —
 # this unit reuses it. Requires the terraform binary on PATH (or set
 # --terraform-bin).
+#
+# >>> MANDATORY EDITS before enabling this unit <<<
+#   * --org-id 123456 in ExecStart is a PLACEHOLDER — replace it with
+#     your organization ID (find it with `meraki2tf --list-orgs`).
+#   * The paths (/opt/meraki2tf/.venv, /var/lib/meraki2tf,
+#     /etc/meraki2tf/env) must match your install locations.
 
 [Unit]
 Description=meraki2tf monthly terraform rehearsal (guarded import-only apply)
@@ -16,8 +22,20 @@ User=meraki2tf
 Group=meraki2tf
 WorkingDirectory=/var/lib/meraki2tf
 EnvironmentFile=/etc/meraki2tf/env
+# Discovery + plan rounds on a large organization take hours. Never
+# let a start timeout SIGTERM the rehearsal mid-apply-window:
+# Type=oneshot disables the start timeout on current systemd, but some
+# distributions/manager configs apply DefaultTimeoutStartSec (~90 s)
+# anyway — make it explicit (or use a generous bound like 12h).
+TimeoutStartSec=infinity
 ExecStart=/opt/meraki2tf/.venv/bin/meraki2tf --org-id 123456 --sync \
     --workdir /var/lib/meraki2tf/dr-kit
+# Optional retention: archive a dated copy of the rebuild kit so a
+# corrupted workdir cannot erase the only restore material; prune old
+# copies. See docs/OPERATIONS.md, "Snapshot retention & archival".
+# (umask 077: the kit archive contains the Terraform state, which
+# carries secret values — keep copies owner-only like the original.)
+#ExecStartPost=/bin/sh -c 'umask 077 && mkdir -p kit-archive && tar czf "kit-archive/dr-kit-$(date +%%Y-%%m-%%d).tar.gz" -C /var/lib/meraki2tf dr-kit && find kit-archive -name "dr-kit-*.tar.gz" -mtime +400 -delete'
 # Exit 3 = coverage gaps (if you pass --fail-on-gaps), exit 4 = the
 # auto-apply stalled on a human review — both are "job ran, humans
 # alerted" outcomes; keep 4 a failure so the stall is visible in
