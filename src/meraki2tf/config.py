@@ -279,6 +279,7 @@ _CONFIG_STR_KEYS = {
     "from-dump": "from_dump",
     "dump-to": "dump_to",
     "drift-baseline": "drift_baseline",
+    "discovery-checkpoint": "discovery_checkpoint",
     "state-file": "state_file",
     "state-backend": "state_backend",
     "backend-config-file": "backend_config_file",
@@ -459,6 +460,15 @@ class RuntimeConfig:
     #: A previous snapshot to diff the fresh discovery against —
     #: API-to-API drift detection in seconds, no terraform read pass.
     drift_baseline: Path | None
+    #: Append-only journal (0600) of completed discovery calls so an
+    #: aborted multi-hour sweep resumes instead of restarting; deleted
+    #: on successful completion.
+    discovery_checkpoint: Path | None
+    #: Cross-network golden-config comparison: two patterns, each
+    #: resolving to exactly one network. Read-only, terraform-free.
+    diff_networks: tuple[str, str] | None
+    #: Optional JSON report path for --diff-networks (names, no values).
+    diff_out: Path | None
     #: Redact secrets/identity from the exported snapshot (--dump-to).
     sanitize: bool
     #: Disaster-recovery action: preview (or, with confirm, execute) a
@@ -575,6 +585,17 @@ class RuntimeConfig:
             drift_baseline=(
                 Path(args.drift_baseline) if args.drift_baseline else None
             ),
+            discovery_checkpoint=(
+                Path(args.discovery_checkpoint)
+                if args.discovery_checkpoint
+                else None
+            ),
+            diff_networks=(
+                (str(args.diff_networks[0]), str(args.diff_networks[1]))
+                if args.diff_networks
+                else None
+            ),
+            diff_out=Path(args.diff_out) if args.diff_out else None,
             dump_to=Path(args.dump_to) if args.dump_to else None,
             sanitize=args.sanitize,
             rebuild=args.rebuild,

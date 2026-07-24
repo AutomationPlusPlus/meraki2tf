@@ -101,6 +101,7 @@ from meraki2tf.providers import (
     MerakiDataProvider,
     StaticJsonDataProvider,
 )
+from meraki2tf.providers.discovery_checkpoint import CheckpointMismatchError
 from meraki2tf.sanitizer import load_or_create_salt, sanitize_graph
 from meraki2tf.scope import (
     LiveNetworkScope,
@@ -310,6 +311,43 @@ def build_parser() -> argparse.ArgumentParser:
             "Real differences dispatch a DRIFT_DETECTED alert."
         ),
     )
+    snapshots.add_argument(
+        "--discovery-checkpoint",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Resumable discovery: journal every completed API call to "
+            "PATH (JSONL, .gz supported; written 0600 — payloads carry "
+            "secrets). An aborted sweep (throttle exhaustion, Ctrl-C, "
+            "crash) keeps the journal, and the next run with the same "
+            "flag resumes instead of restarting; a completed run deletes "
+            "it. Valid on --dump-to exports and live pipeline runs."
+        ),
+    )
+    snapshots.add_argument(
+        "--diff-networks",
+        nargs=2,
+        metavar=("PATTERN_A", "PATTERN_B"),
+        default=None,
+        help=(
+            "Standalone golden-config comparison: diff two networks' "
+            "configuration against each other (spec-normalized, "
+            "attribute names only — never values). Each pattern is a "
+            "case-insensitive glob over network name or ID and must "
+            "match exactly one network. Works live (--org-id) and "
+            "offline (--from-dump). Read-only; no terraform involved."
+        ),
+    )
+    snapshots.add_argument(
+        "--diff-out",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Write the --diff-networks report to PATH as JSON as well "
+            "(attribute names and locators only — values are never "
+            "written)."
+        ),
+    )
     pipeline = parser.add_argument_group(
         "pipeline options",
         "Tune the default read-only pipeline and the scheduled DR job.",
@@ -395,7 +433,11 @@ def build_parser() -> argparse.ArgumentParser:
             "--dump-to: selective backup — restrict discovery to the "
             "matching networks (network:PATTERN selectors only) and "
             "write a partial snapshot usable by --heal but refused by "
-            "--restore, --replay-gaps, and --drift-baseline."
+            "--restore, --replay-gaps, and --drift-baseline. On a "
+            "default live pipeline run: scoped kit generation — "
+            "discovery, the kit, and the plan cover only the matching "
+            "networks (network:PATTERN selectors only); artifacts are "
+            "stamped partial and out-of-scope state is never touched."
         ),
     )
     actions.add_argument(
@@ -650,18 +692,31 @@ def build_dispatcher(config: RuntimeConfig) -> AlertDispatcher:
     return dispatcher
 
 
-def build_provider(config: RuntimeConfig, parser: OpenApiParser) -> MerakiDataProvider:
+def build_provider(
+    config: RuntimeConfig,
+    parser: OpenApiParser,
+    spec_file: Path | None = None,
+) -> MerakiDataProvider:
     if config.dump_path is not None:
         return StaticJsonDataProvider(config.dump_path, parser=parser)
-    if config.dump_to is not None and config.only:
-        # Selective backup: restrict live discovery to the selected
-        # networks (org-level surfaces stay in scope). Export-only —
-        # heal builds its own scoped provider from the snapshot header.
-        return LiveApiDataProvider(
-            parser=parser,
-            network_scope=LiveNetworkScope(selectors=config.only),
-        )
-    return LiveApiDataProvider(parser=parser)
+    # Selective scope (--only): restrict live discovery to the selected
+    # networks (org-level surfaces stay in scope) — the export path AND
+    # the scoped default pipeline. Heal builds its own scoped provider
+    # from the snapshot header and never comes through here.
+    scope = (
+        LiveNetworkScope(selectors=config.only) if config.only else None
+    )
+    checkpoint_sha: str | None = None
+    if config.discovery_checkpoint is not None and spec_file is not None:
+        # The journal is bound to the exact spec document: replayed
+        # payloads re-expand through the spec, so a swap must refuse.
+        checkpoint_sha = spec_fingerprint(spec_file)[1]
+    return LiveApiDataProvider(
+        parser=parser,
+        network_scope=scope,
+        checkpoint_path=config.discovery_checkpoint,
+        spec_sha256=checkpoint_sha,
+    )
 
 
 def _offline_catalog(config: RuntimeConfig) -> ProviderCatalog:
@@ -1809,6 +1864,72 @@ def _list_orgs() -> int:
     return 0
 
 
+def _diff_networks_run(config: RuntimeConfig) -> int:
+    """Standalone cross-network comparison (--diff-networks).
+
+    Read-only end to end: no terraform, no workdir artifacts, no
+    alerts — the report goes to stdout (and, with --diff-out, to a
+    JSON file carrying attribute names only, never values). Live mode
+    narrows discovery to the union of both patterns, so the comparison
+    costs two networks' sweeps instead of the organization's.
+    """
+    from meraki2tf.network_diff import (
+        NetworkResolutionError,
+        compare_networks,
+        comparison_payload,
+        render_network_comparison,
+    )
+
+    assert config.diff_networks is not None  # guarded by the caller
+    pattern_a, pattern_b = config.diff_networks
+    try:
+        spec_parser = OpenApiParser(resolve_spec(config.spec_path))
+        provider: MerakiDataProvider
+        if config.dump_path is not None:
+            provider = StaticJsonDataProvider(
+                config.dump_path, parser=spec_parser
+            )
+        else:
+            provider = LiveApiDataProvider(
+                parser=spec_parser,
+                network_scope=LiveNetworkScope(
+                    selectors=(pattern_a, pattern_b)
+                ),
+            )
+        with provider as source:
+            graph = source.fetch_network_graph(config.org_id)
+    except ScopeFilterError as exc:
+        # A live pattern matching no network: operator input error,
+        # already listing the available networks.
+        logger.critical("%s", exc)
+        return 2
+    except Exception as exc:
+        logger.critical(
+            "Cross-network diff could not load the configuration: %s", exc
+        )
+        return 1
+    try:
+        comparison = compare_networks(
+            graph, pattern_a, pattern_b, spec_parser
+        )
+    except NetworkResolutionError as exc:
+        logger.critical("%s", exc)
+        return 2
+    print(render_network_comparison(comparison))
+    if config.diff_out is not None:
+        config.diff_out.parent.mkdir(parents=True, exist_ok=True)
+        config.diff_out.write_text(
+            json.dumps(comparison_payload(comparison), indent=2) + "\n",
+            encoding="utf-8",
+        )
+        logger.info(
+            "Cross-network diff JSON written to %s (attribute names "
+            "only — values are never written).",
+            config.diff_out,
+        )
+    return 0
+
+
 #: Config-file keys that steer where a confirmed DR action WRITES —
 #: or WHAT executes it. A long-lived file must never pick a write
 #: target, the workdir whose kit/journal a DR action consumes, or the
@@ -1891,6 +2012,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             or config.skip_claims or config.sync or config.rebaseline
             or config.confirm_deletions or config.fail_on_gaps
             or config.check or config.estimate or config.expect_org
+            or config.diff_networks or config.diff_out
+            or config.discovery_checkpoint
         ):
             arg_parser.error(
                 "--list-orgs is a standalone discovery helper; do not "
@@ -1902,6 +2025,46 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"key can see; export {API_KEY_ENV_VAR} first."
             )
         return _list_orgs()
+
+    if config.diff_out is not None and config.diff_networks is None:
+        # Orphaned mode-scoped flags are refused, never silently
+        # ignored (the house rule).
+        arg_parser.error(
+            "--diff-out is only valid together with --diff-networks."
+        )
+    if config.diff_networks is not None:
+        if (
+            config.rebuild or config.heal or config.replay_gaps
+            or config.restore or config.wipe_org or config.wipe_org_name
+            or config.confirm or config.target_org or config.serial_map
+            or config.skip_claims or config.sync
+            or config.confirm_deletions or config.rebaseline
+            or config.fail_on_gaps or config.dump_to is not None
+            or config.sanitize or config.drift_baseline is not None
+            or config.only or config.discovery_checkpoint is not None
+        ):
+            arg_parser.error(
+                "--diff-networks is a standalone read-only comparison; "
+                "combine it only with --from-dump or --org-id (and "
+                "optionally --diff-out / --spec)."
+            )
+        if len(config.org_ids) > 1:
+            arg_parser.error(
+                "--diff-networks compares two networks of ONE "
+                "organization; pass at most one --org-id."
+            )
+        if config.dump_path is None and not config.org_ids:
+            arg_parser.error(
+                "--diff-networks in live mode requires --org-id (or run "
+                "offline against a snapshot with --from-dump)."
+            )
+        if config.dump_path is None and not api_key_present():
+            arg_parser.error(
+                f"--diff-networks in live mode requires {API_KEY_ENV_VAR} "
+                "to discover the two networks; export the key or run "
+                "offline with --from-dump."
+            )
+        return _diff_networks_run(config)
 
     if config.backend.is_remote and config.state_file is not None:
         arg_parser.error(
@@ -1978,12 +2141,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         arg_parser.error("--serial-map is only valid together with --restore.")
     if config.skip_claims and not config.restore:
         arg_parser.error("--skip-claims is only valid together with --restore.")
+    scoped_pipeline = False
     if config.only and not (config.heal or config.dump_to is not None):
-        arg_parser.error(
-            "--only is only valid together with --heal (selective "
-            "recovery) or --dump-to (selective backup)."
-        )
-    if config.only and config.dump_to is not None and not config.heal:
+        # Scoped default pipeline run: generate the kit (and plan) for
+        # a subset of networks — the single-site onboarding case.
+        if (
+            config.rebuild or config.replay_gaps or config.restore
+            or config.wipe_org
+        ):
+            arg_parser.error(
+                "--only cannot be combined with --rebuild, "
+                "--replay-gaps, --restore, or --wipe-org."
+            )
+        if config.dump_path is not None:
+            arg_parser.error(
+                "--only scopes LIVE discovery; re-slicing an existing "
+                "--from-dump snapshot is not supported (a partial "
+                "snapshot input already carries its scope in its "
+                "header)."
+            )
+        scoped_pipeline = True
+    if config.only and (
+        scoped_pipeline or (config.dump_to is not None and not config.heal)
+    ):
         # (--heal + --dump-to is itself refused in the heal branch.)
         if config.dump_path is not None:
             arg_parser.error(
@@ -2003,6 +2183,49 @@ def main(argv: Sequence[str] | None = None) -> int:
             parse_network_selectors(config.only)
         except ScopeFilterError as exc:
             arg_parser.error(str(exc))
+    if scoped_pipeline:
+        if config.confirm_deletions:
+            # A scoped run cannot tell "deleted in Meraki" from "outside
+            # the scope" — discovery never looked at the rest of the
+            # organization. Confirming deletions from that blindfolded
+            # view could remove every out-of-scope resource from the DR
+            # kit and state, so the combination is refused outright
+            # (scoped runs additionally skip deletion review entirely;
+            # deliberate conservatism over silent wrongness).
+            arg_parser.error(
+                "--confirm-deletions cannot be combined with --only: a "
+                "scoped run cannot distinguish deleted objects from "
+                "out-of-scope ones. Review and confirm deletions on a "
+                "full-organization run."
+            )
+        if config.rebaseline:
+            arg_parser.error(
+                "--rebaseline cannot be combined with --only: resetting "
+                "the accumulated baseline from a scoped discovery would "
+                "discard every out-of-scope resource's configuration."
+            )
+        if len(config.org_ids) > 1:
+            arg_parser.error(
+                "--only cannot be combined with multiple --org-id "
+                "values; scope one organization per invocation."
+            )
+    if config.discovery_checkpoint is not None:
+        if (
+            config.rebuild or config.replay_gaps or config.restore
+            or config.wipe_org or config.heal
+            or config.dump_path is not None
+        ):
+            arg_parser.error(
+                "--discovery-checkpoint journals the live discovery "
+                "sweep; it is only valid on --dump-to exports and "
+                "live pipeline runs."
+            )
+        if len(config.org_ids) > 1:
+            arg_parser.error(
+                "--discovery-checkpoint cannot be combined with "
+                "multiple --org-id values: the journal records exactly "
+                "one organization's sweep."
+            )
     if config.wipe_org_name and not config.wipe_org:
         arg_parser.error(
             "--wipe-org-name is only valid together with --wipe-org."
@@ -2432,7 +2655,15 @@ def _run_org_pipeline(
     try:
         spec_file = resolve_spec(config.spec_path)
         spec_parser = OpenApiParser(spec_file)
-        provider = build_provider(config, spec_parser)
+        provider = build_provider(config, spec_parser, spec_file)
+        if config.only and config.dump_to is None:
+            logger.warning(
+                "PARTIAL run: --only scopes discovery, the kit, and the "
+                "plan to the matching network(s); artifacts are stamped "
+                "partial, out-of-scope state is untouched, and deletion "
+                "review is skipped (run full-organization to review "
+                "deletions)."
+            )
         if config.dump_to is not None:
             # The weekly DR job is exactly this invocation; a
             # mid-discovery failure must reach the notification
@@ -2443,11 +2674,12 @@ def _run_org_pipeline(
                     provider, config, spec_parser, dispatcher,
                     spec_file=spec_file,
                 )
-            except ScopeFilterError as exc:
+            except (ScopeFilterError, CheckpointMismatchError) as exc:
                 # Operator input error (a --only selector matched no
-                # network), not a processing fault: fail loudly with
-                # the available networks, no alert — mirroring the
-                # HealFilterError handling in _heal.
+                # network, or a stale/foreign discovery checkpoint),
+                # not a processing fault: fail loudly and actionably,
+                # no alert — mirroring the HealFilterError handling in
+                # _heal.
                 logger.critical("%s", exc)
                 return 2
             except Exception as exc:

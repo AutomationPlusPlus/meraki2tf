@@ -429,6 +429,90 @@ def test_keyboard_interrupt_keeps_the_checkpoint(
     assert "kept" in caplog.text
 
 
+_AGG_PATH = (
+    "/organizations/{organizationId}/wireless/airMarshal/settings/byNetwork"
+)
+_AGG_OP = "getOrganizationWirelessAirMarshalSettingsByNetwork"
+_AGG_COLLECTION = "/networks/{networkId}/wireless/airMarshal/settings"
+
+
+@pytest.mark.parametrize("status", [500, 400])
+def test_aggregation_outcomes_are_journaled(
+    monkeypatch: pytest.MonkeyPatch,
+    spec_parser: OpenApiParser,
+    tmp_path: Path,
+    status: int,
+) -> None:
+    """Aggregation failures/refusals journal like per-scope calls (the
+    run completes, so the journal is deleted — recording still ran)."""
+    checkpoint = tmp_path / "discovery.ckpt.jsonl"
+    responses = dict(REFERENCE_RESPONSES)
+    responses[_AGG_OP] = _FakeApiError(status)
+    provider = _provider(
+        monkeypatch, spec_parser, _dashboard(responses, {}), checkpoint
+    )
+    graph = provider.fetch_network_graph("org-123")
+    if status == 500:
+        assert any(
+            feature.api_path == _AGG_COLLECTION for feature in graph.features
+        )
+    else:
+        assert not any(
+            "airMarshal" in feature.api_path for feature in graph.features
+        )
+    assert not checkpoint.exists()
+
+
+@pytest.mark.parametrize("kind", ["payload", "refused", "unreadable"])
+def test_aggregation_outcomes_replay_from_the_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+    spec_parser: OpenApiParser,
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    checkpoint = tmp_path / "discovery.ckpt.jsonl"
+    journal = DiscoveryCheckpoint(checkpoint, "org-123", "sha-1")
+    if kind == "payload":
+        outcome = CallOutcome(
+            kind=OUTCOME_PAYLOAD,
+            payload=REFERENCE_RESPONSES[_AGG_OP],
+        )
+    elif kind == "refused":
+        outcome = CallOutcome(kind=OUTCOME_REFUSED)
+    else:
+        outcome = CallOutcome(
+            kind=OUTCOME_UNREADABLE, reason="HTTP 503 after every retry"
+        )
+    journal.record(_AGG_PATH, ("org-123",), outcome)
+    journal.close()
+
+    calls: dict[str, int] = {}
+    responses = dict(REFERENCE_RESPONSES)
+    responses[_AGG_OP] = {"items": [{"networkId": "N_1", "tampered": True}]}
+    provider = _provider(
+        monkeypatch, spec_parser, _dashboard(responses, calls), checkpoint
+    )
+    graph = provider.fetch_network_graph("org-123")
+
+    assert calls.get(_AGG_OP, 0) == 0  # replayed, never re-queried
+    airmarshal = [
+        feature
+        for feature in graph.features
+        if "airMarshal" in feature.api_path
+    ]
+    if kind == "payload":
+        assert [feature.payload for feature in airmarshal] == [
+            {"defaultPolicy": "allowed"}
+        ]
+    elif kind == "refused":
+        assert airmarshal == []
+    else:
+        assert [feature.api_path for feature in airmarshal] == [
+            _AGG_COLLECTION
+        ]
+        assert "HTTP 503" in str(airmarshal[0].payload)
+
+
 def test_provider_refuses_a_foreign_checkpoint_before_any_call(
     monkeypatch: pytest.MonkeyPatch,
     spec_parser: OpenApiParser,
