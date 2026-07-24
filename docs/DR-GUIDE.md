@@ -400,10 +400,15 @@ meraki2tf --wipe-org <scratch-org> --wipe-org-name "DR Drill" --confirm
 ```
 
 The wipe is refused outright for **any organization holding claimed
-devices** — production always has hardware, a drill org never does, so
-the destructive path physically cannot target production. The exact
-organization name is a required second factor, and the interlocks are
-re-verified immediately before deletion. Note that dashboard deletion
+devices** — a typical production org always has hardware, a drill org
+never does, so the destructive path cannot target it. Scope that claim
+honestly: a **device-less** production organization (licensing-only,
+Systems-Manager-only, or a hub org whose devices live elsewhere) is
+protected *only* by the exact-name second factor — give drill orgs
+unmistakable names (e.g. "DR Drill 2026-07") and never reuse a
+production org's name for one. The exact organization name is a
+required second factor, and the interlocks are re-verified immediately
+before deletion. Note that dashboard deletion
 is immediate, but backend retention of deleted-organization data is
 governed by Cisco's data-handling policy — for hard-erasure guarantees
 after an unsanitized drill, file a data-deletion request with Meraki

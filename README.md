@@ -3,7 +3,7 @@
 [![Python 3.11–3.14](https://img.shields.io/badge/python-3.11%20%E2%80%93%203.14-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Terraform](https://img.shields.io/badge/terraform-CiscoDevNet%2Fmeraki-844FBA?logo=terraform&logoColor=white)](https://registry.terraform.io/providers/CiscoDevNet/meraki)
 [![CI](https://github.com/AutomationPlusPlus/meraki2tf/actions/workflows/ci.yml/badge.svg)](https://github.com/AutomationPlusPlus/meraki2tf/actions/workflows/ci.yml)
-[![Coverage](https://img.shields.io/badge/coverage-%E2%89%A598%25%20(CI--gated)-success)](#contributor-architecture)
+[![Coverage](https://img.shields.io/badge/coverage-100%25%20(CI--gated)-success)](#contributor-architecture)
 [![Typing: mypy strict](https://img.shields.io/badge/typing-mypy%20strict-blue)](#contributor-architecture)
 [![License: AGPL v3](https://img.shields.io/badge/license-AGPL%20v3-blue)](LICENSE)
 
@@ -70,6 +70,20 @@ its own variable, not `MERAKI_DASHBOARD_API_KEY`) — or let
 the tool keep running on a schedule as a DR safety net. Full install
 notes: [Prerequisites & Installation](#prerequisites--installation).
 
+> **Before you point this at a large production organization:**
+> completeness is the design goal, and it costs reads — a full sweep is
+> roughly one GET per (object × surface), paced under Meraki's shared
+> 10 req/s org budget, which means **hours** on a big org (see
+> [Performance & Scale](docs/OPERATIONS.md#performance--scale)). Try
+> the cheap path first:
+>
+> ```bash
+> meraki2tf --org-id 123456 --check      # validate key/org/terraform/flags — seconds
+> meraki2tf --org-id 123456 --estimate   # request count + wall-clock preview — 2-3 API calls
+> meraki2tf --org-id 123456 --only 'network:Branch-07'   # scoped trial run, one network
+> # or a scoped snapshot: --dump-to trial.jsonl.gz --only 'network:Branch-07'
+> ```
+
 ## Which mode do I want?
 
 | Your goal | Invocation | Where it's documented |
@@ -112,7 +126,9 @@ additive-only, survivors untouched),
 separate `--target-org`, never the source), and
 [`--wipe-org --confirm`](docs/DR-GUIDE.md#restore-drills-and-cleaning-up-after-them)
 (drill-org teardown — refused outright for any organization holding
-claimed devices, so it physically cannot target production).
+claimed devices, which shields any org with hardware; a *device-less*
+production org — licensing-only or Systems-Manager-only — is protected
+only by the exact-name second factor, so name drill orgs distinctly).
 Every scheduled/automated run stays strictly read-only toward Meraki.
 
 **Why dynamic OpenAPI spec parsing?** The Meraki API surface changes
@@ -188,7 +204,12 @@ docker run --rm -e MERAKI_DASHBOARD_API_KEY \
 
 (The Azure-specific image with the runbook wrapper entrypoint lives at
 `deploy/azure/Dockerfile`.) Releases are tagged (`vX.Y.Z`) and listed
-in [`CHANGELOG.md`](CHANGELOG.md) — pin a tag for production use.
+in [`CHANGELOG.md`](CHANGELOG.md). Honest pinning advice: development
+moves faster than tagging right now, and the latest tag can trail
+`main` by a significant feature set (see the `[Unreleased]` section of
+the changelog). For production use, pin a specific `main` commit SHA
+you have validated — or wait for the next tag (a v0.2.0 rollup is
+expected) if you need a blessed point.
 
 ## Documentation
 
