@@ -513,6 +513,104 @@ def test_aggregation_outcomes_replay_from_the_checkpoint(
         assert "HTTP 503" in str(airmarshal[0].payload)
 
 
+def test_template_sweep_calls_replay_from_the_checkpoint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Config-template sweeps journal and resume like every other call:
+    a journaled template-scoped outcome is replayed, not re-queried."""
+    import types
+
+    from conftest import _op
+
+    spec = {
+        "openapi": "3.0.0",
+        "info": {"title": "templates", "version": "1"},
+        "paths": {
+            "/organizations/{organizationId}/configTemplates": {
+                "get": _op("getOrganizationConfigTemplates", "organizations"),
+                "post": _op(
+                    "createOrganizationConfigTemplate", "organizations"
+                ),
+            },
+            "/organizations/{organizationId}/configTemplates"
+            "/{configTemplateId}": {
+                "get": _op("getOrganizationConfigTemplate", "organizations"),
+                "put": _op(
+                    "updateOrganizationConfigTemplate", "organizations"
+                ),
+            },
+            "/networks/{networkId}/appliance/vlans": {
+                "get": _op("getNetworkApplianceVlans", "appliance"),
+            },
+            "/networks/{networkId}/appliance/vlans/{vlanId}": {
+                "get": _op("getNetworkApplianceVlan", "appliance"),
+                "put": _op("updateNetworkApplianceVlan", "appliance"),
+            },
+        },
+    }
+    spec_path = tmp_path / "template-spec.json"
+    spec_path.write_text(json.dumps(spec), encoding="utf-8")
+
+    checkpoint = tmp_path / "discovery.ckpt.jsonl"
+    journal = DiscoveryCheckpoint(checkpoint, "org-123", "sha-1")
+    journal.record(
+        "/networks/{networkId}/appliance/vlans", ("T_1",),
+        CallOutcome(
+            kind=OUTCOME_PAYLOAD,
+            payload=[{"id": 77, "name": "Template-Data"}],
+        ),
+    )
+    journal.close()
+
+    vlan_scopes: list[str] = []
+
+    class Organizations:
+        def getOrganizationNetworks(
+            self, org_id: str, total_pages: str
+        ) -> list[dict[str, Any]]:
+            return [NETWORK]
+
+        def getOrganizationDevices(
+            self, org_id: str, total_pages: str
+        ) -> list[dict[str, Any]]:
+            return []
+
+        def getOrganizationConfigTemplates(
+            self, organizationId: str
+        ) -> list[dict[str, Any]]:
+            return [{"id": "T_1", "name": "Branch Template"}]
+
+    class Appliance:
+        def getNetworkApplianceVlans(
+            self, networkId: str
+        ) -> list[dict[str, Any]]:
+            vlan_scopes.append(networkId)
+            return [{"id": 10, "name": "TAMPERED"}]
+
+    provider = _provider(
+        monkeypatch,
+        OpenApiParser(spec_path),
+        types.SimpleNamespace(
+            organizations=Organizations(), appliance=Appliance()
+        ),
+        checkpoint,
+    )
+    graph = provider.fetch_network_graph("org-123")
+
+    assert vlan_scopes == ["N_1"]  # the template scope was replayed
+    template_vlans = [
+        feature
+        for feature in graph.features
+        if feature.path_values and feature.path_values[0] == "T_1"
+        and feature.api_path
+        == "/networks/{networkId}/appliance/vlans/{vlanId}"
+    ]
+    assert [f.payload for f in template_vlans] == [
+        {"id": 77, "name": "Template-Data"}
+    ]
+    assert not checkpoint.exists()
+
+
 def test_provider_refuses_a_foreign_checkpoint_before_any_call(
     monkeypatch: pytest.MonkeyPatch,
     spec_parser: OpenApiParser,
