@@ -363,6 +363,7 @@ def heal_executed(
     skipped: Sequence[Mapping[str, Any]],
     only: Sequence[str] = (),
     snapshot_scope: Sequence[str] = (),
+    verified_alive: int = 0,
 ) -> AlertEvent:
     """Contract payload for a human-invoked same-org heal: accidentally
     deleted objects recreated from a snapshot, surviving objects never
@@ -371,7 +372,11 @@ def heal_executed(
     alert knows the run deliberately covered a subset of the missing
     objects. ``snapshot_scope`` carries the covered network IDs when
     the heal ran from a partial (selective-backup) snapshot — the
-    counts then describe that scope, not the organization."""
+    counts then describe that scope, not the organization.
+    ``verified_alive`` counts the planned actions the pre-write
+    verification found alive and skipped (additive-only): a nonzero
+    value means the discovery sweep undercounted survivors and deserves
+    its own line in the alert."""
     severity = EventSeverity.WARNING if failed else EventSeverity.INFO
     summary = (
         f"Heal of organization {organization_id}: {len(executed)} "
@@ -386,6 +391,12 @@ def heal_executed(
         "failed": [list(item) for item in failed],
         "skipped": [dict(item) for item in skipped],
     }
+    if verified_alive:
+        summary += (
+            f" {verified_alive} planned action(s) were verified alive "
+            "at execution time and skipped (additive-only)."
+        )
+        details["verified_alive_skips"] = verified_alive
     if only:
         summary += (
             " Selective heal (--only "

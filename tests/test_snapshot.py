@@ -390,3 +390,43 @@ def test_sanitized_scope_omits_raw_selectors(tmp_path: Path) -> None:
         assert scope.network_ids == tuple(
             network.network_id for network in graph.networks
         )
+
+
+def test_snapshot_records_the_export_spec_fingerprint(
+    dump_file: Path, tmp_path: Path
+) -> None:
+    """Both formats stamp (and re-serve) the spec version + sha256 the
+    export ran against, so restore/heal can warn about spec skew."""
+    graph = StaticJsonDataProvider(dump_file).fetch_network_graph()
+    for name in ("snap.json", "snap.jsonl", "snap.jsonl.gz"):
+        path = write_snapshot(
+            graph,
+            tmp_path / name,
+            spec_version="1.52.0",
+            spec_sha256="ab" * 32,
+        )
+        provider = StaticJsonDataProvider(path)
+        assert provider.snapshot_spec_version == "1.52.0"
+        assert provider.snapshot_spec_sha256 == "ab" * 32
+        assert provider.fetch_network_graph() == graph
+
+
+def test_snapshot_spec_fingerprint_is_optional_and_backward_compatible(
+    dump_file: Path, tmp_path: Path
+) -> None:
+    graph = StaticJsonDataProvider(dump_file).fetch_network_graph()
+    for name in ("plain.json", "plain.jsonl"):
+        path = write_snapshot(graph, tmp_path / name)
+        text = (
+            path.read_text(encoding="utf-8")
+            if name.endswith((".json", ".jsonl"))
+            else ""
+        )
+        assert "specVersion" not in text
+        provider = StaticJsonDataProvider(path)
+        assert provider.snapshot_spec_version is None
+        assert provider.snapshot_spec_sha256 is None
+    # Legacy snapshots (written before stamping existed) read as None.
+    legacy = StaticJsonDataProvider(dump_file)
+    assert legacy.snapshot_spec_version is None
+    assert legacy.snapshot_spec_sha256 is None

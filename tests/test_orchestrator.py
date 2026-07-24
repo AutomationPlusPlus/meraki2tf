@@ -1302,6 +1302,53 @@ def test_confirm_deletions_is_a_noop_without_deletions(
     assert summary.deletions_removed == ()
 
 
+def test_transient_deletion_gap_self_heals_and_never_authorizes_removal(
+    tmp_path: Path, api_key: None
+) -> None:
+    """Confirmation is re-verified against the CURRENT run's discovery:
+    an address alerted as deleted on run 1 but discovered again on run
+    2 clears the reviewed set (nothing is removed), and a later real
+    disappearance starts the alert cycle over instead of consuming the
+    stale authorization."""
+    flapped = "meraki_networks.flapped"
+
+    # Run 1: the address transiently vanishes from discovery → alert.
+    orchestrator, recorder, _, runner = _orchestrator(tmp_path)
+    runner.state_addresses = {"meraki_networks.n_1", flapped}
+    summary = orchestrator.run("org-123")
+    assert summary.deletions_pending == (flapped,)
+    assert (tmp_path / PENDING_DELETIONS_FILENAME).exists()
+
+    # Run 2: discovery sees it again; even --confirm-deletions removes
+    # nothing, and the stale reviewed set is cleared.
+    generator = StubGenerator(
+        addresses=("meraki_devices.q2ab", "meraki_networks.n_1", flapped)
+    )
+    orchestrator2, recorder2, _, runner2 = _orchestrator(
+        tmp_path, generator=generator, confirm_deletions=True
+    )
+    runner2.state_addresses = {"meraki_networks.n_1", flapped}
+    summary2 = orchestrator2.run("org-123")
+    assert runner2.removed == []
+    assert summary2.deletions_removed == ()
+    assert summary2.deletions_pending == ()
+    assert not (tmp_path / PENDING_DELETIONS_FILENAME).exists()
+
+    # Run 3: a later REAL disappearance is a new event — alerted anew,
+    # never removed on the strength of run 1's spent review.
+    orchestrator3, recorder3, _, runner3 = _orchestrator(
+        tmp_path, confirm_deletions=True
+    )
+    runner3.state_addresses = {"meraki_networks.n_1", flapped}
+    summary3 = orchestrator3.run("org-123")
+    assert runner3.removed == []
+    assert summary3.deletions_removed == ()
+    assert summary3.deletions_pending == (flapped,)
+    assert EventType.DELETION_PENDING_CONFIRMATION in [
+        e.event_type for e in recorder3.events
+    ]
+
+
 def test_unreadable_endpoints_do_not_read_as_deletions(
     tmp_path: Path, api_key: None
 ) -> None:

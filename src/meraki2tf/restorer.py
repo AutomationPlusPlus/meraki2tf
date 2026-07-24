@@ -68,6 +68,11 @@ from meraki2tf.replayer import (
 )
 from meraki2tf.runbook import write_operations
 from meraki2tf.sanitizer import SECRET_KEY_PATTERN
+from meraki2tf.sdk_verify import (
+    READ_ONLY_SESSION_VERBS,
+    WRITE_SESSION_VERBS,
+    method_matches_verbs,
+)
 from meraki2tf.spec.engine import OperationSpec
 
 logger = logging.getLogger(__name__)
@@ -202,6 +207,9 @@ def plan_restore(graph: NetworkGraph, parser: OpenApiParser) -> RestorePlan:
                 path_values=(device.network_id, device.serial),
                 operation=_device_claim_operation(parser),
                 payload=dict(device.payload),
+                # The claimed-device listing (the claim path minus its
+                # verb segment), for execution-time liveness probes.
+                lookup=lookups.get(DEVICE_CLAIM_PATH.rsplit("/", 1)[0]),
             )
         )
 
@@ -333,6 +341,11 @@ def _classify_feature(
         operation=operation,
         payload=payload,
         secret_reentry=redacted,
+        # The asset's own GET (item, singleton, or collection — same
+        # path either way), for execution-time liveness probes: heal's
+        # pre-write additive-only verification and the second-incident
+        # check on journal-completed actions.
+        lookup=lookups.get(feature.api_path),
     )
 
 
@@ -457,6 +470,13 @@ class ForeignScopeError(RuntimeError):
     snapshot — dispatching it would write into a live organization or
     onto live hardware the restore does not own, so the action is
     refused outright (never deferred, never passed through)."""
+
+
+class SpecVerbMismatchError(RuntimeError):
+    """The spec routed this write to an SDK method whose own source
+    performs session verbs outside put/post — a stale or tampered spec
+    could relabel a *deleting* method as this asset's PUT, so the
+    dispatch is refused outright (fail closed, per-object)."""
 
 
 #: Policy-object grammar embedded in firewall rule strings, and the
@@ -588,6 +608,20 @@ class ReferenceResolver:
     def has_mapping(self, stem: str, old: str) -> bool:
         """Is any mapping recorded for ``(stem, old)``?"""
         return bool(self._entries.get((stem, old)))
+
+    def recorded_targets(self, stem: str, old: str) -> tuple[str, ...]:
+        """Every distinct new ID recorded for ``(stem, old)``.
+
+        Second-incident cleanup: an object journaled as restored but
+        absent again must shed its stale old→dead mapping before the
+        re-create records a fresh one, or every reference to it becomes
+        ambiguous and the resolver (correctly) refuses to guess.
+        """
+        return tuple(
+            dict.fromkeys(
+                new for _, new in self._entries.get((stem, old), [])
+            )
+        )
 
     def sibling_mapping(self, stem: str, old: str) -> str | None:
         """The single new ID recorded for ``(stem, old)`` anywhere.
@@ -951,6 +985,16 @@ _DEFAULT_FLAG_RE = re.compile(r"(?i)^isdefault")
 #: ("SGT has already been taken"); `shortName` is an API keyword the
 #: sanitizer preserves verbatim, so both work from sanitized snapshots.
 _NATURAL_MATCH_KEYS = ("name", "sgt", "shortName")
+
+#: Per-action throttle budget, mirroring discovery's philosophy (see
+#: providers.live): every retry is preceded by the SDK's own throttle
+#: retries and paced by the shared AIMD bucket, whose rate floors and
+#: global pauses grow under sustained saturation — so exhausting this
+#: many attempts means the organization budget stayed saturated for a
+#: long stretch of wall-clock time, not two seconds. Post-disaster
+#: saturation is the DESIGN CASE for a restore: throttled writes are
+#: transient pressure, never a verdict on the object.
+_MAX_THROTTLE_ATTEMPTS = 40
 
 #: The one configure endpoint whose payload embeds org-local catalog
 #: references (firmware version IDs) that no snapshot mapping can
@@ -1408,6 +1452,12 @@ class RestoreJournal:
                     ),
                 )
             )
+        elif record.get("kind") == "unmap":
+            self._drop_mapping(
+                str(record["old"]),
+                str(record["new"]),
+                str(record.get("scope", "")),
+            )
         elif record.get("kind") == "meta":
             self.meta = {
                 str(key): str(value)
@@ -1483,6 +1533,41 @@ class RestoreJournal:
             }
         )
 
+    def record_unmap(self, old: str, new: str, scope: str = "") -> None:
+        """Retire a stale mapping (second incident: the object whose ID
+        it minted is gone again). Durable like every other record, so a
+        resumed run never replays the dead mapping into the resolver."""
+        self._drop_mapping(old, new, scope)
+        self._append(
+            {"kind": "unmap", "old": old, "new": new, "scope": scope}
+        )
+
+    def _drop_mapping(self, old: str, new: str, scope: str) -> None:
+        self.mappings = [
+            row
+            for row in self.mappings
+            if not (row[0] == scope and row[1] == old and row[2] == new)
+        ]
+        if self.id_map.get(old) == new:
+            del self.id_map[old]
+
+
+#: Heal pre-write verification skip reasons. Distinct, greppable
+#: strings: they flow into the HEAL_EXECUTED alert's skipped list and
+#: the run log, so the operator can tell "verified alive" apart from
+#: every other skip class.
+HEAL_VERIFIED_ALIVE_REASON = (
+    "alive at execution time (additive-only): the pre-write "
+    "verification read found the object/settings present live; heal "
+    "never overwrites survivors"
+)
+HEAL_VERIFY_UNCERTAIN_PREFIX = (
+    "pre-write verification could not confirm absence"
+)
+
+#: Cached liveness-probe result standing in for a 404 answer.
+_PROBE_ABSENT: Any = object()
+
 
 @dataclass(frozen=True)
 class RestoreResult:
@@ -1537,6 +1622,15 @@ class OrgRestorer:
         #: an operator's manual recreation of a deleted object must not
         #: be reverted to the stale snapshot copy.
         self._additive_only = additive_only
+        #: (type stem, old ID) of objects THIS run genuinely POSTed or
+        #: claimed (never adopted/journal-loaded ones): children scoped
+        #: under a freshly minted parent cannot predate it, so their
+        #: liveness probes short-circuit to "absent".
+        self._minted: set[tuple[str, str]] = set()
+        #: Liveness-probe read cache for one execution pass, keyed by
+        #: (lookup path, operationId, resolved params): sibling creates
+        #: in the same collection share one paced read.
+        self._probe_cache: dict[tuple[str, str, tuple[str, ...]], Any] = {}
         self._client: Any = None
 
     def _dashboard(self) -> Any:
@@ -1624,10 +1718,19 @@ class OrgRestorer:
         #: Keys granted one drop-unresolvable-references retry after a
         #: deadlocked (no-progress) round — mutually-referencing pairs
         #: (policy object groupIds ↔ group objectIds) otherwise starve
-        #: each other forever.
+        #: each other forever. Reference deferrals ONLY: throttled
+        #: actions never enter (dropping reference fields is a remedy
+        #: for dead references, and silently applying it to a merely
+        #: rate-limited write would strand memberships).
         drop_retry: set[str] = set()
+        #: Action key → 429 deferral count. Tracked separately from
+        #: reference deferrals so a saturated organization budget (the
+        #: post-disaster design case) can never trip the reference
+        #: deadlock breaker or the drop-retry path.
+        throttle_attempts: dict[str, int] = {}
         while pending:
             deferred: list[tuple[RestoreAction, str]] = []
+            throttled: list[RestoreAction] = []
             for action in pending:
                 if self._skip_claims and action.wave in (
                     WAVE_DEVICE_CLAIM, WAVE_DEVICE_FEATURES
@@ -1667,23 +1770,42 @@ class OrgRestorer:
                     )
                     continue
                 if action.key in self._journal.completed:
-                    if (
-                        action.kind == "create"
-                        and not resolver.has_mapping(*_own_identity(action))
-                    ):
-                        # A completed create with no journaled mapping:
-                        # the run that created it could not extract the
-                        # response ID, so every reference to it is dead
-                        # on this and all future resumes. Recover the
-                        # mapping by matching the existing object in
-                        # the target.
-                        remembered = self._reconcile_existing(
-                            dashboard, action, resolver,
-                            graph.organization_id,
+                    # A journal entry proves the object was restored
+                    # ONCE, not that it still exists: a second incident
+                    # (healed Monday, deleted again Friday) must not
+                    # hide behind Monday's journal. Probe the target
+                    # before honoring the resume skip.
+                    verdict, found = self._probe_liveness(
+                        dashboard, action, resolver, graph.organization_id
+                    )
+                    if verdict == "absent":
+                        logger.warning(
+                            "%s is journaled as restored but absent "
+                            "from the target; re-executing (new "
+                            "incident).", action.key,
                         )
-                        if remembered is not None:
+                        self._forget_stale_identity(action, resolver)
+                        if action.kind == "claim":
+                            # Serial-scoped children must wait for the
+                            # re-claim, exactly like a first-time claim.
+                            unclaimed.add(action.path_values[-1])
+                        # Fall through: the action executes again.
+                    else:
+                        if (
+                            action.kind == "create"
+                            and found is not None
+                            and not resolver.has_mapping(
+                                *_own_identity(action)
+                            )
+                        ):
+                            # A completed create with no journaled
+                            # mapping: the run that created it could
+                            # not extract the response ID, so every
+                            # reference to it is dead on this and all
+                            # future resumes. Recover the mapping from
+                            # the probe's match.
                             self._bookkeep_success(
-                                action, remembered, resolver,
+                                action, found, resolver,
                                 graph.organization_id,
                             )
                             logger.warning(
@@ -1692,11 +1814,12 @@ class OrgRestorer:
                                 "object in the target organization.",
                                 action.key,
                             )
-                    skipped.append(
-                        {"target": action.key, "reason": "already restored "
-                         "(journal); resume skips completed actions"}
-                    )
-                    continue
+                        skipped.append(
+                            {"target": action.key, "reason":
+                             "already restored (journal); resume skips "
+                             "completed actions"}
+                        )
+                        continue
                 foreign_serials = [
                     value
                     for name, value in zip(
@@ -1778,6 +1901,71 @@ class OrgRestorer:
                              "claimed into the target organization yet")
                         )
                         continue
+                if self._additive_only:
+                    # Additive-only is only as strong as the discovery
+                    # sweep that decided "missing" — and any silent
+                    # discovery gap (a transient 400, SDK/spec skew)
+                    # would make heal PUT stale snapshot payloads over
+                    # live settings. So heal re-verifies liveness with
+                    # a targeted read immediately before every write:
+                    # only a clean absent answer permits it; uncertain
+                    # is not a license to write; an unverifiable
+                    # surface is refused and reported.
+                    verdict, found = self._probe_liveness(
+                        dashboard, action, resolver, graph.organization_id
+                    )
+                    if verdict == "alive":
+                        if action.kind == "create" and found is not None:
+                            own_stem, own_old = _own_identity(action)
+                            if not resolver.has_mapping(own_stem, own_old):
+                                # Children of the survivor must rewire
+                                # to it; record the mapping (but not a
+                                # completion — nothing was written).
+                                context = self._mapping_context(
+                                    action, graph.organization_id
+                                )
+                                resolver.record(
+                                    own_stem, own_old, found, context
+                                )
+                                self._journal.record_mapping(
+                                    own_old, found,
+                                    scope=own_stem, context=context,
+                                )
+                        skipped.append(
+                            {"target": action.key,
+                             "reason": HEAL_VERIFIED_ALIVE_REASON}
+                        )
+                        continue
+                    if verdict == "uncertain":
+                        logger.warning(
+                            "Skipping heal of %s: the pre-write "
+                            "verification read failed, and uncertainty "
+                            "is not a license to write (additive-only).",
+                            action.key,
+                        )
+                        skipped.append(
+                            {"target": action.key, "reason":
+                             f"{HEAL_VERIFY_UNCERTAIN_PREFIX}: the "
+                             "targeted read errored; re-run --heal once "
+                             "the API reads cleanly"}
+                        )
+                        continue
+                    if verdict == "unverifiable":
+                        failed.append(
+                            (action.key, "cannot verify the object is "
+                             "absent before writing (no usable, "
+                             "verifiably read-only GET for this "
+                             "surface); additive-only heal refuses "
+                             "unverifiable writes — rebuild it manually "
+                             "if it is really missing")
+                        )
+                        if action.kind in ("create", "claim"):
+                            failed_parents.add(_own_identity(action))
+                        continue
+                    # "absent" and "proceed" both fall through: absent
+                    # is the verified green light, and an unresolvable
+                    # probe scope is the dispatch path's business
+                    # (defer or fail loudly, never silently skip).
                 dispatch_action = action
                 injected_paths: tuple[str, ...] = ()
                 if self._skip_claims:
@@ -1800,6 +1988,7 @@ class OrgRestorer:
                     )
                     if injected_paths:
                         dispatch_action = replace(action, payload=filled)
+                freshly_dispatched = False
                 try:
                     new_id: str | None
                     recovered: str | None = None
@@ -1838,6 +2027,7 @@ class OrgRestorer:
                             graph.organization_id,
                             drop_unresolvable=action.key in drop_retry,
                         )
+                        freshly_dispatched = True
                 except _EmptyConfigureSkip as exc:
                     skipped.append(
                         {"target": action.key, "reason": str(exc)}
@@ -1859,14 +2049,29 @@ class OrgRestorer:
                         # Even the SDK's own throttle retries were
                         # exhausted: a saturated shared budget (exactly
                         # the post-disaster situation) is transient
-                        # pressure, not a verdict on the object — defer
-                        # it to the next round with backoff instead of
-                        # failing it and poisoning its whole subtree.
+                        # pressure, not a verdict on the object. The
+                        # action retries next round under the bucket's
+                        # escalating backoff (multiplicative rate cuts
+                        # plus global pauses accumulate across rounds),
+                        # up to a generous per-action attempt budget —
+                        # only exhausting that budget fails it. Throttle
+                        # deferrals never join the reference-deadlock
+                        # accounting below.
                         self._bucket.on_throttle()
-                        deferred.append(
-                            (action, "the dashboard throttled the write "
-                             "(429) beyond the SDK's retries")
-                        )
+                        attempts = throttle_attempts.get(action.key, 0) + 1
+                        throttle_attempts[action.key] = attempts
+                        if attempts >= _MAX_THROTTLE_ATTEMPTS:
+                            failed.append(
+                                (action.key, "the dashboard throttled "
+                                 "the write (429) across "
+                                 f"{attempts} paced attempts; the "
+                                 "shared organization budget stayed "
+                                 "saturated for the whole retry budget")
+                            )
+                            if action.kind in ("create", "claim"):
+                                failed_parents.add(_own_identity(action))
+                            continue
+                        throttled.append(action)
                         continue
                     verdict, salvage = self._salvage_failure(
                         dashboard, dispatch_action, resolver,
@@ -1928,6 +2133,11 @@ class OrgRestorer:
                         continue
                 if action.kind == "claim":
                     unclaimed.discard(action.path_values[-1])
+                if freshly_dispatched and action.kind in ("create", "claim"):
+                    # Genuinely written this run (never adopted or
+                    # journal-replayed): children scoped under it
+                    # cannot predate it — see _probe_liveness.
+                    self._minted.add(_own_identity(action))
                 self._bookkeep_success(
                     action, new_id, resolver, graph.organization_id
                 )
@@ -1936,28 +2146,43 @@ class OrgRestorer:
                     drill_placeholders.append(
                         (action.key, ",".join(injected_paths))
                     )
-            if not deferred:
+            if not deferred and not throttled:
                 break
-            if len(deferred) == len(pending):
-                # Nothing settled this round, so no new mapping can
-                # appear on its own. Grant every deferred action one
-                # retry that omits unresolvable reference fields — a
-                # mutual pair then converges (the first to settle
-                # records the mapping the other needs, and the
-                # surviving side of the pair re-establishes the link).
-                # An action already granted that retry is out of moves;
-                # the UnmappedReferenceError handler fails it.
+            if throttled:
+                logger.warning(
+                    "%d write(s) deferred by API throttling this round; "
+                    "retrying under reduced pacing (per-action budget: "
+                    "%d attempts).", len(throttled), _MAX_THROTTLE_ATTEMPTS,
+                )
+            if not throttled and len(deferred) == len(pending):
+                # A pure reference stall: nothing settled and nothing
+                # was merely throttled, so no new mapping can appear on
+                # its own. Grant every deferred action one retry that
+                # omits unresolvable reference fields — a mutual pair
+                # then converges (the first to settle records the
+                # mapping the other needs, and the surviving side of
+                # the pair re-establishes the link). An action already
+                # granted that retry is out of moves; the
+                # UnmappedReferenceError handler fails it. While any
+                # action is throttle-deferred this breaker never fires:
+                # a throttled write may still settle and record the
+                # mapping the deferred references are waiting for.
                 fresh = [
                     action
                     for action, _ in deferred
                     if action.key not in drop_retry
                 ]
-                if not fresh:
+                if not fresh:  # pragma: no cover - defensive terminator
+                    # Unreachable through today's deferral kinds (an
+                    # unmapped reference on a drop_retry action FAILS
+                    # rather than defers, and serial waits resolve or
+                    # dead-skip with their claim), but the loop must
+                    # still terminate if a future deferral kind stalls.
                     for action, reason in deferred:
                         failed.append((action.key, reason))
                     break
                 drop_retry.update(action.key for action in fresh)
-            pending = [action for action, _ in deferred]
+            pending = [action for action, _ in deferred] + throttled
         if salvage_round:
             # One bounded retry after the whole plan settles: same-wave
             # sibling dependencies (a static route rejected because its
@@ -1998,6 +2223,7 @@ class OrgRestorer:
                     drill_placeholders.append((key, ",".join(injected)))
                 if action.kind in ("create", "claim"):
                     failed_parents.discard(_own_identity(action))
+                    self._minted.add(_own_identity(action))
             if salvaged:
                 recovered_keys = set(salvaged)
                 failed = [
@@ -2008,6 +2234,19 @@ class OrgRestorer:
                     "End-of-run salvage restored %d object(s) whose "
                     "first attempt failed on a same-wave sibling "
                     "dependency: %s", len(salvaged), ", ".join(salvaged),
+                )
+        if self._additive_only:
+            alive_skips = sum(
+                1
+                for entry in skipped
+                if entry["reason"] == HEAL_VERIFIED_ALIVE_REASON
+            )
+            if alive_skips:
+                logger.warning(
+                    "%d planned heal action(s) were verified ALIVE "
+                    "immediately before writing and skipped "
+                    "(additive-only): the discovery sweep undercounted "
+                    "survivors — nothing was overwritten.", alive_skips,
                 )
         if drill_placeholders:
             logger.warning(
@@ -2068,6 +2307,192 @@ class OrgRestorer:
                 scope=own_stem, context=mapping_context,
             )
         self._journal.record_done(action.key)
+
+    @staticmethod
+    def _mapping_context(
+        action: RestoreAction, source_org: str
+    ) -> tuple[str, ...]:
+        """Parent-context values a mapping for the action's own object
+        is recorded under (see the note in ``_bookkeep_success``)."""
+        if action.wave == WAVE_NETWORKS:
+            return ()
+        return tuple(
+            value
+            for value in action.path_values[:-1]
+            if value != source_org
+        )
+
+    def _forget_stale_identity(
+        self, action: RestoreAction, resolver: ReferenceResolver
+    ) -> None:
+        """Retire the journaled mapping(s) of a second-incident object.
+
+        The re-create is about to mint a fresh server ID; leaving the
+        dead old→Monday's-ID mapping standing alongside it would make
+        every reference to the object ambiguous, and the resolver
+        (correctly) refuses to guess.
+        """
+        if action.kind not in ("create", "claim"):
+            return
+        own_stem, own_old = _own_identity(action)
+        for stale in resolver.recorded_targets(own_stem, own_old):
+            resolver.forget(own_stem, own_old, stale)
+            self._journal.record_unmap(own_old, stale, scope=own_stem)
+
+    def _probe_liveness(
+        self,
+        dashboard: Any,
+        action: RestoreAction,
+        resolver: ReferenceResolver,
+        source_org: str,
+    ) -> tuple[str, str | None]:
+        """Targeted read answering "does this object exist live, now?".
+
+        Returns ``(verdict, found_id)``:
+
+        * ``"alive"`` — present (``found_id`` carries the live
+          counterpart's ID for creates, when extractable);
+        * ``"absent"`` — a clean 404/empty/no-match answer;
+        * ``"uncertain"`` — the read errored in a non-404 way or
+          returned an unusable shape (uncertain is not absence);
+        * ``"unverifiable"`` — no usable, verifiably read-only GET;
+        * ``"proceed"`` — the read's scope cannot resolve yet; the
+          dispatch path owns that situation (defer/fail loudly).
+
+        Objects scoped under a parent this very run minted are absent
+        by construction — a child cannot predate its parent — which
+        also keeps heal's verification from misreading a freshly
+        recreated parent's default settings as a survivor.
+        """
+        # A create's own last path value is its identity-to-be-minted,
+        # not an addressed parent (same rule as the failed-parent
+        # matching); a singleton configure's last value IS its parent.
+        own = (
+            _own_identity(action)
+            if action.kind in ("create", "claim")
+            else None
+        )
+        scope_pairs = [
+            (_scope_stem(name), value)
+            for name, value in zip(
+                _PATH_PARAM_RE.findall(action.api_path),
+                action.path_values,
+            )
+        ]
+        if any(
+            pair != own and pair in self._minted for pair in scope_pairs
+        ):
+            return ("absent", None)
+        op = action.lookup
+        if op is None:
+            return ("unverifiable", None)
+        section = getattr(dashboard, op.tags[0], None) if op.tags else None
+        method = (
+            getattr(section, op.operation_id, None)
+            if section is not None
+            else None
+        )
+        if method is None:
+            return ("unverifiable", None)
+        if not method_matches_verbs(method, READ_ONLY_SESSION_VERBS):
+            # Uncertain would skip; unverifiable reports louder — and
+            # under no circumstances is the unproven method called.
+            return ("unverifiable", None)
+        scope_values = action.path_values
+        if action.wave == WAVE_NETWORKS:
+            scope_values = (source_org,)
+        try:
+            params = tuple(
+                resolver.resolve_scope(name, value, action.path_values)
+                for name, value in zip(op.path_params, scope_values)
+            )
+        except (UnmappedReferenceError, ForeignScopeError):
+            return ("proceed", None)
+        cache_key = (op.path, op.operation_id, params)
+        if cache_key in self._probe_cache:
+            result = self._probe_cache[cache_key]
+        else:
+            self._bucket.acquire()
+            try:
+                result = (
+                    method(*params, total_pages="all")
+                    if "total_pages"
+                    in inspect.signature(method).parameters
+                    else method(*params)
+                )
+            except Exception as exc:  # noqa: BLE001 - classify, never raise
+                if getattr(exc, "status", None) == 404:
+                    self._probe_cache[cache_key] = _PROBE_ABSENT
+                    return ("absent", None)
+                # Transient failures (429, 5xx) are not cached: a later
+                # probe of the same scope may read cleanly.
+                return ("uncertain", None)
+            self._bucket.on_success()
+            self._probe_cache[cache_key] = result
+        if result is _PROBE_ABSENT:
+            return ("absent", None)
+        return self._classify_probe(action, result)
+
+    def _classify_probe(
+        self, action: RestoreAction, result: Any
+    ) -> tuple[str, str | None]:
+        """Interpret a liveness read per action kind (see _probe_liveness)."""
+        if action.kind in ("create", "claim"):
+            listing = (
+                result.get("items") if isinstance(result, Mapping) else result
+            )
+            if not isinstance(listing, list):
+                return ("uncertain", None)
+            items = [item for item in listing if isinstance(item, Mapping)]
+            if action.kind == "claim":
+                serial = action.path_values[-1]
+                wanted = self._serial_map.get(serial, serial)
+                present = any(
+                    str(item.get("serial", "")) == wanted for item in items
+                )
+                return ("alive", None) if present else ("absent", None)
+            _, own_old = _own_identity(action)
+            if self._additive_only and any(
+                _item_identifier(action, item) == own_old for item in items
+            ):
+                # Same-organization heal: a survivor keeps its identity,
+                # so the old ID in the listing IS the object.
+                return ("alive", own_old)
+            for key in _NATURAL_MATCH_KEYS:
+                wanted_value = action.payload.get(key)
+                if wanted_value is None or isinstance(
+                    wanted_value, (Mapping, list)
+                ):
+                    continue
+                hits = [
+                    item for item in items if item.get(key) == wanted_value
+                ]
+                if len(hits) == 1:
+                    return ("alive", _item_identifier(action, hits[0]))
+                if hits:
+                    # Several live objects share the natural key: never
+                    # guess an adoption, but a keyed listing with hits
+                    # is not clean absence either.
+                    return ("uncertain", None)
+                return ("absent", None)
+            if self._additive_only:
+                # A readable same-org listing without the old ID is
+                # clean absence even without a natural key.
+                return ("absent", None)
+            if any(
+                _item_identifier(action, item) == own_old for item in items
+            ):
+                # Cross-org restore fallback for client-assigned IDs
+                # (an appliance VLAN keeps its ``id`` across restores).
+                return ("alive", own_old)
+            return ("uncertain", None)
+        if result is None:
+            return ("absent", None)
+        if isinstance(result, (Mapping, list)):
+            if _effectively_empty(result):
+                return ("absent", None)
+            return ("alive", None)
+        return ("uncertain", None)
 
     def _salvage_failure(
         self,
@@ -2505,6 +2930,14 @@ class OrgRestorer:
             raise RuntimeError(
                 f"Meraki SDK exposes no method for {op.operation_id!r}"
             )
+        if not method_matches_verbs(method, WRITE_SESSION_VERBS):
+            raise SpecVerbMismatchError(
+                f"SDK method {op.operation_id!r} resolved for this "
+                f"{op.method.upper()} does not verifiably perform only "
+                "put/post session calls; refusing to dispatch — the "
+                "spec and the installed SDK disagree on what this "
+                "operation does"
+            )
         if action.kind == "create":
             # Write-ahead: recorded after reference rewriting (so a
             # deferral leaves no trace) but before the API call, so a
@@ -2595,6 +3028,16 @@ class OrgRestorer:
             else None
         )
         if method is None:
+            return None
+        if not method_matches_verbs(method, READ_ONLY_SESSION_VERBS):
+            # A lookup that is not verifiably a read must never be
+            # called: proceeding without adoption is safe (worst case
+            # one duplicate-create failure), calling a mislabeled
+            # mutating method is not.
+            logger.warning(
+                "Adoption lookup %r for %s is not verifiably read-only; "
+                "proceeding without it.", op.operation_id, action.key,
+            )
             return None
         self._bucket.acquire()
         try:

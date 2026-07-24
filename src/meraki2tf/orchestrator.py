@@ -46,6 +46,7 @@ from meraki2tf.alerts import (
 )
 from meraki2tf.alerts.models import condense_diff, redact_diff
 from meraki2tf.config import API_KEY_ENV_VAR, api_key_present
+from meraki2tf.fileio import atomic_write_text
 from meraki2tf.coverage import build_manifest, unsupported_payload, write_manifest
 from meraki2tf.hcl_generator import (
     GenerationReport,
@@ -668,14 +669,20 @@ class PipelineOrchestrator:
         return frozenset(str(address) for address in addresses)
 
     def _persist_alerted_deletions(self, addresses: tuple[str, ...]) -> None:
-        """Record (or clear) the alerted set the next confirmation covers."""
+        """Record (or clear) the alerted set the next confirmation covers.
+
+        Atomic like every other artifact: this file *authorizes* future
+        removals, so a torn write must never leave a half-list a
+        ``--confirm-deletions`` run would act on (the reader degrades a
+        corrupt file to "nothing reviewed", losing the review instead).
+        """
         path = self._runner.workdir / PENDING_DELETIONS_FILENAME
         if not addresses:
             path.unlink(missing_ok=True)
             return
-        path.write_text(
+        atomic_write_text(
+            path,
             json.dumps({"addresses": sorted(addresses)}, indent=2) + "\n",
-            encoding="utf-8",
         )
 
     def _review_deletions(

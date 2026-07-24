@@ -107,7 +107,7 @@ from meraki2tf.scope import (
     parse_network_selectors,
 )
 from meraki2tf.snapshot import write_snapshot
-from meraki2tf.spec_resolver import resolve_spec
+from meraki2tf.spec_resolver import resolve_spec, spec_fingerprint
 from meraki2tf.terraform_runner import (
     PROVIDER_FILENAME,
     TerraformError,
@@ -743,6 +743,7 @@ def _export_snapshot(
     config: RuntimeConfig,
     parser: OpenApiParser,
     dispatcher: AlertDispatcher,
+    spec_file: Path | None = None,
 ) -> int:
     """Discover the graph and write it as an offline snapshot (--dump-to)."""
     assert config.dump_to is not None  # guarded by the caller
@@ -795,11 +796,20 @@ def _export_snapshot(
             "written owner-only (0600) — store it like a password file, and "
             "use --sanitize for any copy that leaves the DR vault."
         )
+    spec_version: str | None = None
+    spec_sha256: str | None = None
+    if spec_file is not None:
+        # Stamp the spec identity into the snapshot header so a later
+        # --restore/--heal can warn when its runtime spec differs from
+        # the one that shaped this capture.
+        spec_version, spec_sha256 = spec_fingerprint(spec_file)
     write_snapshot(
         graph,
         config.dump_to,
         sanitized=config.sanitize,
         scope_selectors=tuple(config.only) if config.only else None,
+        spec_version=spec_version,
+        spec_sha256=spec_sha256,
     )
     manifest = _export_coverage(
         raw_graph,
@@ -1028,7 +1038,10 @@ def _restore(config: RuntimeConfig) -> int:
     # written to with the mandated executed-alert left undeliverable.
     dispatcher = build_dispatcher(config)
     try:
-        spec_parser = OpenApiParser(resolve_spec(config.spec_path))
+        # DR write action: never auto-refresh the spec (deterministic
+        # dispatch; the exact spec version+sha256 is logged).
+        spec_file = resolve_spec(config.spec_path, refresh=False)
+        spec_parser = OpenApiParser(spec_file)
         provider = StaticJsonDataProvider(config.dump_path, parser=spec_parser)
         with provider as source:
             # No org-ID override (the CLI refuses --org-id here): the
@@ -1038,6 +1051,7 @@ def _restore(config: RuntimeConfig) -> int:
     except Exception as exc:
         logger.critical("Restore could not load the snapshot: %s", exc)
         return 1
+    _warn_snapshot_spec_skew(provider, spec_file, "--restore")
     # A nested multi-org export records several source organizations,
     # but the executor can only remap ONE source org onto the target:
     # actions belonging to any other recorded org would carry their
@@ -1222,6 +1236,35 @@ def _restore(config: RuntimeConfig) -> int:
     return _alert_outage_exit(dispatcher)
 
 
+def _warn_snapshot_spec_skew(
+    provider: StaticJsonDataProvider, spec_file: Path, action: str
+) -> None:
+    """WARN when the runtime spec differs from the snapshot's recorded one.
+
+    The snapshot header (stamped at export) records which OpenAPI
+    document shaped the capture; a restore/heal planning against a
+    different document may classify assets differently. Old snapshots
+    without the stamp stay silent — there is nothing to compare.
+    """
+    recorded_version = provider.snapshot_spec_version
+    recorded_sha = provider.snapshot_spec_sha256
+    if recorded_version is None and recorded_sha is None:
+        return
+    runtime_version, runtime_sha = spec_fingerprint(spec_file)
+    if recorded_version != runtime_version or (
+        recorded_sha is not None and recorded_sha != runtime_sha
+    ):
+        logger.warning(
+            "%s runs with OpenAPI spec version %s (sha256 %s) but the "
+            "snapshot was exported with version %s (sha256 %s); the "
+            "write plan may classify assets differently than the "
+            "capture did. Pass --spec with the capture-time document "
+            "for exact parity.",
+            action, runtime_version or "unknown", runtime_sha,
+            recorded_version or "unknown", recorded_sha or "unrecorded",
+        )
+
+
 def _target_network_count(target_org: str) -> int:
     """How many networks the restore target organization holds now."""
     import meraki
@@ -1251,6 +1294,7 @@ def _heal(config: RuntimeConfig) -> int:
     assert config.org_id  # guarded by the caller
     from meraki2tf.healer import HealFilterError, filter_heal_plan, plan_heal
     from meraki2tf.restorer import (
+        HEAL_VERIFIED_ALIVE_REASON,
         OrgRestorer,
         RestoreJournal,
         RestoreJournalMismatchError,
@@ -1267,13 +1311,17 @@ def _heal(config: RuntimeConfig) -> int:
         return 1
     dispatcher = build_dispatcher(config)
     try:
-        spec_parser = OpenApiParser(resolve_spec(config.spec_path))
+        # DR write action: never auto-refresh the spec (deterministic
+        # dispatch; the exact spec version+sha256 is logged).
+        spec_file = resolve_spec(config.spec_path, refresh=False)
+        spec_parser = OpenApiParser(spec_file)
         provider = StaticJsonDataProvider(config.dump_path, parser=spec_parser)
         with provider as source:
             snapshot = source.fetch_network_graph(None)
     except Exception as exc:
         logger.critical("Heal could not load the snapshot: %s", exc)
         return 1
+    _warn_snapshot_spec_skew(provider, spec_file, "--heal")
     if provider.snapshot_sanitized:
         logger.critical(
             "--heal requires the unsanitized snapshot: a sanitized "
@@ -1452,6 +1500,14 @@ def _heal(config: RuntimeConfig) -> int:
                 if heal_scope is not None
                 else ()
             ),
+            # Distinct reporting for pre-write verification skips: a
+            # nonzero count means live discovery undercounted survivors
+            # and the additive-only guard caught it at write time.
+            verified_alive=sum(
+                1
+                for entry in result.skipped
+                if entry["reason"] == HEAL_VERIFIED_ALIVE_REASON
+            ),
         )
     )
     if result.failed:
@@ -1471,7 +1527,11 @@ def _replay_gaps(config: RuntimeConfig) -> int:
     """
     assert config.dump_path is not None  # guarded by the caller
     try:
-        spec_parser = OpenApiParser(resolve_spec(config.spec_path))
+        # DR write action: never auto-refresh the spec (deterministic
+        # dispatch; the exact spec version+sha256 is logged).
+        spec_parser = OpenApiParser(
+            resolve_spec(config.spec_path, refresh=False)
+        )
         provider = StaticJsonDataProvider(config.dump_path, parser=spec_parser)
         with provider as source:
             graph = source.fetch_network_graph(config.org_id)
@@ -2187,7 +2247,8 @@ def _run_org_pipeline(
     # names it; dump-mode runs refine this once the snapshot resolves.
     dispatcher.organization_id = config.org_id
     try:
-        spec_parser = OpenApiParser(resolve_spec(config.spec_path))
+        spec_file = resolve_spec(config.spec_path)
+        spec_parser = OpenApiParser(spec_file)
         provider = build_provider(config, spec_parser)
         if config.dump_to is not None:
             # The weekly DR job is exactly this invocation; a
@@ -2196,7 +2257,8 @@ def _run_org_pipeline(
             # "critical script processing faults" trigger).
             try:
                 return _export_snapshot(
-                    provider, config, spec_parser, dispatcher
+                    provider, config, spec_parser, dispatcher,
+                    spec_file=spec_file,
                 )
             except ScopeFilterError as exc:
                 # Operator input error (a --only selector matched no

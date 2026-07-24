@@ -40,6 +40,11 @@ from meraki2tf.openapi_parser import OpenApiParser
 from meraki2tf.providers.live import CONFIG_TEMPLATE_ITEM_PATH
 from meraki2tf.runbook import payload_index, write_operations
 from meraki2tf.sanitizer import REDACTED, SECRET_KEY_PATTERN
+from meraki2tf.sdk_verify import (
+    READ_ONLY_SESSION_VERBS,
+    WRITE_SESSION_VERBS,
+    method_matches_verbs,
+)
 from meraki2tf.spec.engine import OperationSpec
 
 logger = logging.getLogger(__name__)
@@ -632,6 +637,12 @@ class GapReplayer:
                 f"SDK exposes no collection read for {action.target}; "
                 "refusing to replay onto a server-assigned ID blind."
             )
+        if not method_matches_verbs(method, READ_ONLY_SESSION_VERBS):
+            raise ReplayDispatchError(
+                f"Collection read {lookup.operation_id!r} for "
+                f"{action.target} is not verifiably read-only; refusing "
+                "to call it or to replay onto a server-assigned ID blind."
+            )
         lookup_params = {name: params[name] for name in lookup_needed}
         try:
             listing = (
@@ -709,6 +720,17 @@ class GapReplayer:
             else None
         )
         if method is None:
+            return False
+        if not method_matches_verbs(method, READ_ONLY_SESSION_VERBS):
+            # Never call a lookup that is not verifiably a read;
+            # proceeding without the presence check is safe (worst case
+            # the API rejects one duplicate create), calling a
+            # mislabeled mutating method is not.
+            logger.warning(
+                "Already-present lookup %r for %s is not verifiably "
+                "read-only; proceeding with the create.",
+                op.operation_id, action.target,
+            )
             return False
         try:
             listing = (
@@ -812,6 +834,14 @@ class GapReplayer:
             raise ReplayDispatchError(
                 f"Meraki SDK exposes no method for operation "
                 f"{op.operation_id!r} (tags={op.tags!r})."
+            )
+        if not method_matches_verbs(method, WRITE_SESSION_VERBS):
+            raise ReplayDispatchError(
+                f"SDK method {op.operation_id!r} resolved for this "
+                f"{op.method.upper()} does not verifiably perform only "
+                "put/post session calls; refusing to dispatch — the "
+                "spec and the installed SDK disagree on what this "
+                "operation does."
             )
         # Path parameters win over any payload field of the same name —
         # the payload echoes the snapshot tenant's identifiers.
