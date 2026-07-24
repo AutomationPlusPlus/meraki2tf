@@ -27,8 +27,10 @@ import logging
 import os
 import re
 import threading
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any
 
 from meraki2tf.config import read_api_key
@@ -58,8 +60,16 @@ from meraki2tf.providers.discovery import (
     parent_item_path,
     product_segment,
 )
+from meraki2tf.providers.discovery_checkpoint import (
+    OUTCOME_PAYLOAD,
+    OUTCOME_REFUSED,
+    OUTCOME_UNREADABLE,
+    CallOutcome,
+    DiscoveryCheckpoint,
+)
+from meraki2tf.providers.progress import DiscoveryProgress
 from meraki2tf.providers.ratelimit import AdaptiveTokenBucket
-from meraki2tf.scope import LiveNetworkScope
+from meraki2tf.scope import LiveNetworkScope, SnapshotScope
 from meraki2tf.spec.engine import OperationSpec
 
 logger = logging.getLogger(__name__)
@@ -224,6 +234,9 @@ class LiveApiDataProvider(MerakiDataProvider):
         parser: OpenApiParser | None = None,
         *,
         network_scope: LiveNetworkScope | None = None,
+        checkpoint_path: Path | None = None,
+        spec_sha256: str | None = None,
+        progress_clock: Callable[[], float] | None = None,
     ) -> None:
         self._parser = parser
         #: When set, discovery covers only the matching networks and
@@ -232,6 +245,23 @@ class LiveApiDataProvider(MerakiDataProvider):
         #: remain recreatable). Unclaimed devices (no network) fall
         #: outside every network scope by definition.
         self._network_scope = network_scope
+        #: When set, completed calls are journaled here (0600) so an
+        #: aborted sweep resumes instead of restarting from zero; the
+        #: file is deleted when discovery completes. ``spec_sha256``
+        #: stamps/verifies the journal's identity header — replayed
+        #: outcomes expand through the spec, so a spec swap between
+        #: runs must refuse the resume rather than skew the graph.
+        self._checkpoint_path = checkpoint_path
+        self._spec_sha256 = spec_sha256
+        #: Monotonic clock driving the ~30s progress-line cadence;
+        #: injectable so tests control time instead of sleeping.
+        self._progress_clock = progress_clock or time.monotonic
+        #: Mirror of the dump provider's partial-scope declaration:
+        #: set after a scoped fetch so the pipeline stamps every
+        #: artifact of a ``--only`` run partial exactly like a partial
+        #: snapshot input (Cardinal Rule 2 — a scoped kit must never
+        #: read as a full-organization capture).
+        self.snapshot_scope: SnapshotScope | None = None
         #: Side facts of the latest discovery pass (suspect endpoints,
         #: prefilter skip count) for the coverage manifest; ``None``
         #: until a feature-discovery pass has run.
@@ -285,40 +315,76 @@ class LiveApiDataProvider(MerakiDataProvider):
     def fetch_network_graph(self, organization_id: str | None = None) -> NetworkGraph:
         if not organization_id:
             raise ValueError("Live mode requires an explicit organization ID.")
-        dashboard = self._dashboard()
-        networks = tuple(
-            MerakiNetwork.from_payload(item)
-            for item in dashboard.organizations.getOrganizationNetworks(
-                organization_id, total_pages="all"
+        # Opened before any API call: an identity mismatch (wrong org,
+        # wrong spec) must refuse the run without spending API budget.
+        # The two org-level list calls below are deliberately NOT
+        # checkpointed — they are two cheap calls, and re-listing on
+        # resume picks up networks/devices created since the abort.
+        checkpoint: DiscoveryCheckpoint | None = None
+        if self._checkpoint_path is not None:
+            checkpoint = DiscoveryCheckpoint(
+                self._checkpoint_path, organization_id,
+                self._spec_sha256 or "",
             )
-        )
-        devices = tuple(
-            MerakiDevice.from_payload(item)
-            for item in dashboard.organizations.getOrganizationDevices(
-                organization_id, total_pages="all"
+        try:
+            dashboard = self._dashboard()
+            networks = tuple(
+                MerakiNetwork.from_payload(item)
+                for item in dashboard.organizations.getOrganizationNetworks(
+                    organization_id, total_pages="all"
+                )
             )
-        )
-        if self._network_scope is not None:
-            total_networks, total_devices = len(networks), len(devices)
-            networks = self._network_scope.apply(networks)
-            selected_ids = frozenset(n.network_id for n in networks)
             devices = tuple(
-                d for d in devices if d.network_id in selected_ids
+                MerakiDevice.from_payload(item)
+                for item in dashboard.organizations.getOrganizationDevices(
+                    organization_id, total_pages="all"
+                )
             )
-            logger.info(
-                "Scoped discovery: %d of %d network(s) and %d of %d "
-                "device(s) selected; org-level surfaces remain in scope.",
-                len(networks), total_networks, len(devices), total_devices,
+            if self._network_scope is not None:
+                total_networks, total_devices = len(networks), len(devices)
+                networks = self._network_scope.apply(networks)
+                selected_ids = frozenset(n.network_id for n in networks)
+                devices = tuple(
+                    d for d in devices if d.network_id in selected_ids
+                )
+                logger.info(
+                    "Scoped discovery: %d of %d network(s) and %d of %d "
+                    "device(s) selected; org-level surfaces remain in scope.",
+                    len(networks), total_networks, len(devices), total_devices,
+                )
+            features = tuple(
+                self._discover_features(
+                    dashboard, organization_id, networks, devices,
+                    checkpoint=checkpoint,
+                )
             )
-        features = tuple(
-            self._discover_features(dashboard, organization_id, networks, devices)
-        )
+        except BaseException:
+            # Abort (throttle exhaustion, Ctrl-C, crash): the journal
+            # survives so the next run resumes the completed calls.
+            if checkpoint is not None:
+                checkpoint.close()
+                logger.warning(
+                    "Discovery aborted; checkpoint %s kept — re-run with "
+                    "the same --discovery-checkpoint to resume the "
+                    "completed calls instead of restarting.",
+                    self._checkpoint_path,
+                )
+            raise
+        if checkpoint is not None:
+            checkpoint.complete()
         graph = NetworkGraph(
             organization_id=organization_id,
             networks=networks,
             devices=devices,
             features=features,
         )
+        if self._network_scope is not None:
+            self.snapshot_scope = SnapshotScope(
+                network_ids=tuple(
+                    network.network_id for network in networks
+                ),
+                selectors=self._network_scope.selectors,
+            )
         logger.info(
             "Live graph fetched: %d network(s), %d device(s), %d feature(s)",
             len(networks), len(devices), len(features),
@@ -331,6 +397,7 @@ class LiveApiDataProvider(MerakiDataProvider):
         organization_id: str,
         networks: tuple[MerakiNetwork, ...],
         devices: tuple[MerakiDevice, ...],
+        checkpoint: DiscoveryCheckpoint | None = None,
     ) -> list[FeatureConfiguration]:
         """Execute every configuration GET the spec exposes.
 
@@ -360,6 +427,7 @@ class LiveApiDataProvider(MerakiDataProvider):
         bucket = AdaptiveTokenBucket()
         abort = threading.Event()
         stats = _EndpointStats()
+        progress = DiscoveryProgress(bucket, clock=self._progress_clock)
         features: list[FeatureConfiguration] = []
         mappings = parser.resource_mappings()
         lookup = parser.endpoint_lookup()
@@ -378,10 +446,43 @@ class LiveApiDataProvider(MerakiDataProvider):
                 op.path
             )
 
+        def _replay(
+            op: OperationSpec,
+            scope_values: tuple[str, ...],
+            recorded: CallOutcome,
+        ) -> list[FeatureConfiguration]:
+            """A checkpointed outcome, re-expanded like a fresh call.
+
+            Payloads run through the very same spec-driven expansion as
+            live responses (the checkpoint's spec-sha guard makes that
+            sound), refusals replay their suspect-endpoint tally, and
+            unreadable gaps reproduce their gap record verbatim — so a
+            resumed graph is identical to an uninterrupted run's.
+            """
+            if recorded.kind == OUTCOME_UNREADABLE:
+                return [
+                    FeatureConfiguration(
+                        api_path=op.path,
+                        path_values=scope_values,
+                        payload={UNREADABLE_MARKER: recorded.reason},
+                    )
+                ]
+            if recorded.kind == OUTCOME_REFUSED:
+                stats.record(op.path, refused=True)
+                return []
+            stats.record(op.path, refused=False)
+            return expand_endpoint_payload(
+                parser, op, scope_values, recorded.payload
+            )
+
         def _fetch(
             op: OperationSpec, scope_values: tuple[str, ...]
         ) -> list[FeatureConfiguration]:
             params = dict(zip(op.path_params, scope_values))
+            if checkpoint is not None:
+                recorded = checkpoint.get(op.path, scope_values)
+                if recorded is not None:
+                    return _replay(op, scope_values, recorded)
             try:
                 payload = self._try_call(
                     op, params, undispatchable, undispatchable_lock, bucket,
@@ -394,6 +495,11 @@ class LiveApiDataProvider(MerakiDataProvider):
                     "from this snapshot.",
                     op.path, _scope_label(params), exc,
                 )
+                if checkpoint is not None:
+                    checkpoint.record(
+                        op.path, scope_values,
+                        CallOutcome(kind=OUTCOME_UNREADABLE, reason=str(exc)),
+                    )
                 return [
                     FeatureConfiguration(
                         api_path=op.path,
@@ -402,8 +508,47 @@ class LiveApiDataProvider(MerakiDataProvider):
                     )
                 ]
             if payload is None:
+                # None is a genuine scope refusal — unless the run is
+                # aborting, in which case _try_call bails out with None
+                # for calls that never happened; journaling those as
+                # refusals would silently drop them from every resume.
+                if checkpoint is not None and not abort.is_set():
+                    checkpoint.record(
+                        op.path, scope_values,
+                        CallOutcome(kind=OUTCOME_REFUSED),
+                    )
                 return []
+            if checkpoint is not None:
+                checkpoint.record(
+                    op.path, scope_values,
+                    CallOutcome(kind=OUTCOME_PAYLOAD, payload=payload),
+                )
             return expand_endpoint_payload(parser, op, scope_values, payload)
+
+        def _aggregation_gap(
+            mapping: TerraformResourceMapping, reason: str
+        ) -> list[FeatureConfiguration]:
+            return [
+                FeatureConfiguration(
+                    api_path=aggregation_collection_path(mapping),
+                    path_values=(),
+                    payload={UNREADABLE_MARKER: reason},
+                )
+            ]
+
+        def _explode_scoped(
+            mapping: TerraformResourceMapping, payload: Any
+        ) -> list[FeatureConfiguration]:
+            exploded = explode_aggregation_payload(mapping, payload)
+            if self._network_scope is not None:
+                allowed = frozenset(network.network_id for network in networks)
+                exploded = [
+                    feature
+                    for feature in exploded
+                    if not feature.path_values
+                    or feature.path_values[0] in allowed
+                ]
+            return exploded
 
         def _fetch_aggregation(
             mapping: TerraformResourceMapping,
@@ -415,10 +560,23 @@ class LiveApiDataProvider(MerakiDataProvider):
             per-network GET the API never offered. Failures gap the
             entity's own collection path so heal/deletion flows exempt
             it through the ordinary unreadable-marker mechanism.
+            Checkpointed under the aggregation endpoint's own path, so
+            aggregation sweeps resume exactly like per-scope calls.
             """
             agg_op = mapping.aggregation_get
             assert agg_op is not None  # only adopted mappings are queued
             params = {"organizationId": organization_id}
+            key_values = (organization_id,)
+            if checkpoint is not None:
+                recorded = checkpoint.get(agg_op.path, key_values)
+                if recorded is not None:
+                    if recorded.kind == OUTCOME_UNREADABLE:
+                        return _aggregation_gap(mapping, recorded.reason)
+                    if recorded.kind == OUTCOME_REFUSED:
+                        stats.record(agg_op.path, refused=True)
+                        return []
+                    stats.record(agg_op.path, refused=False)
+                    return _explode_scoped(mapping, recorded.payload)
             try:
                 payload = self._try_call(
                     agg_op, params, undispatchable, undispatchable_lock,
@@ -432,35 +590,48 @@ class LiveApiDataProvider(MerakiDataProvider):
                     "objects are missing from this snapshot.",
                     agg_op.path, exc, collection_path,
                 )
-                return [
-                    FeatureConfiguration(
-                        api_path=collection_path,
-                        path_values=(),
-                        payload={UNREADABLE_MARKER: str(exc)},
+                if checkpoint is not None:
+                    checkpoint.record(
+                        agg_op.path, key_values,
+                        CallOutcome(kind=OUTCOME_UNREADABLE, reason=str(exc)),
                     )
-                ]
+                return _aggregation_gap(mapping, str(exc))
             if payload is None:
                 # A 400/404 at org scope: the organization does not
-                # carry the product at all — absence by design.
+                # carry the product at all — absence by design (not
+                # journaled while aborting, like _fetch).
+                if checkpoint is not None and not abort.is_set():
+                    checkpoint.record(
+                        agg_op.path, key_values,
+                        CallOutcome(kind=OUTCOME_REFUSED),
+                    )
                 return []
-            exploded = explode_aggregation_payload(mapping, payload)
-            if self._network_scope is not None:
-                allowed = frozenset(network.network_id for network in networks)
-                exploded = [
-                    feature
-                    for feature in exploded
-                    if not feature.path_values
-                    or feature.path_values[0] in allowed
-                ]
-            return exploded
+            if checkpoint is not None:
+                checkpoint.record(
+                    agg_op.path, key_values,
+                    CallOutcome(kind=OUTCOME_PAYLOAD, payload=payload),
+                )
+            return _explode_scoped(mapping, payload)
+
+        def _tracked(
+            job: Callable[[], list[FeatureConfiguration]]
+        ) -> list[FeatureConfiguration]:
+            try:
+                return job()
+            finally:
+                # Failures count as completed work too: the progress
+                # line reports throughput, not success.
+                progress.item_completed()
 
         def _run_level(
-            items: list[Callable[[], list[FeatureConfiguration]]]
+            label: str,
+            items: list[Callable[[], list[FeatureConfiguration]]],
         ) -> None:
             if not items:
                 return
+            progress.start_level(label, len(items))
             with ThreadPoolExecutor(max_workers=self._workers) as pool:
-                futures = [pool.submit(job) for job in items]
+                futures = [pool.submit(_tracked, job) for job in items]
                 try:
                     # Submission order, not completion order — discovery
                     # output stays deterministic under any pool width.
@@ -536,7 +707,7 @@ class LiveApiDataProvider(MerakiDataProvider):
         for mapping in aggregation_mappings(parser):
             level.append(functools.partial(_fetch_aggregation, mapping))
             level_paths.add(aggregation_collection_path(mapping))
-        _run_level(level)
+        _run_level("single-scope", level)
         if skipped_out_of_scope:
             logger.info(
                 "Product-type prefilter skipped %d endpoint call(s) whose "
@@ -562,11 +733,12 @@ class LiveApiDataProvider(MerakiDataProvider):
                 "network configuration.", len(template_ids),
             )
             _run_level(
+                "config-template",
                 [
                     functools.partial(_fetch, op, (template_id,))
                     for template_id in template_ids
                     for op in network_ops
-                ]
+                ],
             )
 
         # Nested (multi-parameter) configuration surfaces: per-SSID
@@ -597,7 +769,7 @@ class LiveApiDataProvider(MerakiDataProvider):
             for op in parser.endpoints()
             if op.method == "get" and _folds_elsewhere(op)
         )
-        for _, level_ops in itertools.groupby(
+        for param_count, level_ops in itertools.groupby(
             nested_ops, key=lambda op: len(op.path_params)
         ):
             nested_level: list[Callable[[], list[FeatureConfiguration]]] = []
@@ -645,7 +817,7 @@ class LiveApiDataProvider(MerakiDataProvider):
                         },
                     )
                 )
-            _run_level(nested_level)
+            _run_level(f"nested {param_count}-parameter", nested_level)
         suspects = stats.suspects()
         if suspects:
             logger.warning(
