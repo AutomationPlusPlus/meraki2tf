@@ -964,6 +964,16 @@ _DEFAULT_FLAG_RE = re.compile(r"(?i)^isdefault")
 #: sanitizer preserves verbatim, so both work from sanitized snapshots.
 _NATURAL_MATCH_KEYS = ("name", "sgt", "shortName")
 
+#: Per-action throttle budget, mirroring discovery's philosophy (see
+#: providers.live): every retry is preceded by the SDK's own throttle
+#: retries and paced by the shared AIMD bucket, whose rate floors and
+#: global pauses grow under sustained saturation — so exhausting this
+#: many attempts means the organization budget stayed saturated for a
+#: long stretch of wall-clock time, not two seconds. Post-disaster
+#: saturation is the DESIGN CASE for a restore: throttled writes are
+#: transient pressure, never a verdict on the object.
+_MAX_THROTTLE_ATTEMPTS = 40
+
 #: The one configure endpoint whose payload embeds org-local catalog
 #: references (firmware version IDs) that no snapshot mapping can
 #: resolve — see OrgRestorer._shape_firmware_upgrades.
@@ -1636,10 +1646,19 @@ class OrgRestorer:
         #: Keys granted one drop-unresolvable-references retry after a
         #: deadlocked (no-progress) round — mutually-referencing pairs
         #: (policy object groupIds ↔ group objectIds) otherwise starve
-        #: each other forever.
+        #: each other forever. Reference deferrals ONLY: throttled
+        #: actions never enter (dropping reference fields is a remedy
+        #: for dead references, and silently applying it to a merely
+        #: rate-limited write would strand memberships).
         drop_retry: set[str] = set()
+        #: Action key → 429 deferral count. Tracked separately from
+        #: reference deferrals so a saturated organization budget (the
+        #: post-disaster design case) can never trip the reference
+        #: deadlock breaker or the drop-retry path.
+        throttle_attempts: dict[str, int] = {}
         while pending:
             deferred: list[tuple[RestoreAction, str]] = []
+            throttled: list[RestoreAction] = []
             for action in pending:
                 if self._skip_claims and action.wave in (
                     WAVE_DEVICE_CLAIM, WAVE_DEVICE_FEATURES
@@ -1871,14 +1890,29 @@ class OrgRestorer:
                         # Even the SDK's own throttle retries were
                         # exhausted: a saturated shared budget (exactly
                         # the post-disaster situation) is transient
-                        # pressure, not a verdict on the object — defer
-                        # it to the next round with backoff instead of
-                        # failing it and poisoning its whole subtree.
+                        # pressure, not a verdict on the object. The
+                        # action retries next round under the bucket's
+                        # escalating backoff (multiplicative rate cuts
+                        # plus global pauses accumulate across rounds),
+                        # up to a generous per-action attempt budget —
+                        # only exhausting that budget fails it. Throttle
+                        # deferrals never join the reference-deadlock
+                        # accounting below.
                         self._bucket.on_throttle()
-                        deferred.append(
-                            (action, "the dashboard throttled the write "
-                             "(429) beyond the SDK's retries")
-                        )
+                        attempts = throttle_attempts.get(action.key, 0) + 1
+                        throttle_attempts[action.key] = attempts
+                        if attempts >= _MAX_THROTTLE_ATTEMPTS:
+                            failed.append(
+                                (action.key, "the dashboard throttled "
+                                 "the write (429) across "
+                                 f"{attempts} paced attempts; the "
+                                 "shared organization budget stayed "
+                                 "saturated for the whole retry budget")
+                            )
+                            if action.kind in ("create", "claim"):
+                                failed_parents.add(_own_identity(action))
+                            continue
+                        throttled.append(action)
                         continue
                     verdict, salvage = self._salvage_failure(
                         dashboard, dispatch_action, resolver,
@@ -1948,17 +1982,27 @@ class OrgRestorer:
                     drill_placeholders.append(
                         (action.key, ",".join(injected_paths))
                     )
-            if not deferred:
+            if not deferred and not throttled:
                 break
-            if len(deferred) == len(pending):
-                # Nothing settled this round, so no new mapping can
-                # appear on its own. Grant every deferred action one
-                # retry that omits unresolvable reference fields — a
-                # mutual pair then converges (the first to settle
-                # records the mapping the other needs, and the
-                # surviving side of the pair re-establishes the link).
-                # An action already granted that retry is out of moves;
-                # the UnmappedReferenceError handler fails it.
+            if throttled:
+                logger.warning(
+                    "%d write(s) deferred by API throttling this round; "
+                    "retrying under reduced pacing (per-action budget: "
+                    "%d attempts).", len(throttled), _MAX_THROTTLE_ATTEMPTS,
+                )
+            if not throttled and len(deferred) == len(pending):
+                # A pure reference stall: nothing settled and nothing
+                # was merely throttled, so no new mapping can appear on
+                # its own. Grant every deferred action one retry that
+                # omits unresolvable reference fields — a mutual pair
+                # then converges (the first to settle records the
+                # mapping the other needs, and the surviving side of
+                # the pair re-establishes the link). An action already
+                # granted that retry is out of moves; the
+                # UnmappedReferenceError handler fails it. While any
+                # action is throttle-deferred this breaker never fires:
+                # a throttled write may still settle and record the
+                # mapping the deferred references are waiting for.
                 fresh = [
                     action
                     for action, _ in deferred
@@ -1969,7 +2013,7 @@ class OrgRestorer:
                         failed.append((action.key, reason))
                     break
                 drop_retry.update(action.key for action in fresh)
-            pending = [action for action, _ in deferred]
+            pending = [action for action, _ in deferred] + throttled
         if salvage_round:
             # One bounded retry after the whole plan settles: same-wave
             # sibling dependencies (a static route rejected because its

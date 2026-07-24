@@ -4532,6 +4532,119 @@ def test_throttled_writes_defer_instead_of_poisoning_the_subtree(
     assert "429" in reason
 
 
+def test_throttle_storm_never_trips_the_reference_deadlock_breaker(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Consecutive all-throttled rounds are transient saturation, not a
+    reference deadlock: the throttled create retries under backoff and
+    the referring action then resolves the REAL mapping — its reference
+    fields are never silently dropped and nothing is failed."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(
+            GP_ITEM, ("N_1", "100"), {"groupPolicyId": "100", "name": "kiosk"}
+        ),
+        FeatureConfiguration(
+            SSID_ITEM, ("N_1", "0"),
+            {"number": 0, "name": "Corp", "groupPolicyId": "100"},
+        ),
+    )
+    plan = plan_restore(graph, parser)
+    calls: list = []
+    bucket = SimpleNamespace(
+        acquire=lambda: None, on_success=lambda: None,
+        on_throttle=lambda: None,
+    )
+
+    class Throttled(Exception):
+        status = 429
+
+    class Section(_RecordingSection):
+        throttles_left = 2
+
+        def createNetworkGroupPolicy(self, *args, **kwargs) -> dict:
+            self._calls.append(("createNetworkGroupPolicy", args, kwargs))
+            if Section.throttles_left:
+                Section.throttles_left -= 1
+                raise Throttled("429 Too Many Requests")
+            return {"id": "900"}
+
+    section = Section(calls)
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "j.jsonl"),
+        serial_map={"Q2AB-CDEF-GHIJ": "Q9ZZ-NEWW-HWSN"},
+        bucket=bucket,  # type: ignore[arg-type]
+    )
+    restorer._client = SimpleNamespace(
+        organizations=section, networks=section, wireless=section
+    )
+    with caplog.at_level(logging.WARNING, logger="meraki2tf.restorer"):
+        result = restorer.execute(graph, plan)
+    assert result.failed == ()
+    # The SSID waited for the group policy's real mapping — no dropped
+    # reference fields, no deadlock-breaker involvement.
+    ssid = next(c for c in calls if c[0] == "updateNetworkWirelessSsid")
+    assert ssid[2]["groupPolicyId"] == "900"
+    assert "unresolvable reference" not in caplog.text
+    assert "deferred by API throttling" in caplog.text
+
+
+def test_throttle_budget_exhaustion_fails_and_poisons_children(
+    tmp_path: Path,
+) -> None:
+    """Only exhausting the generous per-action attempt budget fails a
+    throttled write; the failure then holds its subtree back exactly
+    like any other failed parent."""
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import (
+        _MAX_THROTTLE_ATTEMPTS,
+        OrgRestorer,
+        RestoreJournal,
+    )
+
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(SNMP_PATH, ("N_1",), {"access": "none"}),
+    )
+    plan = plan_restore(graph, parser)
+    calls: list = []
+    bucket = SimpleNamespace(
+        acquire=lambda: None, on_success=lambda: None,
+        on_throttle=lambda: None,
+    )
+
+    class Throttled(Exception):
+        status = 429
+
+    class Section(_RecordingSection):
+        def createOrganizationNetwork(self, *args, **kwargs) -> dict:
+            self._calls.append(("createOrganizationNetwork", args, kwargs))
+            raise Throttled("429 Too Many Requests")
+
+    section = Section(calls)
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "j.jsonl"),
+        skip_claims=True, bucket=bucket,  # type: ignore[arg-type]
+    )
+    restorer._client = SimpleNamespace(
+        organizations=section, networks=section
+    )
+    result = restorer.execute(graph, plan)
+    creates = [c for c in calls if c[0] == "createOrganizationNetwork"]
+    assert len(creates) == _MAX_THROTTLE_ATTEMPTS
+    ((_, reason),) = [f for f in result.failed if "throttled" in f[1]]
+    assert "retry budget" in reason
+    assert any(
+        "parent object N_1 failed" in entry["reason"]
+        for entry in result.skipped
+    )
+
+
 def test_journal_refuses_non_object_lines(tmp_path: Path) -> None:
     """Line-valid JSON that is not an object must surface as the CLI's
     'journal is unreadable' ValueError, not an AttributeError."""
