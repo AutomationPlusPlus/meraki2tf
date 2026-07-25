@@ -749,7 +749,355 @@ def test_aggregation_mappings_lists_only_adopted_entities(
 ) -> None:
     mappings = aggregation_mappings(spec_parser)
     assert [m.terraform_name for m in mappings] == [
-        "meraki_networks_wireless_air_marshal_settings"
+        "meraki_networks_wireless_air_marshal_settings",
+        "meraki_networks_wireless_ssids_open_roaming",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Nested-element aggregations (…/{element}/config shape) and phantom-scope
+# healing (byNetwork rows scoped by per-product child network ids)
+# ---------------------------------------------------------------------------
+
+
+OPEN_ROAMING_PATH = "/networks/{networkId}/wireless/ssids/{number}/openRoaming"
+
+
+def _open_roaming_mapping(spec_parser: OpenApiParser) -> Any:
+    return spec_parser.resource_mappings()[
+        "meraki_networks_wireless_ssids_open_roaming"
+    ]
+
+
+def test_nested_element_param_recognizes_only_the_nested_shape() -> None:
+    from meraki2tf.providers.discovery import _nested_element_param
+
+    assert _nested_element_param(OPEN_ROAMING_PATH) == "number"
+    # Item path: the second parameter is trailing — a different shape.
+    assert (
+        _nested_element_param("/networks/{networkId}/appliance/vlans/{vlanId}")
+        is None
+    )
+    # Single-parameter collection/singleton paths.
+    assert _nested_element_param("/networks/{networkId}/syslogServers") is None
+    # A malformed segment carrying an unclosed brace must not be
+    # miscounted as the element parameter.
+    assert (
+        _nested_element_param("/networks/{networkId}/{x/things/{id}/conf")
+        is None
+    )
+
+
+def test_aggregation_collection_path_is_the_entitys_own_nested_path(
+    spec_parser: OpenApiParser,
+) -> None:
+    """The canonical path of a nested-element entity is its own
+    two-parameter write path — deriving a shorter prefix would collide
+    with the enclosing collection entity (…/wireless/ssids)."""
+    mapping = _open_roaming_mapping(spec_parser)
+    assert aggregation_collection_path(mapping) == OPEN_ROAMING_PATH
+
+
+def test_explode_nested_aggregation_rows_per_element(
+    spec_parser: OpenApiParser,
+) -> None:
+    """Each row's nested element list explodes to one feature per
+    element at the entity's own path; the payload is the config
+    sub-object named after the trailing path segment when present,
+    else the element minus its identifier."""
+    mapping = _open_roaming_mapping(spec_parser)
+    features = explode_aggregation_payload(
+        mapping,
+        {
+            "items": [
+                {
+                    "networkId": "N_1",
+                    "networkName": "site-a - wireless",
+                    "ssids": [
+                        {
+                            "name": "wifi-x",
+                            "number": 0,
+                            "enabled": True,
+                            "openRoaming": {"enabled": False},
+                        },
+                        {"name": "wifi-y", "number": 1, "enabled": True},
+                    ],
+                },
+            ],
+            "meta": {},
+        },
+    )
+    assert [
+        (f.api_path, f.path_values, dict(f.payload)) for f in features
+    ] == [
+        (OPEN_ROAMING_PATH, ("N_1", "0"), {"enabled": False}),
+        (
+            OPEN_ROAMING_PATH,
+            ("N_1", "1"),
+            {"name": "wifi-y", "enabled": True},
+        ),
+    ]
+
+
+def test_explode_nested_aggregation_unaddressable_pieces_stay_auditable(
+    spec_parser: OpenApiParser,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Rows without an element list, non-object elements, and elements
+    without the identifier all surface as gap records carrying their
+    scope — discovered objects never vanish (Cardinal Rule 2). A row
+    whose element list is empty holds zero objects, not a gap."""
+    mapping = _open_roaming_mapping(spec_parser)
+    with caplog.at_level("WARNING"):
+        features = explode_aggregation_payload(
+            mapping,
+            {
+                "items": [
+                    {
+                        "networkId": "N_1",
+                        "ssids": [
+                            {"number": 2, "openRoaming": {"enabled": True}},
+                            "not-an-object",
+                            {"name": "no-identifier"},
+                        ],
+                    },
+                    {"networkId": "N_1", "notes": "no element list"},
+                    {"networkId": "N_1", "ssids": []},
+                ],
+                "meta": {},
+            },
+        )
+    assert [
+        (f.api_path, f.path_values, dict(f.payload)) for f in features
+    ] == [
+        (OPEN_ROAMING_PATH, ("N_1", "2"), {"enabled": True}),
+        (
+            OPEN_ROAMING_PATH,
+            (),
+            {"networkId": "N_1", "value": "not-an-object"},
+        ),
+        (
+            OPEN_ROAMING_PATH,
+            (),
+            {"networkId": "N_1", "name": "no-identifier"},
+        ),
+        (
+            OPEN_ROAMING_PATH,
+            (),
+            {"networkId": "N_1", "notes": "no element list"},
+        ),
+    ]
+    messages = [record.message for record in caplog.records]
+    assert any("is not an object" in message for message in messages)
+    assert any("no 'number' identifier" in message for message in messages)
+    assert any("no 'number' element list" in message for message in messages)
+
+
+def test_explode_rescopes_phantom_child_network_ids_by_name(
+    spec_parser: OpenApiParser,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A row scoped by an unknown (per-product child) network id is
+    re-scoped to the parent network its name resolves to: exact name
+    match, one stripped " - <suffix>", and a parent name that itself
+    contains " - "."""
+    mapping = _open_roaming_mapping(spec_parser)
+    known = {"N_1": "site-a", "N_2": "alpha - beta"}
+    with caplog.at_level("INFO"):
+        features = explode_aggregation_payload(
+            mapping,
+            {
+                "items": [
+                    {
+                        "networkId": "N_901",
+                        "networkName": "site-a",
+                        "ssids": [{"number": 0, "openRoaming": {"x": 1}}],
+                    },
+                    {
+                        "networkId": "N_902",
+                        "networkName": "site-a - wireless",
+                        "ssids": [{"number": 1, "openRoaming": {"x": 2}}],
+                    },
+                    {
+                        "networkId": "N_903",
+                        "networkName": "alpha - beta - wireless",
+                        "ssids": [{"number": 2, "openRoaming": {"x": 3}}],
+                    },
+                ],
+                "meta": {},
+            },
+            known_networks=known,
+        )
+    assert [(f.path_values, dict(f.payload)) for f in features] == [
+        (("N_1", "0"), {"x": 1}),
+        (("N_1", "1"), {"x": 2}),
+        (("N_2", "2"), {"x": 3}),
+    ]
+    assert any(
+        "re-scoped 3 row(s)" in record.message for record in caplog.records
+    )
+
+
+def test_explode_known_scope_ids_pass_through_unchanged(
+    spec_parser: OpenApiParser,
+) -> None:
+    """A row whose scope id IS a discovered network is never re-scoped,
+    even when its name field points at a different network."""
+    mapping = _air_marshal_mapping(spec_parser)
+    features = explode_aggregation_payload(
+        mapping,
+        {
+            "items": [
+                {
+                    "networkId": "N_1",
+                    "networkName": "site-b",
+                    "defaultPolicy": "blocked",
+                },
+            ],
+            "meta": {},
+        },
+        known_networks={"N_1": "site-a", "N_2": "site-b"},
+    )
+    assert [f.path_values for f in features] == [("N_1",)]
+
+
+def test_explode_rescopes_object_form_scope_by_nested_name(
+    spec_parser: OpenApiParser,
+) -> None:
+    """Flat (non-nested) aggregation rows heal the same way, including
+    the ``network: {id, name}`` object form."""
+    mapping = _air_marshal_mapping(spec_parser)
+    features = explode_aggregation_payload(
+        mapping,
+        {
+            "items": [
+                {
+                    "network": {"id": "N_904", "name": "site-a - appliance"},
+                    "defaultPolicy": "allowed",
+                },
+            ],
+            "meta": {},
+        },
+        known_networks={"N_1": "site-a"},
+    )
+    assert [
+        (f.api_path, f.path_values, dict(f.payload)) for f in features
+    ] == [
+        (
+            "/networks/{networkId}/wireless/airMarshal/settings",
+            ("N_1",),
+            {"defaultPolicy": "allowed"},
+        ),
+    ]
+
+
+def test_explode_unresolvable_scope_becomes_gap_record(
+    spec_parser: OpenApiParser,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unknown scope id whose name resolves to nothing must never be
+    emitted as a feature address — the whole row stays an auditable
+    scope-less gap record instead."""
+    mapping = _open_roaming_mapping(spec_parser)
+    rows = [
+        # Name matches nothing, with and without a strippable suffix.
+        {
+            "networkId": "N_905",
+            "networkName": "unrelated - wireless",
+            "ssids": [{"number": 0}],
+        },
+        # No name field at all.
+        {"networkId": "N_906", "ssids": [{"number": 1}]},
+    ]
+    with caplog.at_level("WARNING"):
+        features = explode_aggregation_payload(
+            mapping,
+            {"items": [dict(row) for row in rows], "meta": {}},
+            known_networks={"N_1": "site-a"},
+        )
+    assert [
+        (f.api_path, f.path_values, dict(f.payload)) for f in features
+    ] == [(OPEN_ROAMING_PATH, (), row) for row in rows]
+    assert (
+        sum(
+            "matches no discovered network" in record.message
+            for record in caplog.records
+        )
+        == 2
+    )
+
+
+def test_explode_flat_and_item_shapes_unchanged_by_known_networks(
+    tmp_path: Path,
+) -> None:
+    """Regression: real-parent-scoped flat rows and item-path rows
+    (air-marshal-rules shape with ruleId) behave identically whether or
+    not the network universe is supplied."""
+    parser = _write_spec(
+        tmp_path,
+        {
+            "/networks/{networkId}/wireless/airMarshal/rules": {
+                "post": {"operationId": "createRule", "tags": ["wireless"]},
+            },
+            "/networks/{networkId}/wireless/airMarshal/rules/{ruleId}": {
+                "put": {"operationId": "updateRule", "tags": ["wireless"]},
+                "delete": {"operationId": "deleteRule", "tags": ["wireless"]},
+            },
+            "/organizations/{organizationId}/wireless/airMarshal/rules": {
+                "get": {
+                    "operationId": "getOrgRules",
+                    "tags": ["wireless"],
+                    "responses": {
+                        "200": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "items": {
+                                                "type": "array",
+                                                "items": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "network": {},
+                                                        "ruleId": {},
+                                                    },
+                                                },
+                                            },
+                                            "meta": {},
+                                        },
+                                    }
+                                }
+                            }
+                        }
+                    },
+                },
+            },
+        },
+    )
+    mapping = parser.resource_mappings()[
+        "meraki_networks_wireless_air_marshal_rules"
+    ]
+    payload = {
+        "items": [
+            {"network": {"id": "N_1"}, "ruleId": "R_1", "type": "block"},
+            {"network": {"id": "N_1"}, "type": "allow"},
+        ],
+        "meta": {},
+    }
+    baseline = explode_aggregation_payload(mapping, payload)
+    healed = explode_aggregation_payload(
+        mapping, payload, known_networks={"N_1": "site-a"}
+    )
+    assert [
+        (f.api_path, f.path_values, dict(f.payload)) for f in baseline
+    ] == [(f.api_path, f.path_values, dict(f.payload)) for f in healed]
+    assert [(f.api_path, f.path_values) for f in baseline] == [
+        (
+            "/networks/{networkId}/wireless/airMarshal/rules/{ruleId}",
+            ("N_1", "R_1"),
+        ),
+        ("/networks/{networkId}/wireless/airMarshal/rules", ("N_1",)),
     ]
 
 
