@@ -94,6 +94,16 @@ the project adheres to [Semantic Versioning](https://semver.org/).
   and every operator-facing message are unchanged.
 
 ### Fixed
+- Drift alerts label a nested reordering as an order change instead of
+  a value edit (#115): the ORDER_CHANGED marker was computed only for
+  the attribute's own value, so a list reordered one level down (a
+  device syslog server's `roles` came back flipped between two captures
+  nothing had touched) reported as `syslog/servers: servers` —
+  indistinguishable from a real syslog reconfiguration, forcing the
+  operator to open both snapshots to triage. Order-only differences are
+  now detected at any depth. Nothing is suppressed: the asset is still
+  reported as modified, and a real value edit sitting beside a
+  reordering still reports before/after.
 - A `--drift-baseline` that is not a meraki2tf snapshot is refused
   instead of faking a full-organization drift (#114): a readable JSON
   file recording no organization — the workdir's own `coverage.json`,

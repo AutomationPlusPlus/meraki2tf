@@ -32,6 +32,7 @@ Noise control is spec-driven, per the project contract:
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -495,6 +496,15 @@ def _change_entry(before: Any, after: Any) -> tuple[Any, Any]:
     is reported as an explicit order change instead of a full
     before/after dump: the drift is real and must alert, but the values
     are identical and would only bloat the digest.
+
+    The reordering is looked for at *any* depth, not just in the
+    attribute's own value. Meraki returns some nested lists in an
+    arbitrary order (a device syslog server's ``roles`` came back
+    flipped between two captures nothing had touched), and an alert
+    reading ``syslog/servers: servers`` is indistinguishable from a real
+    syslog reconfiguration — the operator has to open both snapshots to
+    find out that nothing changed. Labelling it costs nothing and
+    suppresses nothing: the asset is still reported as modified.
     """
     if (
         isinstance(before, list)
@@ -506,7 +516,67 @@ def _change_entry(before: Any, after: Any) -> tuple[Any, Any]:
             ORDER_CHANGED,
             f"{ORDER_CHANGED}: {len(before)} item(s) reordered",
         )
+    if _order_only_difference(before, after):
+        # The reordering sits below the attribute's own value, so an
+        # item count at this level would describe the wrong list.
+        return (ORDER_CHANGED, f"{ORDER_CHANGED}: nested list reordered")
     return (before, after)
+
+
+def _order_only_difference(before: Any, after: Any) -> bool:
+    """Whether two differing values differ *only* in list ordering.
+
+    Every list is compared as a multiset at every depth, so this is
+    true exactly when the two sides carry the same values in a
+    different sequence — however deeply the reordering sits.
+    """
+    if isinstance(before, list) and isinstance(after, list):
+        return len(before) == len(after) and _order_insensitive_equal(
+            before, after
+        )
+    if isinstance(before, Mapping) and isinstance(after, Mapping):
+        return set(before) == set(after) and _order_insensitive_equal(
+            before, after
+        )
+    return False
+
+
+def _order_insensitive_equal(before: Any, after: Any) -> bool:
+    """Deep equality that treats every list as an unordered multiset."""
+    if isinstance(before, list) and isinstance(after, list):
+        return _order_insensitive_multiset(
+            before
+        ) == _order_insensitive_multiset(after)
+    if isinstance(before, Mapping) and isinstance(after, Mapping):
+        return set(before) == set(after) and all(
+            _order_insensitive_equal(before[key], after[key])
+            for key in before
+        )
+    return deep_json_equal(before, after)
+
+
+def _order_insensitive_multiset(items: list[Any]) -> dict[str, int]:
+    """``_canonical_multiset`` with nested lists canonicalised too."""
+    counts: dict[str, int] = {}
+    for item in items:
+        canonical = json.dumps(
+            _order_insensitive_key(item), sort_keys=True, default=str
+        )
+        counts[canonical] = counts.get(canonical, 0) + 1
+    return counts
+
+
+def _order_insensitive_key(value: Any) -> Any:
+    """A representation of ``value`` in which list order cannot matter."""
+    if isinstance(value, list):
+        return sorted(
+            json.dumps(_order_insensitive_key(item), sort_keys=True,
+                       default=str)
+            for item in value
+        )
+    if isinstance(value, Mapping):
+        return {key: _order_insensitive_key(val) for key, val in value.items()}
+    return value
 
 
 def _values_equal(before: Any, after: Any) -> bool:
@@ -532,11 +602,9 @@ def _identity_keyed(items: list[Any]) -> bool:
 
 
 def _canonical_multiset(items: list[Any]) -> dict[str, int]:
-    import json as _json
-
     counts: dict[str, int] = {}
     for item in items:
-        canonical = _json.dumps(item, sort_keys=True, default=str)
+        canonical = json.dumps(item, sort_keys=True, default=str)
         counts[canonical] = counts.get(canonical, 0) + 1
     return counts
 
