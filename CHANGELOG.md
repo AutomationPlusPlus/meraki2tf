@@ -94,6 +94,16 @@ the project adheres to [Semantic Versioning](https://semver.org/).
   and every operator-facing message are unchanged.
 
 ### Fixed
+- A `--drift-baseline` that is not a meraki2tf snapshot is refused
+  instead of faking a full-organization drift (#114): a readable JSON
+  file recording no organization — the workdir's own `coverage.json`,
+  an unrelated `.gz`, a snapshot truncated before its header — loaded
+  as an empty graph, so every discovered object registered as *added*
+  and a `DRIFT_DETECTED` alert claimed the whole org had changed,
+  masking that week's real drift. `--check` reported such a file as a
+  passing "full-organization unsanitized snapshot". Baselines
+  recording no organization now refuse in the preflight and mid-run,
+  alongside the sanitized/partial/foreign-org refusals.
 - Lone UTF-16 surrogates no longer crash the `resources.tf` baseline
   write (#111): the kit generator scrubbed them before escaping but
   the plan reconciler's copy of the escaper did not, so a surrogate

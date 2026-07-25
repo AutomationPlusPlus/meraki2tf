@@ -392,14 +392,17 @@ def _check_drift_baseline(config: RuntimeConfig) -> CheckResult:
             config.drift_baseline, config.org_id
         )
     except ValueError as exc:
-        # MalformedDumpError and the three snapshot_diff refusals are
+        # MalformedDumpError and the four snapshot_diff refusals are
         # all ValueErrors carrying the operator-facing diagnostic.
         return CheckResult("--drift-baseline", STATUS_FAIL, str(exc))
+    # The organization is always recorded here: a baseline that records
+    # none is refused above, precisely so this line cannot vouch for a
+    # file that was never a snapshot.
     return CheckResult(
         "--drift-baseline",
         STATUS_PASS,
         "full-organization unsanitized snapshot (organization "
-        f"{', '.join(recorded) or 'unrecorded'})",
+        f"{', '.join(recorded)})",
     )
 
 
