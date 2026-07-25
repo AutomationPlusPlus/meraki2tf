@@ -210,6 +210,47 @@ def test_plan_replay_skips_unreadable_gap_records(
     assert "unreadable at capture" in skip.reason
 
 
+def test_plan_replay_skips_scope_less_gap_records(
+    spec_parser: OpenApiParser,
+) -> None:
+    """A byNetwork aggregation row that discovery could not resolve to
+    any scope is an auditable diagnostic, not a dispatchable write — it
+    must never reach the executor to die on missing path parameters
+    and be miscounted as a replay FAILURE."""
+    path = "/networks/{networkId}/wireless/airMarshal/settings"
+    graph = _graph(
+        FeatureConfiguration(
+            path,
+            (),
+            {"networkName": "ghost - wireless", "defaultPolicy": "blocked"},
+        )
+    )
+    report = _report(unsupported=(UnsupportedAsset(path, "no match", ()),))
+    actions, skipped = plan_replay(graph, report, spec_parser)
+    assert actions == ()
+    (skip,) = skipped
+    assert skip.identifiers == ()
+    assert skip.reason == (
+        "diagnostic gap record — no scope identifier; covered by the "
+        "runbook's manual list"
+    )
+
+
+def test_is_scope_gap_record_discounts_injected_organization() -> None:
+    """The executors inject the target organizationId themselves, so an
+    org-scoped asset with no discovered values is addressable; any
+    other missing scope parameter is not."""
+    from meraki2tf.replayer import is_scope_gap_record
+
+    org_path = "/organizations/{organizationId}/admins"
+    assert is_scope_gap_record(org_path, ()) is False
+    net_path = "/networks/{networkId}/wireless/airMarshal/settings"
+    assert is_scope_gap_record(net_path, ()) is True
+    assert is_scope_gap_record(net_path, ("N_1",)) is False
+    item_path = "/networks/{networkId}/appliance/vlans/{vlanId}"
+    assert is_scope_gap_record(item_path, ("N_1",)) is True
+
+
 def test_plan_replay_skips_empty_collection_envelopes(
     spec_parser: OpenApiParser,
 ) -> None:

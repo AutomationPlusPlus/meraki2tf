@@ -175,6 +175,34 @@ def test_unrestorable_reasons_are_spec_derived(tmp_path: Path) -> None:
     ]
 
 
+def test_scope_less_gap_records_plan_as_unrestorable(tmp_path: Path) -> None:
+    """A byNetwork aggregation row discovery could not resolve to any
+    scope carries ``path_values=()``: it exists for Cardinal Rule 2
+    visibility and must classify as unrestorable, never dispatch to
+    die on a missing path parameter and count as a restore FAILURE."""
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(
+            SNMP_PATH,
+            (),
+            {"networkName": "ghost - wireless", "access": "none"},
+        )
+    )
+    plan = plan_restore(graph, parser)
+    assert all(action.api_path != SNMP_PATH for action in plan.actions)
+    (gap,) = plan.unrestorable
+    assert gap.path_values == ()
+    assert gap.reason == (
+        "diagnostic gap record — no scope identifier; covered by the "
+        "runbook's manual list"
+    )
+    # End-to-end: the executor never sees the record, so nothing fails.
+    restorer, calls = _executor(tmp_path)
+    result = restorer.execute(graph, plan)
+    assert result.failed == ()
+    assert not [c for c in calls if c[0] == "updateNetworkSnmp"]
+
+
 def test_restore_verdicts_key_containers_under_capture_paths(
     tmp_path: Path,
 ) -> None:

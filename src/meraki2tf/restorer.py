@@ -58,11 +58,13 @@ from meraki2tf.hcl_generator import DEVICE_API_PATH, NETWORK_API_PATH
 from meraki2tf.providers.ratelimit import AdaptiveTokenBucket
 from meraki2tf.replayer import (
     ACTION_LOG_REASON,
+    GAP_RECORD_REASON,
     _collection_items,
     _secret_paths,
     _single_array_body_field,
     _strip_nulls,
     is_action_log,
+    is_scope_gap_record,
     shape_rules,
     split_redacted as _split_redacted,
 )
@@ -244,6 +246,16 @@ def _classify_feature(
             feature.path_values,
             "Endpoint was unreadable at capture — nothing was recorded "
             "to restore; verify it manually after the rebuild.",
+        )
+    if is_scope_gap_record(feature.api_path, feature.path_values):
+        # Scope-less byNetwork gap records exist to keep unresolvable
+        # rows visible (Cardinal Rule 2); dispatching one can only die
+        # on a missing path parameter and pollute the run with a
+        # failure for an object that was never addressable.
+        return Unrestorable(
+            feature.api_path,
+            feature.path_values,
+            GAP_RECORD_REASON,
         )
     ops = writes.get(feature.api_path, ())
     if not ops:

@@ -73,6 +73,30 @@ ACTION_LOG_REASON = (
     "re-execute the recorded action(s); review manually."
 )
 
+#: Plan-time refusal for scope-less diagnostic gap records: the
+#: byNetwork aggregation explosion keeps rows it cannot resolve to any
+#: scope as auditable ``path_values=()`` records (Cardinal Rule 2
+#: visibility) — they are runbook material, never dispatchable writes.
+GAP_RECORD_REASON = (
+    "diagnostic gap record — no scope identifier; covered by the "
+    "runbook's manual list"
+)
+
+
+def is_scope_gap_record(api_path: str, path_values: tuple[str, ...]) -> bool:
+    """True when the asset's identifiers cannot address its write path.
+
+    The write path's parameter arity is counted without
+    ``organizationId`` (both executors inject the target organization);
+    fewer discovered values than the remaining parameters means the
+    asset is a scope-less diagnostic gap record, not a restorable
+    object — dispatching it can only fail on missing path parameters.
+    """
+    required = [
+        name for name in _placeholders(api_path) if name != "organizationId"
+    ]
+    return len(path_values) < len(required)
+
 
 def is_action_log(api_path: str, ops: tuple[OperationSpec, ...]) -> bool:
     """POST-only entity whose collection records one-shot actions."""
@@ -166,6 +190,19 @@ def plan_replay(
 
     for asset in sorted(report.unsupported, key=lambda a: (a.api_path, a.identifiers)):
         payload = payloads.get((asset.api_path, asset.identifiers))
+        if is_scope_gap_record(asset.api_path, asset.identifiers):
+            # Discovery's byNetwork explosion emits these for rows it
+            # could not resolve to any scope; they exist to be reported
+            # (Cardinal Rule 2), and dispatching one can only fail on
+            # missing path parameters.
+            skipped.append(
+                SkippedReplay(
+                    asset.api_path,
+                    asset.identifiers,
+                    GAP_RECORD_REASON,
+                )
+            )
+            continue
         writes = ops.get(asset.api_path, ())
         if not writes:
             skipped.append(
