@@ -5018,6 +5018,12 @@ def test_diff_networks_unreadable_snapshot_exits_1(
         ["--org-id", "123456", "--diff-networks", "A", "B", "--sync"],
         ["--org-id", "123456", "--diff-networks", "A", "B",
          "--only", "network:HQ"],
+        # --expect-org pins a --rebuild/--replay-gaps target; alongside
+        # a standalone comparison it did nothing at all, which the
+        # no-silent-orphans rule forbids (every sibling helper — and
+        # --list-orgs, --check, --estimate — already refuses it).
+        ["--org-id", "123456", "--diff-networks", "A", "B",
+         "--expect-org", "123456"],
         # One organization at most.
         ["--org-id", "123456", "--org-id", "234567",
          "--diff-networks", "A", "B"],

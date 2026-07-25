@@ -133,6 +133,17 @@ JSON dump ─┘   (identical domain models)     │        │            │
 `PROCESSING_FAULT` alert and surfaces as `PipelineError` → exit code 1,
 making the CLI safe for headless cron scheduling.
 
+Before any of it runs, `cli.main` validates the flag combination and
+dispatches to exactly one mode. That validation is safety-critical in
+its own right — an accepted-but-ignored flag is how an operator comes
+to believe a scope, a second factor, or a baseline reset applied when
+it did not — so each mode's rules live in its own `_validate_*` helper
+and the recurring flag sets are named groups (`DR_ACTION_FLAGS`,
+`DR_TARGETING_FLAGS`, `PIPELINE_FLAGS`, `EXPORT_FLAGS`) shared between
+them. Where a mode deliberately departs from a group (`--replay-gaps`
+refuses `--dump-to` with its own message, so it does not use
+`EXPORT_FLAGS` wholesale), the departure carries a comment saying why.
+
 The pipeline never executes `terraform apply`: meraki2tf is a
 disaster-recovery snapshotting tool and stays read-only toward the
 Meraki organization. The single apply path is the explicit CLI action

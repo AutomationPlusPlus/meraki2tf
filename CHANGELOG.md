@@ -54,6 +54,19 @@ the project adheres to [Semantic Versioning](https://semver.org/).
   flake8/mypy/tox/pytest/pre-commit/pip-audit toolchain (this PR).
 
 ### Changed
+- `--expect-org` is now refused alongside `--diff-networks` (#112)
+  instead of being silently ignored. It pins a `--rebuild` /
+  `--replay-gaps` target (as `docs/USAGE.md` already documented) and
+  had no effect on a standalone comparison; every sibling helper
+  (`--list-orgs`, `--check`, `--estimate`) already refused it. **This
+  is the one behavior change in the release**: an invocation that
+  previously ran the comparison while ignoring the flag now exits 2.
+- The CLI's flag-compatibility rules are declarative (#112): the
+  recurring flag sets are named groups (`DR_ACTION_FLAGS`,
+  `DR_TARGETING_FLAGS`, `PIPELINE_FLAGS`, `EXPORT_FLAGS`) shared by
+  per-mode `_validate_*` helpers, replacing eight hand-written `or`
+  chains whose memberships could silently disagree. Every refusal
+  message is unchanged.
 - Shared helpers replace four sets of copy-pasted internals (#111), so
   a rule can no longer be fixed in one copy and left stale in another:
   one HCL literal escaper for every Terraform writer (`hcl.py`), one
