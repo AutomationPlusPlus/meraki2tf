@@ -129,6 +129,12 @@ def _graph() -> NetworkGraph:
     )
 
 
+def test_resolution_accepts_the_only_selector_prefix() -> None:
+    # Muscle memory from --only: "network:HQ" resolves like bare "HQ".
+    assert resolve_network(NETWORKS, "network:HQ").network_id == "N_1"
+    assert resolve_network(NETWORKS, "NETWORK:N_1").network_id == "N_1"
+
+
 def test_resolution_zero_match_lists_candidates() -> None:
     with pytest.raises(NetworkResolutionError, match="matched no network"):
         resolve_network(NETWORKS, "Datacenter-*")
