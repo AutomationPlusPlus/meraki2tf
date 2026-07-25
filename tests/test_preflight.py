@@ -22,6 +22,7 @@ from meraki2tf.snapshot_diff import (
     BaselineOrgMismatchError,
     PartialBaselineError,
     SanitizedBaselineError,
+    UnrecognizedBaselineError,
 )
 from meraki2tf import terraform_runner
 from meraki2tf.terraform_runner import (
@@ -230,14 +231,40 @@ def test_validate_baseline_refuses_foreign_org(tmp_path: Path) -> None:
 def test_validate_baseline_defers_org_check_when_unknown(
     tmp_path: Path,
 ) -> None:
-    """Dump-mode runs know their org only mid-run; no expected org means
-    no early mismatch verdict, and an org-less baseline never matches."""
+    """Dump-mode runs know their org only mid-run, so no expected org
+    means no early mismatch verdict."""
     baseline = _write_snapshot(
         tmp_path / "base.json", {"organizationId": "999999"}
     )
     assert preflight.validate_drift_baseline(baseline, None) == ("999999",)
+
+
+def test_validate_baseline_refuses_file_that_is_not_a_snapshot(
+    tmp_path: Path,
+) -> None:
+    """A readable JSON document recording no organization is some other
+    file, and loads as an empty graph: without this refusal the whole
+    organization falsely registers as added."""
     orgless = _write_snapshot(tmp_path / "orgless.json", {"networks": []})
-    assert preflight.validate_drift_baseline(orgless, "123456") == ()
+    with pytest.raises(UnrecognizedBaselineError) as excinfo:
+        preflight.validate_drift_baseline(orgless, "123456")
+    assert "not a meraki2tf snapshot" in str(excinfo.value)
+    # Refused before the org is known, too — the weekly job's dump-mode
+    # preflight must not defer this one to a mid-run alert.
+    with pytest.raises(UnrecognizedBaselineError):
+        preflight.validate_drift_baseline(orgless, None)
+
+
+def test_validate_baseline_refuses_foreign_artifact(tmp_path: Path) -> None:
+    """The workdir's own coverage.json is the plausible operator slip:
+    it sits beside the snapshot and parses cleanly as JSON."""
+    coverage = _write_snapshot(
+        tmp_path / "coverage.json",
+        {"organization_id": "123456", "coverage_percent": 96.83,
+         "objects": [], "totals": {"discovered": 820}},
+    )
+    with pytest.raises(UnrecognizedBaselineError):
+        preflight.validate_drift_baseline(coverage, "123456")
 
 
 # ---------------------------------------------------------------------------

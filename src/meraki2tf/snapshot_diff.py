@@ -110,6 +110,25 @@ class PartialBaselineError(ValueError):
     """
 
 
+class UnrecognizedBaselineError(ValueError):
+    """The drift baseline is not a meraki2tf snapshot at all.
+
+    Every snapshot this tool writes records its source organization —
+    the v2 stream header, the v1 envelope, and each nested entry's
+    ``info.id``. A readable JSON document that records **none** is some
+    other file: the workdir's own ``coverage.json``, a terraform state,
+    an unrelated ``.gz``, or a snapshot truncated before its header.
+
+    Such a file loads as an empty graph rather than failing, so without
+    this refusal the whole organization would falsely register as
+    **added** — the same alert storm the sanitized/partial/foreign-org
+    refusals exist to prevent, but arriving with a reassuring
+    "full-organization unsanitized snapshot" preflight line in front of
+    it. The weekly job rotates last run's snapshot in as the baseline
+    unattended, so the wrong path must fail loudly, not alert loudly.
+    """
+
+
 def validate_baseline_header(
     provider: Any,
     baseline_path: Any,
@@ -119,8 +138,9 @@ def validate_baseline_header(
 ) -> tuple[str, ...]:
     """Refuse an unusable ``--drift-baseline`` from its header alone.
 
-    The three refusals — sanitized, partial, foreign-organization — are
-    header-level facts, so they are identical whether they fire in
+    The four refusals — sanitized, partial, unrecognized, and
+    foreign-organization — are header-level facts, so they are
+    identical whether they fire in
     :func:`baseline_drift` mid-run or in the preflight that checks the
     same snapshot before a multi-hour discovery sweep. One definition
     keeps the two call sites from drifting apart in either logic or
@@ -152,11 +172,15 @@ def validate_baseline_header(
             "--drift-baseline at a full-organization snapshot."
         )
     recorded: tuple[str, ...] = provider.recorded_organization_ids
-    if (
-        run_organization is not None
-        and recorded
-        and run_organization not in recorded
-    ):
+    if not recorded:
+        raise UnrecognizedBaselineError(
+            f"Drift baseline {baseline_path} records no organization, so "
+            "it is not a meraki2tf snapshot: every discovered object "
+            "would falsely register as added. Point --drift-baseline at "
+            "a snapshot written by --dump-to (a wrong path and a file "
+            "truncated before its header both land here)."
+        )
+    if run_organization is not None and run_organization not in recorded:
         raise BaselineOrgMismatchError(
             f"Drift baseline {baseline_path} was captured from "
             f"organization {', '.join(recorded)}, but this run "
