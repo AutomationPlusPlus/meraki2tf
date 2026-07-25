@@ -110,6 +110,63 @@ class PartialBaselineError(ValueError):
     """
 
 
+def validate_baseline_header(
+    provider: Any,
+    baseline_path: Any,
+    run_organization: str | None,
+    *,
+    run_organization_verb: str = "targets",
+) -> tuple[str, ...]:
+    """Refuse an unusable ``--drift-baseline`` from its header alone.
+
+    The three refusals — sanitized, partial, foreign-organization — are
+    header-level facts, so they are identical whether they fire in
+    :func:`baseline_drift` mid-run or in the preflight that checks the
+    same snapshot before a multi-hour discovery sweep. One definition
+    keeps the two call sites from drifting apart in either logic or
+    operator-facing wording.
+
+    ``run_organization`` is the organization the run resolves to, or
+    ``None`` when it is not knowable yet (a dump-mode preflight learns
+    it only from the snapshot itself) — the org check is then deferred
+    to the mid-run call, which always knows it. ``run_organization_verb``
+    names how the run came by that organization, the one place the two
+    call sites legitimately differ: the preflight *targets* an
+    organization the operator asked for, while the mid-run check
+    *discovered* one. Returns the baseline's recorded organization IDs.
+    """
+    if provider.snapshot_sanitized:
+        raise SanitizedBaselineError(
+            f"Drift baseline {baseline_path} is a sanitized snapshot (it "
+            "carries the 'sanitized' marker): its identifiers are "
+            "pseudonyms, so every asset would falsely register as "
+            "added/removed. Point --drift-baseline at the unsanitized "
+            "snapshot."
+        )
+    scope = provider.snapshot_scope
+    if scope is not None:
+        raise PartialBaselineError(
+            f"Drift baseline {baseline_path} is a PARTIAL export "
+            f"(--only, {len(scope.network_ids)} network(s)): every asset "
+            "outside its scope would falsely register as added. Point "
+            "--drift-baseline at a full-organization snapshot."
+        )
+    recorded: tuple[str, ...] = provider.recorded_organization_ids
+    if (
+        run_organization is not None
+        and recorded
+        and run_organization not in recorded
+    ):
+        raise BaselineOrgMismatchError(
+            f"Drift baseline {baseline_path} was captured from "
+            f"organization {', '.join(recorded)}, but this run "
+            f"{run_organization_verb} organization {run_organization}: "
+            "every asset would falsely register as added+removed. Point "
+            "--drift-baseline at a snapshot of the same organization."
+        )
+    return recorded
+
+
 @dataclass(frozen=True)
 class AssetDiff:
     """One modified asset with its attribute-level changes."""
@@ -254,31 +311,12 @@ def baseline_drift(
     from meraki2tf.providers.dump import StaticJsonDataProvider
 
     provider = StaticJsonDataProvider(baseline_path, parser=parser)
-    if provider.snapshot_sanitized:
-        raise SanitizedBaselineError(
-            f"Drift baseline {baseline_path} is a sanitized snapshot (it "
-            "carries the 'sanitized' marker): its identifiers are "
-            "pseudonyms, so every asset would falsely register as "
-            "added/removed. Point --drift-baseline at the unsanitized "
-            "snapshot."
-        )
-    scope = provider.snapshot_scope
-    if scope is not None:
-        raise PartialBaselineError(
-            f"Drift baseline {baseline_path} is a PARTIAL export "
-            f"(--only, {len(scope.network_ids)} network(s)): every asset "
-            "outside its scope would falsely register as added. Point "
-            "--drift-baseline at a full-organization snapshot."
-        )
-    recorded = provider.recorded_organization_ids
-    if recorded and graph.organization_id not in recorded:
-        raise BaselineOrgMismatchError(
-            f"Drift baseline {baseline_path} was captured from "
-            f"organization {', '.join(recorded)}, but this run discovered "
-            f"organization {graph.organization_id}: every asset would "
-            "falsely register as added+removed. Point --drift-baseline "
-            "at a snapshot of the same organization."
-        )
+    validate_baseline_header(
+        provider,
+        baseline_path,
+        graph.organization_id,
+        run_organization_verb="discovered",
+    )
     baseline = provider.fetch_network_graph(graph.organization_id)
     return diff_graphs(baseline, graph, parser)
 
