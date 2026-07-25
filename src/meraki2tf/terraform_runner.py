@@ -47,6 +47,7 @@ from typing import TYPE_CHECKING, Any
 from .config import API_KEY_ENV_VAR, BackendConfig
 from .fileio import atomic_write_text
 from .fsperms import restrict_to_owner
+from .hcl import hcl_quote
 from .plan_reconciler import (
     ReconciliationPlan,
     apply_enum_case_repairs,
@@ -56,7 +57,6 @@ from .plan_reconciler import (
     drop_resource_blocks,
     duplicate_set_values,
     enum_case_repairs,
-    hcl_quote,
     heredoc_delimiter,
     locate_duplicate_value_resources,
     plan_throttled,
@@ -395,11 +395,6 @@ class ImportGuardViolation(TerraformError):
         self.plan_output = plan_output
 
 
-#: HCL escaping lives with the reconciler's file surgery now; the alias
-#: keeps this module's provider.tf templating (and its tests) intact.
-_hcl_quote = hcl_quote
-
-
 def _attr_pairs(
     kind: str, mapping: dict[str, tuple[str, ...]]
 ) -> set[tuple[str, str, str]]:
@@ -657,7 +652,7 @@ class TerraformRunner:
                 ),
             )
         return _LOCAL_BACKEND_BLOCK.format(
-            state_path=_hcl_quote(str(self._state_path))
+            state_path=hcl_quote(str(self._state_path))
         )
 
     def _adopt_legacy_state(self) -> None:

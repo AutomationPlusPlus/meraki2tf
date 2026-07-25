@@ -643,6 +643,42 @@ def test_numeric_id_references_are_pseudonymized_consistently() -> None:
     assert again == payload
 
 
+def test_string_and_numeric_references_obey_identical_rules() -> None:
+    """The string and numeric arms share one rule set by construction.
+
+    They used to be hand-mirrored branches; a rule added to one and not
+    the other would leak a real identifier under whichever JSON type the
+    writer happened to emit. Every reference kind is asserted through
+    BOTH types so the arms can never drift apart again."""
+    payload = {
+        "networkId": "1234567890123",       # structural key
+        "networkIdNum": 1234567890123,
+        "interfaceId": "9876543210987",     # opaque …Id reference
+        "interfaceIdNum": 9876543210987,
+        "vlanId": "10",                     # short numeric = structure
+        "vlanIdNum": 10,
+        "shortName": "not-an-id",           # no reference key at all
+    }
+    graph = NetworkGraph(
+        "org-123", (), (),
+        (
+            FeatureConfiguration(
+                "/networks/{networkId}/appliance/vpn/bgp", ("N_1",), payload
+            ),
+        ),
+    )
+    cleaned = sanitize_graph(graph, salt=b"fixed").features[0].payload
+    # Same value, same pseudonym — whichever JSON type carried it.
+    assert cleaned["networkIdNum"] == cleaned["networkId"]
+    assert cleaned["interfaceIdNum"] == cleaned["interfaceId"]
+    # Same exemptions, too: short numerics stay structural in both arms.
+    assert cleaned["vlanId"] == "10"
+    assert cleaned["vlanIdNum"] == 10
+    # And nothing real survives either arm.
+    assert "1234567890123" not in cleaned.values()
+    assert 1234567890123 not in cleaned.values()
+
+
 def test_pseudonyms_carry_64_bits_of_digest() -> None:
     """10 hex chars (40 bits) carries ~2% birthday-collision odds at the
     200k-object scale the v2 snapshot targets; 16 hex chars (64 bits)

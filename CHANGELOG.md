@@ -53,7 +53,23 @@ the project adheres to [Semantic Versioning](https://semver.org/).
 - A development requirements file (`requirements-dev.txt`) with the
   flake8/mypy/tox/pytest/pre-commit/pip-audit toolchain (this PR).
 
+### Changed
+- Shared helpers replace four sets of copy-pasted internals (#111), so
+  a rule can no longer be fixed in one copy and left stale in another:
+  one HCL literal escaper for every Terraform writer (`hcl.py`), one
+  definition of the drift-baseline header refusals
+  (`snapshot_diff.validate_baseline_header`), one rule set mapping
+  string *and* numeric ID references in the sanitizer, and one
+  `meraki.DashboardAPI` construction site (`sdk_client.py`) that pins
+  the SDK log-suppression arguments for all eight callers. Behavior
+  and every operator-facing message are unchanged.
+
 ### Fixed
+- Lone UTF-16 surrogates no longer crash the `resources.tf` baseline
+  write (#111): the kit generator scrubbed them before escaping but
+  the plan reconciler's copy of the escaper did not, so a surrogate
+  arriving from a snapshot raised `UnicodeEncodeError` at write time.
+  Both now share the scrubbing escaper.
 - Pure-input refusals always win over the terraform environment probe
   (#106): a partial-snapshot/`--sync` mistake or a foreign discovery
   checkpoint now produces the same exit-2 refusal whether or not the

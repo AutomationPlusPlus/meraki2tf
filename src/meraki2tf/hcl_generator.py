@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from meraki2tf.alerts import AlertDispatcher, unsupported_feature_flagged
+from meraki2tf.hcl import hcl_quote
 from meraki2tf.models import UNREADABLE_MARKER, NetworkGraph
 from meraki2tf.openapi_parser import OpenApiParser, snake_case
 from meraki2tf.provider_catalog import ProviderCatalog
@@ -384,7 +385,7 @@ class HclImportGenerator:
                 continue
             blocks.append(
                 f'import {{\n  to = {address}\n'
-                f'  id = "{self._quote_hcl(import_id)}"\n}}\n'
+                f'  id = "{hcl_quote(import_id)}"\n}}\n'
             )
 
         # Spec-level gaps: write-only configuration endpoints (a PUT the
@@ -504,29 +505,6 @@ class HclImportGenerator:
             api_path=candidate.api_path,
             reason=reason,
             identifiers=candidate.id_values,
-        )
-
-    @staticmethod
-    def _quote_hcl(value: str) -> str:
-        """Escape a raw ID for a quoted HCL string literal.
-
-        Dump-mode snapshots feed arbitrary JSON values into import IDs;
-        an unescaped ``"``, ``\\``, ``${``, ``%{`` or a raw newline
-        would break the whole imports.tf parse or inject an
-        interpolation expression. JSON also admits lone UTF-16
-        surrogates (``"\\ud800"``), which the UTF-8 artifact write
-        cannot encode — they are replaced up front so a corrupted dump
-        cannot crash the run at write time.
-        """
-        value = value.encode("utf-8", errors="replace").decode("utf-8")
-        return (
-            value.replace("\\", "\\\\")
-            .replace('"', '\\"')
-            .replace("\n", "\\n")
-            .replace("\r", "\\r")
-            .replace("\t", "\\t")
-            .replace("${", "$${")
-            .replace("%{", "%%{")
         )
 
     @staticmethod

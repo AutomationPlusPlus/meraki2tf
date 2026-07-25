@@ -33,7 +33,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from meraki2tf.config import read_api_key
+from meraki2tf.sdk_client import dashboard_client
 from meraki2tf.models import (
     UNREADABLE_MARKER,
     DiscoveryDiagnostics,
@@ -278,13 +278,7 @@ class LiveApiDataProvider(MerakiDataProvider):
         )
 
     def _build_client(self, wait_on_rate_limit: bool) -> Any:
-        import meraki
-
-        return meraki.DashboardAPI(
-            api_key=read_api_key(),
-            suppress_logging=True,
-            print_console=False,
-            output_log=False,
+        return dashboard_client(
             wait_on_rate_limit=wait_on_rate_limit,
             maximum_retries=_SDK_MAXIMUM_RETRIES,
         )

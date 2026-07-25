@@ -55,20 +55,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from meraki2tf.hcl import hcl_quote
+
 logger = logging.getLogger(__name__)
-
-
-def hcl_quote(value: str) -> str:
-    """Escape a raw value for interpolation into a quoted HCL literal."""
-    return (
-        value.replace("\\", "\\\\")
-        .replace('"', '\\"')
-        .replace("\n", "\\n")
-        .replace("\r", "\\r")
-        .replace("\t", "\\t")
-        .replace("${", "$${")
-        .replace("%{", "%%{")
-    )
 
 
 #: ``terraform plan -no-color`` diagnostic blocks:

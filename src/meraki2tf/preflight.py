@@ -42,7 +42,6 @@ from meraki2tf.config import (
     ExecutionMode,
     RuntimeConfig,
     api_key_present,
-    read_api_key,
 )
 from meraki2tf.coverage import COVERAGE_JSON_FILENAME
 from meraki2tf.hcl_generator import IMPORTS_FILENAME
@@ -62,11 +61,8 @@ from meraki2tf.providers.discovery import (
 )
 from meraki2tf.providers.dump import StaticJsonDataProvider
 from meraki2tf.providers.live import CONFIG_TEMPLATE_ITEM_PATH
-from meraki2tf.snapshot_diff import (
-    BaselineOrgMismatchError,
-    PartialBaselineError,
-    SanitizedBaselineError,
-)
+from meraki2tf.sdk_client import dashboard_client
+from meraki2tf.snapshot_diff import validate_baseline_header
 from meraki2tf.spec.engine import OperationSpec
 from meraki2tf.spec_resolver import resolve_spec
 from meraki2tf.terraform_runner import (
@@ -110,48 +106,23 @@ def validate_drift_baseline(
 ) -> tuple[str, ...]:
     """Header-level validation of a ``--drift-baseline`` snapshot.
 
-    The authoritative refusals live in
-    :func:`meraki2tf.snapshot_diff.baseline_drift` and still fire
-    mid-run (belt-and-suspenders); this applies exactly those checks to
-    the snapshot header alone — raising the very same exception classes
-    — so a typo'd path, a corrupt file, a sanitized or partial baseline,
-    or a foreign-organization baseline fails in milliseconds instead of
-    after a multi-hour discovery sweep. Returns the baseline's recorded
-    organization IDs. The org check only runs when the run's
-    organization is already known (live mode); dump-mode runs defer it
-    to the mid-run check, which knows the snapshot's organization.
+    The refusals still fire mid-run inside
+    :func:`meraki2tf.snapshot_diff.baseline_drift` (belt-and-suspenders);
+    this runs the very same
+    :func:`~meraki2tf.snapshot_diff.validate_baseline_header` against
+    the snapshot header alone, so a typo'd path, a corrupt file, a
+    sanitized or partial baseline, or a foreign-organization baseline
+    fails in milliseconds instead of after a multi-hour discovery
+    sweep. Returns the baseline's recorded organization IDs. The org
+    check only runs when the run's organization is already known (live
+    mode); dump-mode runs pass ``None`` and defer it to the mid-run
+    check, which knows the snapshot's organization.
     """
-    provider = StaticJsonDataProvider(baseline_path)
-    if provider.snapshot_sanitized:
-        raise SanitizedBaselineError(
-            f"Drift baseline {baseline_path} is a sanitized snapshot (it "
-            "carries the 'sanitized' marker): its identifiers are "
-            "pseudonyms, so every asset would falsely register as "
-            "added/removed. Point --drift-baseline at the unsanitized "
-            "snapshot."
-        )
-    scope = provider.snapshot_scope
-    if scope is not None:
-        raise PartialBaselineError(
-            f"Drift baseline {baseline_path} is a PARTIAL export "
-            f"(--only, {len(scope.network_ids)} network(s)): every asset "
-            "outside its scope would falsely register as added. Point "
-            "--drift-baseline at a full-organization snapshot."
-        )
-    recorded = provider.recorded_organization_ids
-    if (
-        expected_organization is not None
-        and recorded
-        and expected_organization not in recorded
-    ):
-        raise BaselineOrgMismatchError(
-            f"Drift baseline {baseline_path} was captured from "
-            f"organization {', '.join(recorded)}, but this run targets "
-            f"organization {expected_organization}: every asset would "
-            "falsely register as added+removed. Point --drift-baseline "
-            "at a snapshot of the same organization."
-        )
-    return recorded
+    return validate_baseline_header(
+        StaticJsonDataProvider(baseline_path),
+        baseline_path,
+        expected_organization,
+    )
 
 
 def resolve_rebuild_organization(
@@ -246,15 +217,7 @@ def _imports_organization(imports_path: Path) -> str | None:
 
 def _fetch_organizations() -> list[dict[str, Any]]:
     """One read-only ``getOrganizations`` call (the key-validity probe)."""
-    import meraki
-
-    client = meraki.DashboardAPI(
-        api_key=read_api_key(),
-        suppress_logging=True,
-        print_console=False,
-        output_log=False,
-        wait_on_rate_limit=True,
-    )
+    client = dashboard_client(wait_on_rate_limit=True)
     organizations = client.organizations.getOrganizations()
     return [
         organization
@@ -712,17 +675,9 @@ def _estimate_live(
     config: RuntimeConfig, parser: OpenApiParser
 ) -> DiscoveryEstimate:
     """Live estimate: 2-3 read-only enumeration calls, then arithmetic."""
-    import meraki
-
     organization_id = config.org_id
     assert organization_id is not None  # guarded by the CLI
-    client = meraki.DashboardAPI(
-        api_key=read_api_key(),
-        suppress_logging=True,
-        print_console=False,
-        output_log=False,
-        wait_on_rate_limit=True,
-    )
+    client = dashboard_client(wait_on_rate_limit=True)
     networks_raw = client.organizations.getOrganizationNetworks(
         organization_id, total_pages="all"
     )
