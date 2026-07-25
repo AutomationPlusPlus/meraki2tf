@@ -54,6 +54,29 @@ the project adheres to [Semantic Versioning](https://semver.org/).
   flake8/mypy/tox/pytest/pre-commit/pip-audit toolchain (this PR).
 
 ### Fixed
+- Pure-input refusals always win over the terraform environment probe
+  (#106): a partial-snapshot/`--sync` mistake or a foreign discovery
+  checkpoint now produces the same exit-2 refusal whether or not the
+  host has terraform installed (previously CI-only failures — the
+  probe's fault shadowed the refusal on terraform-less runners).
+- `--diff-networks` accepts the `--only` selector spelling
+  (`network:PATTERN`) in addition to bare patterns (#107).
+- byNetwork aggregation explosion (#108): nested-element rows
+  (per-SSID openRoaming lists) explode at the entity's own write path
+  instead of colliding with the ssids entity, and rows keyed by
+  Meraki's per-product child network ids ("N_…", named
+  "parent - wireless") resolve to their parent network by name;
+  unresolvable rows stay auditable gap records instead of becoming
+  phantom-addressed objects.
+- Drill edge cases from the live scratch-org restore (#109):
+  scope-less diagnostic gap records are plan-time skips in both the
+  restorer and the gap replayer (never dispatched, never counted
+  failed); empty-default payloads (e.g. VPN exclusions `[]`) skip with
+  "nothing to restore" instead of PUTting no-ops that 400 on
+  prerequisite-less networks; config templates join the aggregation
+  scope-resolution universe; `--wipe-org` retries Meraki's transient
+  "currently processing data" refusal of organization deletion
+  (5 × 30s, conservative match).
 - Provider import refusals degrade instead of killing the run (#104):
   terraform's "Cannot import non-existent remote object" diagnostic
   (no `with <address>,` line — the address is quoted inline) now rides
