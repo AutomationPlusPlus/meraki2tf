@@ -543,6 +543,34 @@ class _GraphSanitizer:
             return self._id_map[key]
         return self._clean_identity_shaped(key)
 
+    def _mapped_reference(self, text: str, key: str) -> str | None:
+        """Consistent pseudonym for an ID reference under ``key``.
+
+        Covers references seen *only* inside payloads — a ``networkId``
+        pointing at a network absent from the snapshot's own lists, an
+        ``interfaceId``, a nested ``id`` echo, a ``…Ids`` list — which
+        must still map to the same pseudonym the path-level IDs get, or
+        the sanitized replica loses referential consistency. ``None``
+        when the key names no kind of reference.
+
+        Global catalog URIs are exempt (an L7 rule's application id
+        ``meraki:layer7/application/…``): the same value exists in every
+        organization — not identity — and a pseudonym fails the
+        dashboard's URI-format validation on restore.
+        """
+        prefix = _STRUCTURAL_KEYS.get(key.lower())
+        if prefix:
+            self._assign(text, prefix)
+            return self._id_map[text]
+        if (
+            _ID_REFERENCE_KEY.search(key)
+            and not _is_structural_number(text)
+            and not text.startswith("meraki:")
+        ):
+            self._assign(text, "id")
+            return self._id_map[text]
+        return None
+
     def _clean_scalar(
         self, value: Any, key: str | None, secret: bool = False
     ) -> Any:
@@ -551,45 +579,24 @@ class _GraphSanitizer:
         if isinstance(value, str) and value in self._id_map:
             return self._id_map[value]
         if isinstance(value, str) and value and key is not None:
-            # Structural references seen only inside payloads (a
-            # networkId pointing at a network absent from the snapshot's
-            # own lists) still get a consistent pseudonym.
-            prefix = _STRUCTURAL_KEYS.get(key.lower())
-            if prefix:
-                self._assign(value, prefix)
-                return self._id_map[value]
-            # Opaque ID references seen only inside payloads
-            # (`interfaceId`, nested `id` echoes, `…Ids` lists) map to
-            # the same consistent pseudonyms as path-level IDs. Global
-            # catalog URIs are exempt (an L7 rule's application id
-            # `meraki:layer7/application/…`): the same value exists in
-            # every organization — not identity — and a pseudonym fails
-            # the dashboard's URI-format validation on restore.
-            if (
-                _ID_REFERENCE_KEY.search(key)
-                and not _is_structural_number(value)
-                and not value.startswith("meraki:")
-            ):
-                self._assign(value, "id")
-                return self._id_map[value]
+            mapped = self._mapped_reference(value, key)
+            if mapped is not None:
+                return mapped
         if isinstance(value, int) and not isinstance(value, bool):
             # ID references arrive as JSON numbers too (writers vary);
             # a numeric ID is the same identifier as its string form and
-            # must map through the same pseudonym table or it leaks and
-            # breaks referential consistency. The pseudonym is a string,
-            # which changes the JSON type — acceptable for a sanitized
-            # structural replica. Bools are ints in Python; excluded.
+            # must map through the same pseudonym table — via the very
+            # same rules — or it leaks and breaks referential
+            # consistency. The pseudonym is a string, which changes the
+            # JSON type — acceptable for a sanitized structural replica.
+            # Bools are ints in Python; excluded.
             text = str(value)
             if text in self._id_map:
                 return self._id_map[text]
             if key is not None:
-                prefix = _STRUCTURAL_KEYS.get(key.lower())
-                if prefix:
-                    self._assign(text, prefix)
-                    return self._id_map[text]
-                if _ID_REFERENCE_KEY.search(key) and not _is_structural_number(text):
-                    self._assign(text, "id")
-                    return self._id_map[text]
+                mapped = self._mapped_reference(text, key)
+                if mapped is not None:
+                    return mapped
         if secret:
             # Everything under a secret-shaped key is a credential —
             # strings and numbers alike (numeric PINs/passcodes arrive
