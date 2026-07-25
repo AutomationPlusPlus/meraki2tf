@@ -34,7 +34,11 @@ tie unresolvably maps to ``None`` (reported as an unsupported coverage
 gap rather than guessed).
 
 Validated against the provider's own generator definitions at v1.12.2:
-149 matchable spec entities, 0 wrong assignments, 0 collisions.
+149 matchable spec entities, 0 wrong assignments, 0 collisions. Re-run
+against the v1.13.0 catalog: still 0 collisions — its one added type
+(``meraki_network_firmware_upgrades_rollback``) is a POST-only action
+with no discoverable surface, so it is correctly matched by nothing and
+cannot steal ``meraki_network_firmware_upgrades``.
 """
 
 from __future__ import annotations

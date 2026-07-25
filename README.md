@@ -159,10 +159,12 @@ is flagged through the exception auditor instead of silently dropped.
   3.14 recommended — the floor is 3.11 because the `meraki` SDK requires it)
 - The `terraform` CLI on your `PATH` (any version supporting `import` blocks, ≥ 1.5)
 - The [`CiscoDevNet/meraki`](https://registry.terraform.io/providers/CiscoDevNet/meraki)
-  Terraform provider **≥ v1.12.0** — `terraform init` in the generated
-  workdir fetches it; with an older (or not-yet-initialized) provider the
-  tool falls back to a bundled v1.12.2 identity catalog, which can drift
-  from what your workdir actually runs
+  Terraform provider **≥ v1.12.0** (**v1.13.0+ recommended** — it fixes
+  "Missing Resource Identity After Read" on resources deleted
+  out-of-band) — `terraform init` in the generated workdir fetches it;
+  with an older (or not-yet-initialized) provider the tool falls back to
+  a bundled v1.13.0 identity catalog, which can drift from what your
+  workdir actually runs
 - A Meraki dashboard API key (live mode only). A **read-only org admin
   key suffices** for every scheduled/read path — discovery is GET-only
   and source-verified; full access is needed only to *execute* the five

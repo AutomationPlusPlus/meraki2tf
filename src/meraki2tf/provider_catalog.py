@@ -16,7 +16,7 @@ This module models that catalog and its provenance chain:
    in the workdir.
 2. **Workdir cache** — keyless/air-gapped runs (offline dump mode)
    reuse the cache left by a previous keyed run against that workdir.
-3. **Bundled fallback** — a copy of the v1.12.2 identity schemas ships
+3. **Bundled fallback** — a copy of the v1.13.0 identity schemas ships
    inside the package for first-ever offline runs.
 
 The catalog is *provider metadata ingested at runtime*, exactly like the
@@ -133,7 +133,7 @@ class ProviderCatalog:
 
     @classmethod
     def bundled(cls) -> "ProviderCatalog":
-        """The packaged fallback catalog (CiscoDevNet/meraki v1.12.2)."""
+        """The packaged fallback catalog (CiscoDevNet/meraki v1.13.0)."""
         text = (
             importlib_resources.files("meraki2tf.data")
             .joinpath(_BUNDLED_RESOURCE)
@@ -230,7 +230,7 @@ def resolve_catalog(runner: "TerraformRunner", keyed: bool) -> ProviderCatalog:
     catalog = ProviderCatalog.bundled()
     logger.info(
         "Provider catalog: %d resource(s) from the bundled fallback "
-        "(CiscoDevNet/meraki v1.12.2 identity schemas). Run once with an "
+        "(CiscoDevNet/meraki v1.13.0 identity schemas). Run once with an "
         "API key to refresh it from the installed provider.",
         len(catalog.resources),
     )
