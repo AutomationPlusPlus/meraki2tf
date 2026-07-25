@@ -340,6 +340,10 @@ class LiveApiDataProvider(MerakiDataProvider):
                     organization_id, total_pages="all"
                 )
             )
+            # The full pre-scope network universe: aggregation-row scope
+            # healing must recognize every real network in the org, even
+            # ones a --only selector excludes from this snapshot.
+            network_universe = networks
             if self._network_scope is not None:
                 total_networks, total_devices = len(networks), len(devices)
                 networks = self._network_scope.apply(networks)
@@ -356,6 +360,7 @@ class LiveApiDataProvider(MerakiDataProvider):
                 self._discover_features(
                     dashboard, organization_id, networks, devices,
                     checkpoint=checkpoint,
+                    network_universe=network_universe,
                 )
             )
         except BaseException:
@@ -398,6 +403,7 @@ class LiveApiDataProvider(MerakiDataProvider):
         networks: tuple[MerakiNetwork, ...],
         devices: tuple[MerakiDevice, ...],
         checkpoint: DiscoveryCheckpoint | None = None,
+        network_universe: tuple[MerakiNetwork, ...] | None = None,
     ) -> list[FeatureConfiguration]:
         """Execute every configuration GET the spec exposes.
 
@@ -539,7 +545,19 @@ class LiveApiDataProvider(MerakiDataProvider):
         def _explode_scoped(
             mapping: TerraformResourceMapping, payload: Any
         ) -> list[FeatureConfiguration]:
-            exploded = explode_aggregation_payload(mapping, payload)
+            # The full network universe (pre --only scoping) lets the
+            # explosion detect phantom row scopes (per-product child
+            # network ids) and re-scope them to the parent network they
+            # name; the scope filter below then applies to resolved ids.
+            known_networks = {
+                network.network_id: network.name
+                for network in (
+                    networks if network_universe is None else network_universe
+                )
+            }
+            exploded = explode_aggregation_payload(
+                mapping, payload, known_networks=known_networks
+            )
             if self._network_scope is not None:
                 allowed = frozenset(network.network_id for network in networks)
                 exploded = [

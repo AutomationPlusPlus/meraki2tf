@@ -351,10 +351,42 @@ def aggregation_collection_path(mapping: TerraformResourceMapping) -> str:
     for path in mapping.paths:
         if not is_item_path(path) and _path_param_count(path) == 1:
             return path
+    # Nested-element entities (``…/ssids/{number}/openRoaming``): the
+    # entity's own two-parameter write path IS the canonical path.
+    # Deriving anything shorter would address the features at a
+    # *different* entity's collection path and collide with its assets.
+    for path in mapping.paths:
+        if _nested_element_param(path) is not None:
+            return path
     # Entities exposing only item endpoints (PUT/DELETE on
     # ``.../{id}``): the enclosing collection is the item path minus its
     # trailing parameter.
     return parent_item_path(mapping.paths[0]).rsplit("/", 1)[0] or mapping.paths[0]
+
+
+def _nested_element_param(path: str) -> str | None:
+    """Element parameter of a scope+element path with a trailing literal
+    config segment, else ``None``.
+
+    ``/networks/{networkId}/wireless/ssids/{number}/openRoaming`` →
+    ``number``: the path addresses one nested element's config object
+    (an SSID's openRoaming settings), so an aggregation row for it must
+    explode per listed element, never per row. Purely shape-derived —
+    exactly two path parameters, the second followed by at least one
+    literal segment.
+    """
+    segments = _path_segments(path)
+    params = [
+        (index, segment[1:-1])
+        for index, segment in enumerate(segments)
+        if segment.startswith("{") and segment.endswith("}")
+    ]
+    if len(params) != 2 or _path_param_count(path) != 2:
+        return None
+    index, name = params[1]
+    if index >= len(segments) - 1:
+        return None
+    return name
 
 
 def _path_param_count(path: str) -> int:
@@ -398,7 +430,9 @@ def _row_scope_value(
 
 
 def explode_aggregation_payload(
-    mapping: TerraformResourceMapping, payload: Any
+    mapping: TerraformResourceMapping,
+    payload: Any,
+    known_networks: Mapping[str, str] | None = None,
 ) -> list[FeatureConfiguration]:
     """One org-scoped aggregation response → per-scope feature assets.
 
@@ -409,6 +443,15 @@ def explode_aggregation_payload(
     collection was sourced. Rows lacking a scope identifier are kept as
     scope-less records so the exception auditor reports them instead of
     dropping discovered objects (Cardinal Rule 2).
+
+    ``known_networks`` (id → name) enables phantom-scope healing: some
+    byNetwork rows are scoped by a per-product *child* network id (named
+    ``"<parent> - <product>"``) that no other API surface can resolve.
+    A known scope id passes through untouched; an unknown one is
+    re-scoped to the parent network its name field resolves to; a row
+    resolvable neither way stays an auditable scope-less gap record —
+    a feature must never be addressed by an id nothing can resolve.
+    ``None`` (the default) disables the check entirely.
     """
     agg_op = mapping.aggregation_get
     assert agg_op is not None  # only called for adopted mappings
@@ -442,6 +485,13 @@ def explode_aggregation_payload(
         "networkId",
     )
     item_op = _aggregation_item_operation(mapping)
+    element_param = _nested_element_param(collection_path)
+    networks_by_name = (
+        {name: network_id for network_id, name in known_networks.items()}
+        if known_networks is not None
+        else {}
+    )
+    rescoped = 0
     features: list[FeatureConfiguration] = []
     for row in payload:
         if not isinstance(row, Mapping):
@@ -472,7 +522,34 @@ def explode_aggregation_payload(
                 )
             )
             continue
+        if known_networks is not None and scope_value not in known_networks:
+            parent = _parent_by_name(row, scope_param, networks_by_name)
+            if parent is None:
+                logger.warning(
+                    "Aggregation row of %s is scoped to an id that matches "
+                    "no discovered network by id or name; it will be "
+                    "reported as a coverage gap.",
+                    agg_op.path,
+                )
+                features.append(
+                    FeatureConfiguration(
+                        api_path=collection_path,
+                        path_values=(),
+                        payload=dict(row),
+                    )
+                )
+                continue
+            scope_value = parent
+            rescoped += 1
         remainder = {key: value for key, value in row.items() if key != consumed}
+        if element_param is not None:
+            features.extend(
+                _explode_row_elements(
+                    collection_path, element_param,
+                    scope_param, scope_value, remainder,
+                )
+            )
+            continue
         if item_op is not None:
             item_id = element_id(item_op, remainder)
             if item_id is not None:
@@ -489,6 +566,175 @@ def explode_aggregation_payload(
                 api_path=collection_path,
                 path_values=(scope_value,),
                 payload=remainder,
+            )
+        )
+    if rescoped:
+        logger.info(
+            "Aggregation endpoint %s: re-scoped %d row(s) from "
+            "per-product child network ids to their parent network, "
+            "matched by name.",
+            agg_op.path, rescoped,
+        )
+    return features
+
+
+def _row_scope_name(row: Mapping[str, Any], scope_param: str) -> str:
+    """The row's scope-name field, empty when absent.
+
+    Derived from the scope parameter (``networkId`` → ``networkName``
+    flat form, or ``network: {name: …}`` object form) — never the row's
+    bare ``name``, which names the entity's own object and could
+    coincidentally equal a network name and mis-scope the row.
+    """
+    base = (
+        scope_param[: -len("Id")] if scope_param.endswith("Id") else scope_param
+    )
+    nested = row.get(base)
+    for value in (
+        row.get(f"{base}Name"),
+        nested.get("name") if isinstance(nested, Mapping) else None,
+    ):
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _parent_by_name(
+    row: Mapping[str, Any],
+    scope_param: str,
+    networks_by_name: Mapping[str, str],
+) -> str | None:
+    """Resolve a phantom row scope onto a discovered parent network.
+
+    An exact name match wins; otherwise trailing ``" - <suffix>"``
+    parts are stripped one at a time (the child-network naming scheme is
+    ``"<parent name> - <product>"``, and the parent name may itself
+    contain ``" - "``) until a discovered network's name matches.
+    """
+    candidate = _row_scope_name(row, scope_param)
+    while candidate:
+        parent = networks_by_name.get(candidate)
+        if parent is not None:
+            return parent
+        if " - " not in candidate:
+            return None
+        candidate = candidate.rsplit(" - ", 1)[0]
+    return None
+
+
+def _element_value(item: Mapping[str, Any], element_param: str) -> str | None:
+    """The element's identifier under the path's own parameter name."""
+    value = item.get(element_param)
+    if value is None:
+        # A JSON null must not become the literal ID "None".
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _row_element_list(
+    remainder: Mapping[str, Any], element_param: str
+) -> list[Any] | None:
+    """The row's nested element list, spec-identified by content.
+
+    The first list-valued key whose items carry the element identifier
+    (the entity path's second parameter name) is the element list. A row
+    with only empty candidate lists legitimately holds zero elements;
+    ``None`` means no element list exists at all.
+    """
+    fallback: list[Any] | None = None
+    for value in remainder.values():
+        if not isinstance(value, list):
+            continue
+        if any(
+            isinstance(item, Mapping)
+            and _element_value(item, element_param) is not None
+            for item in value
+        ):
+            return value
+        if fallback is None and not value:
+            fallback = value
+    return fallback
+
+
+def _explode_row_elements(
+    collection_path: str,
+    element_param: str,
+    scope_param: str,
+    scope_value: str,
+    remainder: Mapping[str, Any],
+) -> list[FeatureConfiguration]:
+    """One nested-shape aggregation row → per-element feature assets.
+
+    The entity's canonical path addresses one element's config object
+    (``…/ssids/{number}/openRoaming``), so the row must not become one
+    feature: each entry of its nested element list becomes a feature at
+    the entity's own path with ``(scope, element)`` values. The payload
+    is the element's config sub-object — the key named after the path's
+    trailing config segment — when present, else the element minus its
+    identifier. Elements that cannot be addressed stay auditable gap
+    records (Cardinal Rule 2).
+    """
+    config_key = _path_segments(collection_path)[-1]
+    elements = _row_element_list(remainder, element_param)
+    if elements is None:
+        logger.warning(
+            "Aggregation row for %s carries no %r element list; it will "
+            "be reported as a coverage gap.",
+            collection_path, element_param,
+        )
+        return [
+            FeatureConfiguration(
+                api_path=collection_path,
+                path_values=(),
+                payload={scope_param: scope_value, **remainder},
+            )
+        ]
+    features: list[FeatureConfiguration] = []
+    for item in elements:
+        if not isinstance(item, Mapping):
+            logger.warning(
+                "Element of aggregation row for %s is not an object; it "
+                "will be reported as a coverage gap.",
+                collection_path,
+            )
+            features.append(
+                FeatureConfiguration(
+                    api_path=collection_path,
+                    path_values=(),
+                    payload={scope_param: scope_value, "value": item},
+                )
+            )
+            continue
+        item_id = _element_value(item, element_param)
+        if item_id is None:
+            logger.warning(
+                "Element of aggregation row for %s has no %r identifier; "
+                "it will be reported as a coverage gap.",
+                collection_path, element_param,
+            )
+            features.append(
+                FeatureConfiguration(
+                    api_path=collection_path,
+                    path_values=(),
+                    payload={scope_param: scope_value, **item},
+                )
+            )
+            continue
+        config = item.get(config_key)
+        features.append(
+            FeatureConfiguration(
+                api_path=collection_path,
+                path_values=(scope_value, item_id),
+                payload=(
+                    dict(config)
+                    if isinstance(config, Mapping)
+                    else {
+                        key: value
+                        for key, value in item.items()
+                        if key != element_param
+                    }
+                ),
             )
         )
     return features
