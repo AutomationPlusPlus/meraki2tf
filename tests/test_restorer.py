@@ -2143,6 +2143,146 @@ def test_wipe_reports_organization_delete_failure() -> None:
     assert result.failed == (("org-drill", "org has pending licenses"),)
 
 
+def test_wipe_recheck_failure_before_org_deletion_is_reported() -> None:
+    """Hardware claimed mid-teardown fails the final interlock recheck:
+    the organization survives, nothing retries, and the refusal is
+    reported instead of swallowed."""
+    from meraki2tf.restorer import OrgWiper
+
+    wiper = OrgWiper(sleep=lambda seconds: None)
+    dashboard, deleted = _wipe_dashboard(networks=1)
+    calls = {"n": 0}
+
+    def devices(organizationId: str, total_pages: str = "all") -> list:
+        calls["n"] += 1
+        return [] if calls["n"] == 1 else [{"serial": "Q1"}]
+
+    dashboard.organizations.getOrganizationDevices = devices
+    wiper._client = dashboard
+    result = wiper.execute("org-drill", "Drill Org")
+    assert result.organization_deleted is False
+    assert deleted["orgs"] == []
+    ((target, reason),) = result.failed
+    assert target == "org-drill"
+    assert "claimed device" in reason
+
+
+class _WipeApiError(RuntimeError):
+    """Meraki SDK error shape: message text plus a ``status`` code."""
+
+    def __init__(self, status: int, text: str) -> None:
+        super().__init__(text)
+        self.status = status
+
+
+_STILL_PROCESSING = (
+    "deleteOrganization - 400 Bad Request, {'errors': ['Cannot delete "
+    "organization: currently processing data. Please try again later']}"
+)
+
+
+def test_wipe_retries_transient_processing_refusal_then_succeeds(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Observed live: seconds after mass network deletion the dashboard
+    400s deleteOrganization with 'currently processing data', and the
+    same call succeeds minutes later — the wipe waits it out instead of
+    stranding a half-deleted drill org."""
+    from meraki2tf.restorer import OrgWiper
+
+    sleeps: list[float] = []
+    wiper = OrgWiper(sleep=sleeps.append)
+    dashboard, deleted = _wipe_dashboard(networks=1)
+    attempts = {"n": 0}
+    settle = dashboard.organizations.deleteOrganization
+
+    def flaky(organizationId: str) -> dict:
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise _WipeApiError(400, _STILL_PROCESSING)
+        return settle(organizationId)
+
+    dashboard.organizations.deleteOrganization = flaky
+    wiper._client = dashboard
+    with caplog.at_level("WARNING", logger="meraki2tf.restorer"):
+        result = wiper.execute("org-drill", "Drill Org")
+    assert result.organization_deleted is True
+    assert result.failed == ()
+    assert deleted["orgs"] == ["org-drill"]
+    assert sleeps == [30.0, 30.0]
+    retries = [r for r in caplog.records if "refused transiently" in r.message]
+    assert len(retries) == 2
+
+
+def test_wipe_gives_up_after_the_retry_budget_and_reports_not_deleted() -> None:
+    from meraki2tf.restorer import OrgWiper
+
+    sleeps: list[float] = []
+    wiper = OrgWiper(sleep=sleeps.append)
+    dashboard, _ = _wipe_dashboard(networks=0)
+    attempts = {"n": 0}
+
+    def stuck(organizationId: str) -> dict:
+        attempts["n"] += 1
+        raise _WipeApiError(400, _STILL_PROCESSING)
+
+    dashboard.organizations.deleteOrganization = stuck
+    wiper._client = dashboard
+    result = wiper.execute("org-drill", "Drill Org")
+    assert result.organization_deleted is False
+    assert attempts["n"] == 5
+    assert sleeps == [30.0] * 4
+    ((target, reason),) = result.failed
+    assert target == "org-drill"
+    assert "NOT deleted" in reason
+    assert "currently processing" in reason
+
+
+def test_wipe_never_retries_non_matching_deletion_errors() -> None:
+    """Conservative match: a 500 with the same wording, or a 400 with
+    different wording, keeps today's fail-loud single attempt."""
+    from meraki2tf.restorer import OrgWiper
+
+    for error in (
+        _WipeApiError(500, _STILL_PROCESSING),
+        _WipeApiError(400, "it still has networks"),
+    ):
+        sleeps: list[float] = []
+        wiper = OrgWiper(sleep=sleeps.append)
+        dashboard, _ = _wipe_dashboard(networks=0)
+
+        def explode(organizationId: str) -> dict:
+            raise error
+
+        dashboard.organizations.deleteOrganization = explode
+        wiper._client = dashboard
+        result = wiper.execute("org-drill", "Drill Org")
+        assert result.organization_deleted is False
+        assert sleeps == []
+        assert result.failed == (("org-drill", str(error)),)
+
+
+def test_transient_org_deletion_matcher_is_conservative() -> None:
+    from meraki2tf.restorer import _transient_org_deletion
+
+    assert _transient_org_deletion(
+        _WipeApiError(400, "Currently Processing data")
+    ) is True
+    assert _transient_org_deletion(
+        _WipeApiError(409, _STILL_PROCESSING)
+    ) is True
+    assert _transient_org_deletion(
+        _WipeApiError(500, _STILL_PROCESSING)
+    ) is False
+    assert _transient_org_deletion(
+        _WipeApiError(400, "it still has networks")
+    ) is False
+    # No status attribute at all (a plain SDK/transport error).
+    assert _transient_org_deletion(
+        RuntimeError("currently processing")
+    ) is False
+
+
 def test_empty_default_configures_skip_instead_of_dispatching(
     tmp_path: Path,
 ) -> None:
