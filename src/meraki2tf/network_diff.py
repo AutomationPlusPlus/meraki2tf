@@ -83,6 +83,11 @@ def resolve_network(
     networks: Sequence[MerakiNetwork], pattern: str
 ) -> MerakiNetwork:
     """Exactly one network for a pattern, or refuse listing candidates."""
+    if pattern.lower().startswith("network:"):
+        # Muscle memory from --only's selector syntax ("network:HQ*");
+        # --diff-networks patterns are bare, but refusing over the
+        # prefix would be operator-hostile — accept both spellings.
+        pattern = pattern[len("network:"):]
     compiled = glob_pattern(pattern)
     hits = [
         network
