@@ -65,6 +65,93 @@ class CheckpointMismatchError(ValueError):
     """
 
 
+def _wants_gzip(path: Path) -> bool:
+    return path.name.lower().endswith(".gz")
+
+
+def _read_intact_lines(path: Path) -> list[str]:
+    """Every intact line of the journal; a torn tail is dropped.
+
+    A crash mid-append can leave a partial final line — or, for gzip
+    journals, a member without its trailer (``EOFError``). Everything
+    up to the tear is valid; the torn record's call simply re-runs.
+    """
+    lines: list[str] = []
+    try:
+        if _wants_gzip(path):
+            with gzip.open(path, "rt", encoding="utf-8") as handle:
+                for line in handle:
+                    lines.append(line)
+        else:
+            with path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    lines.append(line)
+    except (EOFError, OSError, UnicodeDecodeError) as exc:
+        logger.warning(
+            "Checkpoint %s has a torn tail (%s); records after the "
+            "tear are discarded and their calls will re-run.",
+            path, exc,
+        )
+    return lines
+
+
+def _validate_header(
+    path: Path, header_line: str, organization_id: str, spec_sha256: str
+) -> None:
+    """Refuse a journal whose identity header does not bind this run."""
+    try:
+        header = json.loads(header_line)
+    except json.JSONDecodeError:
+        header = None
+    if (
+        not isinstance(header, dict)
+        or header.get(CHECKPOINT_MARKER) != CHECKPOINT_VERSION
+    ):
+        raise CheckpointMismatchError(
+            f"{path} is not a meraki2tf discovery checkpoint "
+            "(or was written by an incompatible version); refusing to "
+            "resume from it. Point --discovery-checkpoint at a fresh "
+            "path."
+        )
+    recorded_org = str(header.get("organizationId", ""))
+    recorded_sha = str(header.get("specSha256", ""))
+    if recorded_org != organization_id:
+        raise CheckpointMismatchError(
+            f"Checkpoint {path} was recorded for organization "
+            f"{recorded_org}, but this run discovers organization "
+            f"{organization_id}; replaying it would splice "
+            "another organization's data into this snapshot. Use a "
+            "fresh checkpoint path per organization."
+        )
+    if recorded_sha != spec_sha256:
+        raise CheckpointMismatchError(
+            f"Checkpoint {path} was recorded against a "
+            "different OpenAPI spec (sha256 "
+            f"{recorded_sha or 'unrecorded'} vs "
+            f"{spec_sha256}); replayed outcomes would expand "
+            "differently than fresh calls. Re-run with the "
+            "capture-time --spec, or start a fresh checkpoint."
+        )
+
+
+def verify_binding(
+    path: Path, organization_id: str, spec_sha256: str
+) -> None:
+    """Eagerly refuse a stale/foreign checkpoint before anything runs.
+
+    Read-only header check for the CLI's fail-fast validation pass: a
+    mismatched journal must refuse before environment probes and hours
+    of discovery, not when the provider first opens it. A missing or
+    headerless file is fine — this run will write a fresh header.
+    """
+    if not path.exists():
+        return
+    lines = _read_intact_lines(path)
+    if not lines:
+        return
+    _validate_header(path, lines[0], organization_id, spec_sha256)
+
+
 @dataclass(frozen=True)
 class CallOutcome:
     """One completed discovery call's recorded result.
@@ -162,7 +249,7 @@ class DiscoveryCheckpoint:
     # -- storage ------------------------------------------------------
 
     def _wants_gzip(self) -> bool:
-        return self._path.name.lower().endswith(".gz")
+        return _wants_gzip(self._path)
 
     def _open_for_append(self, header: bool) -> TextIO:
         """Open the journal 0600 for appending; write the header if new."""
@@ -207,23 +294,7 @@ class DiscoveryCheckpoint:
         Everything up to the tear is valid; the torn record's call
         simply re-runs.
         """
-        lines: list[str] = []
-        try:
-            if self._wants_gzip():
-                with gzip.open(self._path, "rt", encoding="utf-8") as handle:
-                    for line in handle:
-                        lines.append(line)
-            else:
-                with self._path.open("r", encoding="utf-8") as handle:
-                    for line in handle:
-                        lines.append(line)
-        except (EOFError, OSError, UnicodeDecodeError) as exc:
-            logger.warning(
-                "Checkpoint %s has a torn tail (%s); records after the "
-                "tear are discarded and their calls will re-run.",
-                self._path, exc,
-            )
-        return lines
+        return _read_intact_lines(self._path)
 
     def _load_existing(self) -> bool:
         """Load a previous run's journal, verifying its identity header.
@@ -236,39 +307,9 @@ class DiscoveryCheckpoint:
         if not lines:
             # Zero intact lines: nothing to resume, nothing to verify.
             return False
-        try:
-            header = json.loads(lines[0])
-        except json.JSONDecodeError:
-            header = None
-        if (
-            not isinstance(header, dict)
-            or header.get(CHECKPOINT_MARKER) != CHECKPOINT_VERSION
-        ):
-            raise CheckpointMismatchError(
-                f"{self._path} is not a meraki2tf discovery checkpoint "
-                "(or was written by an incompatible version); refusing to "
-                "resume from it. Point --discovery-checkpoint at a fresh "
-                "path."
-            )
-        recorded_org = str(header.get("organizationId", ""))
-        recorded_sha = str(header.get("specSha256", ""))
-        if recorded_org != self._organization_id:
-            raise CheckpointMismatchError(
-                f"Checkpoint {self._path} was recorded for organization "
-                f"{recorded_org}, but this run discovers organization "
-                f"{self._organization_id}; replaying it would splice "
-                "another organization's data into this snapshot. Use a "
-                "fresh checkpoint path per organization."
-            )
-        if recorded_sha != self._spec_sha256:
-            raise CheckpointMismatchError(
-                f"Checkpoint {self._path} was recorded against a "
-                "different OpenAPI spec (sha256 "
-                f"{recorded_sha or 'unrecorded'} vs "
-                f"{self._spec_sha256}); replayed outcomes would expand "
-                "differently than fresh calls. Re-run with the "
-                "capture-time --spec, or start a fresh checkpoint."
-            )
+        _validate_header(
+            self._path, lines[0], self._organization_id, self._spec_sha256
+        )
         loaded = 0
         for number, line in enumerate(lines[1:], start=2):
             entry = self._parse_entry(line)

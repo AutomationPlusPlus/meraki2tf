@@ -4517,6 +4517,87 @@ def test_partial_from_dump_refused_with_sync(
     assert exit_code == 2
 
 
+def test_input_refusals_precede_terraform_probe(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pure input mistakes refuse even where terraform is absent.
+
+    CI regression: the environment probe used to run before the
+    partial-snapshot gating, so a runner without terraform reported a
+    terraform fault (exit 1 + alert) instead of the input refusal
+    (exit 2, no alert). The probe must lose to every input refusal.
+    """
+    import meraki2tf.cli as cli_module
+    from meraki2tf.terraform_runner import TerraformError
+
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+
+    def broken_probe(_executable: str) -> None:
+        raise TerraformError("terraform binary not found (simulated)")
+
+    monkeypatch.setattr(
+        cli_module, "ensure_supported_terraform", broken_probe
+    )
+    dump = _partial_dump(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(dump), "--sync",
+         "--workdir", str(tmp_path / "ws")]
+    )
+    assert exit_code == 2
+
+
+def test_checkpoint_mismatch_precedes_terraform_probe(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A foreign checkpoint refuses (exit 2) before the probe fires."""
+    import meraki2tf.cli as cli_module
+    from meraki2tf.providers.discovery_checkpoint import DiscoveryCheckpoint
+    from meraki2tf.terraform_runner import TerraformError
+
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+
+    def broken_probe(_executable: str) -> None:
+        raise TerraformError("terraform binary not found (simulated)")
+
+    monkeypatch.setattr(
+        cli_module, "ensure_supported_terraform", broken_probe
+    )
+    checkpoint = tmp_path / "sweep.ckpt.jsonl"
+    DiscoveryCheckpoint(checkpoint, "999999", "other-sha").close()
+    exit_code = main(
+        ["--spec", str(spec_file), "--org-id", "123456",
+         "--workdir", str(tmp_path / "ws"),
+         "--discovery-checkpoint", str(checkpoint)]
+    )
+    assert exit_code == 2
+
+
+def test_terraform_probe_still_fires_on_clean_inputs(
+    spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no input mistakes, a broken terraform is still a fast
+    exit-1 preflight fault — before any discovery runs."""
+    import meraki2tf.cli as cli_module
+    from meraki2tf.terraform_runner import TerraformError
+
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+
+    def broken_probe(_executable: str) -> None:
+        raise TerraformError("terraform binary not found (simulated)")
+
+    monkeypatch.setattr(
+        cli_module, "ensure_supported_terraform", broken_probe
+    )
+    exit_code = main(
+        ["--spec", str(spec_file), "--org-id", "123456",
+         "--workdir", str(tmp_path / "ws")]
+    )
+    assert exit_code == 1
+
+
 def test_partial_from_dump_refused_with_confirm_deletions(
     spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

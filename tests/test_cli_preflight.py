@@ -194,7 +194,12 @@ def test_pipeline_probes_terraform_before_discovery(
     def no_discovery(*args: Any, **kwargs: Any) -> None:
         raise AssertionError("discovery must not start without terraform")
 
-    monkeypatch.setattr("meraki2tf.cli.build_provider", no_discovery)
+    # The probe deliberately runs AFTER provider construction (pure
+    # input refusals win over environment faults) but BEFORE the
+    # orchestrator — where the sweep would actually be spent.
+    monkeypatch.setattr(
+        "meraki2tf.cli.PipelineOrchestrator.run", no_discovery
+    )
     delivered: list[dict[str, Any]] = []
 
     def fake_urlopen(

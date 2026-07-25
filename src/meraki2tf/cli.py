@@ -101,7 +101,10 @@ from meraki2tf.providers import (
     MerakiDataProvider,
     StaticJsonDataProvider,
 )
-from meraki2tf.providers.discovery_checkpoint import CheckpointMismatchError
+from meraki2tf.providers.discovery_checkpoint import (
+    CheckpointMismatchError,
+    verify_binding,
+)
 from meraki2tf.sanitizer import load_or_create_salt, sanitize_graph
 from meraki2tf.scope import (
     LiveNetworkScope,
@@ -711,6 +714,16 @@ def build_provider(
         # The journal is bound to the exact spec document: replayed
         # payloads re-expand through the spec, so a swap must refuse.
         checkpoint_sha = spec_fingerprint(spec_file)[1]
+        # Eager header check: a stale/foreign journal refuses NOW —
+        # before the terraform probe and before any API call — so the
+        # clean input refusal is never shadowed by an environment
+        # fault (and CI without terraform sees the same behavior as a
+        # workstation that has it).
+        verify_binding(
+            config.discovery_checkpoint,
+            config.org_id or "",
+            checkpoint_sha,
+        )
     return LiveApiDataProvider(
         parser=parser,
         network_scope=scope,
@@ -2639,19 +2652,6 @@ def _run_org_pipeline(
                 )
             )
             return 1
-    if config.dump_to is None and api_key_present():
-        # This run will plan (and in sync mode apply) through
-        # terraform; probe the binary and version now. Snapshot
-        # exports and keyless air-gapped runs never invoke terraform,
-        # so they deliberately skip the probe.
-        try:
-            ensure_supported_terraform(config.terraform_bin)
-        except TerraformError as exc:
-            logger.critical("%s", exc)
-            dispatcher.dispatch(
-                processing_fault(stage="terraform preflight", error=str(exc))
-            )
-            return 1
     try:
         spec_file = resolve_spec(config.spec_path)
         spec_parser = OpenApiParser(spec_file)
@@ -2715,6 +2715,24 @@ def _run_org_pipeline(
                 "only that scope, not the organization.",
                 len(partial_scope.network_ids),
             )
+        if api_key_present():
+            # This run will plan (and in sync mode apply) through
+            # terraform; probe the binary and version now — after every
+            # pure-input refusal above (partial-snapshot gating, scope
+            # selectors, checkpoint binding), but still before the
+            # discovery sweep. Input mistakes must never be masked by
+            # an environment fault. Keyless air-gapped runs never
+            # invoke terraform, so they deliberately skip the probe.
+            try:
+                ensure_supported_terraform(config.terraform_bin)
+            except TerraformError as exc:
+                logger.critical("%s", exc)
+                dispatcher.dispatch(
+                    processing_fault(
+                        stage="terraform preflight", error=str(exc)
+                    )
+                )
+                return 1
         runner = TerraformRunner(
             config.workdir,
             executable=config.terraform_bin,
@@ -2742,6 +2760,13 @@ def _run_org_pipeline(
             drift_baseline=config.drift_baseline,
         )
         summary = orchestrator.run(config.org_id)
+    except CheckpointMismatchError as exc:
+        # Operator input error (a stale or foreign discovery
+        # checkpoint), surfaced by the eager header check at provider
+        # build time: fail loudly and actionably, no fault alert —
+        # mirroring the export path's handling.
+        logger.critical("%s", exc)
+        return 2
     except PreflightRefusalError as exc:
         # An expected refusal (preconditions unmet); nothing ran and no
         # fault alert belongs to it — same clean-refusal exit the other

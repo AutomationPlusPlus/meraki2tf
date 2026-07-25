@@ -627,3 +627,54 @@ def test_provider_refuses_a_foreign_checkpoint_before_any_call(
         provider.fetch_network_graph("org-123")
     assert calls == {}  # refused before spending any API budget
     assert checkpoint.exists()  # a mismatch never destroys the journal
+
+
+# ------------------------------------------------------- verify_binding
+
+
+def test_verify_binding_missing_file_is_a_no_op(tmp_path: Path) -> None:
+    from meraki2tf.providers.discovery_checkpoint import verify_binding
+
+    verify_binding(tmp_path / "absent.jsonl", "org-123", "sha-a")
+
+
+def test_verify_binding_headerless_file_is_a_no_op(tmp_path: Path) -> None:
+    from meraki2tf.providers.discovery_checkpoint import verify_binding
+
+    empty = tmp_path / "empty.jsonl"
+    empty.write_text("")
+    verify_binding(empty, "org-123", "sha-a")
+
+
+def test_verify_binding_accepts_a_matching_journal(tmp_path: Path) -> None:
+    from meraki2tf.providers.discovery_checkpoint import (
+        DiscoveryCheckpoint,
+        verify_binding,
+    )
+
+    path = tmp_path / "sweep.jsonl"
+    DiscoveryCheckpoint(path, "org-123", "sha-a").close()
+    verify_binding(path, "org-123", "sha-a")
+
+
+def test_verify_binding_refuses_foreign_org_and_spec(tmp_path: Path) -> None:
+    from meraki2tf.providers.discovery_checkpoint import (
+        DiscoveryCheckpoint,
+        verify_binding,
+    )
+
+    path = tmp_path / "sweep.jsonl"
+    DiscoveryCheckpoint(path, "org-123", "sha-a").close()
+    with pytest.raises(CheckpointMismatchError):
+        verify_binding(path, "org-999", "sha-a")
+    with pytest.raises(CheckpointMismatchError):
+        verify_binding(path, "org-123", "sha-b")
+    with pytest.raises(CheckpointMismatchError):
+        verify_binding(tmp_path_not_journal(tmp_path), "org-123", "sha-a")
+
+
+def tmp_path_not_journal(tmp_path: Path) -> Path:
+    """A file that exists but is not a checkpoint journal."""
+    bogus = tmp_path / "bogus.jsonl"
+    bogus.write_text('{"something": "else"}\n')
+    return bogus
