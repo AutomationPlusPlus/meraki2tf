@@ -33,7 +33,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from meraki2tf.config import read_api_key
+from meraki2tf.sdk_client import (
+    WRITE_ENGINE_MAXIMUM_RETRIES,
+    dashboard_client,
+)
 from meraki2tf.hcl_generator import GenerationReport
 from meraki2tf.models import UNREADABLE_MARKER, NetworkGraph
 from meraki2tf.openapi_parser import OpenApiParser
@@ -429,19 +432,8 @@ class GapReplayer:
 
     def _dashboard(self) -> Any:
         if self._client is None:
-            import meraki
-
-            self._client = meraki.DashboardAPI(
-                api_key=read_api_key(),
-                suppress_logging=True,
-                print_console=False,
-                output_log=False,
-                # A replay competes for the shared 10 req/s org budget —
-                # in a real recovery, against every other integration
-                # hammering the rebuilt tenant. The SDK's default 2
-                # throttle retries give up far too early for writes
-                # whose failure poisons the run's results.
-                maximum_retries=8,
+            self._client = dashboard_client(
+                maximum_retries=WRITE_ENGINE_MAXIMUM_RETRIES
             )
             logger.debug("Meraki dashboard client initialized for replay.")
         return self._client

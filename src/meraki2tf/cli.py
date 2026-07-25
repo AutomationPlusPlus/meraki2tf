@@ -71,7 +71,6 @@ from meraki2tf.config import (
     StateBackend,
     api_key_present,
     load_config_file,
-    read_api_key,
 )
 from meraki2tf.coverage import build_manifest, unsupported_payload, write_manifest
 from meraki2tf.hcl_generator import HclImportGenerator
@@ -111,6 +110,7 @@ from meraki2tf.scope import (
     ScopeFilterError,
     parse_network_selectors,
 )
+from meraki2tf.sdk_client import dashboard_client
 from meraki2tf.snapshot import write_snapshot
 from meraki2tf.spec_resolver import resolve_spec, spec_fingerprint
 from meraki2tf.terraform_runner import (
@@ -1411,16 +1411,7 @@ def _warn_snapshot_spec_skew(
 
 def _target_network_count(target_org: str) -> int:
     """How many networks the restore target organization holds now."""
-    import meraki
-
-    from meraki2tf.config import read_api_key
-
-    dashboard = meraki.DashboardAPI(
-        api_key=read_api_key(),
-        suppress_logging=True,
-        print_console=False,
-        output_log=False,
-    )
+    dashboard = dashboard_client()
     networks = dashboard.organizations.getOrganizationNetworks(
         target_org, total_pages="all"
     )
@@ -1841,16 +1832,8 @@ def _list_orgs() -> int:
     stdout so it works interactively and in shell pipelines; nothing is
     written to the workdir and no alerts are dispatched.
     """
-    import meraki
-
     try:
-        client = meraki.DashboardAPI(
-            api_key=read_api_key(),
-            suppress_logging=True,
-            print_console=False,
-            output_log=False,
-            wait_on_rate_limit=True,
-        )
+        client = dashboard_client(wait_on_rate_limit=True)
         organizations = client.organizations.getOrganizations()
     except Exception as exc:
         logger.critical("Could not list organizations: %s", exc)

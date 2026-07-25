@@ -42,7 +42,6 @@ from meraki2tf.config import (
     ExecutionMode,
     RuntimeConfig,
     api_key_present,
-    read_api_key,
 )
 from meraki2tf.coverage import COVERAGE_JSON_FILENAME
 from meraki2tf.hcl_generator import IMPORTS_FILENAME
@@ -62,6 +61,7 @@ from meraki2tf.providers.discovery import (
 )
 from meraki2tf.providers.dump import StaticJsonDataProvider
 from meraki2tf.providers.live import CONFIG_TEMPLATE_ITEM_PATH
+from meraki2tf.sdk_client import dashboard_client
 from meraki2tf.snapshot_diff import validate_baseline_header
 from meraki2tf.spec.engine import OperationSpec
 from meraki2tf.spec_resolver import resolve_spec
@@ -217,15 +217,7 @@ def _imports_organization(imports_path: Path) -> str | None:
 
 def _fetch_organizations() -> list[dict[str, Any]]:
     """One read-only ``getOrganizations`` call (the key-validity probe)."""
-    import meraki
-
-    client = meraki.DashboardAPI(
-        api_key=read_api_key(),
-        suppress_logging=True,
-        print_console=False,
-        output_log=False,
-        wait_on_rate_limit=True,
-    )
+    client = dashboard_client(wait_on_rate_limit=True)
     organizations = client.organizations.getOrganizations()
     return [
         organization
@@ -683,17 +675,9 @@ def _estimate_live(
     config: RuntimeConfig, parser: OpenApiParser
 ) -> DiscoveryEstimate:
     """Live estimate: 2-3 read-only enumeration calls, then arithmetic."""
-    import meraki
-
     organization_id = config.org_id
     assert organization_id is not None  # guarded by the CLI
-    client = meraki.DashboardAPI(
-        api_key=read_api_key(),
-        suppress_logging=True,
-        print_console=False,
-        output_log=False,
-        wait_on_rate_limit=True,
-    )
+    client = dashboard_client(wait_on_rate_limit=True)
     networks_raw = client.organizations.getOrganizationNetworks(
         organization_id, total_pages="all"
     )

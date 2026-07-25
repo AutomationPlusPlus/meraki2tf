@@ -40,6 +40,10 @@ src/meraki2tf/
 │                         #   + --rebuild organization resolution (--expect-org interlock)
 ├── fileio.py             # Atomic writes (tmp + rename) for every artifact
 ├── fsperms.py            # Owner-only (0600) enforcement + degraded-filesystem warning
+├── sdk_client.py         # The one meraki.DashboardAPI construction site: SDK console/file
+│                         #   logging suppressed by construction, key read from the environment
+├── hcl.py                # The one HCL literal escaper, shared by every Terraform writer
+│                         #   (quote/backslash/newline/interpolation + lone-surrogate scrub)
 ├── hcl_generator.py      # HclImportGenerator → imports.tf, duplicate-id records, exception auditing
 ├── coverage.py           # coverage.json / coverage.txt manifest: per-object status, spec-level
 │                         #   accounting (rpc/read-only/suspect), reconciled totals (totals.unaccounted)
@@ -228,6 +232,12 @@ sweeps; each closes a class of silent wrongness:
 
 - The API token lives only in `MERAKI_DASHBOARD_API_KEY`; it is read at
   client-construction time, passed into the SDK, and never retained.
+- Every dashboard client is built by `sdk_client.dashboard_client()`,
+  which pins `suppress_logging` / `print_console` / `output_log` — the
+  SDK's own console output and `meraki_api_*.log` file would otherwise
+  record request/response detail. Because there is one construction
+  site, that suppression is a property of the codebase rather than a
+  convention each call site has to remember.
 - `SecretRedactionFilter` scrubs `Authorization` /
   `X-Cisco-Meraki-API-Key` values from every log record at every level.
 - The generated `provider.tf` is credential-free — the

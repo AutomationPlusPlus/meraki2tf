@@ -14,6 +14,8 @@ import gzip
 import json
 import logging
 import smtplib
+import sys
+import types
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -39,6 +41,7 @@ from meraki2tf.plan_reconciler import synthesize_hcl
 from meraki2tf.providers.dump import MalformedDumpError, StaticJsonDataProvider
 from meraki2tf.providers.live import _method_is_read_only
 from meraki2tf.sanitizer import SECRET_KEY_PATTERN
+from meraki2tf.sdk_client import dashboard_client
 from meraki2tf.spec_resolver import SpecResolutionError, _download, _parse_spec
 
 
@@ -100,6 +103,48 @@ def test_every_hcl_writer_shares_the_surrogate_safe_escaper() -> None:
     synthesize_hcl({"name": "site \ud800 one"}).encode("utf-8")
     synthesize_hcl(["\ud800"]).encode("utf-8")
     synthesize_hcl({"\ud800": "v"}).encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# sdk_client: SDK log hygiene is a property of the one construction site
+# ---------------------------------------------------------------------------
+
+
+def test_every_dashboard_client_suppresses_sdk_logging(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Left at its defaults the SDK prints request/response detail to
+    the console and writes a meraki_api_*.log file — records carrying
+    Authorization headers and payload values. Every path that talks to
+    the dashboard builds its client here, so the suppression is asserted
+    once, on the single construction site."""
+    captured: dict[str, Any] = {}
+
+    stub = types.ModuleType("meraki")
+    stub.DashboardAPI = lambda **kwargs: captured.update(kwargs)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "meraki", stub)
+    monkeypatch.setenv("MERAKI_DASHBOARD_API_KEY", "k" * 40)
+
+    dashboard_client(wait_on_rate_limit=True, maximum_retries=8)
+    assert captured["suppress_logging"] is True
+    assert captured["print_console"] is False
+    assert captured["output_log"] is False
+    # Call-site concerns still pass through.
+    assert captured["wait_on_rate_limit"] is True
+    assert captured["maximum_retries"] == 8
+
+
+def test_log_hygiene_arguments_cannot_be_overridden(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller re-passing one of the pinned arguments is a TypeError,
+    not a silent downgrade to a logging client."""
+    stub = types.ModuleType("meraki")
+    stub.DashboardAPI = lambda **kwargs: None  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "meraki", stub)
+    monkeypatch.setenv("MERAKI_DASHBOARD_API_KEY", "k" * 40)
+    with pytest.raises(TypeError, match="suppress_logging"):
+        dashboard_client(suppress_logging=False)
 
 
 # ---------------------------------------------------------------------------
