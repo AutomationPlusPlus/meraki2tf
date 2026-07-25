@@ -447,11 +447,15 @@ def explode_aggregation_payload(
     ``known_networks`` (id → name) enables phantom-scope healing: some
     byNetwork rows are scoped by a per-product *child* network id (named
     ``"<parent> - <product>"``) that no other API surface can resolve.
-    A known scope id passes through untouched; an unknown one is
-    re-scoped to the parent network its name field resolves to; a row
-    resolvable neither way stays an auditable scope-less gap record —
-    a feature must never be addressed by an id nothing can resolve.
-    ``None`` (the default) disables the check entirely.
+    The mapping is the full resolution universe — networks AND config
+    templates, whose per-product children appear in byNetwork rows the
+    same way ("<template name> - <product>"). A known scope id passes
+    through untouched; an unknown one is re-scoped to the parent its
+    name field resolves to (exact match first, then trailing
+    ``" - <suffix>"`` parts stripped one at a time); a row resolvable
+    neither way stays an auditable scope-less gap record — a feature
+    must never be addressed by an id nothing can resolve. ``None`` (the
+    default) disables the check entirely.
     """
     agg_op = mapping.aggregation_get
     assert agg_op is not None  # only called for adopted mappings

@@ -41,7 +41,8 @@ import hashlib
 import logging
 import os
 import re
-from collections.abc import Mapping, Sequence
+import time
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -58,11 +59,15 @@ from meraki2tf.hcl_generator import DEVICE_API_PATH, NETWORK_API_PATH
 from meraki2tf.providers.ratelimit import AdaptiveTokenBucket
 from meraki2tf.replayer import (
     ACTION_LOG_REASON,
+    EMPTY_DEFAULT_REASON,
+    GAP_RECORD_REASON,
     _collection_items,
     _secret_paths,
     _single_array_body_field,
     _strip_nulls,
     is_action_log,
+    is_empty_default_payload,
+    is_scope_gap_record,
     shape_rules,
     split_redacted as _split_redacted,
 )
@@ -244,6 +249,16 @@ def _classify_feature(
             feature.path_values,
             "Endpoint was unreadable at capture — nothing was recorded "
             "to restore; verify it manually after the rebuild.",
+        )
+    if is_scope_gap_record(feature.api_path, feature.path_values):
+        # Scope-less byNetwork gap records exist to keep unresolvable
+        # rows visible (Cardinal Rule 2); dispatching one can only die
+        # on a missing path parameter and pollute the run with a
+        # failure for an object that was never addressable.
+        return Unrestorable(
+            feature.api_path,
+            feature.path_values,
+            GAP_RECORD_REASON,
         )
     ops = writes.get(feature.api_path, ())
     if not ops:
@@ -2920,6 +2935,17 @@ class OrgRestorer:
                 "the captured payload holds no writable values (null "
                 "leaves only); nothing to restore"
             )
+        if (
+            action.kind == "configure"
+            and isinstance(body, Mapping)
+            and is_empty_default_payload(body, action.api_path)
+        ):
+            # Nothing but empty containers once the aggregation row's
+            # scope-name echo is ignored: the configuration does not
+            # exist, and the dashboard 400s the no-op PUT on orgs that
+            # lack the endpoint's prerequisites (vpnExclusions needs
+            # minimum firmware + default VPN routes).
+            raise _EmptyConfigureSkip(EMPTY_DEFAULT_REASON)
         section = getattr(dashboard, op.tags[0], None) if op.tags else None
         method = (
             getattr(section, op.operation_id, None)
@@ -3202,6 +3228,26 @@ class WipeRefusedError(RuntimeError):
     """A safety interlock refused the wipe target."""
 
 
+#: Bounded retry budget for the final ``deleteOrganization`` call:
+#: seconds after a mass network teardown the dashboard can answer 400
+#: "Cannot delete organization: currently processing data. Please try
+#: again later" — a transient backend state that clears on its own, as
+#: observed live (a manual re-run minutes later succeeded). Only that
+#: exact condition retries; every other error keeps failing loud.
+_ORG_DELETE_ATTEMPTS = 5
+_ORG_DELETE_RETRY_SECONDS = 30.0
+
+
+def _transient_org_deletion(exc: Exception) -> bool:
+    """A 400/409 whose text says the backend is still digesting the
+    just-deleted networks — the one retryable ``deleteOrganization``
+    refusal. Conservative on purpose: any other status or wording is a
+    real verdict and must fail loud."""
+    if getattr(exc, "status", None) not in (400, 409):
+        return False
+    return "currently processing" in str(exc).lower()
+
+
 class OrgWiper:
     """Tears down a drill organization after a restore rehearsal.
 
@@ -3225,9 +3271,16 @@ class OrgWiper:
     real secrets or identifiers ever enter the org).
     """
 
-    def __init__(self, bucket: AdaptiveTokenBucket | None = None) -> None:
+    def __init__(
+        self,
+        bucket: AdaptiveTokenBucket | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
         self._bucket = bucket or AdaptiveTokenBucket()
         self._client: Any = None
+        #: Injectable wait between transient deleteOrganization
+        #: retries, so tests never sleep for real.
+        self._sleep = sleep
 
     def _dashboard(self) -> Any:
         if self._client is None:
@@ -3435,12 +3488,48 @@ class OrgWiper:
                 # once more so hardware claimed mid-teardown stops the
                 # organization deletion instead of vanishing with it.
                 self.preview(organization_id, expected_name)
-                self._bucket.acquire()
-                dashboard.organizations.deleteOrganization(organization_id)
-                self._bucket.on_success()
-                org_deleted = True
             except Exception as exc:  # noqa: BLE001
                 failed.append((organization_id, str(exc)))
+        if not failed:
+            for attempt in range(1, _ORG_DELETE_ATTEMPTS + 1):
+                try:
+                    self._bucket.acquire()
+                    dashboard.organizations.deleteOrganization(
+                        organization_id
+                    )
+                    self._bucket.on_success()
+                    org_deleted = True
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    if (
+                        attempt < _ORG_DELETE_ATTEMPTS
+                        and _transient_org_deletion(exc)
+                    ):
+                        # Observed live: seconds after mass network
+                        # deletion the backend is still processing and
+                        # 400s the org deletion; the same call succeeds
+                        # minutes later. Wait out the transient instead
+                        # of stranding a half-wiped drill org.
+                        logger.warning(
+                            "deleteOrganization for %s refused "
+                            "transiently (%s); retrying in %.0fs "
+                            "(attempt %d/%d).",
+                            organization_id, exc,
+                            _ORG_DELETE_RETRY_SECONDS,
+                            attempt + 1, _ORG_DELETE_ATTEMPTS,
+                        )
+                        self._sleep(_ORG_DELETE_RETRY_SECONDS)
+                        continue
+                    reason = str(exc)
+                    if _transient_org_deletion(exc):
+                        reason = (
+                            f"still refused after {attempt} paced "
+                            f"attempt(s); the organization was NOT "
+                            f"deleted — re-run --wipe-org once the "
+                            f"dashboard finishes processing: {exc}"
+                        )
+                    failed.append((organization_id, reason))
+                    break
         return WipeResult(
             deleted_networks=tuple(deleted),
             organization_deleted=org_deleted,

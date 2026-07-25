@@ -210,6 +210,119 @@ def test_plan_replay_skips_unreadable_gap_records(
     assert "unreadable at capture" in skip.reason
 
 
+def test_plan_replay_skips_scope_less_gap_records(
+    spec_parser: OpenApiParser,
+) -> None:
+    """A byNetwork aggregation row that discovery could not resolve to
+    any scope is an auditable diagnostic, not a dispatchable write — it
+    must never reach the executor to die on missing path parameters
+    and be miscounted as a replay FAILURE."""
+    path = "/networks/{networkId}/wireless/airMarshal/settings"
+    graph = _graph(
+        FeatureConfiguration(
+            path,
+            (),
+            {"networkName": "ghost - wireless", "defaultPolicy": "blocked"},
+        )
+    )
+    report = _report(unsupported=(UnsupportedAsset(path, "no match", ()),))
+    actions, skipped = plan_replay(graph, report, spec_parser)
+    assert actions == ()
+    (skip,) = skipped
+    assert skip.identifiers == ()
+    assert skip.reason == (
+        "diagnostic gap record — no scope identifier; covered by the "
+        "runbook's manual list"
+    )
+
+
+def test_is_scope_gap_record_discounts_injected_organization() -> None:
+    """The executors inject the target organizationId themselves, so an
+    org-scoped asset with no discovered values is addressable; any
+    other missing scope parameter is not."""
+    from meraki2tf.replayer import is_scope_gap_record
+
+    org_path = "/organizations/{organizationId}/admins"
+    assert is_scope_gap_record(org_path, ()) is False
+    net_path = "/networks/{networkId}/wireless/airMarshal/settings"
+    assert is_scope_gap_record(net_path, ()) is True
+    assert is_scope_gap_record(net_path, ("N_1",)) is False
+    item_path = "/networks/{networkId}/appliance/vlans/{vlanId}"
+    assert is_scope_gap_record(item_path, ("N_1",)) is True
+
+
+def test_plan_replay_skips_empty_default_puts(
+    spec_parser: OpenApiParser,
+) -> None:
+    """A PUT of nothing but empty containers (after the aggregation
+    row's scope-name echo is ignored) restores no configuration and
+    can 400 on orgs lacking the endpoint's prerequisites — the
+    vpnExclusions shape observed live."""
+    path = "/networks/{networkId}/wireless/airMarshal/settings"
+    graph = _graph(
+        FeatureConfiguration(
+            path,
+            ("N_1",),
+            {
+                "networkName": "HQ - appliance",
+                "custom": [],
+                "majorApplications": [],
+                "detail": None,
+            },
+        )
+    )
+    report = _report(
+        unsupported=(UnsupportedAsset(path, "no match", ("N_1",)),)
+    )
+    actions, skipped = plan_replay(graph, report, spec_parser)
+    assert actions == ()
+    (skip,) = skipped
+    assert skip.reason == "empty default configuration — nothing to restore"
+
+
+def test_plan_replay_keeps_false_zero_and_empty_string_puts(
+    spec_parser: OpenApiParser,
+) -> None:
+    """Conservative emptiness: false/0/"" are real configuration (a
+    deliberately disabled feature is not an empty default) and the
+    write must dispatch."""
+    path = "/networks/{networkId}/wireless/airMarshal/settings"
+    for scalar in (False, 0, ""):
+        graph = _graph(
+            FeatureConfiguration(
+                path,
+                ("N_1",),
+                {"networkName": "HQ", "custom": [], "setting": scalar},
+            )
+        )
+        report = _report(
+            unsupported=(UnsupportedAsset(path, "no match", ("N_1",)),)
+        )
+        actions, skipped = plan_replay(graph, report, spec_parser)
+        assert skipped == (), repr(scalar)
+        (action,) = actions
+        assert action.payload["setting"] == scalar
+
+
+def test_scope_context_keys_and_empty_default_shapes() -> None:
+    from meraki2tf.replayer import is_empty_default_payload, scope_context_keys
+
+    vlan_path = "/networks/{networkId}/appliance/vlans/{vlanId}"
+    assert scope_context_keys(vlan_path) == frozenset(
+        {"networkId", "network", "networkName", "vlanId", "vlan", "vlanName"}
+    )
+    # Parameters without an ``Id`` suffix keep their own stem.
+    assert scope_context_keys("/devices/{serial}/switch/ports") == frozenset(
+        {"serial", "serialName"}
+    )
+    # Only-context payloads hold nothing but the scope echo.
+    assert is_empty_default_payload({"networkName": "HQ"}, vlan_path) is True
+    assert is_empty_default_payload({"custom": [], "sub": {}}, vlan_path) is True
+    # A populated container or any scalar is real configuration.
+    assert is_empty_default_payload({"custom": ["x"]}, vlan_path) is False
+    assert is_empty_default_payload({"enabled": False}, vlan_path) is False
+
+
 def test_plan_replay_skips_empty_collection_envelopes(
     spec_parser: OpenApiParser,
 ) -> None:

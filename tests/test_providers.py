@@ -1198,6 +1198,113 @@ def test_config_template_contents_are_swept_as_network_scopes(
     assert [f.path_values for f in template_vlans] == [("T_1", "77")]
 
 
+def test_aggregation_resolution_universe_includes_config_templates(
+    tmp_path: Path,
+) -> None:
+    """A byNetwork row scoped by a CONFIG TEMPLATE's per-product child
+    id (named "<template name> - <product>") must resolve onto the
+    template, exactly like network children — observed live as
+    scope-less gap records ("seed2-template - wireless") before the
+    template list was threaded into the resolution universe. A row
+    resolvable neither way still stays an auditable gap record."""
+    import json as _json
+
+    from conftest import AIR_MARSHAL_BY_NETWORK_SCHEMA, _op
+
+    marshal_path = "/networks/{networkId}/wireless/airMarshal/settings"
+    spec = {
+        "openapi": "3.0.0",
+        "info": {"title": "template-aggregation", "version": "1"},
+        "paths": {
+            "/organizations/{organizationId}/configTemplates": {
+                "get": _op("getOrganizationConfigTemplates", "organizations"),
+            },
+            "/organizations/{organizationId}/configTemplates"
+            "/{configTemplateId}": {
+                "get": _op("getOrganizationConfigTemplate", "organizations"),
+                "put": _op(
+                    "updateOrganizationConfigTemplate", "organizations"
+                ),
+            },
+            marshal_path: {
+                "put": _op(
+                    "updateNetworkWirelessAirMarshalSettings", "wireless"
+                ),
+            },
+            "/organizations/{organizationId}/wireless/airMarshal/settings"
+            "/byNetwork": {
+                "get": _op(
+                    "getOrganizationWirelessAirMarshalSettingsByNetwork",
+                    "wireless",
+                    response_schema=AIR_MARSHAL_BY_NETWORK_SCHEMA,
+                ),
+            },
+        },
+    }
+    spec_path = tmp_path / "template-aggregation-spec.json"
+    spec_path.write_text(_json.dumps(spec), encoding="utf-8")
+
+    class Organizations:
+        def getOrganizationNetworks(
+            self, org_id: str, total_pages: str
+        ) -> list[dict[str, Any]]:
+            return [dict(NETWORK_PAYLOAD)]
+
+        def getOrganizationDevices(
+            self, org_id: str, total_pages: str
+        ) -> list[dict[str, Any]]:
+            return []
+
+        def getOrganizationConfigTemplates(
+            self, organizationId: str
+        ) -> list[dict[str, Any]]:
+            return [{"id": "T_1", "name": "seed2-template"}]
+
+    class Wireless:
+        def getOrganizationWirelessAirMarshalSettingsByNetwork(
+            self, organizationId: str
+        ) -> dict[str, Any]:
+            return {
+                "items": [
+                    {
+                        "networkId": "N_555",
+                        "networkName": "seed2-template - wireless",
+                        "defaultPolicy": "blocked",
+                    },
+                    {
+                        "networkId": "N_666",
+                        "networkName": "vanished - wireless",
+                        "defaultPolicy": "allowed",
+                    },
+                ],
+                "meta": {},
+            }
+
+    provider = LiveApiDataProvider(parser=OpenApiParser(spec_path))
+    provider._client = types.SimpleNamespace(
+        organizations=Organizations(), wireless=Wireless()
+    )
+    graph = provider.fetch_network_graph("org-123")
+    marshal = [f for f in graph.features if f.api_path == marshal_path]
+    assert [(f.path_values, dict(f.payload)) for f in marshal] == [
+        (
+            ("T_1",),
+            {
+                "networkName": "seed2-template - wireless",
+                "defaultPolicy": "blocked",
+            },
+        ),
+        (
+            (),
+            {
+                "networkId": "N_666",
+                "networkName": "vanished - wireless",
+                "defaultPolicy": "allowed",
+            },
+        ),
+    ]
+
+
 def test_try_call_still_skips_scope_refusals_with_status(
     live_provider: LiveApiDataProvider, spec_parser: OpenApiParser
 ) -> None:
