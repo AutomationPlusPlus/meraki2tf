@@ -1966,8 +1966,7 @@ def _apply_config_file(
         if any(token == option or token.startswith(f"{option}=") for token in tokens)
     }
     dr_action = any(
-        getattr(args, dest, False)
-        for dest in ("rebuild", "replay_gaps", "restore", "heal", "wipe_org")
+        getattr(args, dest, False) for dest in DR_ACTION_FLAGS
     )
     for dest, value in overrides.items():
         if dr_action and dest in _DR_TARGET_DESTS and dest not in explicit:
@@ -1983,142 +1982,153 @@ def _apply_config_file(
             setattr(args, dest, value)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    arg_parser = build_parser()
-    args = arg_parser.parse_args(argv)
-    _apply_config_file(
-        arg_parser, args, sys.argv[1:] if argv is None else list(argv)
+#: The five human-invoked disaster-recovery actions. Each is a
+#: standalone mode that ends the run; every one of them is a preview
+#: until --confirm is added (Cardinal Rule 1).
+DR_ACTION_FLAGS = ("rebuild", "heal", "replay_gaps", "restore", "wipe_org")
+
+#: Flags that only shape a DR action — its blast radius, its second
+#: factor, its target. Orphaned (no DR action alongside), each one is
+#: refused rather than ignored: a flag that does nothing would let an
+#: operator believe an effect happened when it did not.
+DR_TARGETING_FLAGS = (
+    "confirm", "target_org", "serial_map", "skip_claims", "wipe_org_name",
+)
+
+#: Flags that steer the terraform pipeline (state materialization,
+#: deletion confirmation, the coverage gate, baseline reset).
+PIPELINE_FLAGS = ("sync", "confirm_deletions", "fail_on_gaps", "rebaseline")
+
+#: Flags that steer snapshot export and the snapshot-diff drift chain.
+EXPORT_FLAGS = ("dump_to", "sanitize", "drift_baseline")
+
+
+def _flags_set(config: RuntimeConfig, *groups: Sequence[str]) -> bool:
+    """True when the operator passed any flag in the named groups.
+
+    Every flag these groups name is a bool, a ``Path | None``, a
+    ``str | None`` or a tuple, so "was it passed?" is exactly its
+    truthiness — no flag has a meaningful falsy non-``None`` value.
+    """
+    return any(
+        bool(getattr(config, name)) for group in groups for name in group
     )
-    try:
-        config = RuntimeConfig.from_args(args)
-    except BackendConfigError as exc:
-        arg_parser.error(str(exc))
-    configure_logging(verbose=config.verbose, log_format=config.log_format)
 
-    if config.list_orgs:
-        # Orphaned companions are refused, never silently ignored (the
-        # house rule): the helper answers one question and exits, so any
-        # mode or target flag alongside it marks a misunderstanding.
-        if (
-            config.org_ids or config.dump_path or config.dump_to
-            or config.drift_baseline or config.sanitize
-            or config.rebuild or config.heal or config.replay_gaps
-            or config.restore or config.wipe_org or config.wipe_org_name
-            or config.confirm or config.target_org or config.serial_map
-            or config.skip_claims or config.sync or config.rebaseline
-            or config.confirm_deletions or config.fail_on_gaps
-            or config.check or config.estimate or config.expect_org
-            or config.diff_networks or config.diff_out
-            or config.discovery_checkpoint
-        ):
-            arg_parser.error(
-                "--list-orgs is a standalone discovery helper; do not "
-                "combine it with any other mode or target flag."
-            )
-        if not api_key_present():
-            arg_parser.error(
-                f"--list-orgs asks the dashboard which organizations your "
-                f"key can see; export {API_KEY_ENV_VAR} first."
-            )
-        return _list_orgs()
 
+def _validate_list_orgs(
+    arg_parser: argparse.ArgumentParser, config: RuntimeConfig
+) -> None:
+    """--list-orgs answers one question and exits: nothing combines."""
+    # Orphaned companions are refused, never silently ignored (the
+    # house rule): the helper answers one question and exits, so any
+    # mode or target flag alongside it marks a misunderstanding. This
+    # is the one check that names EVERY mode and target flag.
+    if _flags_set(
+        config,
+        DR_ACTION_FLAGS, DR_TARGETING_FLAGS, PIPELINE_FLAGS, EXPORT_FLAGS,
+        ("org_ids", "dump_path", "expect_org", "check", "estimate",
+         "diff_networks", "diff_out", "discovery_checkpoint"),
+    ):
+        arg_parser.error(
+            "--list-orgs is a standalone discovery helper; do not "
+            "combine it with any other mode or target flag."
+        )
+    if not api_key_present():
+        arg_parser.error(
+            f"--list-orgs asks the dashboard which organizations your "
+            f"key can see; export {API_KEY_ENV_VAR} first."
+        )
+
+
+def _validate_diff_networks(
+    arg_parser: argparse.ArgumentParser, config: RuntimeConfig
+) -> None:
+    """--diff-networks: read-only, one org, --from-dump or --org-id."""
     if config.diff_out is not None and config.diff_networks is None:
         # Orphaned mode-scoped flags are refused, never silently
         # ignored (the house rule).
         arg_parser.error(
             "--diff-out is only valid together with --diff-networks."
         )
-    if config.diff_networks is not None:
-        if (
-            config.rebuild or config.heal or config.replay_gaps
-            or config.restore or config.wipe_org or config.wipe_org_name
-            or config.confirm or config.target_org or config.serial_map
-            or config.skip_claims or config.sync
-            or config.confirm_deletions or config.rebaseline
-            or config.fail_on_gaps or config.dump_to is not None
-            or config.sanitize or config.drift_baseline is not None
-            or config.only or config.discovery_checkpoint is not None
-        ):
-            arg_parser.error(
-                "--diff-networks is a standalone read-only comparison; "
-                "combine it only with --from-dump or --org-id (and "
-                "optionally --diff-out / --spec)."
-            )
-        if len(config.org_ids) > 1:
-            arg_parser.error(
-                "--diff-networks compares two networks of ONE "
-                "organization; pass at most one --org-id."
-            )
-        if config.dump_path is None and not config.org_ids:
-            arg_parser.error(
-                "--diff-networks in live mode requires --org-id (or run "
-                "offline against a snapshot with --from-dump)."
-            )
-        if config.dump_path is None and not api_key_present():
-            arg_parser.error(
-                f"--diff-networks in live mode requires {API_KEY_ENV_VAR} "
-                "to discover the two networks; export the key or run "
-                "offline with --from-dump."
-            )
-        return _diff_networks_run(config)
-
-    if config.backend.is_remote and config.state_file is not None:
+    if config.diff_networks is None:
+        return
+    # --from-dump and --org-id are the comparison's own inputs, so they
+    # are the two flags NOT named here (see the message).
+    if _flags_set(
+        config,
+        DR_ACTION_FLAGS, DR_TARGETING_FLAGS, PIPELINE_FLAGS, EXPORT_FLAGS,
+        ("expect_org", "only", "discovery_checkpoint"),
+    ):
         arg_parser.error(
-            "--state-file names a local state path and cannot be combined with "
-            f"a remote --state-backend ({config.backend.backend.value}); the "
-            "remote backend's state location comes from --backend-config "
-            "(the azurerm/s3 'key' or gcs 'prefix' setting)."
+            "--diff-networks is a standalone read-only comparison; "
+            "combine it only with --from-dump or --org-id (and "
+            "optionally --diff-out / --spec)."
+        )
+    if len(config.org_ids) > 1:
+        arg_parser.error(
+            "--diff-networks compares two networks of ONE "
+            "organization; pass at most one --org-id."
+        )
+    if config.dump_path is None and not config.org_ids:
+        arg_parser.error(
+            "--diff-networks in live mode requires --org-id (or run "
+            "offline against a snapshot with --from-dump)."
+        )
+    if config.dump_path is None and not api_key_present():
+        arg_parser.error(
+            f"--diff-networks in live mode requires {API_KEY_ENV_VAR} "
+            "to discover the two networks; export the key or run "
+            "offline with --from-dump."
         )
 
+
+def _validate_check_estimate(
+    arg_parser: argparse.ArgumentParser, config: RuntimeConfig
+) -> None:
+    """--check / --estimate: read-only helpers, one at a time."""
     if config.check and config.estimate:
         arg_parser.error(
             "--check and --estimate are separate standalone helpers; "
             "run one at a time."
         )
-    if config.check or config.estimate:
-        helper = "--check" if config.check else "--estimate"
-        if (
-            config.rebuild or config.heal or config.replay_gaps
-            or config.restore or config.wipe_org or config.wipe_org_name
-            or config.confirm or config.target_org
-            or config.serial_map is not None or config.skip_claims
-            or config.expect_org
-        ):
-            arg_parser.error(
-                f"{helper} is a standalone read-only helper; do not "
-                "combine it with disaster-recovery actions or --confirm."
-            )
-    if config.check:
-        return preflight.run_check_command(config, build_dispatcher)
-    if config.estimate:
-        if (
-            config.dump_to is not None or config.drift_baseline is not None
-            or config.sanitize or config.sync or config.rebaseline
-            or config.confirm_deletions or config.fail_on_gaps
-            or config.only
-        ):
-            arg_parser.error(
-                "--estimate previews discovery cost only; do not combine "
-                "it with pipeline, export, or scope flags."
-            )
-        if config.dump_path is None:
-            if len(config.org_ids) != 1:
-                arg_parser.error(
-                    "--estimate needs exactly one --org-id in live mode "
-                    "(or --from-dump for an offline estimate)."
-                )
-            if not api_key_present():
-                arg_parser.error(
-                    "--estimate enumerates networks and devices via the "
-                    f"dashboard API; export {API_KEY_ENV_VAR} first (or "
-                    "estimate offline with --from-dump)."
-                )
-        return preflight.run_estimate_command(config)
-
-    if config.confirm and not (
-        config.rebuild or config.replay_gaps or config.restore
-        or config.heal or config.wipe_org
+    if not (config.check or config.estimate):
+        return
+    helper = "--check" if config.check else "--estimate"
+    # Pipeline/export flags are deliberately NOT refused here: --check
+    # exists to validate a full flag set, which includes them.
+    if _flags_set(
+        config, DR_ACTION_FLAGS, DR_TARGETING_FLAGS, ("expect_org",)
     ):
+        arg_parser.error(
+            f"{helper} is a standalone read-only helper; do not "
+            "combine it with disaster-recovery actions or --confirm."
+        )
+    if not config.estimate:
+        return
+    if _flags_set(config, PIPELINE_FLAGS, EXPORT_FLAGS, ("only",)):
+        arg_parser.error(
+            "--estimate previews discovery cost only; do not combine "
+            "it with pipeline, export, or scope flags."
+        )
+    if config.dump_path is None:
+        if len(config.org_ids) != 1:
+            arg_parser.error(
+                "--estimate needs exactly one --org-id in live mode "
+                "(or --from-dump for an offline estimate)."
+            )
+        if not api_key_present():
+            arg_parser.error(
+                "--estimate enumerates networks and devices via the "
+                f"dashboard API; export {API_KEY_ENV_VAR} first (or "
+                "estimate offline with --from-dump)."
+            )
+
+
+def _validate_dr_companions(
+    arg_parser: argparse.ArgumentParser, config: RuntimeConfig
+) -> None:
+    """Every DR-shaping flag must have its DR action alongside it."""
+    if config.confirm and not _flags_set(config, DR_ACTION_FLAGS):
         arg_parser.error(
             "--confirm is only valid together with --rebuild, --replay-gaps, "
             "--restore, --heal, or --wipe-org."
@@ -2137,13 +2147,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         arg_parser.error("--serial-map is only valid together with --restore.")
     if config.skip_claims and not config.restore:
         arg_parser.error("--skip-claims is only valid together with --restore.")
+
+
+def _validate_only(
+    arg_parser: argparse.ArgumentParser, config: RuntimeConfig
+) -> None:
+    """Validate every use of --only.
+
+    ``--only`` wears three hats: heal selector, scoped export, and
+    scoped pipeline run. --heal is therefore absent from the refusal
+    below — the selector is that action's own argument.
+    """
     scoped_pipeline = False
     if config.only and not (config.heal or config.dump_to is not None):
         # Scoped default pipeline run: generate the kit (and plan) for
         # a subset of networks — the single-site onboarding case.
-        if (
-            config.rebuild or config.replay_gaps or config.restore
-            or config.wipe_org
+        if _flags_set(
+            config, ("rebuild", "replay_gaps", "restore", "wipe_org")
         ):
             arg_parser.error(
                 "--only cannot be combined with --rebuild, "
@@ -2205,192 +2225,176 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "--only cannot be combined with multiple --org-id "
                 "values; scope one organization per invocation."
             )
-    if config.discovery_checkpoint is not None:
-        if (
-            config.rebuild or config.replay_gaps or config.restore
-            or config.wipe_org or config.heal
-            or config.dump_path is not None
-        ):
-            arg_parser.error(
-                "--discovery-checkpoint journals the live discovery "
-                "sweep; it is only valid on --dump-to exports and "
-                "live pipeline runs."
-            )
-        if len(config.org_ids) > 1:
-            arg_parser.error(
-                "--discovery-checkpoint cannot be combined with "
-                "multiple --org-id values: the journal records exactly "
-                "one organization's sweep."
-            )
-    if config.wipe_org_name and not config.wipe_org:
+
+
+def _validate_discovery_checkpoint(
+    arg_parser: argparse.ArgumentParser, config: RuntimeConfig
+) -> None:
+    """--discovery-checkpoint journals ONE live sweep, nothing else."""
+    if config.discovery_checkpoint is None:
+        return
+    if _flags_set(config, DR_ACTION_FLAGS, ("dump_path",)):
         arg_parser.error(
-            "--wipe-org-name is only valid together with --wipe-org."
+            "--discovery-checkpoint journals the live discovery "
+            "sweep; it is only valid on --dump-to exports and "
+            "live pipeline runs."
         )
-    if config.wipe_org:
-        if not config.wipe_org_name:
-            arg_parser.error(
-                "--wipe-org requires --wipe-org-name: the organization's "
-                "exact name is the second factor for the teardown."
-            )
-        if (
-            config.rebuild or config.replay_gaps or config.restore
-            or config.heal
-            or config.sync or config.confirm_deletions or config.fail_on_gaps
-            or config.rebaseline or config.dump_to is not None
-            or config.sanitize or config.dump_path is not None
-            or config.drift_baseline is not None
-        ):
-            arg_parser.error(
-                "--wipe-org is a standalone drill-teardown action; do not "
-                "combine it with any other mode."
-            )
-        if config.org_ids:
-            # A differing --org-id would be silently ignored while the
-            # operator believes it scoped the wipe (no-silent-orphans);
-            # a matching one marks a production-shaped target.
-            arg_parser.error(
-                "--org-id cannot be combined with --wipe-org: the wipe "
-                "targets exactly the organization named by --wipe-org."
-            )
-        logger.info(
-            "meraki2tf starting in drill-wipe (disaster recovery) mode."
-        )
-        return _wipe_org(config)
-    if config.heal:
-        if config.dump_path is None:
-            arg_parser.error(
-                "--heal recreates missing objects from an offline "
-                "snapshot; pass the unsanitized export via --from-dump."
-            )
-        if len(config.org_ids) != 1:
-            arg_parser.error(
-                "--heal requires exactly one --org-id: the organization "
-                "to heal, which must be the snapshot's own source "
-                "organization."
-            )
-        if config.restore or config.rebuild or config.replay_gaps:
-            arg_parser.error(
-                "--heal is a standalone DR action; do not combine it "
-                "with --restore, --rebuild, or --replay-gaps."
-            )
-        if (
-            config.sync
-            or config.confirm_deletions
-            or config.fail_on_gaps
-            or config.rebaseline
-            or config.dump_to is not None
-            or config.sanitize
-            or config.drift_baseline is not None
-        ):
-            arg_parser.error(
-                "--heal cannot be combined with pipeline or export flags."
-            )
-        logger.info("meraki2tf starting in heal (partial recovery) mode.")
-        return _heal(config)
-    if config.restore:
-        if config.dump_path is None:
-            arg_parser.error(
-                "--restore rebuilds from an offline snapshot; pass the "
-                "unsanitized export via --from-dump."
-            )
-        if not config.target_org:
-            arg_parser.error(
-                "--restore requires --target-org: the (fresh or scratch) "
-                "organization to rebuild into. It never writes to the "
-                "snapshot's source organization."
-            )
-        if config.rebuild or config.replay_gaps:
-            arg_parser.error(
-                "--restore is a standalone DR action; do not combine it "
-                "with --rebuild or --replay-gaps."
-            )
-        if config.org_ids:
-            # The never-write-to-source interlock compares --target-org
-            # against the snapshot's *recorded* source organization; an
-            # --org-id override would replace that recorded value and
-            # let a restore target the very org the snapshot came from.
-            arg_parser.error(
-                "--org-id cannot be combined with --restore: the source "
-                "organization is read from the snapshot itself (the "
-                "never-restore-into-the-source-org check depends on it)."
-            )
-        if (
-            config.sync
-            or config.confirm_deletions
-            or config.fail_on_gaps
-            or config.rebaseline
-            or config.dump_to is not None
-            or config.sanitize
-            or config.drift_baseline is not None
-        ):
-            arg_parser.error(
-                "--restore cannot be combined with pipeline or export flags."
-            )
-        logger.info(
-            "meraki2tf starting in restore (disaster recovery) mode."
-        )
-        return _restore(config)
-    if config.rebuild and config.replay_gaps:
+    if len(config.org_ids) > 1:
         arg_parser.error(
-            "--rebuild and --replay-gaps are separate DR steps; run "
-            "--rebuild --confirm first, then --replay-gaps."
+            "--discovery-checkpoint cannot be combined with "
+            "multiple --org-id values: the journal records exactly "
+            "one organization's sweep."
         )
-    if config.replay_gaps:
-        if config.dump_path is None:
-            arg_parser.error(
-                "--replay-gaps replays from an offline snapshot; pass the "
-                "unsanitized export via --from-dump."
-            )
-        if config.dump_to is not None or config.sanitize:
-            arg_parser.error(
-                "--replay-gaps cannot be combined with --dump-to or "
-                "--sanitize."
-            )
-        if (
-            config.sync
-            or config.confirm_deletions
-            or config.fail_on_gaps
-            or config.rebaseline
-            or config.drift_baseline is not None
-        ):
-            arg_parser.error(
-                "--replay-gaps cannot be combined with the pipeline flags "
-                "--sync, --confirm-deletions, --fail-on-gaps, "
-                "--rebaseline, or --drift-baseline."
-            )
-        logger.info(
-            "meraki2tf starting in gap replay (disaster recovery) mode."
+
+
+def _validate_wipe_org(
+    arg_parser: argparse.ArgumentParser, config: RuntimeConfig
+) -> None:
+    """--wipe-org: standalone teardown, name as the second factor."""
+    if not config.wipe_org_name:
+        arg_parser.error(
+            "--wipe-org requires --wipe-org-name: the organization's "
+            "exact name is the second factor for the teardown."
         )
-        return _replay_gaps(config)
-    if config.rebuild:
-        if config.dump_path is not None or config.dump_to is not None:
-            arg_parser.error(
-                "--rebuild operates on an existing --workdir; it cannot be "
-                "combined with --from-dump or --dump-to."
-            )
-        if config.org_ids:
-            # Orphaned mode-scoped flags are refused, never silently
-            # ignored: the rebuild applies whatever kit the workdir
-            # holds — it is not scoped or verified against an
-            # organization ID, and accepting one would let the operator
-            # believe it was.
-            arg_parser.error(
-                "--rebuild does not take --org-id: the apply targets "
-                "whatever organization the workdir's kit and state "
-                "resolve to."
-            )
-        if (
-            config.sync or config.confirm_deletions or config.fail_on_gaps
-            or config.rebaseline or config.sanitize
-            or config.drift_baseline is not None
-        ):
-            arg_parser.error(
-                "--rebuild cannot be combined with the pipeline flags "
-                "--sync, --confirm-deletions, --fail-on-gaps, "
-                "--rebaseline, --sanitize, or --drift-baseline."
-            )
-        logger.info("meraki2tf starting in rebuild (disaster recovery) mode.")
-        return _rebuild(config)
+    if _flags_set(
+        config,
+        ("rebuild", "replay_gaps", "restore", "heal"),
+        PIPELINE_FLAGS, EXPORT_FLAGS, ("dump_path",),
+    ):
+        arg_parser.error(
+            "--wipe-org is a standalone drill-teardown action; do not "
+            "combine it with any other mode."
+        )
+    if config.org_ids:
+        # A differing --org-id would be silently ignored while the
+        # operator believes it scoped the wipe (no-silent-orphans);
+        # a matching one marks a production-shaped target.
+        arg_parser.error(
+            "--org-id cannot be combined with --wipe-org: the wipe "
+            "targets exactly the organization named by --wipe-org."
+        )
+
+
+def _validate_heal(
+    arg_parser: argparse.ArgumentParser, config: RuntimeConfig
+) -> None:
+    """--heal: one org, its own snapshot, no pipeline or export."""
+    if config.dump_path is None:
+        arg_parser.error(
+            "--heal recreates missing objects from an offline "
+            "snapshot; pass the unsanitized export via --from-dump."
+        )
+    if len(config.org_ids) != 1:
+        arg_parser.error(
+            "--heal requires exactly one --org-id: the organization "
+            "to heal, which must be the snapshot's own source "
+            "organization."
+        )
+    if config.restore or config.rebuild or config.replay_gaps:
+        arg_parser.error(
+            "--heal is a standalone DR action; do not combine it "
+            "with --restore, --rebuild, or --replay-gaps."
+        )
+    if _flags_set(config, PIPELINE_FLAGS, EXPORT_FLAGS):
+        arg_parser.error(
+            "--heal cannot be combined with pipeline or export flags."
+        )
+
+
+def _validate_restore(
+    arg_parser: argparse.ArgumentParser, config: RuntimeConfig
+) -> None:
+    """--restore: snapshot in, --target-org out, never the source org."""
+    if config.dump_path is None:
+        arg_parser.error(
+            "--restore rebuilds from an offline snapshot; pass the "
+            "unsanitized export via --from-dump."
+        )
+    if not config.target_org:
+        arg_parser.error(
+            "--restore requires --target-org: the (fresh or scratch) "
+            "organization to rebuild into. It never writes to the "
+            "snapshot's source organization."
+        )
+    if config.rebuild or config.replay_gaps:
+        arg_parser.error(
+            "--restore is a standalone DR action; do not combine it "
+            "with --rebuild or --replay-gaps."
+        )
+    if config.org_ids:
+        # The never-write-to-source interlock compares --target-org
+        # against the snapshot's *recorded* source organization; an
+        # --org-id override would replace that recorded value and
+        # let a restore target the very org the snapshot came from.
+        arg_parser.error(
+            "--org-id cannot be combined with --restore: the source "
+            "organization is read from the snapshot itself (the "
+            "never-restore-into-the-source-org check depends on it)."
+        )
+    if _flags_set(config, PIPELINE_FLAGS, EXPORT_FLAGS):
+        arg_parser.error(
+            "--restore cannot be combined with pipeline or export flags."
+        )
+
+
+def _validate_replay_gaps(
+    arg_parser: argparse.ArgumentParser, config: RuntimeConfig
+) -> None:
+    """--replay-gaps: replays a snapshot's gaps, no pipeline flags."""
+    if config.dump_path is None:
+        arg_parser.error(
+            "--replay-gaps replays from an offline snapshot; pass the "
+            "unsanitized export via --from-dump."
+        )
+    # --dump-to/--sanitize are refused just below with their own
+    # message, which is why EXPORT_FLAGS is not used wholesale here.
+    if config.dump_to is not None or config.sanitize:
+        arg_parser.error(
+            "--replay-gaps cannot be combined with --dump-to or "
+            "--sanitize."
+        )
+    if _flags_set(config, PIPELINE_FLAGS, ("drift_baseline",)):
+        arg_parser.error(
+            "--replay-gaps cannot be combined with the pipeline flags "
+            "--sync, --confirm-deletions, --fail-on-gaps, "
+            "--rebaseline, or --drift-baseline."
+        )
+
+
+def _validate_rebuild(
+    arg_parser: argparse.ArgumentParser, config: RuntimeConfig
+) -> None:
+    """--rebuild: applies the workdir's existing kit, nothing else."""
+    # --dump-to is refused here (with --from-dump, under the workdir
+    # message), which is why EXPORT_FLAGS is not used wholesale below.
+    if config.dump_path is not None or config.dump_to is not None:
+        arg_parser.error(
+            "--rebuild operates on an existing --workdir; it cannot be "
+            "combined with --from-dump or --dump-to."
+        )
+    if config.org_ids:
+        # Orphaned mode-scoped flags are refused, never silently
+        # ignored: the rebuild applies whatever kit the workdir
+        # holds — it is not scoped or verified against an
+        # organization ID, and accepting one would let the operator
+        # believe it was.
+        arg_parser.error(
+            "--rebuild does not take --org-id: the apply targets "
+            "whatever organization the workdir's kit and state "
+            "resolve to."
+        )
+    if _flags_set(config, PIPELINE_FLAGS, ("sanitize", "drift_baseline")):
+        arg_parser.error(
+            "--rebuild cannot be combined with the pipeline flags "
+            "--sync, --confirm-deletions, --fail-on-gaps, "
+            "--rebaseline, --sanitize, or --drift-baseline."
+        )
+
+
+def _validate_pipeline_run(
+    arg_parser: argparse.ArgumentParser, config: RuntimeConfig
+) -> None:
+    """The default/--sync pipeline: export, key, and fan-out rules."""
     if config.dump_to is not None and (
         config.sync or config.confirm_deletions or config.rebaseline
     ):
@@ -2422,54 +2426,147 @@ def main(argv: Sequence[str] | None = None) -> int:
             "of the next one. Export the unsanitized snapshot for the "
             "drift chain and sanitize a separate copy for sharing."
         )
-    if len(config.org_ids) > 1:
-        # Multi-organization fan-out covers the pipeline modes only
-        # (default read-only and --sync). Snapshot modes are inherently
-        # single-organization (one snapshot file per org), and shared
-        # state targets would silently interleave organizations.
-        if config.mode is ExecutionMode.DUMP:
+    if len(config.org_ids) <= 1:
+        return
+    # Multi-organization fan-out covers the pipeline modes only
+    # (default read-only and --sync). Snapshot modes are inherently
+    # single-organization (one snapshot file per org), and shared
+    # state targets would silently interleave organizations.
+    if config.mode is ExecutionMode.DUMP:
+        arg_parser.error(
+            "--from-dump holds a single organization's snapshot; "
+            "run one invocation per snapshot instead of repeating "
+            "--org-id."
+        )
+    if config.dump_to is not None or config.drift_baseline is not None:
+        arg_parser.error(
+            "snapshot export/diff (--dump-to / --drift-baseline) is "
+            "single-organization; run one invocation per "
+            "organization, each with its own snapshot paths."
+        )
+    if config.state_file is not None:
+        arg_parser.error(
+            "--state-file cannot be combined with multiple --org-id "
+            "values; each organization keeps its own state under "
+            "<workdir>/<org-id>/."
+        )
+    for org in config.org_ids:
+        if "/" in org or "\\" in org or ".." in org:
             arg_parser.error(
-                "--from-dump holds a single organization's snapshot; "
-                "run one invocation per snapshot instead of repeating "
-                "--org-id."
+                f"--org-id {org!r} is not usable in a multi-org run: "
+                "organization IDs become workdir path segments."
             )
-        if config.dump_to is not None or config.drift_baseline is not None:
+    if config.backend.is_remote:
+        if config.backend.config_file is not None:
             arg_parser.error(
-                "snapshot export/diff (--dump-to / --drift-baseline) is "
-                "single-organization; run one invocation per "
-                "organization, each with its own snapshot paths."
+                "--backend-config-file cannot be combined with "
+                "multiple --org-id values; pass repeated "
+                "--backend-config settings with an {org-id} "
+                "placeholder in the state address instead."
             )
-        if config.state_file is not None:
+        if not any(
+            ORG_ID_PLACEHOLDER in value
+            for _, value in config.backend.settings
+        ):
             arg_parser.error(
-                "--state-file cannot be combined with multiple --org-id "
-                "values; each organization keeps its own state under "
-                "<workdir>/<org-id>/."
+                "a remote --state-backend with multiple --org-id "
+                "values requires an {org-id} placeholder in the "
+                "state address (the azurerm/s3 'key' or gcs "
+                "'prefix' setting), so each organization gets its "
+                "own state object."
             )
-        for org in config.org_ids:
-            if "/" in org or "\\" in org or ".." in org:
-                arg_parser.error(
-                    f"--org-id {org!r} is not usable in a multi-org run: "
-                    "organization IDs become workdir path segments."
-                )
-        if config.backend.is_remote:
-            if config.backend.config_file is not None:
-                arg_parser.error(
-                    "--backend-config-file cannot be combined with "
-                    "multiple --org-id values; pass repeated "
-                    "--backend-config settings with an {org-id} "
-                    "placeholder in the state address instead."
-                )
-            if not any(
-                ORG_ID_PLACEHOLDER in value
-                for _, value in config.backend.settings
-            ):
-                arg_parser.error(
-                    "a remote --state-backend with multiple --org-id "
-                    "values requires an {org-id} placeholder in the "
-                    "state address (the azurerm/s3 'key' or gcs "
-                    "'prefix' setting), so each organization gets its "
-                    "own state object."
-                )
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Validate the flag combination, then dispatch to one mode.
+
+    Flag validation is the bulk of the work and it is safety-critical:
+    an accepted-but-ignored flag is how an operator comes to believe a
+    scope, a second factor, or a baseline reset applied when it did
+    not. Each mode's rules live in its own ``_validate_*`` helper above,
+    and the recurring flag sets are the named groups they share
+    (``DR_ACTION_FLAGS`` and friends) rather than hand-written ``or``
+    chains that can silently disagree. Order matters: the standalone
+    helpers answer and exit before any mode rule runs.
+    """
+    arg_parser = build_parser()
+    args = arg_parser.parse_args(argv)
+    _apply_config_file(
+        arg_parser, args, sys.argv[1:] if argv is None else list(argv)
+    )
+    try:
+        config = RuntimeConfig.from_args(args)
+    except BackendConfigError as exc:
+        arg_parser.error(str(exc))
+    configure_logging(verbose=config.verbose, log_format=config.log_format)
+
+    # Standalone read-only helpers: each answers one question and exits.
+    if config.list_orgs:
+        _validate_list_orgs(arg_parser, config)
+        return _list_orgs()
+    _validate_diff_networks(arg_parser, config)
+    if config.diff_networks is not None:
+        return _diff_networks_run(config)
+
+    if config.backend.is_remote and config.state_file is not None:
+        arg_parser.error(
+            "--state-file names a local state path and cannot be combined with "
+            f"a remote --state-backend ({config.backend.backend.value}); the "
+            "remote backend's state location comes from --backend-config "
+            "(the azurerm/s3 'key' or gcs 'prefix' setting)."
+        )
+
+    _validate_check_estimate(arg_parser, config)
+    if config.check:
+        return preflight.run_check_command(config, build_dispatcher)
+    if config.estimate:
+        return preflight.run_estimate_command(config)
+
+    _validate_dr_companions(arg_parser, config)
+    _validate_only(arg_parser, config)
+    _validate_discovery_checkpoint(arg_parser, config)
+    if config.wipe_org_name and not config.wipe_org:
+        # Checked here rather than beside the other orphaned-companion
+        # refusals so its precedence against them is unchanged.
+        arg_parser.error(
+            "--wipe-org-name is only valid together with --wipe-org."
+        )
+
+    # The disaster-recovery actions, each standalone and ending the run.
+    if config.wipe_org:
+        _validate_wipe_org(arg_parser, config)
+        logger.info(
+            "meraki2tf starting in drill-wipe (disaster recovery) mode."
+        )
+        return _wipe_org(config)
+    if config.heal:
+        _validate_heal(arg_parser, config)
+        logger.info("meraki2tf starting in heal (partial recovery) mode.")
+        return _heal(config)
+    if config.restore:
+        _validate_restore(arg_parser, config)
+        logger.info(
+            "meraki2tf starting in restore (disaster recovery) mode."
+        )
+        return _restore(config)
+    if config.rebuild and config.replay_gaps:
+        arg_parser.error(
+            "--rebuild and --replay-gaps are separate DR steps; run "
+            "--rebuild --confirm first, then --replay-gaps."
+        )
+    if config.replay_gaps:
+        _validate_replay_gaps(arg_parser, config)
+        logger.info(
+            "meraki2tf starting in gap replay (disaster recovery) mode."
+        )
+        return _replay_gaps(config)
+    if config.rebuild:
+        _validate_rebuild(arg_parser, config)
+        logger.info("meraki2tf starting in rebuild (disaster recovery) mode.")
+        return _rebuild(config)
+
+    # The default (and --sync) pipeline: the only non-standalone mode.
+    _validate_pipeline_run(arg_parser, config)
     # The dispatcher only needs config, so it exists before anything
     # that can fail: every fatal path below — spec resolution, provider
     # or runner construction included — gets at least one

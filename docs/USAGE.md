@@ -408,7 +408,10 @@ so it is safe to paste into tickets and CI logs. Device-scoped
 features (serials differ by definition), org-scoped features (shared
 by both), and unreadable capture gaps are excluded and counted as
 notes. Works live (`--org-id`) and offline (`--from-dump`); add
-**`--diff-out PATH`** to also write the report as JSON.
+**`--diff-out PATH`** to also write the report as JSON. Being
+standalone, it combines with `--from-dump`/`--org-id`, `--diff-out`
+and `--spec` and nothing else — any pipeline, export or
+disaster-recovery flag alongside it is refused rather than ignored.
 
 ```bash
 meraki2tf --org-id 123456 --diff-networks 'Golden-Site' 'Branch-07' \
