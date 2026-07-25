@@ -693,7 +693,16 @@ def render_diff(diff: SnapshotDiff, limit: int = 50) -> str:
     for feature in diff.removed[:limit]:
         lines.append(f"- {feature.api_path} ({','.join(feature.path_values)})")
     for asset in diff.modified[:limit]:
-        attrs = ", ".join(sorted(asset.changed))
+        attrs = ", ".join(
+            # A reordering carries no new values, so the digest says so
+            # outright: without the note it reads exactly like a value
+            # edit and the operator has to open both snapshots to find
+            # out that nothing actually changed.
+            f"{name} (order changed)"
+            if asset.changed[name][0] == ORDER_CHANGED
+            else name
+            for name in sorted(asset.changed)
+        )
         lines.append(
             f"~ {asset.api_path} ({','.join(asset.path_values)}): {attrs}"
         )
