@@ -20,6 +20,7 @@ from typing import Any
 
 import pytest
 
+from meraki2tf import hcl_generator, plan_reconciler, terraform_runner
 from meraki2tf.alerts.email import EmailNotifier
 from meraki2tf.alerts.models import processing_fault, redact_diff
 from meraki2tf.alerts.webhook import (
@@ -30,9 +31,11 @@ from meraki2tf.alerts.webhook import (
 )
 from meraki2tf.fileio import atomic_write_text
 from meraki2tf.fsperms import restrict_to_owner
+from meraki2tf.hcl import hcl_quote
 from meraki2tf.hcl_generator import HclImportGenerator
 from meraki2tf.logging_setup import SecretRedactionFilter
 from meraki2tf.models import MerakiNetwork
+from meraki2tf.plan_reconciler import synthesize_hcl
 from meraki2tf.providers.dump import MalformedDumpError, StaticJsonDataProvider
 from meraki2tf.providers.live import _method_is_read_only
 from meraki2tf.sanitizer import SECRET_KEY_PATTERN
@@ -79,9 +82,24 @@ def test_ledger_rejects_tampered_addresses(
 def test_quote_hcl_strips_lone_surrogates() -> None:
     """json.loads happily yields lone UTF-16 surrogates from a dump;
     they must not crash the UTF-8 imports.tf write."""
-    quoted = HclImportGenerator._quote_hcl("L_\ud800123")
+    quoted = hcl_quote("L_\ud800123")
     quoted.encode("utf-8")  # must not raise
     assert "123" in quoted and "L_" in quoted
+
+
+def test_every_hcl_writer_shares_the_surrogate_safe_escaper() -> None:
+    """The escaper has exactly one definition for a reason: the
+    reconciler's resources.tf baseline and the runner's provider.tf
+    templating write UTF-8 from the same externally-sourced strings the
+    kit generator does, and a second copy without the surrogate scrub
+    would crash those writes instead."""
+    for module in (hcl_generator, plan_reconciler, terraform_runner):
+        assert module.hcl_quote is hcl_quote
+    # The reconciler's state-value emitter is the path that regressed:
+    # a surrogate reaching it used to raise at write time.
+    synthesize_hcl({"name": "site \ud800 one"}).encode("utf-8")
+    synthesize_hcl(["\ud800"]).encode("utf-8")
+    synthesize_hcl({"\ud800": "v"}).encode("utf-8")
 
 
 # ---------------------------------------------------------------------------

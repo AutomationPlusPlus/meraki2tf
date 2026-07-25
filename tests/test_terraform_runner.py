@@ -898,7 +898,7 @@ def test_provider_anchor_escapes_hcl_specials_in_state_path(
 
 
 def test_hcl_quote_escapes_control_characters() -> None:
-    assert terraform_runner._hcl_quote("a\nb\rc\td") == "a\\nb\\rc\\td"
+    assert terraform_runner.hcl_quote("a\nb\rc\td") == "a\\nb\\rc\\td"
 
 
 def test_plan_preview_never_generates_config(
