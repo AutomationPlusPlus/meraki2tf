@@ -991,6 +991,43 @@ def test_explode_rescopes_object_form_scope_by_nested_name(
     ]
 
 
+def test_explode_rescopes_template_child_ids_by_template_name(
+    spec_parser: OpenApiParser,
+) -> None:
+    """The resolution universe carries config templates alongside
+    networks: a row scoped by a template's per-product child id (named
+    "<template name> - <product>") re-scopes onto the template, and a
+    template id used directly passes through untouched — exactly like
+    networks."""
+    mapping = _air_marshal_mapping(spec_parser)
+    known = {"N_1": "site-a", "CT_1": "seed2-template"}
+    features = explode_aggregation_payload(
+        mapping,
+        {
+            "items": [
+                {
+                    "networkId": "N_907",
+                    "networkName": "seed2-template - wireless",
+                    "defaultPolicy": "blocked",
+                },
+                {"networkId": "CT_1", "defaultPolicy": "allowed"},
+            ],
+            "meta": {},
+        },
+        known_networks=known,
+    )
+    assert [(f.path_values, dict(f.payload)) for f in features] == [
+        (
+            ("CT_1",),
+            {
+                "networkName": "seed2-template - wireless",
+                "defaultPolicy": "blocked",
+            },
+        ),
+        (("CT_1",), {"defaultPolicy": "allowed"}),
+    ]
+
+
 def test_explode_unresolvable_scope_becomes_gap_record(
     spec_parser: OpenApiParser,
     caplog: pytest.LogCaptureFixture,

@@ -542,24 +542,38 @@ class LiveApiDataProvider(MerakiDataProvider):
                 )
             ]
 
+        #: Config-template id → name, filled from the single-scope
+        #: level's discoveries before the aggregation level runs: a
+        #: byNetwork row scoped by a template's per-product child id is
+        #: named "<template name> - <product>", which only the template
+        #: list can resolve.
+        template_scopes: dict[str, str] = {}
+
         def _explode_scoped(
             mapping: TerraformResourceMapping, payload: Any
         ) -> list[FeatureConfiguration]:
-            # The full network universe (pre --only scoping) lets the
-            # explosion detect phantom row scopes (per-product child
-            # network ids) and re-scope them to the parent network they
-            # name; the scope filter below then applies to resolved ids.
-            known_networks = {
+            # The full network universe (pre --only scoping) plus every
+            # config template lets the explosion detect phantom row
+            # scopes (per-product child ids of networks AND templates)
+            # and re-scope them to the parent they name; the scope
+            # filter below then applies to resolved ids.
+            known_scopes = {
                 network.network_id: network.name
                 for network in (
                     networks if network_universe is None else network_universe
                 )
             }
+            known_scopes.update(template_scopes)
             exploded = explode_aggregation_payload(
-                mapping, payload, known_networks=known_networks
+                mapping, payload, known_networks=known_scopes
             )
             if self._network_scope is not None:
-                allowed = frozenset(network.network_id for network in networks)
+                # Template-scoped rows always pass: the template sweep
+                # reads config templates regardless of the network
+                # scope, and aggregation-sourced assets must agree.
+                allowed = frozenset(
+                    network.network_id for network in networks
+                ) | frozenset(template_scopes)
                 exploded = [
                     feature
                     for feature in exploded
@@ -721,9 +735,18 @@ class LiveApiDataProvider(MerakiDataProvider):
         # GET-less entities adopted via an org-scoped aggregation GET
         # (byNetwork pattern): one call each at org scope, exploded into
         # per-scope assets. Without these the whole surface class (Air
-        # Marshal, RRM, uplink NAT, …) silently vanishes.
+        # Marshal, RRM, uplink NAT, …) silently vanishes. They run as
+        # their own level AFTER the single-scope sweep so the explosion
+        # resolves phantom child scopes against everything that sweep
+        # discovered — including config templates, whose per-product
+        # children appear in byNetwork rows too.
+        aggregation_level: list[
+            Callable[[], list[FeatureConfiguration]]
+        ] = []
         for mapping in aggregation_mappings(parser):
-            level.append(functools.partial(_fetch_aggregation, mapping))
+            aggregation_level.append(
+                functools.partial(_fetch_aggregation, mapping)
+            )
             level_paths.add(aggregation_collection_path(mapping))
         _run_level("single-scope", level)
         if skipped_out_of_scope:
@@ -738,13 +761,21 @@ class LiveApiDataProvider(MerakiDataProvider):
         # a config template) is invisible to the per-network sweep —
         # without this pass it would vanish from the snapshot and the
         # rebuilt org would re-inherit nothing (Cardinal Rule 2).
-        template_ids = tuple(
-            feature.path_values[-1]
-            for feature in features
-            if feature.api_path == CONFIG_TEMPLATE_ITEM_PATH
-            and feature.path_values
-            and UNREADABLE_MARKER not in feature.payload
+        template_scopes.update(
+            {
+                feature.path_values[-1]: str(
+                    feature.payload.get("name") or ""
+                )
+                for feature in features
+                if feature.api_path == CONFIG_TEMPLATE_ITEM_PATH
+                and feature.path_values
+                and UNREADABLE_MARKER not in feature.payload
+            }
         )
+        template_ids = tuple(template_scopes)
+        # Aggregation calls run only now, with the template resolution
+        # universe complete.
+        _run_level("aggregation", aggregation_level)
         if template_ids:
             logger.info(
                 "Sweeping %d config template(s) for template-held "
