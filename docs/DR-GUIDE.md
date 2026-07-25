@@ -259,8 +259,12 @@ Notes:
   the run — a case-insensitive glob over each missing object's name or
   ID, optionally prefixed with its type (`network:`, `ssid:`,
   `vlan:`, …, singular or plural). A matched container brings its whole
-  missing subtree; missing objects the selection depends on (a deleted
-  parent, a referenced missing object) are auto-included and reported.
+  missing subtree, and the container may be one that **survived**:
+  naming a network that is still standing recovers the objects deleted
+  inside it (the survivor itself is never written — heal stays
+  additive-only), which is the usual "recover site X" case. Missing
+  objects the selection depends on (a deleted parent, a referenced
+  missing object) are auto-included and reported.
   A selector matching nothing is refused loudly — a typo must never
   masquerade as a successful no-op heal. Filtering only ever *shrinks*
   the run: everything above (additive-only, preview-first, journaling)

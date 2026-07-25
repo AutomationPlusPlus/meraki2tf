@@ -64,6 +64,14 @@ class HealPlan:
     identity_mappings: tuple[IdentityMapping, ...]
     surviving_count: int
     snapshot_asset_count: int
+    #: Surviving objects that can contain others (a network that is
+    #: still there, an SSID slot that still exists). ``--only`` matches
+    #: these as *scope anchors* only: naming one selects the missing
+    #: objects underneath it, never the survivor itself — heal stays
+    #: additive-only. The common incident is objects deleted *inside* a
+    #: network that is still standing, where the operator scopes the
+    #: recovery by the site's name.
+    surviving_anchors: tuple[RestoreAction, ...] = ()
 
     def summary(self) -> str:
         text = (
@@ -154,6 +162,7 @@ def plan_heal(
         identity_mappings=tuple(mappings),
         surviving_count=len(surviving),
         snapshot_asset_count=len(full.actions),
+        surviving_anchors=tuple(a for a in surviving if _is_anchor(a)),
     )
 
 
@@ -418,26 +427,66 @@ def filter_heal_plan(
     kept_defaults: set[str] = set()
     matches: list[tuple[str, int]] = []
     unmatched: list[str] = []
+    container_anchors: list[tuple[str, str, frozenset[str]]] = []
     for selector in parsed:
-        count = 0
+        hit_keys: set[str] = set()
+        hit_unrestorable: set[tuple[str, tuple[str, ...]]] = set()
+        hit_defaults: set[str] = set()
         for action in actions:
             if _selector_hits(
                 selector, action.api_path, action.path_values, action.payload
             ):
-                selected.add(action.key)
-                count += 1
+                hit_keys.add(action.key)
         for item in plan.missing.unrestorable:
             if _selector_hits(selector, item.api_path, item.path_values, {}):
-                kept_unrestorable.add((item.api_path, item.path_values))
-                count += 1
+                hit_unrestorable.add((item.api_path, item.path_values))
         for entry in plan.missing.defaults:
             if _selector_hits(
                 selector, entry.api_path, entry.path_values, {}
             ):
-                kept_defaults.add(entry.key)
-                count += 1
+                hit_defaults.add(entry.key)
+        # A SURVIVING container the selector names anchors the scope
+        # too: "recover site X" must work whether X itself was deleted
+        # or only objects inside it were. The survivor is never
+        # selected — only the missing objects under it — so this can
+        # still only ever shrink what heal executes.
+        anchors_here = [
+            _anchor_of(action)
+            for action in plan.surviving_anchors
+            if _selector_hits(
+                selector, action.api_path, action.path_values, action.payload
+            )
+        ]
+        if anchors_here:
+            container_anchors.extend(anchors_here)
+            hit_keys |= {
+                action.key
+                for action in actions
+                if _in_scope(
+                    action.api_path, action.path_values, anchors_here
+                )
+            }
+            hit_unrestorable |= {
+                (item.api_path, item.path_values)
+                for item in plan.missing.unrestorable
+                if _in_scope(item.api_path, item.path_values, anchors_here)
+            }
+            hit_defaults |= {
+                entry.key
+                for entry in plan.missing.defaults
+                if _in_scope(entry.api_path, entry.path_values, anchors_here)
+            }
+        selected |= hit_keys
+        kept_unrestorable |= hit_unrestorable
+        kept_defaults |= hit_defaults
+        # Deduplicated per selector, so a selector that names both a
+        # missing object and its surviving parent is not counted twice.
+        count = len(hit_keys) + len(hit_unrestorable) + len(hit_defaults)
         matches.append((selector.raw, count))
         if count == 0:
+            # A surviving container with nothing missing under it is
+            # still a zero-match: heal would write nothing, and a
+            # silent no-op must never look like a recovery.
             unmatched.append(selector.raw)
     if unmatched:
         raise HealFilterError(_zero_match_message(unmatched, plan.missing))
@@ -450,7 +499,7 @@ def filter_heal_plan(
             _anchor_of(by_key[key])
             for key in selected
             if _is_anchor(by_key[key])
-        ]
+        ] + container_anchors
         grown = {
             action.key
             for action in actions
