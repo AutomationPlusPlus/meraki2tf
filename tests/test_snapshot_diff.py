@@ -392,6 +392,21 @@ def test_duplicate_asset_keys_warn_about_shadowed_drift(
     assert any("Duplicate asset key" in r.message for r in caplog.records)
 
 
+def test_render_diff_marks_order_changes_in_the_digest() -> None:
+    """The alert digest names attributes only, so a reordering is
+    indistinguishable from a value edit unless it says so."""
+    rules = [{"name": "a", "publicPort": "80"}, {"name": "b", "publicPort": "443"}]
+    previous = _graph(_vlan("10", portForwardingRules=list(rules)))
+    current = _graph(_vlan("10", portForwardingRules=list(reversed(rules))))
+    text = render_diff(diff_graphs(previous, current))
+    assert "portForwardingRules (order changed)" in text
+
+    # A real value edit stays unannotated.
+    renamed = _graph(_vlan("10", name="Data-renamed"))
+    plain = render_diff(diff_graphs(_graph(_vlan("10", name="Data")), renamed))
+    assert "name" in plain and "order changed" not in plain
+
+
 def test_render_diff_is_secret_free_and_bounded() -> None:
     previous = _graph(*[_vlan(str(i), psk="hunter2") for i in range(60)])
     current = _graph(*[_vlan(str(i), psk="CHANGED") for i in range(60)])
