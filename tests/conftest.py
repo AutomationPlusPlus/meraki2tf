@@ -60,6 +60,29 @@ AIR_MARSHAL_BY_NETWORK_SCHEMA: dict[str, Any] = {
 }
 
 
+#: Enveloped org-scoped aggregation for the GET-less nested-element
+#: openRoaming entity: each row carries a network identifier plus an
+#: SSID list, and each SSID item nests its config under ``openRoaming``
+#: (the "per-SSID PUT + org byNetwork GET" shape).
+OPEN_ROAMING_BY_NETWORK_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "networkId": {},
+                    "networkName": {},
+                    "ssids": {"type": "array"},
+                },
+            },
+        },
+        "meta": {"type": "object"},
+    },
+}
+
+
 #: Minimized spec mirroring real Meraki OpenAPI structure: canonical
 #: network/device entities, an org-scoped network collection, a nested
 #: VLAN entity, a camelCase singleton, a collection without an item
@@ -150,6 +173,19 @@ PIPELINE_SPEC: dict[str, Any] = {
                 "getOrganizationWirelessAirMarshalSettingsByNetwork",
                 "wireless",
                 response_schema=AIR_MARSHAL_BY_NETWORK_SCHEMA,
+            ),
+        },
+        # GET-less nested-element entity (per-SSID config object) whose
+        # collection source is an org-scoped byNetwork aggregation that
+        # nests one element list per row.
+        "/networks/{networkId}/wireless/ssids/{number}/openRoaming": {
+            "put": _op("updateNetworkWirelessSsidOpenRoaming", "wireless"),
+        },
+        "/organizations/{organizationId}/wireless/ssids/openRoaming/byNetwork": {
+            "get": _op(
+                "getOrganizationWirelessSsidsOpenRoamingByNetwork",
+                "wireless",
+                response_schema=OPEN_ROAMING_BY_NETWORK_SCHEMA,
             ),
         },
     },

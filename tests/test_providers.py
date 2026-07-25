@@ -71,6 +71,30 @@ class FakeWireless:
             "meta": {"counts": {"items": {"total": 1}}},
         }
 
+    def getOrganizationWirelessSsidsOpenRoamingByNetwork(
+        self, organizationId: str
+    ) -> dict[str, Any]:
+        # Nested-element aggregation row scoped by a per-product CHILD
+        # network id (the live-observed phantom-scope shape): resolved
+        # back to the parent network "HQ" via its " - wireless" name.
+        return {
+            "items": [
+                {
+                    "networkId": "N_777",
+                    "networkName": "HQ - wireless",
+                    "ssids": [
+                        {
+                            "name": "corp-wifi",
+                            "number": 0,
+                            "enabled": True,
+                            "openRoaming": {"enabled": False},
+                        },
+                    ],
+                },
+            ],
+            "meta": {"counts": {"items": {"total": 1}}},
+        }
+
 
 class FakeNetworksSection:
     def getNetworkSyslogServers(self, networkId: str) -> list[dict[str, Any]]:
@@ -659,11 +683,23 @@ def test_live_provider_builds_graph_with_spec_driven_features(
     ]
     assert air_marshal.payload == {"defaultPolicy": "blocked"}
 
+    # The GET-less nested-element openRoaming entity: its byNetwork row
+    # is scoped by a phantom per-product child network id, re-scoped to
+    # the parent "HQ" by name, and exploded per SSID at the entity's own
+    # two-parameter path with the config sub-object as the payload.
+    open_roaming = by_path[
+        (
+            "/networks/{networkId}/wireless/ssids/{number}/openRoaming",
+            ("N_1", "0"),
+        )
+    ]
+    assert open_roaming.payload == {"enabled": False}
+
     # Folded collection aliases (/organizations/{organizationId}/networks
     # lists first-class network assets) are not re-emitted as features,
     # and the refusing sensor endpoint is skipped, not fatal. The two
     # unidentifiable VLAN elements surface as collection-path assets.
-    assert len(graph.features) == 8
+    assert len(graph.features) == 9
 
     # The genuine 400 sensor refusal was a single scope — visibility
     # diagnostics carry no suspects and nothing was prefiltered (the
@@ -696,7 +732,7 @@ def test_live_dispatch_gap_warns_once_and_records_gap_features(
     ] == [("/organizations/{organizationId}/admins", ("org-123",))]
     assert "cannot be dispatched" in gaps[0].payload[UNREADABLE_MARKER]
     # Everything else still discovered, plus the explicit gap record.
-    assert len(graph.features) == 8
+    assert len(graph.features) == 9
 
 
 def test_try_call_gaps_operations_already_known_undispatchable(
@@ -1582,6 +1618,34 @@ class _RecordingScopedDashboard:
                     "meta": {},
                 }
 
+            def getOrganizationWirelessSsidsOpenRoamingByNetwork(
+                self, organizationId: str
+            ) -> dict[str, Any]:
+                # Both rows are scoped by phantom per-product child ids;
+                # resolution must use the FULL network universe (HQ is
+                # outside the --only scope), then the scope filter drops
+                # the out-of-scope parent's assets — never gap-records
+                # them.
+                return {
+                    "items": [
+                        {
+                            "networkId": "N_888",
+                            "networkName": "HQ - wireless",
+                            "ssids": [
+                                {"number": 0, "openRoaming": {"enabled": True}},
+                            ],
+                        },
+                        {
+                            "networkId": "N_999",
+                            "networkName": "Branch-07 - wireless",
+                            "ssids": [
+                                {"number": 1, "openRoaming": {"enabled": False}},
+                            ],
+                        },
+                    ],
+                    "meta": {},
+                }
+
         class ApplianceSsids:
             def getNetworkApplianceSsids(
                 self, networkId: str
@@ -1630,6 +1694,19 @@ def test_live_scoped_fetch_narrows_networks_and_devices(
         if f.api_path == "/networks/{networkId}/wireless/airMarshal/settings"
     ]
     assert [f.path_values for f in air_marshal] == [("N_2",)]
+    # Nested-element aggregation rows scoped by phantom child ids: the
+    # in-scope parent's row survives (re-scoped to N_2), while the
+    # out-of-scope parent's row is filtered out entirely — resolution
+    # ran against the full network universe, so it never degraded into
+    # a scope-less gap record.
+    open_roaming = [
+        f
+        for f in graph.features
+        if f.api_path
+        == "/networks/{networkId}/wireless/ssids/{number}/openRoaming"
+    ]
+    assert [f.path_values for f in open_roaming] == [("N_2", "1")]
+    assert dict(open_roaming[0].payload) == {"enabled": False}
 
 
 def test_live_scoped_fetch_id_form_tolerates_missing_network(
