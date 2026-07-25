@@ -538,6 +538,56 @@ def test_reordered_root_and_envelope_lists_report_order_changes() -> None:
     assert entry[0] == ORDER_CHANGED
 
 
+def test_nested_reordering_is_labelled_an_order_change() -> None:
+    """A reordering nested inside the attribute's value is still an
+    order change, not a value edit.
+
+    Observed live: a device syslog server's `roles` came back flipped
+    between two captures nothing had touched, and the alert read
+    `syslog/servers: servers` — indistinguishable from a real syslog
+    reconfiguration.
+    """
+    from meraki2tf.snapshot_diff import ORDER_CHANGED, _payload_changes
+
+    def servers(roles: list[str]) -> dict[str, object]:
+        return {
+            "servers": [
+                {
+                    "host": "10.0.0.1",
+                    "port": 514,
+                    "transportProtocol": "UDP",
+                    "roles": roles,
+                }
+            ]
+        }
+
+    entry = _payload_changes(
+        servers(["wirelessIpfilter", "applianceIpfilter"]),
+        servers(["applianceIpfilter", "wirelessIpfilter"]),
+        None,
+    )["servers"]
+    assert entry[0] == ORDER_CHANGED
+    assert "nested list reordered" in entry[1]
+
+
+def test_nested_value_edit_is_not_an_order_change() -> None:
+    """The label must never swallow a real edit hiding beside a
+    reordering: a changed value still reports before/after."""
+    from meraki2tf.snapshot_diff import ORDER_CHANGED, _payload_changes
+
+    before = {"servers": [{"host": "10.0.0.1", "roles": ["a", "b"]}]}
+    # same reordering, but the host changed too
+    after = {"servers": [{"host": "10.0.0.9", "roles": ["b", "a"]}]}
+    entry = _payload_changes(before, after, None)["servers"]
+    assert entry[0] != ORDER_CHANGED
+    assert entry == (before["servers"], after["servers"])
+
+    # a nested list that gained an item is a value change, not a reorder
+    grew = {"servers": [{"host": "10.0.0.1", "roles": ["a", "b", "c"]}]}
+    entry = _payload_changes(before, grew, None)["servers"]
+    assert entry[0] != ORDER_CHANGED
+
+
 def test_envelope_mismatch_between_sides_is_still_drift() -> None:
     """When only ONE side wraps its collection in the {items, meta}
     envelope (capture-format change, hand-edited snapshot), each side
