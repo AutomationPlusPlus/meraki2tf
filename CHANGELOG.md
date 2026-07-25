@@ -7,6 +7,15 @@ the project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- `--heal --only` scopes by a **surviving** container (#117): naming a
+  network that is still standing now recovers the objects deleted
+  inside it — the usual "recover site X" incident. Previously only a
+  *deleted* object could anchor a scope, so the selector refused with
+  "matched no missing object" whenever the site itself had survived,
+  and scoping a partial recovery by site was impossible. The survivor
+  is never written (heal remains additive-only), filtering still only
+  ever shrinks the run, and a container with nothing missing under it
+  is still a loud zero-match rather than a silent no-op.
 - Operator preflight (#102): `--check` validates an entire flag set in
   seconds — API key, `--org-id` resolution, terraform binary and
   version, provider catalog, `--drift-baseline` header, workdir

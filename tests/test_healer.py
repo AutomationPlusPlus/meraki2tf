@@ -345,6 +345,67 @@ def test_only_network_selects_its_subtree_and_nothing_else(
     assert selection.plan.surviving_count == plan.surviving_count
 
 
+def test_only_scopes_by_a_SURVIVING_network(tmp_path: Path) -> None:
+    """The common incident: the network is still standing and objects
+    inside it were deleted. Scoping the recovery by the site's name
+    must select that network's missing children.
+
+    Round-6 E2E: `--heal --only 'network:ember*'` refused with "matched
+    no missing object" because only *missing* objects could anchor a
+    scope.
+    """
+    snapshot = _snapshot()
+    # N_1 survives; its group policy and VLAN were deleted. N_2 is gone.
+    live = _org(
+        (_network("N_1", "HQ"),),
+        (FeatureConfiguration(SNMP_PATH, ("N_1",), {"access": "none"}),),
+    )
+    plan = plan_heal(snapshot, live, _heal_spec(tmp_path))
+    selection = filter_heal_plan(plan, ("network:HQ",))
+    selected = {a.key for a in selection.plan.missing.actions}
+    assert selected == {f"{GP_ITEM}::N_1,100", f"{VLAN_ITEM}::N_1,10"}
+    # The surviving network itself is never dispatched (additive-only).
+    assert "/organizations/{organizationId}/networks::N_1" not in selected
+    # ...and the other, genuinely deleted network stays out.
+    assert not any(key.endswith("N_2") for key in selected)
+    assert selection.selector_matches == (("network:HQ", 2),)
+
+
+def test_only_surviving_container_with_nothing_missing_still_refuses(
+    tmp_path: Path,
+) -> None:
+    """A surviving container that lost nothing is a zero match: heal
+    would write nothing, and a silent no-op must never look like a
+    recovery."""
+    snapshot = _snapshot()
+    live = _org(
+        (_network("N_1", "HQ"), _network("N_2", "Branch")),
+        (FeatureConfiguration(SNMP_PATH, ("N_2",), {"access": "none"}),),
+    )
+    plan = plan_heal(snapshot, live, _heal_spec(tmp_path))
+    with pytest.raises(HealFilterError) as excinfo:
+        filter_heal_plan(plan, ("network:Branch",))
+    assert "matched no missing object" in str(excinfo.value)
+
+
+def test_only_counts_a_missing_object_under_its_survivor_once(
+    tmp_path: Path,
+) -> None:
+    """A selector naming both a missing object and its surviving parent
+    scope must not double-count it."""
+    snapshot = _snapshot()
+    live = _org(
+        (_network("N_1", "HQ"),),
+        (FeatureConfiguration(SNMP_PATH, ("N_1",), {"access": "none"}),),
+    )
+    plan = plan_heal(snapshot, live, _heal_spec(tmp_path))
+    # 'HQ' matches the surviving network; its two missing children join
+    # exactly once.
+    selection = filter_heal_plan(plan, ("HQ",))
+    assert selection.selector_matches == (("HQ", 2),)
+    assert len(selection.plan.missing.actions) == 2
+
+
 def test_only_ssid_selects_nested_surfaces_not_cross_network_twins(
     tmp_path: Path,
 ) -> None:
