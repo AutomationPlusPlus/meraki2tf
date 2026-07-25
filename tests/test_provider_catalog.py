@@ -143,7 +143,7 @@ def test_cache_file_missing_is_a_catalog_error(tmp_path: Path) -> None:
 def test_bundled_catalog_ships_the_full_provider_surface() -> None:
     catalog = ProviderCatalog.bundled()
     assert catalog.source == "bundled"
-    assert len(catalog.resources) == 205
+    assert len(catalog.resources) == 206
     assert catalog.resources["meraki_appliance_vlan"] == frozenset(
         {"id", "network_id"}
     )
@@ -219,7 +219,7 @@ def test_corrupt_cache_falls_back_to_bundled(
     with caplog.at_level(logging.WARNING):
         resolved = resolve_catalog(runner, keyed=False)  # type: ignore[arg-type]
     assert resolved.source == "bundled"
-    assert len(resolved.resources) == 205
+    assert len(resolved.resources) == 206
 
 
 def test_keyless_resolution_without_cache_uses_bundled(tmp_path: Path) -> None:

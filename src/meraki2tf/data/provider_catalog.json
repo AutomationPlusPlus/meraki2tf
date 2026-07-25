@@ -1,7 +1,7 @@
 {
  "_comment": "Bundled fallback copy of the CiscoDevNet/meraki provider's resource identity schemas (terraform providers schema -json). Used only when a run has no API key AND no cached catalog in the workdir; keyed runs refresh the cache automatically from the installed provider. Regenerate by running `terraform providers schema -json` in an initialized workspace and extracting resource_identity_schemas -> attribute names.",
  "provider": "registry.terraform.io/ciscodevnet/meraki",
- "provider_version": "1.12.2",
+ "provider_version": "1.13.0",
  "resources": {
   "meraki_appliance_cellular_firewall_rules": [
    "network_id"
@@ -269,6 +269,9 @@
    "network_id"
   ],
   "meraki_network_firmware_upgrades": [
+   "network_id"
+  ],
+  "meraki_network_firmware_upgrades_rollback": [
    "network_id"
   ],
   "meraki_network_floor_plan": [

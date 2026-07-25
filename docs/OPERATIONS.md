@@ -335,10 +335,10 @@ seconds before you schedule anything.
 **Resource names look right but import IDs seem off / resources are
 missing.**
 meraki2tf reads resource identity schemas from the *installed*
-`CiscoDevNet/meraki` provider and needs **≥ v1.12.0**. With an older
-provider (or no `terraform init` yet) it falls back to a bundled
-v1.12.2 catalog, which can drift from what your workdir actually runs.
-Upgrade the provider and re-run.
+`CiscoDevNet/meraki` provider and needs **≥ v1.12.0** (v1.13.0+
+recommended). With an older provider (or no `terraform init` yet) it
+falls back to a bundled v1.13.0 catalog, which can drift from what your
+workdir actually runs. Upgrade the provider and re-run.
 
 **Discovery is slow on a big organization.**
 That's the design trade-off: completeness over speed. Every object ×

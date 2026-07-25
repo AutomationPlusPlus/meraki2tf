@@ -54,6 +54,22 @@ the project adheres to [Semantic Versioning](https://semver.org/).
   flake8/mypy/tox/pytest/pre-commit/pip-audit toolchain (this PR).
 
 ### Changed
+- The bundled fallback provider catalog is refreshed to
+  `CiscoDevNet/meraki` **v1.13.0** (206 resource identity schemas, up
+  from v1.12.2's 205). The only delta is the added
+  `meraki_network_firmware_upgrades_rollback` type — no identity
+  attribute changed and nothing was removed, so no import ID moves.
+  That type is a POST-only action sharing its identity (`network_id`)
+  with `meraki_network_firmware_upgrades`; the matcher correctly maps
+  it to nothing, and a regression test now pins that so it can never
+  shadow the real resource. This affects only first-ever offline runs
+  (no API key *and* no workdir cache) — keyed runs already read the
+  installed provider's schemas, so they picked v1.13.0 up on their next
+  `terraform init` without this change. The floor stays `>= 1.12.0`
+  (identity schemas ship from there), but **v1.13.0+ is now
+  recommended**: it fixes the "Missing Resource Identity After Read"
+  provider error on resources deleted out-of-band, which is exactly the
+  clickops-deletion case the DR loop is built to survive.
 - `--expect-org` is now refused alongside `--diff-networks` (#112)
   instead of being silently ignored. It pins a `--rebuild` /
   `--replay-gaps` target (as `docs/USAGE.md` already documented) and

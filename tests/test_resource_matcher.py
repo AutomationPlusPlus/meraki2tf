@@ -291,7 +291,7 @@ def test_path_matches_covers_folded_aliases(
 @pytest.mark.skipif(not REPO_SPEC.exists(), reason="repo spec3.json not present")
 def test_bundled_catalog_matches_the_real_spec() -> None:
     """Integration-grade validation against the real Meraki OpenAPI spec
-    and the bundled v1.12.2 identity schemas (the ground truth this
+    and the bundled v1.13.0 identity schemas (the ground truth this
     matcher was tuned on: 149 verified pairs, 0 wrong, 0 collisions)."""
     parser = OpenApiParser(REPO_SPEC)
     catalog = ProviderCatalog.bundled()
@@ -302,6 +302,10 @@ def test_bundled_catalog_matches_the_real_spec() -> None:
     assert len(matched) >= 149
     names = [match.terraform_name for match in matched.values()]
     assert len(names) == len(set(names))  # one-to-one, no collisions
+    # Action-only provider types (POST with no readable surface) share
+    # their identity with the real resource they act on, so they must
+    # stay unmatched or they would shadow it.
+    assert "meraki_network_firmware_upgrades_rollback" not in names
 
     lookup = path_matches(parser, catalog)
 
