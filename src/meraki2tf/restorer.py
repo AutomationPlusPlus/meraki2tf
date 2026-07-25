@@ -58,12 +58,14 @@ from meraki2tf.hcl_generator import DEVICE_API_PATH, NETWORK_API_PATH
 from meraki2tf.providers.ratelimit import AdaptiveTokenBucket
 from meraki2tf.replayer import (
     ACTION_LOG_REASON,
+    EMPTY_DEFAULT_REASON,
     GAP_RECORD_REASON,
     _collection_items,
     _secret_paths,
     _single_array_body_field,
     _strip_nulls,
     is_action_log,
+    is_empty_default_payload,
     is_scope_gap_record,
     shape_rules,
     split_redacted as _split_redacted,
@@ -2932,6 +2934,17 @@ class OrgRestorer:
                 "the captured payload holds no writable values (null "
                 "leaves only); nothing to restore"
             )
+        if (
+            action.kind == "configure"
+            and isinstance(body, Mapping)
+            and is_empty_default_payload(body, action.api_path)
+        ):
+            # Nothing but empty containers once the aggregation row's
+            # scope-name echo is ignored: the configuration does not
+            # exist, and the dashboard 400s the no-op PUT on orgs that
+            # lack the endpoint's prerequisites (vpnExclusions needs
+            # minimum firmware + default VPN routes).
+            raise _EmptyConfigureSkip(EMPTY_DEFAULT_REASON)
         section = getattr(dashboard, op.tags[0], None) if op.tags else None
         method = (
             getattr(section, op.operation_id, None)

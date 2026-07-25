@@ -82,6 +82,13 @@ GAP_RECORD_REASON = (
     "runbook's manual list"
 )
 
+#: Skip reason for adopted settings surfaces captured as nothing but
+#: empty containers: the configuration does not exist, and PUTting the
+#: no-op into an org that lacks the endpoint's prerequisites draws a
+#: 400 (vpnExclusions: "Networks must meet minimum firmware
+#: requirements…") for nothing.
+EMPTY_DEFAULT_REASON = "empty default configuration — nothing to restore"
+
 
 def is_scope_gap_record(api_path: str, path_values: tuple[str, ...]) -> bool:
     """True when the asset's identifiers cannot address its write path.
@@ -96,6 +103,39 @@ def is_scope_gap_record(api_path: str, path_values: tuple[str, ...]) -> bool:
         name for name in _placeholders(api_path) if name != "organizationId"
     ]
     return len(path_values) < len(required)
+
+
+def scope_context_keys(api_path: str) -> frozenset[str]:
+    """Payload keys that only restate the asset's own path scope.
+
+    The aggregation explosion consumes exactly one scope key per row
+    (the flat id or the object form); the sibling spellings — the
+    ``<scope>Name`` field, the unconsumed object, a leftover flat id —
+    survive in the payload as pure context. Derived from the path's own
+    placeholders, never hard-coded per entity.
+    """
+    keys: set[str] = set()
+    for name in _placeholders(api_path):
+        base = name[: -len("Id")] if name.endswith("Id") else name
+        keys.update((name, base, f"{base}Name"))
+    return frozenset(keys)
+
+
+def is_empty_default_payload(payload: Mapping[str, Any], api_path: str) -> bool:
+    """Nothing but empty containers once scope context is ignored.
+
+    An unconfigured adopted surface reads back as empty lists/objects
+    plus the row's scope-name echo (vpnExclusions: ``{"networkName":
+    …, "custom": [], "majorApplications": []}``). Conservative on
+    purpose: any scalar — including ``False``, ``0``, and ``""`` — is
+    real configuration and keeps the write.
+    """
+    context = scope_context_keys(api_path)
+    return all(
+        value is None or (isinstance(value, (Mapping, list)) and not value)
+        for key, value in payload.items()
+        if key not in context
+    )
 
 
 def is_action_log(api_path: str, ops: tuple[OperationSpec, ...]) -> bool:
@@ -283,6 +323,20 @@ def plan_replay(
                     "snapshot); re-enter manually: " + ", ".join(redacted),
                 )
             )
+        if writes[0].method == "put" and is_empty_default_payload(
+            clean, asset.api_path
+        ):
+            # A PUT of nothing but empty containers restores no
+            # configuration and can 400 on endpoints whose
+            # prerequisites the target org does not meet.
+            skipped.append(
+                SkippedReplay(
+                    asset.api_path,
+                    asset.identifiers,
+                    EMPTY_DEFAULT_REASON,
+                )
+            )
+            continue
         actions.append(
             ReplayAction(
                 kind="object",

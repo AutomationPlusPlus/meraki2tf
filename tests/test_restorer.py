@@ -2143,6 +2143,76 @@ def test_wipe_reports_organization_delete_failure() -> None:
     assert result.failed == (("org-drill", "org has pending licenses"),)
 
 
+def test_empty_default_configures_skip_instead_of_dispatching(
+    tmp_path: Path,
+) -> None:
+    """The vpnExclusions shape observed live: nothing but empty
+    containers plus the aggregation row's scope-name echo. The PUT
+    restores configuration that does not exist and 400s on orgs
+    lacking the endpoint's prerequisites — skip, distinctly."""
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(
+            SNMP_PATH,
+            ("N_1",),
+            {
+                "networkName": "HQ - appliance",
+                "custom": [],
+                "majorApplications": [],
+                "detail": None,
+            },
+        )
+    )
+    plan = plan_restore(graph, parser)
+    restorer, calls = _executor(tmp_path)
+    result = restorer.execute(graph, plan)
+    assert result.failed == ()
+    assert not [c for c in calls if c[0] == "updateNetworkSnmp"]
+    (skip,) = [
+        entry
+        for entry in result.skipped
+        if entry["target"].startswith(SNMP_PATH)
+    ]
+    assert skip["reason"] == (
+        "empty default configuration — nothing to restore"
+    )
+
+
+def test_false_zero_and_empty_string_configures_still_dispatch(
+    tmp_path: Path,
+) -> None:
+    """Conservative emptiness: false/0/"" are real configuration (a
+    deliberately disabled feature is not an empty default), so the
+    write must go out."""
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(
+            SNMP_PATH,
+            ("N_1",),
+            {
+                "networkName": "HQ - appliance",
+                "custom": [],
+                "enabled": False,
+                "port": 0,
+                "comment": "",
+            },
+        )
+    )
+    plan = plan_restore(graph, parser)
+    restorer, calls = _executor(tmp_path)
+    result = restorer.execute(graph, plan)
+    assert result.failed == ()
+    (snmp,) = [c for c in calls if c[0] == "updateNetworkSnmp"]
+    assert snmp[2]["enabled"] is False
+    assert snmp[2]["port"] == 0
+    assert snmp[2]["comment"] == ""
+    assert not [
+        entry
+        for entry in result.skipped
+        if entry["target"].startswith(SNMP_PATH)
+    ]
+
+
 def test_drill_secret_placeholders_fill_redacted_slots(tmp_path: Path) -> None:
     """A sanitized-snapshot drill substitutes valid placeholder secrets
     so secret-requiring writes rehearse instead of failing ('Password
