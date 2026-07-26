@@ -1820,6 +1820,60 @@ def test_snapshot_baseline_drift_dispatches_alert(
     assert "OLD-NAME" not in drift_events[0].details["diff"]  # names, not values
 
 
+def test_snapshot_drift_alert_carries_the_coverage_gaps(
+    tmp_path: Path, api_key: None
+) -> None:
+    """On the weekly snapshot-only job the drift alert is the WARNING
+    event that pages someone — RUN_SUCCESS is INFO and never pages — so
+    it must carry the manual-rebuild list. Dispatched at comparison
+    time it reported zero gaps on an org that had them: a false
+    statement to the operator, not merely an omission."""
+    from meraki2tf.snapshot import write_snapshot
+
+    baseline_graph = NetworkGraph(
+        organization_id="org-123",
+        networks=(),
+        devices=(),
+        features=(
+            FeatureConfiguration(
+                "/networks/{networkId}/appliance/vlans/{vlanId}",
+                ("N_1", "10"),
+                {"id": "10", "name": "OLD-NAME"},
+            ),
+        ),
+    )
+    baseline = write_snapshot(baseline_graph, tmp_path / "baseline.json")
+
+    recorder = RecordingNotifier()
+    generator = StubGenerator(
+        unsupported=(
+            UnsupportedAsset(
+                api_path="/networks/{networkId}/wireless/radio/rrm",
+                reason="no mapping",
+                identifiers=("N_1",),
+            ),
+        )
+    )
+    runner = StubRunner(tmp_path, plan_exit=0, plan_stdout="No changes.")
+    orchestrator = PipelineOrchestrator(
+        provider=StubProvider(),
+        generator=generator,  # type: ignore[arg-type]
+        runner=runner,  # type: ignore[arg-type]
+        dispatcher=AlertDispatcher([recorder]),
+        drift_baseline=baseline,
+    )
+    orchestrator.run("org-123")
+
+    (drift,) = [
+        e for e in recorder.events if e.event_type is EventType.DRIFT_DETECTED
+    ]
+    assert drift.details["origin"] == "snapshot-diff"
+    assert drift.details["unsupported_count"] == 1
+    assert drift.details["unsupported"][0]["api_path"] == (
+        "/networks/{networkId}/wireless/radio/rrm"
+    )
+
+
 def test_snapshot_baseline_with_no_drift_is_quiet(
     tmp_path: Path, api_key: None
 ) -> None:
