@@ -993,10 +993,16 @@ class _EmptyConfigureSkip(Exception):
     """A configure payload stripped to nothing — nothing to write."""
 
 
-#: Payload keys that identify an object as the Meraki-provisioned
-#: default of its collection (staged upgrade groups carry `isDefault`,
-#: adaptive-policy groups `isDefaultGroup`).
-_DEFAULT_FLAG_RE = re.compile(r"(?i)^isdefault")
+#: Payload keys that identify an object as a Meraki-provisioned default
+#: of its collection. The dashboard spells the flag `is<Something>
+#: Default<Something>`: staged upgrade groups carry `isDefault`,
+#: adaptive-policy groups `isDefaultGroup`, and the two RF profiles
+#: every wireless network is born with carry `isIndoorDefault` /
+#: `isOutdoorDefault`. Matching the whole family rather than the
+#: `isDefault` prefix alone is what keeps adoption working when the
+#: name cannot be trusted — a renamed built-in, or a sanitized
+#: snapshot whose names are pseudonyms.
+_DEFAULT_FLAG_RE = re.compile(r"(?i)^is[a-z]*default[a-z]*$")
 
 #: Natural identity keys tried, in order, when adopt-by-name finds no
 #: counterpart. Each is unique within its collection per the dashboard
