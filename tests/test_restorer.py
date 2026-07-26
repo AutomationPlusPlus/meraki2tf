@@ -50,6 +50,9 @@ def _restore_spec(tmp_path: Path) -> OpenApiParser:
             "/networks/{networkId}/devices/claim": {
                 "post": _op("claimNetworkDevices", "networks"),
             },
+            "/networks/{networkId}/bind": {
+                "post": _op("bindNetwork", "networks"),
+            },
             "/organizations/{organizationId}/admins": {
                 "get": _op("getOrganizationAdmins", "organizations"),
                 "post": _op("createOrganizationAdmin", "organizations"),
@@ -1364,6 +1367,9 @@ def _cross_scope_spec(tmp_path: Path) -> OpenApiParser:
                 "get": _op("getOrganizationNetworks", "organizations"),
                 "post": _op("createOrganizationNetwork", "organizations"),
             },
+            "/networks/{networkId}/bind": {
+                "post": _op("bindNetwork", "networks"),
+            },
             "/networks/{networkId}/devices/claim": {
                 "post": _op("claimNetworkDevices", "networks"),
             },
@@ -1513,6 +1519,68 @@ def test_template_references_and_features_use_the_rebuilt_template(
     assert network[2]["configTemplateId"] == "T_NEW"
     snmp = next(c for c in calls if c[0] == "updateNetworkSnmp")
     assert snmp[1] == ("T_NEW",)  # never the snapshot's template ID
+
+
+def test_bound_networks_are_rebound_to_the_rebuilt_template(
+    tmp_path: Path,
+) -> None:
+    """A network bound to a config template is re-bound after the
+    rebuild, at the template's NEW id.
+
+    Regression (E2E r7): the binding is captured on the network object
+    but replayed by nothing — /networks/{networkId}/bind is an RPC-shaped
+    POST, so the endpoint sweep excludes it and the restore never
+    planned it. A template-governed site came back standalone, silently:
+    the coverage manifest, the runbook and the restore result all said
+    the network restored cleanly.
+    """
+    from meraki2tf.restorer import NETWORK_BIND_PATH
+
+    parser = _cross_scope_spec(tmp_path)
+    graph = _template_graph()
+    plan = plan_restore(graph, parser)
+    bind = next(a for a in plan.actions if a.api_path == NETWORK_BIND_PATH)
+    # Last wave: a bound network refuses direct writes to the surfaces
+    # its template governs, so its own captured features go first.
+    assert bind.wave == max(a.wave for a in plan.actions)
+
+    restorer, calls = _executor(
+        tmp_path,
+        responses={
+            "createOrganizationConfigTemplate": {"id": "T_NEW"},
+            "createOrganizationNetwork": {"id": "N_NEW"},
+        },
+    )
+    result = restorer.execute(graph, plan)
+
+    assert result.failed == ()
+    bound = next(c for c in calls if c[0] == "bindNetwork")
+    assert bound[1] == ("N_NEW",)          # the rebuilt network
+    assert bound[2]["configTemplateId"] == "T_NEW"   # the rebuilt template
+    assert f"{NETWORK_BIND_PATH}::N_1" in result.executed
+
+
+def test_an_unbindable_network_reports_the_binding_as_unrestorable(
+    tmp_path: Path,
+) -> None:
+    """A spec without bindNetwork must not drop the binding silently."""
+    from meraki2tf.restorer import NETWORK_BIND_PATH
+
+    _cross_scope_spec(tmp_path)  # writes cross-spec.json
+    document = json.loads(
+        (tmp_path / "cross-spec.json").read_text(encoding="utf-8")
+    )
+    document["paths"].pop(NETWORK_BIND_PATH)
+    stripped = tmp_path / "no-bind-spec.json"
+    stripped.write_text(json.dumps(document), encoding="utf-8")
+
+    plan = plan_restore(_template_graph(), OpenApiParser(stripped))
+    assert all(a.api_path != NETWORK_BIND_PATH for a in plan.actions)
+    (gap,) = [
+        u for u in plan.unrestorable if u.api_path == NETWORK_BIND_PATH
+    ]
+    assert gap.path_values == ("N_1",)
+    assert "re-bind it in the dashboard" in gap.reason
 
 
 def test_template_features_fail_loudly_when_the_template_is_dead(

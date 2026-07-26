@@ -91,6 +91,11 @@ WAVE_NETWORKS = 2
 WAVE_DEVICE_CLAIM = 3
 WAVE_NETWORK_FEATURES = 4
 WAVE_DEVICE_FEATURES = 5
+#: Config-template bindings go LAST. A bound network refuses direct
+#: writes to the surfaces its template governs, so binding earlier
+#: would turn the network's own captured features into 400s; binding
+#: after them reproduces the source organization's end state.
+WAVE_NETWORK_BIND = 6
 
 #: Write endpoints for the container waves. Containers are *captured*
 #: under the pseudo-paths in ``hcl_generator`` (``/networks/{networkId}``,
@@ -98,6 +103,16 @@ WAVE_DEVICE_FEATURES = 5
 #: endpoints, so verdict joins must key both spellings.
 NETWORK_CREATE_PATH = "/organizations/{organizationId}/networks"
 DEVICE_CLAIM_PATH = "/networks/{networkId}/devices/claim"
+#: Binding a network to a config template. The spec shape is an RPC
+#: action (POST, no GET), so the endpoint sweep excludes it — but the
+#: relationship it establishes is durable *configuration*, recorded on
+#: the network object itself as ``configTemplateId``. Restoring the
+#: network without it silently returns a template-governed site as a
+#: standalone one, so the binding is replayed from the network's own
+#: captured payload rather than from a feature of its own.
+NETWORK_BIND_PATH = "/networks/{networkId}/bind"
+#: The network-payload key naming the template a network is bound to.
+CONFIG_TEMPLATE_REFERENCE = "configTemplateId"
 
 
 @dataclass(frozen=True)
@@ -204,6 +219,37 @@ def plan_restore(graph: NetworkGraph, parser: OpenApiParser) -> RestorePlan:
                 operation=_network_create_operation(parser),
                 payload=dict(network.payload),
                 lookup=lookups.get(NETWORK_CREATE_PATH),
+            )
+        )
+    for network in graph.networks:
+        template = network.payload.get(CONFIG_TEMPLATE_REFERENCE)
+        if not template:
+            continue
+        bind = _network_bind_operation(parser)
+        if bind is None:
+            unrestorable.append(
+                Unrestorable(
+                    api_path=NETWORK_BIND_PATH,
+                    path_values=(network.network_id,),
+                    reason=(
+                        "the spec exposes no bindNetwork operation, so "
+                        "this network's config-template binding cannot "
+                        "be replayed; re-bind it in the dashboard after "
+                        "the rebuild"
+                    ),
+                )
+            )
+            continue
+        actions.append(
+            RestoreAction(
+                kind="configure",
+                wave=WAVE_NETWORK_BIND,
+                api_path=NETWORK_BIND_PATH,
+                path_values=(network.network_id,),
+                operation=bind,
+                # Only the reference: autoBind and the rest of the
+                # network payload are not this call's business.
+                payload={CONFIG_TEMPLATE_REFERENCE: template},
             )
         )
     for device in graph.devices:
@@ -409,6 +455,19 @@ def _network_create_operation(parser: OpenApiParser) -> OperationSpec:
         path_params=("organizationId",),
         tags=("organizations",),
     )
+
+
+def _network_bind_operation(parser: OpenApiParser) -> OperationSpec | None:
+    """The bindNetwork POST, or None when the spec omits it.
+
+    No synthesized fallback: unlike the network create, a missing bind
+    endpoint must surface as an unrestorable binding rather than a
+    dispatch that fails at execution time.
+    """
+    for op in parser.endpoints():
+        if op.method == "post" and op.path == NETWORK_BIND_PATH:
+            return op
+    return None
 
 
 def _device_claim_operation(parser: OpenApiParser) -> OperationSpec:

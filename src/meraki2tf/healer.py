@@ -34,9 +34,12 @@ from meraki2tf.models import NetworkGraph
 from meraki2tf.openapi_parser import OpenApiParser
 from meraki2tf.scope import glob_pattern
 from meraki2tf.restorer import (
+    NETWORK_BIND_PATH,
+    NETWORK_CREATE_PATH,
     WAVE_NETWORKS,
     RestoreAction,
     RestorePlan,
+    Unrestorable,
     _GRAMMAR_KEYS,
     _NATURAL_MATCH_KEYS,
     _OBJ_GRP_RE,
@@ -116,6 +119,51 @@ def live_asset_keys(live: NetworkGraph, parser: OpenApiParser) -> frozenset[str]
     return frozenset(keys)
 
 
+def _split_survivor_bindings(
+    missing: tuple[RestoreAction, ...],
+) -> tuple[tuple[RestoreAction, ...], tuple[Unrestorable, ...]]:
+    """Keep config-template bindings out of a heal unless the network
+    itself is being recreated.
+
+    A network that is standing but no longer bound reads as a "missing"
+    binding, and re-binding it would hand its whole configuration to a
+    template — the largest possible modification of a survivor, under
+    the one flag that promises never to modify one. Heal recreates
+    deletions; a lost binding is reported for a human instead.
+
+    A binding whose network IS missing rides along with the recreation:
+    the network is being rebuilt from the snapshot, so restoring it
+    unbound would be the incomplete answer.
+    """
+    recreated = {
+        action.path_values[0]
+        for action in missing
+        if action.api_path == NETWORK_CREATE_PATH
+    }
+    kept: list[RestoreAction] = []
+    deferred: list[Unrestorable] = []
+    for action in missing:
+        if (
+            action.api_path == NETWORK_BIND_PATH
+            and action.path_values[0] not in recreated
+        ):
+            deferred.append(
+                Unrestorable(
+                    api_path=action.api_path,
+                    path_values=action.path_values,
+                    reason=(
+                        "the network is standing but is no longer bound "
+                        "to its config template; heal is additive-only "
+                        "and never re-binds a surviving network — "
+                        "re-bind it in the dashboard"
+                    ),
+                )
+            )
+            continue
+        kept.append(action)
+    return tuple(kept), tuple(deferred)
+
+
 def plan_heal(
     snapshot: NetworkGraph, live: NetworkGraph, parser: OpenApiParser
 ) -> HealPlan:
@@ -130,6 +178,7 @@ def plan_heal(
     alive = live_asset_keys(live, parser)
     missing = tuple(a for a in full.actions if a.key not in alive)
     surviving = tuple(a for a in full.actions if a.key in alive)
+    missing, unbound = _split_survivor_bindings(missing)
     mappings: list[IdentityMapping] = []
     for action in surviving:
         if action.kind not in ("create", "claim"):
@@ -151,7 +200,7 @@ def plan_heal(
         item
         for item in full.unrestorable
         if f"{item.api_path}::{','.join(item.path_values)}" not in alive
-    )
+    ) + unbound
     defaults = tuple(
         entry for entry in full.defaults if entry.key not in alive
     )
