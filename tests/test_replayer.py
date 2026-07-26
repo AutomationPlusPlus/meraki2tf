@@ -26,6 +26,7 @@ from meraki2tf.replayer import (
     GapReplayer,
     ReplayAction,
     ReplayDispatchError,
+    SanitizedReplayTargetError,
     _collection_items,
     _single_array_body_field,
     is_action_log,
@@ -728,6 +729,65 @@ def _vlan_action(spec_parser: OpenApiParser, network: str = "N_2") -> ReplayActi
         operation=op,
         lookup=_lookup_op(spec_parser, "getNetworkApplianceVlans"),
     )
+
+
+def test_execute_refuses_a_sanitized_snapshot_in_a_foreign_org(
+    monkeypatch: pytest.MonkeyPatch, spec_parser: OpenApiParser
+) -> None:
+    """A sanitized replay whose scopes match nothing live is refused.
+
+    Regression (E2E r7): a sanitized snapshot replayed into an
+    unrelated organization wrote its org-scoped gaps there — a splash
+    theme named with a pseudonym and overwritten VRF settings. The
+    network-scoped actions already refused to guess a target; the
+    org-scoped ones had no equivalent interlock.
+    """
+    dashboard = _FakeDashboard(networks=[])
+    _install_fake_meraki(monkeypatch, dashboard)
+    with pytest.raises(SanitizedReplayTargetError) as excinfo:
+        GapReplayer().execute(
+            (_vlan_action(spec_parser),),
+            target_organization_id="org-999",
+            snapshot_organization_id="org-0001",
+            network_ids={},
+            sanitized=True,
+        )
+    assert "org-999" in str(excinfo.value)
+    assert dashboard.appliance.calls == []
+
+
+def test_execute_allows_a_sanitized_snapshot_in_its_drill_org(
+    monkeypatch: pytest.MonkeyPatch, spec_parser: OpenApiParser
+) -> None:
+    """The drill flow still works: one joined scope corroborates it."""
+    dashboard = _FakeDashboard(networks=[])
+    _install_fake_meraki(monkeypatch, dashboard)
+    executed, failed, _skipped = GapReplayer().execute(
+        (_vlan_action(spec_parser),),
+        target_organization_id="org-999",
+        snapshot_organization_id="org-0001",
+        network_ids={"N_2": "N_LIVE"},
+        sanitized=True,
+    )
+    assert failed == ()
+    assert len(executed) == 1
+
+
+def test_execute_allows_an_unsanitized_snapshot_without_a_join(
+    monkeypatch: pytest.MonkeyPatch, spec_parser: OpenApiParser
+) -> None:
+    """The interlock is armed by sanitization only; real snapshots keep
+    today's per-object failure behaviour."""
+    dashboard = _FakeDashboard(networks=[])
+    _install_fake_meraki(monkeypatch, dashboard)
+    executed, failed, _skipped = GapReplayer().execute(
+        (_vlan_action(spec_parser),),
+        target_organization_id="org-999",
+        snapshot_organization_id="org-123",
+        network_ids={},
+    )
+    assert executed == ()
+    assert len(failed) == 1
 
 
 def test_execute_remaps_ids_and_prefers_path_params(

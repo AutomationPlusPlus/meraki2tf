@@ -92,6 +92,7 @@ from meraki2tf.provider_catalog import (
 )
 from meraki2tf.replayer import (
     GapReplayer,
+    SanitizedReplayTargetError,
     plan_replay,
     template_bound_networks,
 )
@@ -1693,7 +1694,9 @@ def _replay_gaps(config: RuntimeConfig) -> int:
             "markers and identifiers are pseudonyms. Gap replay against "
             "a live tenant needs the unsanitized DR snapshot; redacted "
             "attributes will be skipped and reported for manual "
-            "re-entry."
+            "re-entry, and --confirm will refuse outright unless the "
+            "target organization holds this snapshot's networks (i.e. "
+            "it is the drill organization restored from it)."
         )
     # The organization remap keys on the snapshot's RECORDED source org:
     # --org-id names the (rebuilt) target organization, and using the
@@ -1797,10 +1800,15 @@ def _replay_gaps(config: RuntimeConfig) -> int:
     except Exception as exc:
         logger.critical("Gap replay could not enumerate live networks: %s", exc)
         return 1
-    executed, failed, refused = replayer.execute(
-        actions, target_org, snapshot_org, network_ids,
-        template_bound=template_bound_networks(graph),
-    )
+    try:
+        executed, failed, refused = replayer.execute(
+            actions, target_org, snapshot_org, network_ids,
+            template_bound=template_bound_networks(graph),
+            sanitized=provider.snapshot_sanitized,
+        )
+    except SanitizedReplayTargetError as exc:
+        logger.critical("%s", exc)
+        return 2
     skipped = (*skipped, *refused)
     dispatcher.dispatch(
         gap_replay_executed(

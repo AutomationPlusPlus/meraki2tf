@@ -57,6 +57,10 @@ class ReplayDispatchError(RuntimeError):
     """A replay operation could not be resolved onto the Meraki SDK."""
 
 
+class SanitizedReplayTargetError(RuntimeError):
+    """A sanitized snapshot was replayed into an uncorroborated org."""
+
+
 #: Terminal nouns of one-shot operational "action log" collections:
 #: POST-only, GET-discoverable surfaces whose entries record executed
 #: actions (sensor reboot commands, PII delete requests, controller
@@ -547,6 +551,8 @@ class GapReplayer:
         snapshot_organization_id: str,
         network_ids: Mapping[str, str],
         template_bound: frozenset[str] = frozenset(),
+        *,
+        sanitized: bool = False,
     ) -> tuple[
         tuple[str, ...],
         tuple[tuple[str, str], ...],
@@ -557,7 +563,40 @@ class GapReplayer:
         Returns ``(executed, failed, skipped)``; the skips are refusals
         classified at execution time (template-bound surfaces) that the
         pure planner cannot foresee.
+
+        ``sanitized`` marks a snapshot whose identifiers are pseudonyms,
+        which arms the target-corroboration interlock below. It lives
+        here rather than only in the CLI for the same reason the
+        import-only apply guard lives in ``terraform_runner``: no future
+        call path may reach the writes without passing it.
+
+        :raises SanitizedReplayTargetError: the snapshot is sanitized
+            and nothing proves the target organization is the one it
+            describes.
         """
+        if sanitized and not network_ids:
+            # A sanitized snapshot's recorded org ID is a pseudonym, so
+            # the org-scoped writes below (splash themes, VRF settings,
+            # …) would land on whatever --org-id names — a real tenant
+            # included — carrying pseudonymized names and values. The
+            # network/config-template name join is the only available
+            # proof of identity: a live org holding networks named like
+            # this snapshot's pseudonyms can only be one that was
+            # rebuilt from it. Nothing joined ⇒ a foreign organization,
+            # so refuse before the first write rather than after.
+            # (Network-scoped actions already refuse to guess a target;
+            # this closes the org-scoped hole beside them.)
+            raise SanitizedReplayTargetError(
+                f"Refusing to replay a SANITIZED snapshot into "
+                f"organization {target_organization_id}: none of the "
+                "snapshot's networks or config templates exist there, "
+                "so nothing shows this organization was rebuilt from "
+                "this snapshot. A sanitized replay carries pseudonyms, "
+                "not real configuration — org-scoped writes would "
+                "overwrite live settings with them. Replay the "
+                "UNSANITIZED snapshot, or target the drill "
+                "organization restored from this one."
+            )
         executed: list[str] = []
         failed: list[tuple[str, str]] = []
         skipped: list[SkippedReplay] = []
