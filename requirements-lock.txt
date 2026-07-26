@@ -34,8 +34,9 @@ frozenlist==1.8.0 \
     --hash=sha256:cba69cb73723c3f329622e34bdbf5ce1f80c21c290ff04256cff1cd3c2036ed2
 idna==3.18 \
     --hash=sha256:7f952cbe720b688055e3f87de14f5c3e5fdaa8bc3928985c4077ca689de849a2
-meraki==3.3.0 \
-    --hash=sha256:b3f6e3c7199a3bef3e4eca798bed17b6aae8c3716fa5353c13e1fda952121f06
+meraki==4.3.1 \
+    --hash=sha256:29c2b12544041eb8e1e47e4ec915cc624f6d7790e2e9052258caf6b007f89295 \
+    --hash=sha256:f51d393d3b392d2a0f32aa3119a0b11ca775eec70ed8f578f96e52e8142050ff
 multidict==6.7.1 \
     --hash=sha256:7eee46ccb30ff48a1e35bb818cc90846c6be2b68240e42a78599166722cea709
 propcache==0.5.2 \
