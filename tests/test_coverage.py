@@ -210,6 +210,42 @@ def test_spec_level_gaps_still_carry_a_restore_verdict() -> None:
     assert all("restore_via" in obj for obj in manifest["objects"])
 
 
+def test_summary_counts_write_only_endpoints_beside_the_objects(
+    tmp_path: Path,
+) -> None:
+    """The write-only endpoints listed under 'cannot rebuild' are also
+    counted in the header.
+
+    Regression (E2E r7): the header said 'unsupported: 26' while the
+    list below it carried 35 entries, because the 9 write-only
+    endpoints are counted separately in the JSON totals and had no line
+    of their own in the summary.
+    """
+    unsupported = (
+        UnsupportedAsset(
+            api_path="/networks/{networkId}/mystery",
+            reason="No Terraform resource maps to this API path.",
+            identifiers=("N_1",),
+        ),
+        UnsupportedAsset(
+            api_path="/networks/{networkId}/sm/devices/fields",
+            reason="write-only endpoint: the API offers no way to read it",
+            identifiers=(),
+        ),
+    )
+    manifest = build_manifest(
+        organization_id="org-123",
+        captured=CAPTURED,
+        unsupported=unsupported,
+        state_addresses=frozenset(),
+        spec_gap_count=1,
+    )
+    write_manifest(manifest, tmp_path)
+    summary = (tmp_path / COVERAGE_SUMMARY_FILENAME).read_text(encoding="utf-8")
+    assert "unsupported      : 1 (MANUAL rebuild required)" in summary
+    assert "Plus write-only endpoints : 1" in summary
+
+
 def test_partial_scope_stamps_manifest_and_summary(tmp_path: Path) -> None:
     """A scoped (--only) run must never leave a plausible-looking
     full-org manifest behind (Cardinal Rule 2): both artifacts carry
