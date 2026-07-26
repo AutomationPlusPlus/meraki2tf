@@ -178,6 +178,38 @@ def test_manifest_carries_restore_verdicts() -> None:
     )
 
 
+def test_spec_level_gaps_still_carry_a_restore_verdict() -> None:
+    """An unsupported object with no restore verdict falls back to
+    ``unrestorable`` rather than omitting the field.
+
+    Regression (E2E r7): the 9 write-only endpoints are spec-level
+    findings with no graph object, so the restore planner produced no
+    verdict for them and the manifest emitted them with no
+    ``restore_via`` key at all — a consumer reading the manual-rebuild
+    list off that field skipped them silently.
+    """
+    unsupported = (
+        UnsupportedAsset(
+            api_path="/networks/{networkId}/sm/devices/fields",
+            reason="write-only endpoint: the API offers no way to read "
+                   "this configuration back",
+            identifiers=(),
+        ),
+    )
+    manifest = build_manifest(
+        organization_id="org-123",
+        captured=(),
+        unsupported=unsupported,
+        state_addresses=frozenset(),
+        restore_via={},
+        spec_gap_count=1,
+    )
+    (record,) = manifest["objects"]
+    assert record["status"] == STATUS_UNSUPPORTED
+    assert record["restore_via"].startswith("unrestorable: write-only")
+    assert all("restore_via" in obj for obj in manifest["objects"])
+
+
 def test_partial_scope_stamps_manifest_and_summary(tmp_path: Path) -> None:
     """A scoped (--only) run must never leave a plausible-looking
     full-org manifest behind (Cardinal Rule 2): both artifacts carry
