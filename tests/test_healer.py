@@ -46,6 +46,9 @@ def _heal_spec(tmp_path: Path) -> OpenApiParser:
             "/networks/{networkId}/devices/claim": {
                 "post": _op("claimNetworkDevices", "networks"),
             },
+            "/networks/{networkId}/bind": {
+                "post": _op("bindNetwork", "networks"),
+            },
             "/networks/{networkId}/groupPolicies": {
                 "get": _op("getNetworkGroupPolicies", "networks"),
                 "post": _op("createNetworkGroupPolicy", "networks"),
@@ -129,6 +132,65 @@ def _live_after_accident() -> NetworkGraph:
             FeatureConfiguration(SNMP_PATH, ("N_1",), {"access": "none"}),
         ),
     )
+
+
+def _bound_network(net_id: str, name: str, template: str) -> MerakiNetwork:
+    return MerakiNetwork.from_payload(
+        {"id": net_id, "organizationId": "org-123", "name": name,
+         "productTypes": ["appliance"], "timeZone": "UTC",
+         "configTemplateId": template}
+    )
+
+
+def test_heal_never_rebinds_a_surviving_network(tmp_path: Path) -> None:
+    """A standing network that lost its config-template binding is
+    reported, never re-bound.
+
+    Re-binding hands the network's whole configuration to a template —
+    the largest possible modification of a survivor, under the one flag
+    that promises never to modify one.
+    """
+    snapshot = NetworkGraph(
+        organization_id="org-123",
+        networks=(_bound_network("N_1", "HQ", "T_1"),),
+        devices=(),
+        features=(FeatureConfiguration(SNMP_PATH, ("N_1",), {"access": "none"}),),
+    )
+    live = NetworkGraph(  # same network, standing, no longer bound
+        organization_id="org-123",
+        networks=(_network("N_1", "HQ"),),
+        devices=(),
+        features=(FeatureConfiguration(SNMP_PATH, ("N_1",), {"access": "none"}),),
+    )
+    plan = plan_heal(snapshot, live, _heal_spec(tmp_path))
+
+    assert all(
+        "/bind" not in action.api_path for action in plan.missing.actions
+    )
+    (gap,) = [
+        item for item in plan.missing.unrestorable if "/bind" in item.api_path
+    ]
+    assert gap.path_values == ("N_1",)
+    assert "never re-binds a surviving network" in gap.reason
+
+
+def test_heal_rebinds_a_network_it_recreates(tmp_path: Path) -> None:
+    """A binding whose network is being rebuilt rides along: restoring
+    the network unbound would be the incomplete answer."""
+    snapshot = NetworkGraph(
+        organization_id="org-123",
+        networks=(_bound_network("N_2", "Branch", "T_1"),),
+        devices=(),
+        features=(FeatureConfiguration(SNMP_PATH, ("N_2",), {"access": "none"}),),
+    )
+    live = NetworkGraph(  # the whole network was deleted
+        organization_id="org-123", networks=(), devices=(), features=()
+    )
+    plan = plan_heal(snapshot, live, _heal_spec(tmp_path))
+
+    bind = [a for a in plan.missing.actions if "/bind" in a.api_path]
+    assert [a.path_values for a in bind] == [("N_2",)]
+    assert not [i for i in plan.missing.unrestorable if "/bind" in i.api_path]
 
 
 def test_plan_heal_classifies_missing_vs_surviving(tmp_path: Path) -> None:
