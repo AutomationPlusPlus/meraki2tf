@@ -1923,11 +1923,23 @@ def _diff_networks_run(config: RuntimeConfig) -> int:
         return 2
     print(render_network_comparison(comparison))
     if config.diff_out is not None:
-        config.diff_out.parent.mkdir(parents=True, exist_ok=True)
-        config.diff_out.write_text(
-            json.dumps(comparison_payload(comparison), indent=2) + "\n",
-            encoding="utf-8",
-        )
+        try:
+            config.diff_out.parent.mkdir(parents=True, exist_ok=True)
+            config.diff_out.write_text(
+                json.dumps(comparison_payload(comparison), indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            # Every other unwritable-path in the CLI answers with one
+            # CRITICAL line; this one raised through main() and printed
+            # a traceback on top of an otherwise complete report.
+            logger.critical(
+                "Cross-network diff could not be written to %s: %s. The "
+                "comparison above is complete — re-run with a writable "
+                "--diff-out path to capture it as JSON.",
+                config.diff_out, exc,
+            )
+            return 1
         logger.info(
             "Cross-network diff JSON written to %s (attribute names "
             "only — values are never written).",

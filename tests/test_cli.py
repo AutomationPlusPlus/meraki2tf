@@ -5038,6 +5038,34 @@ def test_diff_networks_offline_reports_and_writes_json(
     assert "512" not in diff_out.read_text(encoding="utf-8")
 
 
+def test_diff_networks_unwritable_diff_out_is_a_clean_error(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An unwritable --diff-out reports one CRITICAL line, not a traceback.
+
+    Regression (E2E r7): the write raised straight through main(), so a
+    complete comparison was followed by a stack trace — every other
+    unwritable-path in the CLI answers with a diagnostic.
+    """
+    _no_network(monkeypatch)
+    blocked = tmp_path / "blocked"
+    blocked.write_text("not a directory", encoding="utf-8")
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(_diff_dump(tmp_path)),
+         "--diff-networks", "HQ", "Branch",
+         "--diff-out", str(blocked / "sub" / "diff.json")]
+    )
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "Cross-network diff could not be written" in captured.err
+    assert "Traceback" not in captured.err
+    # The report itself still reached the operator.
+    assert "Cross-network configuration diff" in captured.out
+
+
 def test_diff_networks_ambiguous_or_same_pattern_exits_2(
     spec_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
