@@ -103,6 +103,22 @@ the project adheres to [Semantic Versioning](https://semver.org/).
   and every operator-facing message are unchanged.
 
 ### Fixed
+- A **truncated snapshot is no longer read as a whole organization**.
+  The v2 stream format had no end-of-stream marker, so a snapshot cut
+  short in transit — a complete gzip member holding half the records, a
+  `.jsonl` cut on a line boundary by a full disk or a partial blob
+  download — parsed cleanly and every consumer treated the surviving
+  fraction as the entire org. An 821-record capture cut to 32 records
+  produced a DR kit, exit 0, and a confident "90.32% coverage" over 31
+  assets with no hint that 96% of the organization was missing;
+  `--restore` would have rebuilt that fragment and called it a success.
+  Snapshots now end with a counted `meraki2tfSnapshotEnd` record and
+  their header declares it, so readers refuse a file that is truncated,
+  is missing records from the middle, or has a second snapshot
+  concatenated onto it. Snapshots written before this change carry no
+  such claim and still load — with a warning that their completeness
+  cannot be verified — so the weekly job's rotated `--drift-baseline`
+  survives the upgrade.
 - Drift alerts label a reordering as an order change instead of a value
   edit, in the digest the operator actually reads (#115, #116): the ORDER_CHANGED marker was computed only for
   the attribute's own value, so a list reordered one level down (a

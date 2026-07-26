@@ -430,3 +430,121 @@ def test_snapshot_spec_fingerprint_is_optional_and_backward_compatible(
     legacy = StaticJsonDataProvider(dump_file)
     assert legacy.snapshot_spec_version is None
     assert legacy.snapshot_spec_sha256 is None
+
+
+def _v2_lines(path: Path) -> list[str]:
+    return path.read_text(encoding="utf-8").splitlines()
+
+
+def _rewrite(path: Path, lines: list[str]) -> Path:
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def test_v2_snapshot_ends_with_a_counted_trailer(tmp_path: Path) -> None:
+    """The end-of-stream record is the only proof the writer finished;
+    without it a truncated copy is indistinguishable from a small org."""
+    graph = _payload_graph()
+    path = write_snapshot(graph, tmp_path / "snap.jsonl")
+    lines = _v2_lines(path)
+
+    header = json.loads(lines[0])
+    assert header[snapshot.SNAPSHOT_V2_TRAILER_FLAG] is True
+    trailer = json.loads(lines[-1])
+    assert trailer["kind"] == snapshot.SNAPSHOT_V2_TRAILER_KIND
+    assert trailer["records"] == len(lines) - 2
+    # The trailer is bookkeeping, never a graph record.
+    reloaded = StaticJsonDataProvider(path).fetch_network_graph()
+    assert reloaded == graph
+
+
+def test_truncated_v2_snapshot_is_refused(tmp_path: Path) -> None:
+    """A snapshot cut short in transit parses fine and every consumer
+    would read the surviving fraction as the whole organization."""
+    from meraki2tf.providers.dump import MalformedDumpError
+
+    path = write_snapshot(_payload_graph(), tmp_path / "snap.jsonl")
+    _rewrite(path, _v2_lines(path)[:-2])
+
+    with pytest.raises(MalformedDumpError, match="TRUNCATED"):
+        StaticJsonDataProvider(path).fetch_network_graph()
+
+
+def test_v2_snapshot_with_lost_records_is_refused(tmp_path: Path) -> None:
+    """Records dropped from the middle leave the trailer intact; only
+    the count catches it."""
+    from meraki2tf.providers.dump import MalformedDumpError
+
+    path = write_snapshot(_payload_graph(), tmp_path / "snap.jsonl")
+    lines = _v2_lines(path)
+    _rewrite(path, lines[:1] + lines[2:])
+
+    with pytest.raises(MalformedDumpError, match="CORRUPT"):
+        StaticJsonDataProvider(path).fetch_network_graph()
+
+
+@pytest.mark.parametrize("extra", ["concatenated", "appended"])
+def test_records_after_the_trailer_are_refused(tmp_path: Path, extra: str) -> None:
+    """`cat a.jsonl b.jsonl` merges one org's records into another's
+    header; an append does the same on a smaller scale."""
+    from meraki2tf.providers.dump import MalformedDumpError
+
+    path = write_snapshot(_payload_graph(), tmp_path / "snap.jsonl")
+    lines = _v2_lines(path)
+    tail = lines if extra == "concatenated" else [lines[1]]
+    _rewrite(path, lines + tail)
+
+    with pytest.raises(MalformedDumpError, match="end-of-stream record"):
+        StaticJsonDataProvider(path).fetch_network_graph()
+
+
+def test_trailer_with_an_unusable_count_is_refused(tmp_path: Path) -> None:
+    """A non-integer count proves nothing; treating it as satisfied
+    would hand truncation a trivial bypass."""
+    from meraki2tf.providers.dump import MalformedDumpError
+
+    path = write_snapshot(_payload_graph(), tmp_path / "snap.jsonl")
+    lines = _v2_lines(path)
+    lines[-1] = json.dumps(
+        {"kind": snapshot.SNAPSHOT_V2_TRAILER_KIND, "records": True}
+    )
+    _rewrite(path, lines)
+
+    with pytest.raises(MalformedDumpError, match="no usable record count"):
+        StaticJsonDataProvider(path).fetch_network_graph()
+
+
+def test_pre_trailer_snapshots_still_load_with_a_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Snapshots written by older meraki2tf carry no completeness claim.
+    The weekly job feeds last week's snapshot to this week's run, so the
+    first run after an upgrade must not fail — but the operator has to
+    know the file cannot be verified."""
+    path = write_snapshot(_payload_graph(), tmp_path / "snap.jsonl")
+    lines = _v2_lines(path)
+    header = json.loads(lines[0])
+    del header[snapshot.SNAPSHOT_V2_TRAILER_FLAG]
+    _rewrite(path, [json.dumps(header)] + lines[1:-1])
+
+    with caplog.at_level("WARNING", logger="meraki2tf.providers.dump"):
+        loaded = StaticJsonDataProvider(path).fetch_network_graph()
+
+    assert loaded == _payload_graph()
+    assert any("predates end-of-stream" in r.message for r in caplog.records)
+
+
+def test_trailer_without_the_header_flag_is_still_enforced(
+    tmp_path: Path,
+) -> None:
+    """A hand-edited header must not disarm the proof that is present."""
+    from meraki2tf.providers.dump import MalformedDumpError
+
+    path = write_snapshot(_payload_graph(), tmp_path / "snap.jsonl")
+    lines = _v2_lines(path)
+    header = json.loads(lines[0])
+    del header[snapshot.SNAPSHOT_V2_TRAILER_FLAG]
+    _rewrite(path, [json.dumps(header)] + lines[2:])
+
+    with pytest.raises(MalformedDumpError, match="CORRUPT"):
+        StaticJsonDataProvider(path).fetch_network_graph()

@@ -66,6 +66,29 @@ def graph_to_snapshot(graph: NetworkGraph) -> dict[str, Any]:
 SNAPSHOT_V2_MARKER = "meraki2tfSnapshot"
 SNAPSHOT_V2_VERSION = 2
 
+#: ``kind`` of the v2 stream's final record — the end-of-stream proof.
+#:
+#: Local writes are already crash-safe (temp file + rename + fsync), but
+#: a snapshot is a *transported* artifact: uploaded to blob storage,
+#: rotated in as next week's ``--drift-baseline``, copied to an
+#: air-gapped host. Any of those can deliver a well-formed prefix — a
+#: complete gzip member holding half the records, or a ``.jsonl`` cut on
+#: a line boundary — and every line-oriented reader would accept it as a
+#: whole-organization capture. Nothing in the format said "this is the
+#: end", so a half-captured org read as a small org: coverage reported a
+#: confident percentage of the fraction that survived, and --restore
+#: would rebuild that fraction and call it a success.
+SNAPSHOT_V2_TRAILER_KIND = "meraki2tfSnapshotEnd"
+
+#: Header flag announcing that this writer emits the trailer above.
+#:
+#: Readers need it to tell "truncated" from "written by an older
+#: meraki2tf": snapshots in the field predate the trailer, and the
+#: weekly job feeds last week's snapshot to this week's run, so a blanket
+#: refusal would break the first run after an upgrade. Flag present ⇒
+#: the trailer is mandatory and a missing one is corruption.
+SNAPSHOT_V2_TRAILER_FLAG = "trailer"
+
 #: Suffixes selecting the v2 stream format from --dump-to paths.
 _V2_SUFFIXES = (".jsonl.gz", ".jsonl")
 
@@ -234,6 +257,7 @@ def _write_snapshot_v2(
     header: dict[str, Any] = {
         SNAPSHOT_V2_MARKER: SNAPSHOT_V2_VERSION,
         "organizationId": graph.organization_id,
+        SNAPSHOT_V2_TRAILER_FLAG: True,
     }
     if sanitized:
         header["sanitized"] = True
@@ -310,3 +334,20 @@ def _write_v2_records(
             )
             + "\n"
         )
+    # End-of-stream proof, written last on purpose: reaching this line
+    # means every record above it made it out of the writer. The count
+    # catches the subtler corruption a bare marker misses — records lost
+    # from the middle of a stream that still ends correctly.
+    handle.write(
+        json.dumps(
+            {
+                "kind": SNAPSHOT_V2_TRAILER_KIND,
+                "records": (
+                    len(graph.networks)
+                    + len(graph.devices)
+                    + len(graph.features)
+                ),
+            }
+        )
+        + "\n"
+    )

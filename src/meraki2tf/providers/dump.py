@@ -92,7 +92,7 @@ def _load_snapshot_document(path: "Path") -> Any:
     detected by content (gzip magic / header marker), not by filename,
     so renamed files keep working.
     """
-    from meraki2tf.snapshot import SNAPSHOT_V2_MARKER
+    from meraki2tf.snapshot import SNAPSHOT_V2_MARKER, SNAPSHOT_V2_TRAILER_KIND
 
     with path.open("rb") as sniff:
         raw = sniff.read(2)
@@ -109,10 +109,28 @@ def _load_snapshot_document(path: "Path") -> Any:
             features: list[Any] = []
             buckets = {"network": networks, "device": devices, "feature": features}
             dropped = 0
+            trailer: dict[str, Any] | None = None
             for line in handle:
                 if not line.strip():
                     continue
                 record = json.loads(line)
+                if trailer is not None:
+                    # Anything at all past the end-of-stream record — a
+                    # second snapshot's header from `cat a b > c`, a
+                    # hand-appended object, another trailer — means one
+                    # document's records are being merged into another's
+                    # organization.
+                    raise MalformedDumpError(
+                        f"Snapshot {path} has records after its "
+                        "end-of-stream record; the file has been "
+                        "appended to or concatenated. Re-export it."
+                    )
+                if (
+                    isinstance(record, dict)
+                    and record.get("kind") == SNAPSHOT_V2_TRAILER_KIND
+                ):
+                    trailer = record
+                    continue
                 if not isinstance(record, dict):
                     # Valid JSON but not an object: just as lost as an
                     # unknown kind — it must count toward the loud
@@ -136,6 +154,12 @@ def _load_snapshot_document(path: "Path") -> Any:
                     "be corrupted.",
                     path, dropped,
                 )
+            _verify_stream_complete(
+                path,
+                head,
+                trailer,
+                len(networks) + len(devices) + len(features),
+            )
             # Known header keys only — a new v2 header field must be
             # added here too, or it silently vanishes on read.
             return {
@@ -150,6 +174,68 @@ def _load_snapshot_document(path: "Path") -> Any:
             }
         rest = handle.read()
     return json.loads(first + rest)
+
+
+def _verify_stream_complete(
+    path: "Path",
+    header: dict[str, Any],
+    trailer: dict[str, Any] | None,
+    read: int,
+) -> None:
+    """Refuse a v2 snapshot that cannot prove it is whole.
+
+    A truncated snapshot is the DR failure mode with no symptom: it
+    parses, it carries a valid header, and every consumer treats the
+    surviving fraction as the whole organization. Coverage then reports
+    a confident percentage of a partial capture, ``--drift-baseline``
+    calls the missing remainder additions, and ``--restore`` rebuilds a
+    fragment and exits 0. The trailer written by :mod:`meraki2tf.
+    snapshot` is the only evidence the writer reached the end, so a
+    snapshot that claims to have one and does not is refused outright.
+
+    Snapshots written before the trailer existed carry no claim, so they
+    stay readable — with a warning, because their completeness is
+    genuinely unknowable.
+    """
+    from meraki2tf.snapshot import SNAPSHOT_V2_TRAILER_FLAG
+
+    if not header.get(SNAPSHOT_V2_TRAILER_FLAG):
+        if trailer is None:
+            logger.warning(
+                "Snapshot %s predates end-of-stream verification: it "
+                "carries no record count, so a truncated copy cannot be "
+                "distinguished from a complete one. Re-export it to get "
+                "a verifiable snapshot.",
+                path,
+            )
+            return
+        # Trailer without the header flag: a hand-edited header, or a
+        # file assembled by something other than this writer. The proof
+        # is present, so use it rather than trusting the missing claim.
+    if trailer is None:
+        raise MalformedDumpError(
+            f"Snapshot {path} is TRUNCATED: its header declares an "
+            "end-of-stream record that the file does not contain, so "
+            f"the {read} record(s) read are only part of the capture. "
+            "Refusing to treat a partial snapshot as a whole "
+            "organization — re-export it, or re-fetch the copy that was "
+            "cut short in transit."
+        )
+    expected = trailer.get("records")
+    if not isinstance(expected, int) or isinstance(expected, bool):
+        raise MalformedDumpError(
+            f"Snapshot {path} has an end-of-stream record with no usable "
+            f"record count ({expected!r}); its completeness cannot be "
+            "verified. Re-export it."
+        )
+    if expected != read:
+        raise MalformedDumpError(
+            f"Snapshot {path} is CORRUPT: its end-of-stream record "
+            f"counts {expected} record(s) but {read} were read. Records "
+            "were lost or altered after the snapshot was written — "
+            "re-export it, or re-fetch the copy that was damaged in "
+            "transit."
+        )
 
 
 _NESTED_MARKER = "organizations"
