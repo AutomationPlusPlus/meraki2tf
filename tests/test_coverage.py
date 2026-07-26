@@ -56,6 +56,7 @@ def test_build_manifest_statuses_totals_and_percentage() -> None:
         "unsupported": 1,
         "duplicate_id": 0,
         "write_only_endpoints": 0,
+        "unmanageable_relationships": 0,
     }
     assert manifest["coverage_percent"] == 66.67
     by_status = {entry["status"] for entry in manifest["objects"]}
@@ -246,6 +247,43 @@ def test_summary_counts_write_only_endpoints_beside_the_objects(
     assert "Plus write-only endpoints : 1" in summary
 
 
+def test_relationship_gaps_are_counted_apart_from_write_only_endpoints(
+    tmp_path: Path,
+) -> None:
+    """A config-template binding is not a write-only endpoint.
+
+    Both are gaps that are not discovered objects, so both live in
+    spec_gap_count for reconciliation — but the manifest must name each
+    for what it is rather than filing a binding under 'never readable'.
+    """
+    unsupported = (
+        UnsupportedAsset(
+            api_path="/networks/{networkId}/sm/devices/fields",
+            reason="write-only endpoint: the API offers no way to read it",
+            identifiers=(),
+        ),
+        UnsupportedAsset(
+            api_path="/networks/{networkId}/bind",
+            reason="the network is bound to a config template …",
+            identifiers=("N_1",),
+        ),
+    )
+    manifest = build_manifest(
+        organization_id="org-123",
+        captured=CAPTURED,
+        unsupported=unsupported,
+        state_addresses=frozenset(),
+        spec_gap_count=2,
+        relationship_gap_count=1,
+    )
+    assert manifest["totals"]["write_only_endpoints"] == 1
+    assert manifest["totals"]["unmanageable_relationships"] == 1
+    write_manifest(manifest, tmp_path)
+    summary = (tmp_path / COVERAGE_SUMMARY_FILENAME).read_text(encoding="utf-8")
+    assert "Plus write-only endpoints : 1" in summary
+    assert "Plus unmanageable relationships : 1" in summary
+
+
 def test_partial_scope_stamps_manifest_and_summary(tmp_path: Path) -> None:
     """A scoped (--only) run must never leave a plausible-looking
     full-org manifest behind (Cardinal Rule 2): both artifacts carry
@@ -303,6 +341,7 @@ def test_duplicate_records_count_and_render(tmp_path: Path) -> None:
         "unsupported": 0,
         "duplicate_id": 1,
         "write_only_endpoints": 0,
+        "unmanageable_relationships": 0,
     }
     assert manifest["coverage_percent"] == 100.0
     duplicate = next(

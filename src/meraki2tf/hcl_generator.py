@@ -177,10 +177,15 @@ class GenerationReport:
     #: Assets whose import ID another captured asset already carries;
     #: explicit records so coverage totals reconcile against the graph.
     duplicates: tuple[DuplicateAsset, ...] = ()
-    #: How many ``unsupported`` entries are spec-level findings (write-
-    #: only endpoints) rather than discovered graph objects — the
-    #: coverage reconciliation must not expect them in the graph count.
+    #: How many ``unsupported`` entries are NOT discovered graph
+    #: objects — write-only endpoints plus unmanageable relationships —
+    #: so coverage reconciliation does not expect them in the graph
+    #: count.
     spec_gap_count: int = 0
+    #: The relationship share of ``spec_gap_count`` (config-template
+    #: bindings). Counted apart so the manifest can name each kind for
+    #: what it is instead of filing a binding under "write-only".
+    relationship_gap_count: int = 0
 
     @property
     def captured_addresses(self) -> frozenset[str]:
@@ -466,6 +471,7 @@ class HclImportGenerator:
             unreadable_types=frozenset(unreadable_types),
             duplicates=tuple(duplicates),
             spec_gap_count=len(spec_gaps),
+            relationship_gap_count=len(binding_gaps),
         )
 
     @staticmethod

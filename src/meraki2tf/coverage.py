@@ -75,6 +75,7 @@ def build_manifest(
     duplicates: tuple[DuplicateAsset, ...] = (),
     discovered_assets: int | None = None,
     spec_gap_count: int = 0,
+    relationship_gap_count: int = 0,
     excluded_rpc_paths: tuple[str, ...] = (),
     api_read_only_paths: tuple[str, ...] = (),
     suspect_endpoints: tuple[SuspectEndpoint, ...] = (),
@@ -164,7 +165,11 @@ def build_manifest(
         "pending_import": len(captured) - imported,
         "unsupported": graph_unsupported,
         "duplicate_id": len(duplicates),
-        "write_only_endpoints": spec_gap_count,
+        # spec_gap_count covers everything that is not a graph object;
+        # the relationship share is named separately so a config-template
+        # binding is never filed under "write-only endpoint".
+        "write_only_endpoints": spec_gap_count - relationship_gap_count,
+        "unmanageable_relationships": relationship_gap_count,
     }
     if unaccounted:
         logger.warning(
@@ -295,6 +300,13 @@ def _render_summary(manifest: dict[str, Any]) -> str:
         "(covered by their primary record)",
         f"Coverage           : {manifest['coverage_percent']}%",
     ]
+    if totals.get("unmanageable_relationships"):
+        lines += [
+            f"Plus unmanageable relationships : "
+            f"{totals['unmanageable_relationships']} (config-template "
+            "bindings no provider attribute expresses — listed below and "
+            "counted separately from the objects above)",
+        ]
     if totals.get("write_only_endpoints"):
         # Listed with the unsupported objects below but NOT part of the
         # `unsupported` count above, because they are endpoints rather

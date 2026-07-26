@@ -1411,6 +1411,7 @@ def test_coverage_manifest_written_every_run(tmp_path: Path, api_key: None) -> N
         "unsupported": 1,
         "duplicate_id": 0,
         "write_only_endpoints": 0,
+        "unmanageable_relationships": 0,
         "unaccounted": -3,
     }
     statuses = {
