@@ -244,10 +244,11 @@ class PipelineOrchestrator:
                 graph.asset_count(), graph.organization_id, self._provider.mode,
             )
 
-            snapshot_drift: str | None = None
+            pending_drift: tuple[str, str] | None = None
             if self._drift_baseline is not None:
                 stage = "snapshot drift comparison"
-                snapshot_drift = self._compare_snapshot_baseline(graph)
+                pending_drift = self._compare_snapshot_baseline(graph)
+            snapshot_drift = pending_drift[0] if pending_drift else None
 
             stage = "workspace preparation"
             self._runner.prepare_workspace()
@@ -309,6 +310,11 @@ class PipelineOrchestrator:
                 len(report.unsupported),
             )
             unsupported_details = unsupported_payload(report.unsupported)
+            if pending_drift is not None:
+                stage = "snapshot drift alert"
+                self._dispatch_snapshot_drift(
+                    pending_drift, unsupported_details
+                )
 
             stage = "deletion review"
             deletions_pending: tuple[str, ...]
@@ -1235,13 +1241,19 @@ class PipelineOrchestrator:
             return None
         return None  # pragma: no cover - every loop arm returns/continues
 
-    def _compare_snapshot_baseline(self, graph: NetworkGraph) -> str | None:
+    def _compare_snapshot_baseline(
+        self, graph: NetworkGraph
+    ) -> tuple[str, str] | None:
         """API-to-API drift: fresh discovery vs the baseline snapshot.
 
         Sees drift classes the terraform comparison cannot (provider-
-        inexpressible objects, secret values) in seconds, offline. Real
-        differences dispatch the mandated DRIFT_DETECTED alert with an
-        attribute-naming digest — never values.
+        inexpressible objects, secret values) in seconds, offline.
+
+        Returns ``(summary, rendered diff)`` for
+        :meth:`_dispatch_snapshot_drift`, or ``None`` when the org is
+        unchanged. The comparison runs here — early, offline, before the
+        expensive generation pass — but the alert cannot be sent until
+        the coverage gaps it must carry are known.
         """
         from meraki2tf.snapshot_diff import baseline_drift, render_diff
 
@@ -1252,18 +1264,37 @@ class PipelineOrchestrator:
             logger.info("Snapshot drift vs baseline: none.")
             return None
         summary = drift.summary()
+        logger.warning("Snapshot drift vs baseline (%s).", summary)
+        return summary, render_diff(drift)
+
+    def _dispatch_snapshot_drift(
+        self,
+        drift: tuple[str, str],
+        unsupported_details: list[dict[str, Any]],
+    ) -> None:
+        """Send the snapshot-diff DRIFT_DETECTED alert with its gaps.
+
+        Deliberately deferred until generation has classified the org:
+        the drift alert is the WARNING-severity event that pages someone
+        on a drifted week (RUN_SUCCESS is INFO and never pages), so it
+        is the one payload that must carry the manual-rebuild list. Sent
+        at comparison time it reported ``unsupported_count: 0`` on an
+        organization with dozens of gaps — not an omission but a false
+        statement, to the operator and to anything triaging the payload.
+        """
+        summary, diff = drift
         logger.warning(
-            "Snapshot drift vs baseline (%s); dispatching DRIFT_DETECTED "
-            "alert.", summary,
+            "Dispatching DRIFT_DETECTED alert for snapshot drift (%s) "
+            "with %d coverage gap(s).", summary, len(unsupported_details),
         )
         self._dispatcher.dispatch(
             drift_detected(
-                diff=render_diff(drift),
+                diff=diff,
                 workspace=str(self._runner.workdir),
+                unsupported=unsupported_details,
                 origin="snapshot-diff",
             )
         )
-        return summary
 
     def _materialize_state(
         self, unsupported_details: list[dict[str, Any]]

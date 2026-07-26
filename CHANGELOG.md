@@ -103,6 +103,16 @@ the project adheres to [Semantic Versioning](https://semver.org/).
   and every operator-facing message are unchanged.
 
 ### Fixed
+- The snapshot-diff drift alert now carries the coverage gaps it always
+  claimed to. On the weekly snapshot-only job `DRIFT_DETECTED` is the
+  WARNING-severity event that pages someone (`RUN_SUCCESS` is INFO and
+  never pages), so it is the payload that must carry the manual-rebuild
+  list — but it was dispatched during the baseline comparison, before
+  generation had classified the organization, and so reported
+  `unsupported_count: 0` and `unsupported: []` on an org with 38 gaps.
+  Not an omission but a false statement, to the operator and to
+  anything triaging the payload. The comparison still runs early and
+  offline; only the dispatch moved to after the gaps are known.
 - A **truncated snapshot is no longer read as a whole organization**.
   The v2 stream format had no end-of-stream marker, so a snapshot cut
   short in transit — a complete gzip member holding half the records, a
