@@ -104,6 +104,25 @@ WRITE_ONLY_REASON = (
     "discovery and must be verified manually."
 )
 
+#: The endpoint that binds a network to a config template, and the
+#: network-payload key recording the relationship. Terraform's
+#: meraki_network resource has no attribute for it, so a network that
+#: is bound in Meraki comes back standalone from a kit rebuild.
+NETWORK_BIND_PATH = "/networks/{networkId}/bind"
+CONFIG_TEMPLATE_REFERENCE = "configTemplateId"
+
+#: Exception-auditor reason for a config-template binding the kit
+#: cannot carry. The network itself imports fine — the *relationship*
+#: is what no provider attribute expresses, and losing it silently
+#: would return a template-governed site as a standalone one.
+TEMPLATE_BINDING_REASON = (
+    "the network is bound to a config template, and the "
+    "CiscoDevNet/meraki provider has no attribute expressing that "
+    "binding: a Terraform rebuild recreates the network STANDALONE. "
+    "Re-bind it after '--rebuild --confirm' (the direct-API "
+    "'--restore' path rebinds it automatically)."
+)
+
 
 @dataclass(frozen=True)
 class DuplicateAsset:
@@ -401,6 +420,24 @@ class HclImportGenerator:
             )
             for path in self.spec_surfaces().write_only_paths
         )
+        # Config-template bindings: captured on the network object, but
+        # no provider attribute carries them, so the kit rebuilds a
+        # bound site standalone. Flagged the same way so the operator
+        # meets it in the manifest, the runbook and the alerts rather
+        # than discovering it after a rebuild (Cardinal Rule 2).
+        binding_gaps = tuple(
+            self._flag(
+                ImportCandidate(
+                    api_path=NETWORK_BIND_PATH,
+                    id_values=(network.network_id,),
+                ),
+                TEMPLATE_BINDING_REASON,
+                audit=audit,
+            )
+            for network in graph.networks
+            if network.payload.get(CONFIG_TEMPLATE_REFERENCE)
+        )
+        spec_gaps += binding_gaps
         unsupported.extend(spec_gaps)
 
         imports_file = workdir / IMPORTS_FILENAME
