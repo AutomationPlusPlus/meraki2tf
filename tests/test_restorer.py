@@ -3107,6 +3107,26 @@ def test_default_flag_key_detects_truthy_isdefault_variants() -> None:
     assert _default_flag_key({"isDefault": False}) is None
     assert _default_flag_key({}) is None
     assert _default_flag_key({"isDefault": "true"}) is None  # literal True only
+    # Regression (E2E r7): the built-in RF profiles every wireless
+    # network is born with are flagged is<Indoor|Outdoor>Default, which
+    # the isDefault-prefix match missed — so a restore recreated them
+    # beside the target's own instead of adopting them.
+    assert _default_flag_key(
+        {"name": "Basic Indoor Profile", "isIndoorDefault": True,
+         "isOutdoorDefault": False}
+    ) == "isIndoorDefault"
+    assert _default_flag_key(
+        {"name": "Basic Outdoor Profile", "isIndoorDefault": False,
+         "isOutdoorDefault": True}
+    ) == "isOutdoorDefault"
+    # A custom profile carries the same keys, both false: a normal create.
+    assert _default_flag_key(
+        {"name": "custom", "isIndoorDefault": False,
+         "isOutdoorDefault": False}
+    ) is None
+    # Unrelated is*-shaped keys must not be read as a default flag.
+    assert _default_flag_key({"isEnabled": True}) is None
+    assert _default_flag_key({"defaultsTo": True}) is None
 
 
 def test_match_collection_item_falls_back_through_natural_keys() -> None:
@@ -3282,6 +3302,72 @@ def _staged_spec(tmp_path: Path) -> OpenApiParser:
     path = tmp_path / "staged-adopt-spec.json"
     path.write_text(json.dumps(spec), encoding="utf-8")
     return OpenApiParser(path)
+
+
+def test_indoor_default_flagged_creates_adopt_the_provisioned_default(
+    tmp_path: Path,
+) -> None:
+    """Regression (E2E r7): an ``is<Indoor|Outdoor>Default`` object is a
+    Meraki-provisioned default too.
+
+    Every wireless network is born with a 'Basic Indoor Profile' and a
+    'Basic Outdoor Profile'. Their flags did not match the isDefault
+    prefix, so a restore created a second copy of each beside the
+    target's own — six surplus RF profiles across three networks in the
+    round-7 drill, because the sanitized snapshot's pseudonymized names
+    also defeated the adopt-by-name fallback that had been hiding it.
+    """
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    parser = _staged_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(
+            STAGED_GROUP_ITEM, ("N_1", "id-0032"),
+            # Shaped like a sanitized built-in RF profile: pseudonymized
+            # name, real flag.
+            {"groupId": "id-0032", "name": "name-afd96bce79e55a56",
+             "isIndoorDefault": True, "isOutdoorDefault": False},
+        ),
+    )
+    plan = plan_restore(graph, parser)
+    calls: list = []
+
+    class Section(_RecordingSection):
+        def getNetworkFirmwareUpgradesStagedGroups(
+            self, networkId: str
+        ) -> list[dict]:
+            self._calls.append(
+                ("getNetworkFirmwareUpgradesStagedGroups", (networkId,), {})
+            )
+            return [
+                {"groupId": "indoor", "name": "Basic Indoor Profile",
+                 "isIndoorDefault": True, "isOutdoorDefault": False},
+                {"groupId": "outdoor", "name": "Basic Outdoor Profile",
+                 "isIndoorDefault": False, "isOutdoorDefault": True},
+            ]
+
+    section = Section(calls)
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "j.jsonl"), skip_claims=True
+    )
+    restorer._client = SimpleNamespace(
+        organizations=section, networks=section
+    )
+    result = restorer.execute(graph, plan)
+
+    assert result.failed == ()
+    ops = [c[0] for c in calls]
+    assert "createNetworkFirmwareUpgradesStagedGroup" not in ops  # adopted
+    assert f"{STAGED_GROUP_ITEM}::N_1,id-0032" in result.executed
+    # The indoor built-in was adopted — not the outdoor one beside it.
+    aligned = next(
+        c for c in calls
+        if c[0] == "updateNetworkFirmwareUpgradesStagedGroup"
+    )
+    assert "indoor" in aligned[1] or aligned[2].get("groupId") == "indoor"
+    assert "outdoor" not in json.dumps([aligned[1], aligned[2]])
 
 
 def test_default_flagged_creates_adopt_the_provisioned_default(
