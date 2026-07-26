@@ -162,7 +162,30 @@ meraki2tf --rebuild --confirm --workdir ./generated
 ```
 
 `--rebuild` alone is always a dry run (`terraform plan`); nothing is
-touched until you add `--confirm`. Prefer doing it by hand? The workdir
+touched until you add `--confirm`.
+
+> **Re-run the pipeline first if anything changed the organization out of
+> band.** `--rebuild` applies whatever the workdir last captured, so a kit
+> that has fallen behind reality will push the stale version back. Two
+> ways to get there, both seen in end-to-end testing:
+>
+> - **You changed something in the dashboard.** The kit still holds the
+>   previous value and the apply reverts your change — which is exactly
+>   what the action is *for*, but only if you meant it.
+> - **A `--heal` ran.** Heal recreates a deleted object with a **new**
+>   server-assigned ID, so the kit and state still name the dead one. The
+>   plan then reads `1 to add` and a `--confirm` creates a **duplicate**
+>   of an object that already exists.
+>
+> Both cases are visible before you commit to them: the preview names
+> every resource it would create, and a pipeline run reports
+> `N resource(s) tracked in the DR kit were not discovered in Meraki
+> (deleted?)`. Reconcile with `--sync --confirm-deletions` (or
+> `--rebaseline` on a workdir whose state tracks nothing), confirm the
+> preview is `0 to add, 0 to change, 0 to destroy`, and only then add
+> `--confirm`.
+
+Prefer doing it by hand? The workdir
 is a plain Terraform root module — but note that the
 `CiscoDevNet/meraki` provider reads its credential from
 `MERAKI_API_KEY`, not `MERAKI_DASHBOARD_API_KEY` (meraki2tf bridges
