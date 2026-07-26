@@ -87,7 +87,12 @@ def build_manifest(
     ``(api_path, identifiers)`` to the direct-API restore verdict
     (``create``/``configure``/``claim`` or an ``unrestorable: reason``)
     so the manifest answers both questions: will Terraform import it,
-    and will the API rebuild it.
+    and will the API rebuild it. Every ``unsupported`` object carries a
+    verdict either way: the ones with no graph object behind them
+    (write-only endpoints and other spec-level findings) fall back to
+    ``unrestorable`` with their own recorded reason, so a consumer
+    reading the manual-rebuild list off ``restore_via`` never skips
+    one.
 
     ``scope_networks`` marks a **partial** run (``--only`` selective
     backup, or a partial ``--from-dump`` input): the manifest then
@@ -122,8 +127,18 @@ def build_manifest(
     for raw, entry in zip(unsupported, unsupported_payload(unsupported)):
         record = {"status": STATUS_UNSUPPORTED, **entry}
         verdict = restore_lookup.get((raw.api_path, raw.identifiers))
-        if verdict is not None:
-            record["restore_via"] = verdict
+        if verdict is None:
+            # Spec-level findings (write-only endpoints, unreadable
+            # surfaces) are not graph objects, so the restore planner
+            # never produced a verdict for them. Emitting the entry
+            # without one would let a consumer that groups on
+            # restore_via — the machine-readable form of the
+            # manual-rebuild runbook — drop them silently, which is
+            # exactly the blind spot Cardinal Rule 2 forbids. Nothing
+            # was captured for them, so unrestorable is the honest
+            # verdict, and their own recorded reason says why.
+            verdict = f"unrestorable: {raw.reason}"
+        record["restore_via"] = verdict
         objects.append(record)
     for duplicate in duplicates:
         objects.append(
