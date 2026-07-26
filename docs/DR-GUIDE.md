@@ -354,7 +354,12 @@ resources. Notes:
   written without `--confirm`.
 - **Snapshot must be unsanitized.** Replay reads the real secret values
   from the snapshot; a `--sanitize`d snapshot has them masked and those
-  entries are skipped (and reported).
+  entries are skipped (and reported). A sanitized snapshot additionally
+  cannot be replayed into an organization that does not already hold
+  its (pseudonymized) networks: `--confirm` refuses with exit 2, because
+  org-scoped writes would otherwise overwrite a live tenant's settings
+  with pseudonyms. Drills — replaying into the organization the same
+  sanitized snapshot was just restored into — are unaffected.
 - **New-org remapping.** A rebuilt organization issues new network IDs;
   snapshot path values are remapped to the live tenant by network
   name before each call. Values embedded *inside* payloads are not

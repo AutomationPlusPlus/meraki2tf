@@ -1842,6 +1842,60 @@ def test_replay_gaps_warns_on_sanitized_snapshots(
     assert "SANITIZED" in console
 
 
+def test_replay_gaps_confirm_refuses_a_sanitized_snapshot_elsewhere(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--confirm with a sanitized snapshot refuses an organization that
+    does not hold the snapshot's (pseudonymized) networks.
+
+    Regression (E2E r7): replaying a sanitized snapshot into an
+    unrelated live organization created a splash theme named with a
+    pseudonym and overwrote org-scoped settings there.
+    """
+    from conftest import DUMP_DOCUMENT
+
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    recorded = _install_fake_meraki_module(monkeypatch)
+    document = json.loads(json.dumps(DUMP_DOCUMENT))
+    document["sanitized"] = True
+    # A sanitized snapshot's network carries a pseudonym, which the
+    # foreign organization (live network 'HQ'/N_1) does not hold.
+    document["networks"][0]["id"] = "net-0001"
+    document["networks"][0]["name"] = "network-f98cc813f140f8cf"
+    for feature in document["features"]:
+        feature["pathValues"] = [
+            "net-0001" if value == "N_1" else value
+            for value in feature["pathValues"]
+        ]
+    document["features"].append(
+        {
+            "apiPath": "/organizations/{organizationId}/admins/{adminId}",
+            "pathValues": ["org-123", "A_1"],
+            "payload": {
+                "id": "A_1",
+                "name": "name-abc",
+                "email": "a@b.example",
+                "apiKey": "fixture-secret",
+            },
+        }
+    )
+    dump = tmp_path / "sanitized-org-scoped.json"
+    dump.write_text(json.dumps(document), encoding="utf-8")
+    exit_code = main(
+        ["--spec", str(spec_file), "--from-dump", str(dump),
+         "--org-id", "org-999", "--workdir", str(tmp_path / "ws"),
+         "--replay-gaps", "--confirm"]
+    )
+    console = capsys.readouterr().err
+    assert exit_code == 2
+    assert "SANITIZED" in console
+    assert recorded["admin"] == []  # nothing reached the organization
+
+
 def test_replay_gaps_legacy_state_filename_is_a_clean_error(
     spec_file: Path,
     tmp_path: Path,
