@@ -744,6 +744,68 @@ def test_force_delete_single_component_identity_trails_false(
     assert 'id = "W1,false"' in content
 
 
+def test_config_template_bindings_flagged_as_a_kit_gap(
+    tmp_path: Path, recorder: RecordingNotifier
+) -> None:
+    """A network bound to a config template rebuilds STANDALONE from the
+    kit, and the operator must be told.
+
+    Regression (E2E r7): the provider's meraki_network has no attribute
+    expressing the binding, so a --rebuild returns a template-governed
+    site as a standalone one — silently. Nothing in the manifest, the
+    runbook or the alerts mentioned it.
+    """
+    from meraki2tf.hcl_generator import (
+        NETWORK_BIND_PATH,
+        TEMPLATE_BINDING_REASON,
+    )
+
+    spec = {
+        "openapi": "3.0.1",
+        "paths": {
+            "/networks/{networkId}": {
+                "get": {"operationId": "getNetwork", "tags": ["networks"]},
+                "put": {"operationId": "updateNetwork", "tags": ["networks"]},
+            },
+        },
+    }
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text(json.dumps(spec), encoding="utf-8")
+    generator = HclImportGenerator(
+        OpenApiParser(spec_path), AlertDispatcher([recorder]), fixture_catalog
+    )
+    graph = NetworkGraph(
+        organization_id="org-123",
+        networks=(
+            MerakiNetwork.from_payload(
+                {"id": "N_1", "organizationId": "org-123", "name": "Bound",
+                 "productTypes": ["appliance"], "configTemplateId": "T_1"}
+            ),
+            MerakiNetwork.from_payload(
+                {"id": "N_2", "organizationId": "org-123", "name": "Free",
+                 "productTypes": ["appliance"]}
+            ),
+        ),
+        devices=(),
+        features=(),
+    )
+    report = generator.generate(graph, tmp_path)
+
+    bindings = [
+        asset for asset in report.unsupported
+        if asset.api_path == NETWORK_BIND_PATH
+    ]
+    assert [asset.identifiers for asset in bindings] == [("N_1",)]
+    assert bindings[0].reason == TEMPLATE_BINDING_REASON
+    # Counted with the spec-level gaps, so coverage totals still
+    # reconcile against the objects discovery produced.
+    assert report.spec_gap_count == len(bindings)
+    assert any(
+        event.event_type is EventType.UNSUPPORTED_FEATURE_FLAGGED
+        for event in recorder.events
+    )
+
+
 def test_write_only_endpoints_flagged_as_spec_level_gaps(
     tmp_path: Path, recorder: RecordingNotifier
 ) -> None:
