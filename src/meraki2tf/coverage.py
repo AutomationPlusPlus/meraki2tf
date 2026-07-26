@@ -295,6 +295,17 @@ def _render_summary(manifest: dict[str, Any]) -> str:
         "(covered by their primary record)",
         f"Coverage           : {manifest['coverage_percent']}%",
     ]
+    if totals.get("write_only_endpoints"):
+        # Listed with the unsupported objects below but NOT part of the
+        # `unsupported` count above, because they are endpoints rather
+        # than discovered objects — so without this line the reader
+        # counts more entries in that list than the total admits and
+        # under-reads how much needs manual verification.
+        lines += [
+            f"Plus write-only endpoints : {totals['write_only_endpoints']} "
+            "(never readable, so invisible to discovery — listed below "
+            "and counted separately from the objects above)",
+        ]
     if totals.get("unaccounted"):
         lines += [
             "",
