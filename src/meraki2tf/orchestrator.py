@@ -494,6 +494,7 @@ class PipelineOrchestrator:
                 duplicates=report.duplicates,
                 discovered_assets=graph.asset_count(),
                 spec_gap_count=report.spec_gap_count,
+                relationship_gap_count=report.relationship_gap_count,
                 excluded_rpc_paths=surfaces.rpc_only_paths,
                 api_read_only_paths=surfaces.api_read_only_paths,
                 suspect_endpoints=(
