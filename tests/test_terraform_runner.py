@@ -2349,6 +2349,97 @@ def test_prune_baseline_is_heredoc_aware(runner: TerraformRunner) -> None:
     assert 'resource "meraki_networks" "n_1"' in text  # neighbor intact
 
 
+def test_block_body_end_flags_unterminated_block() -> None:
+    """The scanner must report closer-not-found so callers can fail
+    closed instead of treating end-of-file as the block boundary."""
+    lines = ['resource "x" "a" {\n', "  body = <<EOT\n", "still open\n"]
+    end, terminated = terraform_runner._block_body_end(lines, 1)
+    assert (end, terminated) == (len(lines), False)
+    closed = ['resource "x" "a" {\n', "  name = \"HQ\"\n", "}\n"]
+    assert terraform_runner._block_body_end(closed, 1) == (2, True)
+
+
+def test_prune_baseline_quoted_double_angle_value_is_not_a_heredoc(
+    runner: TerraformRunner,
+) -> None:
+    """A block whose value holds ``<<MOVED`` (an ordinary dashboard
+    rename) must not be read as a heredoc opener: pruning an earlier
+    block must leave the hostile block and every later block intact,
+    never truncate resources.tf to EOF (Cardinal Rule 2)."""
+    runner.prepare_workspace()
+    hostile = (
+        'resource "meraki_networks" "hostile" {\n'
+        '  name = "HQ <<MOVED>> 2026"\n'
+        "}\n"
+    )
+    tail = 'resource "meraki_networks" "n_2" {\n  name = "Branch"\n}\n'
+    baseline = (
+        'resource "meraki_networks" "n_1" {\n  name = "HQ"\n}\n'
+        "\n" + hostile + "\n" + tail
+    )
+    aggregated = runner.workdir / AGGREGATED_CONFIG_FILENAME
+    aggregated.write_text(baseline, encoding="utf-8")
+    runner._prune_baseline(["meraki_networks.n_1"])
+    text = aggregated.read_text(encoding="utf-8")
+    assert 'resource "meraki_networks" "n_1"' not in text
+    assert 'name = "HQ <<MOVED>> 2026"' in text  # hostile block survives
+    assert 'resource "meraki_networks" "n_2"' in text  # later block survives
+
+
+def test_prune_baseline_skips_unterminated_block(
+    runner: TerraformRunner, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An unterminated target block (no column-0 closer before EOF) must
+    be skipped with a warning — pruning it would truncate the file and
+    silently drop later blocks while coverage.json still reports them."""
+    runner.prepare_workspace()
+    tail = 'resource "meraki_networks" "keep" {\n  name = "Keep"\n}\n'
+    baseline = (
+        'resource "meraki_x" "broken" {\n'
+        "  body = <<EOT\n"
+        "never closes\n" + tail
+    )
+    aggregated = runner.workdir / AGGREGATED_CONFIG_FILENAME
+    aggregated.write_text(baseline, encoding="utf-8")
+    with caplog.at_level("WARNING", logger="meraki2tf.terraform_runner"):
+        runner._prune_baseline(["meraki_x.broken"])
+    assert any("Skipped pruning" in r.message for r in caplog.records)
+    # File untouched: nothing truncated, the later block still present.
+    assert aggregated.read_text(encoding="utf-8") == baseline
+
+
+def test_absorb_rejects_a_mis_parsed_merged_block(
+    runner: TerraformRunner,
+) -> None:
+    """If a runaway heredoc scan folds two blocks into one, the parsed
+    block body carries a second column-0 resource opener; absorbing it
+    would write a duplicate definition that fails ``terraform validate``
+    and wedges every later run. Fail closed instead."""
+    runner.prepare_workspace()
+    generated = runner.workdir / terraform_runner.GENERATED_CONFIG_FILENAME
+    # Block "a" has an unterminated heredoc, so the splitter folds block
+    # "b" into it — the exact mis-parse the guard must catch.
+    generated.write_text(
+        'resource "meraki_x" "a" {\n'
+        "  body = <<EOT\n"
+        "}\n"
+        "\n"
+        'resource "meraki_y" "b" {\n  name = "B"\n}\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(TerraformError, match="resource openers"):
+        runner._absorb_generated_config()
+    # Nothing was written to the baseline.
+    assert not (runner.workdir / AGGREGATED_CONFIG_FILENAME).exists()
+
+
+def test_assert_no_merged_blocks_passes_clean_blocks() -> None:
+    """A well-formed block set (one opener each) must not raise."""
+    terraform_runner._assert_no_merged_blocks(
+        {"meraki_x.a": 'resource "meraki_x" "a" {\n  name = "A"\n}\n'}
+    )
+
+
 def test_verified_copies_older_than_the_stale_window_are_swept(
     runner: TerraformRunner,
 ) -> None:

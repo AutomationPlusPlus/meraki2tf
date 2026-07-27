@@ -55,6 +55,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from meraki2tf.fileio import atomic_write_text
 from meraki2tf.hcl import hcl_quote
 
 logger = logging.getLogger(__name__)
@@ -526,16 +527,51 @@ def classify_plan(document: Any) -> ReconciliationPlan:
 # ---------------------------------------------------------------------------
 
 
-#: A heredoc opener anywhere on a line: ``<<EOT`` / ``<<-EOT``.
+#: A heredoc opener as the *last* token on a line: ``<<EOT`` / ``<<-EOT``.
 #: Terraform's generator emits heredocs for multi-line strings (webhook
 #: payloadTemplate bodies, JSON blobs), whose content may well contain
-#: a ``}`` at column 0 — string data, not a block closer.
-_HEREDOC_OPENER = re.compile(r"<<-?([A-Za-z_][A-Za-z0-9_-]*)")
+#: a ``}`` at column 0 — string data, not a block closer. The trailing
+#: ``[ \t]*$`` anchor is load-bearing: hclfmt always emits a real opener
+#: last on its line, so a ``<<TAG`` sitting earlier — inside a quoted
+#: attribute value like ``name = "HQ <<MOVED>> 2026"`` (an ordinary
+#: dashboard rename) — is string data and must not open a phantom
+#: heredoc. Treating it as one makes the closer-scan run to EOF and
+#: silently truncates the DR baseline, deleting later resource blocks.
+_HEREDOC_OPENER = re.compile(r"<<-?([A-Za-z_][A-Za-z0-9_-]*)[ \t]*$")
+
+
+def _strip_quoted_spans(line: str) -> str:
+    """Return ``line`` with the contents of double-quoted strings removed.
+
+    Tracks quote state with backslash-escape handling so a ``<<TAG`` that
+    lives inside a quoted attribute value cannot be mistaken for a
+    heredoc opener even if it happens to end the quoted string. Belt to
+    the end-anchor's suspenders: anchoring alone already rejects a
+    ``<<TAG`` followed by more value text, and this additionally rejects
+    a ``<<TAG"`` that ends the quote at end of line.
+    """
+    result: list[str] = []
+    in_quote = False
+    escaped = False
+    for char in line:
+        if in_quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_quote = False
+        elif char == '"':
+            in_quote = True
+        else:
+            result.append(char)
+    return "".join(result)
 
 
 def heredoc_delimiter(line: str) -> str | None:
-    """The heredoc delimiter a line opens, if any."""
-    match = _HEREDOC_OPENER.search(line)
+    """The heredoc delimiter a line opens, if any (end-anchored,
+    quote-aware — see :data:`_HEREDOC_OPENER`)."""
+    match = _HEREDOC_OPENER.search(_strip_quoted_spans(line))
     return match.group(1) if match else None
 
 
@@ -603,7 +639,7 @@ def _edit_resource_block(
         return False
     start, end = span
     replacement = editor(text[start:end])
-    path.write_text(text[:start] + replacement + text[end:], encoding="utf-8")
+    atomic_write_text(path, text[:start] + replacement + text[end:])
     return True
 
 
@@ -627,7 +663,7 @@ def drop_resource_blocks(config_files: tuple[Path, ...], addresses: set[str]) ->
             changed = True
             removed += 1
         if changed:
-            path.write_text(text, encoding="utf-8")
+            atomic_write_text(path, text)
     return removed
 
 
@@ -645,7 +681,7 @@ def drop_import_blocks(imports_file: Path, addresses: set[str]) -> int:
         text, count = pattern.subn("", text)
         removed += count
     if removed:
-        imports_file.write_text(text, encoding="utf-8")
+        atomic_write_text(imports_file, text)
     return removed
 
 
