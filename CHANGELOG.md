@@ -103,6 +103,28 @@ the project adheres to [Semantic Versioning](https://semver.org/).
   and every operator-facing message are unchanged.
 
 ### Fixed
+- The Meraki SDK's 4.x "smart flow" rate limiter no longer persists its
+  mapping cache. Enabled by default, it writes network IDs, device
+  serials, and organization IDs to
+  `~/.meraki/.cache/rate_limit_cache.json` — outside the workdir, at the
+  process umask, retained for a week — which is an undeclared artifact of
+  tenant identifiers the security contract does not allow for. The
+  limiter itself is kept (it paces the shared 10 req/s organization
+  budget); only its cache and its log channel are switched off, in the
+  one client factory every dashboard path already goes through. An SDK
+  that exposes smart flow but not the setting that disables the cache
+  fails closed rather than silently resuming writes.
+- `requirements-lock.txt` re-resolved for the SDK's 4.x closure, which
+  replaced `aiohttp` and `requests` with `httpx`. The bumped file pinned
+  neither `httpx` nor its dependencies, so
+  `pip install --require-hashes -r requirements-lock.txt` — the
+  unattended worker install and the container image build — failed
+  outright, while still carrying an aiohttp stack nothing imports. A
+  version bump rewrites the pinned line without re-resolving what sits
+  beneath it, so `tox -e lock` now verifies the closure and the
+  hash-pinned install on every PR; the documented install commands pass
+  `--only-binary=:all:` so a missing wheel fails loudly instead of
+  building from source.
 - `--from-dump` with an `--org-id` naming a **different** organization is
   now refused instead of silently relabelling the run. The override is
   load-bearing for `--replay-gaps` (where `--org-id` names the rebuilt

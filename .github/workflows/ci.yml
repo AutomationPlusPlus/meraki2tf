@@ -43,6 +43,17 @@ jobs:
       - run: pip install tox
       - run: tox -e audit
 
+  lock:
+    name: lock closure
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - run: pip install tox
+      - run: tox -e lock
+
   test:
     name: pytest (py${{ matrix.python-version }})
     runs-on: ubuntu-latest

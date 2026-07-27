@@ -12,13 +12,13 @@ repos:
     hooks:
       - id: flake8
         name: flake8 (approved linter)
-        entry: python -m flake8 src/ tests/
+        entry: python -m flake8 src/ tests/ tools/
         language: system
         types: [python]
         pass_filenames: false
       - id: mypy
         name: mypy (strict type check)
-        entry: python -m mypy src/
+        entry: python -m mypy src/ tools/
         language: system
         types: [python]
         pass_filenames: false
