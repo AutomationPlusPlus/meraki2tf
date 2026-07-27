@@ -91,6 +91,11 @@ class ProviderCatalog:
         ``meraki`` matches, so mirrors and registry proxies work), but
         strict about identity schemas: a provider without them predates
         v1.12.0 and cannot drive import-ID composition.
+
+        Raises :class:`CatalogError` when the document has no
+        ``provider_schemas`` object, contains no Meraki provider, or
+        publishes no resource identity schemas — an empty catalog would
+        misreport every resource as unmatched.
         """
         schemas = document.get("provider_schemas")
         if not isinstance(schemas, Mapping):
@@ -124,7 +129,11 @@ class ProviderCatalog:
 
     @classmethod
     def from_cache_file(cls, path: Path) -> "ProviderCatalog":
-        """Load a catalog previously cached by :func:`resolve_catalog`."""
+        """Load a catalog previously cached by :func:`resolve_catalog`.
+
+        Raises :class:`CatalogError` when the cache file cannot be read
+        or parsed, or its payload is malformed.
+        """
         try:
             document = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:

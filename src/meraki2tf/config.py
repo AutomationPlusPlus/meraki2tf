@@ -186,7 +186,15 @@ class BackendConfig:
         config_items: list[str] | None,
         config_file: str | None,
     ) -> "BackendConfig":
-        """Parse and validate the backend flags, or raise ``BackendConfigError``."""
+        """Parse and validate the backend flags.
+
+        Raises :class:`BackendConfigError` for an unknown
+        ``--state-backend``, a malformed ``--backend-config`` item, a
+        credential-shaped key passed on the command line (secrets must
+        come from the environment, never argv or logs), backend settings
+        supplied for the local backend, or a remote backend missing a
+        required state-address key.
+        """
         try:
             backend = StateBackend(backend_name)
         except ValueError:
@@ -359,6 +367,10 @@ def load_config_file(path: Path) -> dict[str, object]:
     and credential-shaped values are refused everywhere — the file must
     never hold a secret (the API key only ever comes from the
     ``MERAKI_DASHBOARD_API_KEY`` environment variable).
+
+    Raises :class:`ConfigFileError` when the file cannot be read, is not
+    valid TOML, or carries a refused, ambiguous, or credential-shaped
+    key.
     """
     try:
         raw = path.read_bytes()
@@ -666,6 +678,9 @@ def read_api_key() -> str:
 
     Callers must pass the value directly into the SDK client and drop it;
     holding it on long-lived objects is prohibited.
+
+    Raises :class:`MissingApiKeyError` when the environment variable is
+    unset or empty — live mode cannot proceed without it.
     """
     key = os.environ.get(API_KEY_ENV_VAR, "").strip()
     if not key:

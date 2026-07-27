@@ -404,6 +404,18 @@ class StaticJsonDataProvider(MerakiDataProvider):
         return (org_id,) if org_id else ()
 
     def fetch_network_graph(self, organization_id: str | None = None) -> NetworkGraph:
+        """Reconstruct the discovered graph from an offline snapshot.
+
+        Structural parity with live discovery is the point: the same
+        :class:`NetworkGraph` is rebuilt from a static JSON file so
+        air-gapped and regression runs process identically to a live
+        sweep. Handles both the canonical snapshot contract and the
+        nested multi-parameter export shape, falling back to the
+        organization the snapshot records when none is supplied. Raises
+        :class:`MalformedDumpError` when the snapshot records no
+        organization and none is supplied, or is otherwise structurally
+        invalid.
+        """
         if _NESTED_MARKER in self._document:
             return self._graph_from_nested(organization_id)
         return self._graph_from_contract(organization_id)

@@ -111,6 +111,17 @@ class EmailNotifier(Notifier):
         return message
 
     def send(self, event: AlertEvent) -> None:
+        """Email the event to the configured recipients over SMTP.
+
+        Alert bodies carry the full resource inventory and drift diffs,
+        so the hop opportunistically upgrades to STARTTLS with a verified
+        context when the relay advertises it; a relay that advertises
+        STARTTLS but then fails to negotiate fails the send rather than
+        falling back to plaintext, closing the active-MITM downgrade. SMTP
+        credentials are read from the environment at send time and never
+        held. Raises the SMTP client's errors when connection,
+        authentication, or delivery fails.
+        """
         message = self.build_message(event)
         credentials = _read_smtp_credentials()
         with self._smtp_factory(self._host, self._port, self._timeout) as smtp:

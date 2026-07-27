@@ -185,6 +185,16 @@ def redact_diff(text: str) -> str:
 
 
 class EventType(enum.Enum):
+    """The kind of run event an alert reports.
+
+    The closed set of things a run notifies on — the read-only pipeline
+    outcomes (drift, success, unsupported features, faults, pending
+    deletions) and the human-invoked disaster-recovery actions
+    (gap replay, restore, heal, org wipe, rebuild). Each member's string
+    value is the stable identifier carried on the wire, so notification
+    consumers can route on it without parsing prose.
+    """
+
     DRIFT_DETECTED = "DRIFT_DETECTED"
     RUN_SUCCESS = "RUN_SUCCESS"
     UNSUPPORTED_FEATURE_FLAGGED = "UNSUPPORTED_FEATURE_FLAGGED"
@@ -210,6 +220,13 @@ class EventType(enum.Enum):
 
 
 class EventSeverity(enum.Enum):
+    """How urgently an alert should be surfaced.
+
+    Maps onto the severity vocabulary the transports expect (e.g.
+    PagerDuty), letting a channel escalate a ``CRITICAL`` fault while
+    routing an ``INFO`` run-success notification quietly.
+    """
+
     INFO = "info"
     WARNING = "warning"
     CRITICAL = "critical"

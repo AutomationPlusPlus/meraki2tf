@@ -307,6 +307,17 @@ class LiveApiDataProvider(MerakiDataProvider):
         return client
 
     def fetch_network_graph(self, organization_id: str | None = None) -> NetworkGraph:
+        """Discover the whole organization live via the Meraki SDK.
+
+        Lists networks and devices, then walks the spec-derived feature
+        surface (optionally restricted by an ``--only`` scope and resumed
+        from a discovery checkpoint) into a single :class:`NetworkGraph`.
+        Completeness is favoured over speed — a DR kit missing objects is
+        a false sense of safety. Read-only: no call mutates Meraki.
+
+        Raises :class:`ValueError` when no ``organization_id`` is given —
+        live mode cannot guess which organization to read.
+        """
         if not organization_id:
             raise ValueError("Live mode requires an explicit organization ID.")
         # Opened before any API call: an identity mismatch (wrong org,
@@ -1020,4 +1031,10 @@ class LiveApiDataProvider(MerakiDataProvider):
         return method(**params)
 
     def close(self) -> None:
+        """Drop the cached SDK client so its session is released.
+
+        The client holds the API key only transiently; clearing the
+        reference lets the transport (and the token with it) be garbage
+        collected once the run's discovery is done.
+        """
         self._client = None

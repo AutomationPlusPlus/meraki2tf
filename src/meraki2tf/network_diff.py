@@ -83,7 +83,12 @@ class NetworkComparison:
 def resolve_network(
     networks: Sequence[MerakiNetwork], pattern: str
 ) -> MerakiNetwork:
-    """Exactly one network for a pattern, or refuse listing candidates."""
+    """Exactly one network for a pattern, or refuse listing candidates.
+
+    Raises :class:`NetworkResolutionError` when the pattern matches no
+    network or more than one — a diff needs a single unambiguous network
+    on each side.
+    """
     if pattern.lower().startswith("network:"):
         # Muscle memory from --only's selector syntax ("network:HQ*");
         # --diff-networks patterns are bare, but refusing over the
@@ -163,7 +168,12 @@ def compare_networks(
     pattern_b: str,
     parser: OpenApiParser | None = None,
 ) -> NetworkComparison:
-    """Diff two networks of one discovered graph, feature by feature."""
+    """Diff two networks of one discovered graph, feature by feature.
+
+    Raises :class:`NetworkResolutionError` when either pattern fails to
+    resolve to exactly one network (via :func:`resolve_network`) or when
+    both patterns resolve to the same network.
+    """
     network_a = resolve_network(graph.networks, pattern_a)
     network_b = resolve_network(graph.networks, pattern_b)
     if network_a.network_id == network_b.network_id:

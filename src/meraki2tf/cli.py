@@ -164,6 +164,13 @@ def _distribution_version() -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Construct the full ``meraki2tf`` argument parser.
+
+    The single source of truth for the command-line surface: every flag,
+    its help text, and its argument grouping are declared here so the
+    ``--help`` output, the ``--config`` TOML destinations, and the
+    runtime configuration all stay derived from one definition.
+    """
     parser = argparse.ArgumentParser(
         prog="meraki2tf",
         description=(
@@ -714,6 +721,20 @@ def build_provider(
     parser: OpenApiParser,
     spec_file: Path | None = None,
 ) -> MerakiDataProvider:
+    """Build the discovery provider the run's inputs call for.
+
+    Returns a :class:`StaticJsonDataProvider` when ``--from-dump`` names
+    a snapshot (read as the organization it records), otherwise a
+    :class:`LiveApiDataProvider` — optionally scope-restricted for
+    ``--only`` and bound to a discovery checkpoint journal. The
+    DR write actions that legitimately target a different organization
+    (``--replay-gaps``, ``--heal``) build their own providers and never
+    come through here.
+
+    Raises :class:`OrganizationMismatchError` when a dump snapshot's
+    recorded organization conflicts with an explicit ``--org-id`` — the
+    read pipeline always reads a snapshot as the org it records.
+    """
     if config.dump_path is not None:
         provider = StaticJsonDataProvider(config.dump_path, parser=parser)
         # Every path through this factory (the read-only pipeline, the

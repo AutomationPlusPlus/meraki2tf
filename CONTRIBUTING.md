@@ -39,6 +39,30 @@ needed only for live plan/apply paths — the test suite mocks it.
 - Sign your commits (`git config commit.gpgsign true`).
 - Keep commits small and atomic; PRs should read as one reviewable story.
 
+### Docstring style
+
+The house style is deliberate and consistent — match it rather than
+introducing a new one:
+
+- **Narrative prose, rationale-first.** Document *why* the code is the way
+  it is — the race window it closes, the contract guarantee it upholds, the
+  disaster-recovery consequence of getting it wrong — not just what it does.
+  The reader can see *what* from the signature; the docstring earns its space
+  by explaining the reasoning a future maintainer would otherwise have to
+  reconstruct.
+- **Name the exceptions a callable raises**, with the condition, in prose —
+  e.g. "Raises `TerraformError` when the saved plan contains any non-import
+  action." A caller shouldn't have to read the body to learn what can go
+  wrong.
+- **Use Sphinx cross-references** — `` :class:`Foo` ``, `` :func:`bar` ``,
+  `` :meth:`Baz.qux` `` — when referring to other symbols.
+- **No Google/Numpy `Args:` / `Returns:` / `Raises:` sections.** The codebase
+  uses none and nothing consumes them; keep return/raise information in the
+  prose. (`` :raises Foo: `` info fields are fine where prose already reads
+  awkwardly, but prose is the default.)
+- Skip docstrings that would only restate the signature: `__init__` covered by
+  its class docstring, and one-line self-documenting properties.
+
 ### Tooling constraints
 
 `flake8` + `mypy` + `tox` + `pytest` are the approved toolchain. Do **not**
