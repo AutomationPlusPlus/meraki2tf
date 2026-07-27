@@ -2,4 +2,4 @@
 # Escalation Policy. The development toolchain (linting, typing, tests)
 # lives in requirements-dev.txt; the hash-pinned runtime closure for
 # unattended workers is requirements-lock.txt.
-meraki>=3.0,<5
+meraki>=4.3,<5
