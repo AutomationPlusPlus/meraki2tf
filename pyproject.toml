@@ -20,7 +20,7 @@ classifiers = [
 # or a compromised future major. For the deployment path, resolve this
 # through the hash-pinned requirements-lock.txt at the repository root
 # (pip install --require-hashes -r requirements-lock.txt).
-dependencies = ["meraki>=3.0,<5"]
+dependencies = ["meraki>=4.3,<5"]
 
 [project.scripts]
 meraki2tf = "meraki2tf.cli:main"
