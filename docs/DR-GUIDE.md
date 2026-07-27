@@ -36,7 +36,7 @@ Each run leaves a complete rebuild kit in `--workdir`:
 | `provider.tf` | meraki2tf | Credential-free provider + backend anchor (local by default; a partial remote block for `--state-backend`) |
 | `resources.tf` | meraki2tf (accumulated from `terraform plan -generate-config-out`) | Full HCL configuration for every captured asset — the actual rebuild material and the drift-comparison baseline |
 | `generated_resources.tf` | terraform (transient) | Freshly generated config for new imports; folded into `resources.tf` after every plan |
-| `coverage.json` / `coverage.txt` | meraki2tf | Per-run coverage manifest: every discovered object with status `imported`, `pending-import`, or `unsupported` (with reason), plus totals and a coverage percentage |
+| `coverage.json` / `coverage.txt` | meraki2tf | Per-run coverage manifest: every discovered object with status `imported`, `pending-import`, or `unsupported` (with reason), plus totals and a coverage percentage. `coverage.json` also carries a `kit` object fingerprinting the `imports.tf` it was written beside (`imports_sha256` + `import_block_count`) so `--check` can verify the manifest and the kit still agree |
 | `runbook.md` | meraki2tf | Per-run DR runbook: for each object Terraform can't rebuild — the endpoint, identifiers, reason, redacted payload, and the `--replay-gaps` write op — plus which secret attributes to restore and where in the snapshot they live |
 | `meraki2tf.tfstate` | terraform (`--sync` runs, `--rebuild --confirm`, or a manual apply) | State tracking, once the resources are adopted (local backend; a remote `--state-backend` keeps state in its own store instead) |
 

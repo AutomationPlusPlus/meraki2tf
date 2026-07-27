@@ -43,7 +43,13 @@ from meraki2tf.config import (
     RuntimeConfig,
     api_key_present,
 )
-from meraki2tf.coverage import COVERAGE_JSON_FILENAME
+from meraki2tf.coverage import (
+    COVERAGE_JSON_FILENAME,
+    KIT_ABSENT,
+    KIT_MATCH,
+    KIT_MISMATCH,
+    verify_kit_fingerprint,
+)
 from meraki2tf.hcl_generator import IMPORTS_FILENAME
 from meraki2tf.openapi_parser import OpenApiParser, entity_key
 from meraki2tf.provider_catalog import (
@@ -481,6 +487,36 @@ def _check_workdir(config: RuntimeConfig) -> CheckResult:
     )
 
 
+def _check_kit_integrity(config: RuntimeConfig) -> CheckResult:
+    """Verify the workdir's coverage.json still matches its imports.tf.
+
+    ``coverage.json`` claims "these N resources are in ``imports.tf``,"
+    but a kit corrupted outside the workdir lock — a pre-lock kit, a
+    manual edit, external tampering, a partial write — would leave the
+    manifest vouching for a kit it no longer matches, a direct
+    Cardinal-Rule-2 gap. The manifest carries a fingerprint of the kit
+    (:func:`~meraki2tf.coverage.kit_fingerprint`); this recomputes it
+    (:func:`~meraki2tf.coverage.verify_kit_fingerprint`) and reports
+    whether the two agree. A pure local-file check: it reads no Meraki
+    API and needs no key, so it runs and returns a useful verdict on a
+    ``--from-dump`` or air-gapped ``--check``. Raises nothing — a
+    corrupt manifest degrades to SKIP.
+    """
+    status, detail = verify_kit_fingerprint(config.workdir)
+    if status == KIT_MATCH:
+        return CheckResult("kit integrity", STATUS_PASS, detail)
+    if status == KIT_MISMATCH:
+        return CheckResult(
+            "kit integrity",
+            STATUS_FAIL,
+            f"coverage.json does not match imports.tf ({detail}); the kit "
+            f"may be corrupt or from a different/overlapping run",
+        )
+    # KIT_ABSENT: nothing stamped to verify.
+    assert status == KIT_ABSENT
+    return CheckResult("kit integrity", STATUS_SKIP, detail)
+
+
 def _check_alert_channels(
     config: RuntimeConfig,
     dispatcher_factory: Callable[[RuntimeConfig], AlertDispatcher],
@@ -517,6 +553,7 @@ def run_preflight_checks(
     results.append(_check_provider_catalog(config))
     results.append(_check_drift_baseline(config))
     results.append(_check_workdir(config))
+    results.append(_check_kit_integrity(config))
     results.append(_check_alert_channels(config, dispatcher_factory))
     return results
 

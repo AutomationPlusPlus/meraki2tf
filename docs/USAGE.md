@@ -207,7 +207,7 @@ Quick reference (each flag is described in detail below):
 | --- | --- | --- |
 | `--version` | — | Print the installed meraki2tf version and exit |
 | `--list-orgs` | — | List every organization the API key can see (ID + name) and exit — the way to find `--org-id` |
-| `--check` | — | Standalone preflight: validate the whole flag set (key, org, terraform, catalog, baseline, workdir, alert channels) in seconds — one PASS/FAIL/SKIP line per check, nonzero exit on failure, mutates nothing |
+| `--check` | — | Standalone preflight: validate the whole flag set (key, org, terraform, catalog, baseline, workdir, kit integrity, alert channels) in seconds — one PASS/FAIL/SKIP line per check, nonzero exit on failure, mutates nothing |
 | `--estimate` | — | Standalone cost preview: expected discovery request count + wall-clock estimates (2-3 API calls live; zero with `--from-dump`) |
 | `--config PATH` | — | TOML file of recurring settings (CLI > file > default); DR actions, confirmations, and credentials refused |
 | `--org-id` | — | Organization to discover (required in live mode); repeat for sequential multi-org fan-out |
@@ -307,10 +307,22 @@ the fastest way to find the `--org-id` value.
 seconds, before committing to a multi-hour sweep. Checks the API key
 (and that it can see each `--org-id`), the terraform binary and its
 version, the provider identity catalog, the `--drift-baseline` header
-(organization match, unsanitized, full-org), workdir writability, and
-the alert-channel configuration — one `PASS`/`FAIL`/`SKIP` line per
-check, nonzero exit on any failure. Read-only and side-effect-free: no
-workdir writes, no `terraform init`, nothing touched in Meraki.
+(organization match, unsanitized, full-org), workdir writability, kit
+integrity, and the alert-channel configuration — one `PASS`/`FAIL`/`SKIP`
+line per check, nonzero exit on any failure. Read-only and
+side-effect-free: no workdir writes, no `terraform init`, nothing
+touched in Meraki.
+
+The **kit integrity** check verifies the workdir is internally
+consistent: every run stamps `coverage.json` with a fingerprint (a
+sha256 and import-block count) of the `imports.tf` it was written
+beside, under a `kit` object, and this check recomputes it and reports
+`PASS`/`FAIL`/`SKIP` depending on whether the manifest and the kit
+still agree — so a DR kit that was edited, truncated, or corrupted
+after the manifest vouched for it is caught (a `SKIP` just means there
+is no kit stamped yet, e.g. a legacy manifest or a run with zero
+pending imports). It is a pure local-file check and runs offline, with
+no API key, on a `--from-dump` or air-gapped `--check`.
 Combine it with the exact flags your scheduled job will use:
 
 ```bash

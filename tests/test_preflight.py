@@ -677,6 +677,62 @@ def test_check_workdir_states(
         locked.chmod(0o700)
 
 
+def test_check_kit_integrity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The kit-integrity check is a pure local-file verdict: no API key,
+    no live org — it must PASS/FAIL/SKIP offline on a --from-dump run."""
+    from meraki2tf.coverage import build_manifest, write_manifest
+    from meraki2tf.hcl_generator import IMPORTS_FILENAME
+
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    kit = 'import {\n  to = meraki_networks.n_1\n  id = "org,N_1"\n}\n'
+
+    def stamped(workdir: Path) -> None:
+        (workdir / IMPORTS_FILENAME).write_text(kit, encoding="utf-8")
+        manifest = build_manifest(
+            organization_id="org",
+            captured=(),
+            unsupported=(),
+            state_addresses=frozenset(),
+        )
+        write_manifest(manifest, workdir)
+
+    # A matching pair PASSes — and needs no API key to say so.
+    good = tmp_path / "good"
+    good.mkdir()
+    stamped(good)
+    result = preflight._check_kit_integrity(
+        _config(["--check", "--workdir", str(good)])
+    )
+    assert result.status == preflight.STATUS_PASS
+    assert "1 import block(s)" in result.detail
+
+    # A kit tampered with after stamping FAILs, naming the mismatch.
+    bad = tmp_path / "bad"
+    bad.mkdir()
+    stamped(bad)
+    (bad / IMPORTS_FILENAME).write_text(
+        kit + 'import {\n  to = meraki_networks.n_2\n  id = "org,N_2"\n}\n',
+        encoding="utf-8",
+    )
+    result = preflight._check_kit_integrity(
+        _config(["--check", "--workdir", str(bad)])
+    )
+    assert result.status == preflight.STATUS_FAIL
+    assert "does not match imports.tf" in result.detail
+    assert "found 2 block(s)" in result.detail
+
+    # A legacy/kitless workdir SKIPs — nothing stamped to verify.
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    result = preflight._check_kit_integrity(
+        _config(["--check", "--workdir", str(empty)])
+    )
+    assert result.status == preflight.STATUS_SKIP
+
+
 def test_check_alert_channels(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
