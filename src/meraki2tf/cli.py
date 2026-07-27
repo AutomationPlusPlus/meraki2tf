@@ -698,13 +698,26 @@ def build_dispatcher(config: RuntimeConfig) -> AlertDispatcher:
     return dispatcher
 
 
+class OrganizationMismatchError(ValueError):
+    """``--org-id`` contradicts the organization the snapshot records."""
+
+
 def build_provider(
     config: RuntimeConfig,
     parser: OpenApiParser,
     spec_file: Path | None = None,
 ) -> MerakiDataProvider:
     if config.dump_path is not None:
-        return StaticJsonDataProvider(config.dump_path, parser=parser)
+        provider = StaticJsonDataProvider(config.dump_path, parser=parser)
+        # Every path through this factory (the read-only pipeline, the
+        # --dump-to export, --diff-networks) reads a snapshot as the
+        # organization it records. --replay-gaps, the one action for
+        # which --org-id legitimately names a *different* organization,
+        # builds its own provider and never comes through here.
+        conflict = provider.organization_mismatch(config.org_id)
+        if conflict is not None:
+            raise OrganizationMismatchError(conflict)
+        return provider
     # Selective scope (--only): restrict live discovery to the selected
     # networks (org-level surfaces stay in scope) — the export path AND
     # the scoped default pipeline. Heal builds its own scoped provider
@@ -2758,7 +2771,13 @@ def _run_org_pipeline(
     try:
         spec_file = resolve_spec(config.spec_path)
         spec_parser = OpenApiParser(spec_file)
-        provider = build_provider(config, spec_parser, spec_file)
+        try:
+            provider = build_provider(config, spec_parser, spec_file)
+        except OrganizationMismatchError as exc:
+            # Operator input error, like the --heal and --drift-baseline
+            # organization refusals: loud, actionable, no alert.
+            logger.critical("%s", exc)
+            return 2
         if config.only and config.dump_to is None:
             logger.warning(
                 "PARTIAL run: --only scopes discovery, the kit, and the "

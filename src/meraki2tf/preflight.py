@@ -315,6 +315,32 @@ def _check_org_ids(
     return results
 
 
+def _check_snapshot_organization(config: RuntimeConfig) -> list[CheckResult]:
+    """Catch ``--from-dump`` + ``--org-id`` naming different orgs.
+
+    Reported here as well as refused at run time so the scheduled job
+    learns about it from ``--check`` in a second, and because the
+    consequence is silent: the run would succeed and only the artifacts
+    would carry the wrong organization.
+    """
+    if config.dump_path is None or not config.org_id:
+        return []
+    try:
+        provider = StaticJsonDataProvider(config.dump_path)
+    except ValueError as exc:
+        return [CheckResult("--from-dump", STATUS_FAIL, str(exc))]
+    conflict = provider.organization_mismatch(config.org_id)
+    if conflict is not None:
+        return [CheckResult("--from-dump", STATUS_FAIL, conflict)]
+    return [
+        CheckResult(
+            "--from-dump",
+            STATUS_PASS,
+            f"snapshot organization matches --org-id {config.org_id}",
+        )
+    ]
+
+
 def _check_terraform(config: RuntimeConfig) -> CheckResult:
     if config.dump_to is not None:
         return CheckResult(
@@ -475,6 +501,7 @@ def run_preflight_checks(
     api_key_result, organizations = _check_api_key(config)
     results = [api_key_result]
     results.extend(_check_org_ids(config, organizations))
+    results.extend(_check_snapshot_organization(config))
     results.append(_check_terraform(config))
     results.append(_check_provider_catalog(config))
     results.append(_check_drift_baseline(config))

@@ -293,6 +293,47 @@ class StaticJsonDataProvider(MerakiDataProvider):
         self._document: dict[str, Any] = document
         logger.debug("Loaded offline snapshot from %s", dump_path)
 
+    def organization_mismatch(self, organization_id: str | None) -> str | None:
+        """Diagnostic when ``--org-id`` contradicts the snapshot's org.
+
+        In dump mode ``--org-id`` *overrides* the graph's organization,
+        which is load-bearing for ``--replay-gaps`` (it names the
+        rebuilt target the snapshot's objects are replayed into). On
+        every other path an override that disagrees with the recorded
+        organization can only relabel: the assets keep the snapshot
+        org's network IDs while the coverage manifest, the runbook, and
+        the alerts are all headed with the other organization.
+
+        That mislabelling is not cosmetic. ``--rebuild`` resolves its
+        target organization *from coverage.json*, so a kit built from
+        org A's snapshot under ``--org-id B`` reports "Rebuild target
+        organization: B" — and ``--expect-org B``, the assertion whose
+        whole job is refusing to rebuild the wrong organization, passes.
+        The realistic way in is a wrapper or ``--config`` file that pins
+        ``org-id`` while ``--from-dump`` is pointed at another org's
+        snapshot.
+
+        Returns ``None`` when there is nothing to complain about, so
+        callers keep their own exit codes (the CLI refuses; ``--check``
+        reports a FAIL).
+        """
+        recorded = self.recorded_organization_ids
+        if not organization_id or not recorded:
+            return None
+        if organization_id in recorded:
+            return None
+        return (
+            f"Snapshot {self._path} was captured from organization "
+            f"{', '.join(recorded)}, but --org-id says {organization_id}. "
+            "In dump mode the organization comes from the snapshot; an "
+            "--org-id that disagrees would only relabel the artifacts — "
+            "the coverage manifest, runbook, and alerts would name "
+            f"{organization_id} while every asset still belongs to "
+            f"{recorded[0]}, and --rebuild/--expect-org would read that "
+            "label as truth. Drop --org-id, or point --from-dump at "
+            "that organization's snapshot."
+        )
+
     @property
     def snapshot_sanitized(self) -> bool:
         """Whether the snapshot declares itself sanitized (--sanitize).
