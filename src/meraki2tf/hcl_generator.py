@@ -30,7 +30,7 @@ from pathlib import Path
 
 from meraki2tf.alerts import AlertDispatcher, unsupported_feature_flagged
 from meraki2tf.fileio import atomic_write_text
-from meraki2tf.hcl import hcl_quote
+from meraki2tf.hcl import hcl_quote, unsafe_identifier_reason
 from meraki2tf.models import UNREADABLE_MARKER, NetworkGraph
 from meraki2tf.openapi_parser import OpenApiParser, snake_case
 from meraki2tf.provider_catalog import ProviderCatalog
@@ -348,19 +348,15 @@ class HclImportGenerator:
             components = self._import_components(
                 match, candidate, graph.organization_id
             )
-            if any("," in component for component in components):
-                # The provider splits compound import IDs positionally
-                # on commas; a comma inside a component (only possible
-                # in a doctored dump — the dashboard never issues one)
-                # would shift every later component, in the worst case
-                # landing "true" in a force_delete slot.
+            component_reason = self._unimportable_component_reason(components)
+            if component_reason is not None:
+                # A corrupted or doctored dump (the dashboard never issues
+                # these) can carry an import ID that cannot address its
+                # object; emitting a block for it would report an
+                # un-importable asset as covered (Cardinal Rule 2), so it
+                # is flagged unsupported instead.
                 unsupported.append(
-                    self._flag(
-                        candidate,
-                        "An import ID component contains a comma, which "
-                        "would corrupt the provider's compound import ID.",
-                        audit=audit,
-                    )
+                    self._flag(candidate, component_reason, audit=audit)
                 )
                 continue
             import_id = ",".join(components)
@@ -504,6 +500,36 @@ class HclImportGenerator:
         if match.needs_org_prefix:
             components.insert(0, organization_id)
         return tuple(components)
+
+    @staticmethod
+    def _unimportable_component_reason(components: tuple[str, ...]) -> str | None:
+        """Why *components* can't form a usable compound import ID, or ``None``.
+
+        The provider splits a compound import ID positionally on commas, so
+        every component must be non-empty, comma-free, and byte-for-byte
+        addressable. A comma would shift every later component (in the worst
+        case landing ``"false"`` in a force_delete slot); an empty component
+        collapses two commas into one and can never match an object; a
+        surrogate, control character, or edge whitespace would be silently
+        rewritten (see ``unsafe_identifier_reason``) into an ID that no
+        longer names its object. All three surface as ``unsupported`` rather
+        than a wrong-but-covered import (Cardinal Rule 2).
+        """
+        for component in components:
+            if "," in component:
+                return (
+                    "An import ID component contains a comma, which would "
+                    "corrupt the provider's compound import ID."
+                )
+            if component == "":
+                return (
+                    "An import ID component is empty, so the compound import "
+                    "ID cannot address the object."
+                )
+            unsafe = unsafe_identifier_reason(component)
+            if unsafe is not None:
+                return f"An import ID component {unsafe}."
+        return None
 
     @staticmethod
     def _candidates(graph: NetworkGraph) -> list[ImportCandidate]:

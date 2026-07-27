@@ -35,9 +35,14 @@ class MerakiNetwork:
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "MerakiNetwork":
-        network_id = str(payload.get("id", "")).strip()
-        if not network_id:
+        network_id = str(payload.get("id", ""))
+        if not network_id.strip():
             raise MalformedPayloadError(f"Network payload has no 'id': {sorted(payload)}")
+        # The raw ID is kept verbatim (not stripped): an ID carrying edge
+        # whitespace or a control character is un-importable, and silently
+        # trimming it would emit an import block that looks covered but
+        # addresses nothing. Such IDs surface as an ``unsupported`` coverage
+        # entry in the kit generator instead (see ``unsafe_identifier_reason``).
         # A bare-string productTypes (hand-edited dump) would decompose
         # into single characters and silently skip product surfaces.
         raw_types = payload.get("productTypes")
@@ -66,9 +71,12 @@ class MerakiDevice:
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "MerakiDevice":
-        serial = str(payload.get("serial", "")).strip()
-        if not serial:
+        serial = str(payload.get("serial", ""))
+        if not serial.strip():
             raise MalformedPayloadError(f"Device payload has no 'serial': {sorted(payload)}")
+        # Kept verbatim, like the network ID above: a whitespace/control-
+        # bearing serial is flagged unsupported downstream rather than
+        # silently trimmed into a wrong-but-covered import.
         return cls(
             serial=serial,
             network_id=str(payload.get("networkId", "")),

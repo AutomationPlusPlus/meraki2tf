@@ -304,17 +304,118 @@ def test_import_ids_are_hcl_escaped(
     assert '"N"1' not in content  # no unterminated string literal
 
 
-def test_newlines_in_import_ids_are_escaped(
-    generator: HclImportGenerator, tmp_path: Path
+def test_control_char_in_import_id_is_flagged_not_imported(
+    generator: HclImportGenerator, tmp_path: Path, recorder: RecordingNotifier
 ) -> None:
-    """HCL quoted literals cannot span lines; a raw newline in one ID
-    would corrupt the entire imports.tf."""
+    """F3: a control character (here a newline) in an ID only ever comes
+    from a corrupted/doctored dump — no live object carries it, so the
+    escaped import block could never address anything. It must surface as
+    an unsupported coverage gap, never a wrong-but-covered import."""
     report = generator.generate(
         _graph(networks=(_network("N\n1"),), devices=(), features=()), tmp_path
     )
     content = report.imports_file.read_text(encoding="utf-8")
+    assert report.imports_written == 0
+    (gap,) = report.unsupported
+    assert "control character" in gap.reason
+    assert "import {" not in content  # no import block emitted at all
+    assert recorder.events[0].event_type is EventType.UNSUPPORTED_FEATURE_FLAGGED
+
+
+def test_surrogate_in_import_id_is_flagged_not_mutated(
+    generator: HclImportGenerator, tmp_path: Path, recorder: RecordingNotifier
+) -> None:
+    """F3: a lone UTF-16 surrogate cannot be UTF-8 encoded; the escaper
+    would silently swap it for ``?`` and emit an import ID that addresses
+    a different (or no) object while coverage calls the asset covered.
+    Reject it as unsupported instead."""
+    report = generator.generate(
+        _graph(networks=(_network("L_\ud800123"),), devices=(), features=()),
+        tmp_path,
+    )
+    content = report.imports_file.read_text(encoding="utf-8")
+    assert report.imports_written == 0
+    (gap,) = report.unsupported
+    assert "un-encodable" in gap.reason
+    assert "?" not in content  # the mutated ID was never written
+    assert recorder.events[0].event_type is EventType.UNSUPPORTED_FEATURE_FLAGGED
+
+
+def test_trailing_whitespace_id_is_flagged_not_silently_trimmed(
+    generator: HclImportGenerator, tmp_path: Path
+) -> None:
+    """F3: the model layer no longer strips edge whitespace from an ID,
+    so a trailing-newline network ID surfaces as unsupported rather than
+    being trimmed into a wrong-but-covered import."""
+    report = generator.generate(
+        _graph(networks=(_network("L_123\n"),), devices=(), features=()), tmp_path
+    )
+    assert report.imports_written == 0
+    (gap,) = report.unsupported
+    assert "whitespace" in gap.reason
+
+
+def test_normal_ids_are_unaffected_by_the_identifier_guard(
+    generator: HclImportGenerator, tmp_path: Path
+) -> None:
+    """The guard must reject only silently-altered IDs — an ordinary
+    network ID still imports unchanged."""
+    report = generator.generate(
+        _graph(networks=(_network("L_647392837465"),), devices=(), features=()),
+        tmp_path,
+    )
+    content = report.imports_file.read_text(encoding="utf-8")
     assert report.imports_written == 1
-    assert 'id = "org-123,N\\n1"' in content
+    assert report.unsupported == ()
+    assert 'id = "org-123,L_647392837465"' in content
+
+
+def test_empty_id_component_is_flagged_not_imported(
+    generator: HclImportGenerator, tmp_path: Path, recorder: RecordingNotifier
+) -> None:
+    """F4: a feature whose path values include an empty component emits
+    ``id = "net,"`` — an ID that can never import — yet used to be counted
+    pending. An empty NETWORK id already aborts cleanly; an empty path
+    component must be flagged unsupported the same way, not covered."""
+    report = generator.generate(
+        _graph(
+            networks=(),
+            devices=(),
+            features=(
+                FeatureConfiguration(
+                    "/networks/{networkId}/appliance/vlans/{vlanId}", ("N_1", "")
+                ),
+            ),
+        ),
+        tmp_path,
+    )
+    content = report.imports_file.read_text(encoding="utf-8")
+    assert report.imports_written == 0
+    (gap,) = report.unsupported
+    assert "empty" in gap.reason
+    assert '"N_1,"' not in content  # no un-importable block emitted
+    assert recorder.events[0].event_type is EventType.UNSUPPORTED_FEATURE_FLAGGED
+
+
+def test_identifier_guard_preserves_coverage_accounting(
+    generator: HclImportGenerator, tmp_path: Path
+) -> None:
+    """Every discovered graph object must still reconcile as pending,
+    unsupported, or duplicate — a rejected ID moves the object from
+    pending to unsupported, it does not drop from the totals."""
+    graph = _graph(
+        networks=(_network("N_ok"), _network("N_bad\n")),
+        devices=(),
+        features=(),
+    )
+    report = generator.generate(graph, tmp_path)
+    graph_candidates = len(graph.networks) + len(graph.devices) + len(graph.features)
+    graph_unsupported = len(report.unsupported) - report.spec_gap_count
+    assert graph_candidates == (
+        len(report.captured) + graph_unsupported + len(report.duplicates)
+    )
+    assert report.imports_written == 1  # only N_ok
+    assert graph_unsupported == 1  # only N_bad
 
 
 def test_collision_suffixes_ignore_discovery_order(
