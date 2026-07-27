@@ -804,7 +804,7 @@ def _estimate_from_dump(
 
 
 def _format_duration(seconds: float) -> str:
-    total = int(round(seconds))
+    total = round(seconds)
     hours, remainder = divmod(total, 3600)
     minutes, secs = divmod(remainder, 60)
     if hours:

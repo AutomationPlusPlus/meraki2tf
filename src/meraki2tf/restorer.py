@@ -2116,7 +2116,7 @@ class OrgRestorer:
                         continue
                     deferred.append((action, str(exc)))
                     continue
-                except Exception as exc:  # noqa: BLE001 - per-object isolation
+                except Exception as exc:  # per-object isolation
                     if getattr(exc, "status", None) == 429:
                         # Even the SDK's own throttle retries were
                         # exhausted: a saturated shared budget (exactly
@@ -2270,7 +2270,7 @@ class OrgRestorer:
                         dashboard, dispatch_action, resolver,
                         graph.organization_id,
                     )
-                except Exception as exc:  # noqa: BLE001 - original stands
+                except Exception as exc:  # original stands
                     # Same withholding rule as the main handler: the SDK
                     # error text can echo the rejected request fields,
                     # and this action's payload may carry live secrets.
@@ -2492,7 +2492,7 @@ class OrgRestorer:
                     in inspect.signature(method).parameters
                     else method(*params)
                 )
-            except Exception as exc:  # noqa: BLE001 - classify, never raise
+            except Exception as exc:  # classify, never raise
                 if getattr(exc, "status", None) == 404:
                     self._probe_cache[cache_key] = _PROBE_ABSENT
                     return ("absent", None)
@@ -2607,7 +2607,7 @@ class OrgRestorer:
             minimal = replace(action, payload={"enabled": False})
             try:
                 self._dispatch(dashboard, minimal, resolver, source_org)
-            except Exception:  # noqa: BLE001 - degrade to the default
+            except Exception:  # degrade to the default
                 return ("skip", skip_reason)
             logger.warning(
                 "Restored %s as disabled-only: the dashboard rejected "
@@ -2686,7 +2686,7 @@ class OrgRestorer:
             retry = replace(action, payload=remaining)
             try:
                 self._dispatch(dashboard, retry, resolver, source_org)
-            except Exception as exc:  # noqa: BLE001 - iterate or stand down
+            except Exception as exc:  # iterate or stand down
                 if getattr(exc, "status", None) != 400:
                     return None
                 current = str(exc)
@@ -2873,7 +2873,7 @@ class OrgRestorer:
         follow_up = replace(action, kind="configure", operation=action.aligner)
         try:
             self._dispatch(dashboard, follow_up, resolver, source_org)
-        except Exception as exc:  # noqa: BLE001 - adoption stands
+        except Exception as exc:  # adoption stands
             logger.warning(
                 "Adopted %s but could not align its content with the "
                 "snapshot (%s, status %s); review it in the dashboard.",
@@ -3129,7 +3129,7 @@ class OrgRestorer:
                 if "total_pages" in inspect.signature(method).parameters
                 else method(*params.values())
             )
-        except Exception as exc:  # noqa: BLE001 - fall back to the POST
+        except Exception as exc:  # fall back to the POST
             logger.debug(
                 "Adoption lookup for %s failed (%s); proceeding "
                 "with the create.", action.key, exc,
@@ -3229,7 +3229,7 @@ class OrgRestorer:
         self._bucket.acquire()
         try:
             current = method(network_id)
-        except Exception as exc:  # noqa: BLE001 - degrade to "no match"
+        except Exception as exc:  # degrade to "no match"
             logger.debug(
                 "Target firmware catalog for %s is unreadable (%s); "
                 "pending upgrades will be dropped as unmatchable.",
@@ -3408,7 +3408,7 @@ class OrgWiper:
                 organization_id
             )
             self._bucket.on_success()
-        except Exception as exc:  # noqa: BLE001 - degrade to none found
+        except Exception as exc:  # degrade to none found
             logger.debug(
                 "Could not enumerate config templates for %s (%s).",
                 organization_id, exc,
@@ -3450,7 +3450,7 @@ class OrgWiper:
                 organization_id
             )
             self._bucket.on_success()
-        except Exception as exc:  # noqa: BLE001 - degrade to no deletion
+        except Exception as exc:  # degrade to no deletion
             logger.debug(
                 "Could not enumerate admins for %s (%s); the wipe will "
                 "not remove any admin.", organization_id, exc,
@@ -3487,7 +3487,7 @@ class OrgWiper:
                 dashboard.networks.deleteNetwork(network_id)
                 self._bucket.on_success()
                 deleted.append(network_id)
-            except Exception as exc:  # noqa: BLE001 - per-object isolation
+            except Exception as exc:  # per-object isolation
                 failed.append((network_id, str(exc)))
         if not failed:
             # Config templates are backed by hidden networks the loop
@@ -3504,7 +3504,7 @@ class OrgWiper:
                         "Wipe removed config template %s from "
                         "organization %s.", template_id, organization_id,
                     )
-                except Exception as exc:  # noqa: BLE001 - isolate
+                except Exception as exc:  # isolate
                     failed.append((f"configTemplate:{template_id}", str(exc)))
         org_deleted = False
         if not failed:
@@ -3525,7 +3525,7 @@ class OrgWiper:
                         "Wipe removed admin %s from organization %s.",
                         admin_email, organization_id,
                     )
-                except Exception as exc:  # noqa: BLE001 - isolate
+                except Exception as exc:  # isolate
                     failed.append((f"admin:{admin_id}", str(exc)))
         if not failed:
             try:
@@ -3534,7 +3534,7 @@ class OrgWiper:
                 # once more so hardware claimed mid-teardown stops the
                 # organization deletion instead of vanishing with it.
                 self.preview(organization_id, expected_name)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 failed.append((organization_id, str(exc)))
         if not failed:
             for attempt in range(1, _ORG_DELETE_ATTEMPTS + 1):
@@ -3546,7 +3546,7 @@ class OrgWiper:
                     self._bucket.on_success()
                     org_deleted = True
                     break
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     if (
                         attempt < _ORG_DELETE_ATTEMPTS
                         and _transient_org_deletion(exc)

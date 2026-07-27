@@ -278,7 +278,7 @@ def test_heal_executor_recreates_only_missing_with_identity_refs(
     calls: list = []
 
     class Section:
-        def __getattr__(self, operation_id: str):  # noqa: ANN204
+        def __getattr__(self, operation_id: str):
             def _dispatch(*args: object, **kwargs: object) -> dict:
                 calls.append((operation_id, args, kwargs))
                 if operation_id == "createOrganizationNetwork":

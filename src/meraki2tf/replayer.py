@@ -607,7 +607,7 @@ class GapReplayer:
         ):
             try:
                 serials = self.claimed_serials(target_organization_id)
-            except Exception as exc:  # noqa: BLE001 - verified per action
+            except Exception as exc:  # verified per action
                 logger.error(
                     "Cannot enumerate the target organization's claimed "
                     "devices: %s", exc,
@@ -860,7 +860,7 @@ class GapReplayer:
                 if "total_pages" in inspect.signature(method).parameters
                 else method(**lookup_params)
             )
-        except Exception as exc:  # noqa: BLE001 - fall back to the POST
+        except Exception as exc:  # fall back to the POST
             logger.debug(
                 "Already-present lookup for %s failed (%s); proceeding "
                 "with the create.", action.target, exc,

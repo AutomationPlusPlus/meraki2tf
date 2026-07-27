@@ -73,7 +73,7 @@ def test_meraki_method_without_verbs_fails_closed() -> None:
 
 def test_meraki_method_without_readable_source_fails_closed() -> None:
     namespace: dict[str, Any] = {}
-    exec("def sourceless(*a, **k):\n    return {}", namespace)  # noqa: S102
+    exec("def sourceless(*a, **k):\n    return {}", namespace)
     sourceless = namespace["sourceless"]
     sourceless.__module__ = "meraki.api.networks"
     assert not method_matches_verbs(sourceless, WRITE_SESSION_VERBS)
