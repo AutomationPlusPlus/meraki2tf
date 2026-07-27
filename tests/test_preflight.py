@@ -996,3 +996,73 @@ def test_run_estimate_command_live_path(
     config = _config(["--estimate", "--org-id", "123456"])
     assert preflight.run_estimate_command(config) == 0
     assert "TOTAL                : ~16" in capsys.readouterr().out
+
+
+def test_check_flags_snapshot_org_disagreeing_with_org_id(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    dump_file: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The consequence is silent — the run succeeds and only the
+    artifacts carry the wrong organization — so --check has to surface
+    it in the second it takes, before the scheduled job runs."""
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    _fake_terraform(monkeypatch)
+    config = _config(
+        [
+            "--check",
+            "--from-dump", str(dump_file),
+            "--org-id", "org-999",
+            "--workdir", str(tmp_path),
+        ]
+    )
+    assert preflight.run_check_command(config, build_dispatcher) == 1
+    out = capsys.readouterr().out
+    assert "[FAIL] --from-dump:" in out
+    assert "org-123" in out and "org-999" in out
+
+
+def test_check_passes_when_snapshot_org_matches_org_id(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    dump_file: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    _fake_terraform(monkeypatch)
+    config = _config(
+        [
+            "--check",
+            "--from-dump", str(dump_file),
+            "--org-id", "org-123",
+            "--workdir", str(tmp_path),
+        ]
+    )
+    assert preflight.run_check_command(config, build_dispatcher) == 0
+    assert "[PASS] --from-dump: snapshot organization matches" in (
+        capsys.readouterr().out
+    )
+
+
+def test_check_reports_an_unreadable_snapshot_as_a_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A corrupt or truncated snapshot must fail the check, not crash
+    the preflight that exists to keep failures out of the run."""
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    _fake_terraform(monkeypatch)
+    broken = tmp_path / "broken.json"
+    broken.write_text("not a snapshot", encoding="utf-8")
+    config = _config(
+        [
+            "--check",
+            "--from-dump", str(broken),
+            "--org-id", "org-123",
+            "--workdir", str(tmp_path),
+        ]
+    )
+    assert preflight.run_check_command(config, build_dispatcher) == 1
+    assert "[FAIL] --from-dump:" in capsys.readouterr().out

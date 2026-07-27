@@ -103,6 +103,19 @@ the project adheres to [Semantic Versioning](https://semver.org/).
   and every operator-facing message are unchanged.
 
 ### Fixed
+- `--from-dump` with an `--org-id` naming a **different** organization is
+  now refused instead of silently relabelling the run. The override is
+  load-bearing for `--replay-gaps` (where `--org-id` names the rebuilt
+  target) but on every other path it only mislabels: the assets keep the
+  snapshot org's network IDs while `coverage.json`, the runbook, and the
+  alerts are all headed with the other organization. That is not
+  cosmetic — `--rebuild` resolves its target organization *from*
+  `coverage.json`, so a kit built from org A's snapshot under `--org-id
+  B` announced "Rebuild target organization: B" and `--expect-org B`,
+  the assertion whose whole job is refusing to rebuild the wrong
+  organization, **passed**. The same mismatch was already refused for
+  `--heal` and `--drift-baseline`; the canonical-snapshot pipeline was
+  the one path missing the check. `--check` now reports it too.
 - The snapshot-diff drift alert now carries the coverage gaps it always
   claimed to. On the weekly snapshot-only job `DRIFT_DETECTED` is the
   WARNING-severity event that pages someone (`RUN_SUCCESS` is INFO and

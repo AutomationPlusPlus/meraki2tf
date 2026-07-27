@@ -5187,3 +5187,40 @@ def test_diff_networks_live_zero_match_exits_2(
         ["--spec", str(spec_file), "--org-id", "123456",
          "--diff-networks", "Nowhere", "AlsoNowhere"]
     ) == 2
+
+
+def test_org_id_contradicting_the_snapshot_is_refused(
+    dump_file: Path, tmp_path: Path
+) -> None:
+    """In dump mode an --org-id that disagrees with the snapshot only
+    relabels: the assets keep the snapshot org's IDs while coverage.json
+    names the other organization — and --rebuild resolves its target
+    from coverage.json, so --expect-org would pass on a kit built from
+    someone else's snapshot."""
+    code = main(
+        [
+            "--from-dump", str(dump_file),
+            "--org-id", "org-999",
+            "--workdir", str(tmp_path / "wd"),
+        ]
+    )
+    assert code == 2
+    # Refused before anything was generated: no mislabelled manifest for
+    # --rebuild/--expect-org to later read as truth.
+    assert not (tmp_path / "wd" / "coverage.json").exists()
+
+
+def test_org_id_matching_the_snapshot_is_accepted(
+    dump_file: Path, tmp_path: Path
+) -> None:
+    """Naming the snapshot's own organization stays a no-op."""
+    assert (
+        main(
+            [
+                "--from-dump", str(dump_file),
+                "--org-id", "org-123",
+                "--dump-to", str(tmp_path / "out.jsonl.gz"),
+            ]
+        )
+        == 0
+    )

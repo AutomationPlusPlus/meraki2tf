@@ -2209,3 +2209,19 @@ def test_endpoints_refused_by_every_scope_become_suspects(
         and f.path_values == ("N_3",)
         for f in graph.features
     )
+
+
+def test_organization_mismatch_explains_the_relabelling(
+    dump_file: Path,
+) -> None:
+    """The diagnostic has to name both organizations and say why a
+    relabelled artifact matters — --rebuild resolves its target from
+    coverage.json, so --expect-org would pass on the wrong kit."""
+    provider = StaticJsonDataProvider(dump_file)
+
+    assert provider.organization_mismatch(None) is None
+    assert provider.organization_mismatch("org-123") is None
+    conflict = provider.organization_mismatch("org-999")
+    assert conflict is not None
+    assert "org-123" in conflict and "org-999" in conflict
+    assert "--expect-org" in conflict
