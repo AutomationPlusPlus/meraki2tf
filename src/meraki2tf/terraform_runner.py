@@ -747,7 +747,27 @@ class TerraformRunner:
             raise TerraformError(
                 f"Existing state file {self._state_path} is unreadable: {exc}"
             ) from exc
-        resources = document.get("resources", []) if isinstance(document, dict) else []
+        resources = (
+            document.get("resources") if isinstance(document, dict) else None
+        )
+        if not isinstance(resources, list):
+            # Valid JSON, but no managed-resource list to read: the
+            # "resources" key is a dict, missing, or the document is not
+            # an object. A genuine empty state is {"resources": []} — a
+            # list — and still parses to zero addresses below. Anything
+            # else is shape-corrupt: warn (like the loud refusal for
+            # unparseable JSON and the empty-file warning) so an operator
+            # notices, rather than a silent fresh start that would let a
+            # malformed state mis-report full coverage.
+            logger.warning(
+                "State file %s is valid JSON but has no readable managed-"
+                'resource list (its "resources" is %s, not an array); '
+                "treating it as no state. Verify --state-file — a malformed "
+                "state cannot vouch for what is tracked.",
+                self._state_path,
+                type(resources).__name__ if resources is not None else "absent",
+            )
+            return frozenset()
         addresses = frozenset(_local_state_addresses(resources))
         logger.info(
             "Existing state tracks %d managed resource(s).", len(addresses)
@@ -778,6 +798,49 @@ class TerraformRunner:
             len(addresses),
         )
         return addresses
+
+    def state_organization(self) -> str | None:
+        """The single ``organization_id`` every managed instance carries.
+
+        Backs the orchestrator's round-9 foreign-state guard: a state
+        naming a different organization than the run just discovered
+        cannot rebuild this organization and would otherwise report full
+        coverage falsely (Cardinal Rule 2). Returns ``None`` when the
+        state is empty, absent, or ambiguous (instances disagree or carry
+        no org) — a legitimate first run must still proceed.
+
+        The local path reuses the very extraction ``--rebuild`` /
+        ``--expect-org`` trust; a remote backend has no local file, so
+        its org is read from ``terraform show -json`` like its addresses.
+        """
+        if self._backend.is_remote:
+            return self._remote_state_organization()
+        # Deferred import: preflight imports terraform_runner at module
+        # load, so importing it up top would be circular.
+        from meraki2tf.preflight import state_organization
+
+        return state_organization(self._state_path)
+
+    def _remote_state_organization(self) -> str | None:
+        """The unanimous managed-instance ``organization_id`` from a
+        remote backend's state (``terraform show -json``), or ``None``.
+
+        Only the locator is read, never logged. An empty/uninitialized
+        remote state has no ``values`` key and yields ``None`` — the same
+        fresh-run signal as an absent local state.
+        """
+        self._ensure_init()
+        result = self._run("show", "-json")
+        try:
+            document = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise TerraformError(
+                f"terraform show -json produced unparseable state output: {exc}"
+            ) from exc
+        values = document.get("values") if isinstance(document, dict) else None
+        root = values.get("root_module") if isinstance(values, dict) else None
+        found = set(_show_module_organizations(root))
+        return found.pop() if len(found) == 1 else None
 
     def init(self) -> TerraformCommandResult:
         """Initialize the workspace/backend, at most once per runner.
@@ -1832,6 +1895,30 @@ def _show_module_addresses(module: Any) -> Iterator[str]:
     children = module.get("child_modules")
     for child in children if isinstance(children, list) else ():
         yield from _show_module_addresses(child)
+
+
+def _show_module_organizations(module: Any) -> Iterator[str]:
+    """``organization_id`` attribute values from one ``show -json`` module.
+
+    Mirrors :func:`_show_module_addresses`: descends ``child_modules``
+    recursively and reads each managed resource's
+    ``values.organization_id``. Only the locator is read, never logged.
+    """
+    if not isinstance(module, dict):
+        return
+    resources = module.get("resources")
+    for resource in resources if isinstance(resources, list) else ():
+        if not isinstance(resource, dict) or resource.get("mode") != "managed":
+            continue
+        values = resource.get("values")
+        if not isinstance(values, dict):
+            continue
+        value = str(values.get("organization_id") or "").strip()
+        if value:
+            yield value
+    children = module.get("child_modules")
+    for child in children if isinstance(children, list) else ():
+        yield from _show_module_organizations(child)
 
 
 def _document_malformed_entry_count(document: Any) -> int:

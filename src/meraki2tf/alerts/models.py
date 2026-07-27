@@ -282,7 +282,7 @@ def run_success(
 
 
 def deletion_pending_confirmation(
-    addresses: Sequence[str], workspace: str
+    addresses: Sequence[str], workspace: str, note: str | None = None
 ) -> AlertEvent:
     """Contract payload for Meraki deletions awaiting human confirmation.
 
@@ -290,7 +290,21 @@ def deletion_pending_confirmation(
     accidental clickops deletion must not quietly poison the rebuild
     baseline. The listed resources stay in the kit and the state until
     a human confirms their removal with ``--confirm-deletions``.
+
+    ``note`` carries an optional diagnosis hint (round-9 finding G3):
+    when every tracked resource vanishes at once the state may be
+    foreign or mis-pointed rather than the org having emptied.
     """
+    details: dict[str, Any] = {
+        "addresses": list(addresses),
+        "workspace": workspace,
+        "remediation": (
+            "Review the deletions; if intentional, re-run with "
+            "--confirm-deletions to remove them from the baseline and state."
+        ),
+    }
+    if note:
+        details["note"] = note
     return AlertEvent(
         event_type=EventType.DELETION_PENDING_CONFIRMATION,
         severity=EventSeverity.WARNING,
@@ -298,14 +312,7 @@ def deletion_pending_confirmation(
             f"{len(addresses)} resource(s) deleted in Meraki await human "
             "confirmation before removal from the DR kit."
         ),
-        details={
-            "addresses": list(addresses),
-            "workspace": workspace,
-            "remediation": (
-                "Review the deletions; if intentional, re-run with "
-                "--confirm-deletions to remove them from the baseline and state."
-            ),
-        },
+        details=details,
     )
 
 

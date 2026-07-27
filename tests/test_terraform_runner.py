@@ -381,6 +381,226 @@ def test_unreadable_state_is_a_hard_error(tmp_path: Path) -> None:
         runner.existing_addresses()
 
 
+def test_shape_corrupt_state_resources_dict_warns_not_silent(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Finding G4: valid JSON whose "resources" is a dict (not a list)
+    must WARN and name the problem, not silently read as a fresh start
+    that would let a malformed state mis-report full coverage."""
+    state = tmp_path / "terraform.tfstate"
+    state.write_text('{"resources": {}}', encoding="utf-8")
+    runner = TerraformRunner(tmp_path / "ws", state_path=state)
+    with caplog.at_level("WARNING", logger="meraki2tf.terraform_runner"):
+        assert runner.existing_addresses() == frozenset()
+    assert any(
+        "no readable managed-resource list" in r.message and "dict" in r.message
+        for r in caplog.records
+    )
+
+
+def test_shape_corrupt_state_resources_absent_warns(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A valid-JSON object with no "resources" key at all is malformed,
+    not empty: warn (naming it "absent") rather than a silent fresh
+    start."""
+    state = tmp_path / "terraform.tfstate"
+    state.write_text('{"version": 4}', encoding="utf-8")
+    runner = TerraformRunner(tmp_path / "ws", state_path=state)
+    with caplog.at_level("WARNING", logger="meraki2tf.terraform_runner"):
+        assert runner.existing_addresses() == frozenset()
+    assert any(
+        "no readable managed-resource list" in r.message and "absent" in r.message
+        for r in caplog.records
+    )
+
+
+def test_genuine_empty_state_resources_list_stays_silent(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A genuine empty state {"resources": []} must NOT trip the G4
+    warning — it is a legitimate fresh start."""
+    state = tmp_path / "terraform.tfstate"
+    state.write_text('{"resources": []}', encoding="utf-8")
+    runner = TerraformRunner(tmp_path / "ws", state_path=state)
+    with caplog.at_level("WARNING", logger="meraki2tf.terraform_runner"):
+        assert runner.existing_addresses() == frozenset()
+    assert not any(
+        "no readable managed-resource list" in r.message for r in caplog.records
+    )
+
+
+def test_state_organization_reads_unanimous_local_org(tmp_path: Path) -> None:
+    """Finding G1: the runner surfaces the single organization_id every
+    managed instance carries, reusing the preflight extraction."""
+    state = tmp_path / "terraform.tfstate"
+    state.write_text(
+        json.dumps(
+            {
+                "resources": [
+                    {
+                        "mode": "managed",
+                        "type": "meraki_networks",
+                        "name": "n_1",
+                        "instances": [
+                            {"attributes": {"organization_id": "654321"}}
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    runner = TerraformRunner(tmp_path / "ws", state_path=state)
+    assert runner.state_organization() == "654321"
+
+
+def test_state_organization_none_for_empty_local_state(tmp_path: Path) -> None:
+    """No state file → no organization to compare (fresh start allowed)."""
+    runner = TerraformRunner(tmp_path / "ws", state_path=tmp_path / "absent.tfstate")
+    assert runner.state_organization() is None
+
+
+def test_state_organization_none_when_local_instances_disagree(
+    tmp_path: Path,
+) -> None:
+    """Ambiguous state cannot vouch for an organization → None."""
+    state = tmp_path / "terraform.tfstate"
+    state.write_text(
+        json.dumps(
+            {
+                "resources": [
+                    {
+                        "mode": "managed",
+                        "type": "meraki_networks",
+                        "name": "a",
+                        "instances": [
+                            {"attributes": {"organization_id": "111111"}},
+                            {"attributes": {"organization_id": "222222"}},
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    runner = TerraformRunner(tmp_path / "ws", state_path=state)
+    assert runner.state_organization() is None
+
+
+def test_azurerm_state_organization_read_via_show_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding G1 also covers the remote backend: the org is read from
+    the managed resources' values.organization_id in show -json,
+    descending child modules."""
+    runner = _azurerm_runner(tmp_path / "ws")
+    state_json = json.dumps(
+        {
+            "values": {
+                "root_module": {
+                    "resources": [
+                        {
+                            "mode": "managed",
+                            "type": "meraki_networks",
+                            "name": "n_1",
+                            "values": {"organization_id": "654321"},
+                        },
+                        {
+                            "mode": "data",
+                            "type": "meraki_networks",
+                            "name": "lookup",
+                            "values": {"organization_id": "ignored"},
+                        },
+                        {
+                            "mode": "managed",
+                            "type": "meraki_devices",
+                            "name": "no_values",
+                        },
+                    ],
+                    "child_modules": [
+                        {
+                            "resources": [
+                                {
+                                    "mode": "managed",
+                                    "type": "meraki_devices",
+                                    "name": "edge",
+                                    "values": {"organization_id": "654321"},
+                                }
+                            ]
+                        }
+                    ],
+                }
+            }
+        }
+    )
+    script = ScriptedSubprocess(
+        (0, "Initialized", None),
+        (0, state_json, None),
+    )
+    monkeypatch.setattr(terraform_runner.subprocess, "run", script.run)
+    assert runner.state_organization() == "654321"
+
+
+def test_azurerm_state_organization_none_when_ambiguous(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = _azurerm_runner(tmp_path / "ws")
+    state_json = json.dumps(
+        {
+            "values": {
+                "root_module": {
+                    "resources": [
+                        {
+                            "mode": "managed",
+                            "type": "meraki_networks",
+                            "name": "a",
+                            "values": {"organization_id": "111111"},
+                        },
+                        {
+                            "mode": "managed",
+                            "type": "meraki_networks",
+                            "name": "b",
+                            "values": {"organization_id": "222222"},
+                        },
+                    ]
+                }
+            }
+        }
+    )
+    script = ScriptedSubprocess(
+        (0, "Initialized", None),
+        (0, state_json, None),
+    )
+    monkeypatch.setattr(terraform_runner.subprocess, "run", script.run)
+    assert runner.state_organization() is None
+
+
+def test_azurerm_state_organization_none_for_empty_remote_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    script = ScriptedSubprocess(
+        (0, "Initialized", None),
+        (0, json.dumps({"format_version": "1.0"}), None),
+    )
+    monkeypatch.setattr(terraform_runner.subprocess, "run", script.run)
+    runner = _azurerm_runner(tmp_path / "ws")
+    assert runner.state_organization() is None
+
+
+def test_azurerm_state_organization_rejects_unparseable_show(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    script = ScriptedSubprocess(
+        (0, "Initialized", None),
+        (0, "{not json", None),
+    )
+    monkeypatch.setattr(terraform_runner.subprocess, "run", script.run)
+    runner = _azurerm_runner(tmp_path / "ws")
+    with pytest.raises(TerraformError, match="unparseable state"):
+        runner.state_organization()
+
+
 # --- Remote (azurerm) backend --------------------------------------------
 
 

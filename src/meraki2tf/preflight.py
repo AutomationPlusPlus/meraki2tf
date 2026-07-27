@@ -158,6 +158,17 @@ def resolve_rebuild_organization(
     return None
 
 
+def state_organization(state_path: Path | None) -> str | None:
+    """Public wrapper over :func:`_state_organization`.
+
+    The orchestrator's round-9 foreign-state guard reuses the very
+    logic ``--rebuild``/``--expect-org`` already trust: the single
+    ``organization_id`` every managed instance in a local state carries,
+    or ``None`` when the state is empty, absent, or ambiguous.
+    """
+    return _state_organization(state_path)
+
+
 def _state_organization(state_path: Path | None) -> str | None:
     """The single organization_id every managed state instance carries.
 
