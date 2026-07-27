@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "meraki2tf"
-version = "0.1.0"
+version = "0.2.0"
 description = "Extract Cisco Meraki configurations and translate them into Terraform structures with drift detection and alerting."
 readme = "README.md"
 requires-python = ">=3.11"

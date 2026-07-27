@@ -6,7 +6,17 @@ the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-27
+
 ### Added
+- Dependabot now watches the container images (a `docker` ecosystem
+  entry for the root and `deploy/azure` Dockerfiles), so the pinned
+  Terraform version and the `python:*-slim` base no longer drift
+  unmanaged (#137, #140).
+- `CONTRIBUTING.md` documents the house docstring convention
+  (rationale-first prose, Sphinx cross-refs, name the exceptions a
+  callable raises); the public API now names the exception classes it
+  raises across ~27 callables (#147).
 - `--heal --only` scopes by a **surviving** container (#117): naming a
   network that is still standing now recovers the objects deleted
   inside it — the usual "recover site X" incident. Previously only a
@@ -63,6 +73,17 @@ the project adheres to [Semantic Versioning](https://semver.org/).
   flake8/mypy/tox/pytest/pre-commit/pip-audit toolchain (this PR).
 
 ### Changed
+- The bundled container image pins Terraform **1.15.8** (up from
+  1.9.8); the `--sync` plan-JSON parsing and the import-only apply
+  guard were re-validated against it by the monthly rehearsal (#137).
+- The `meraki` SDK floor is raised to `>=4.3,<5`. The tool is only
+  tested and hash-pinned against the 4.x line, and the 4.x smart-flow
+  cache protection is a no-op on 3.x, so the supported range now matches
+  the tested one (#136).
+- Dead code removed and the duplicated `--log-format` choice list is
+  single-sourced from `logging_setup.LOG_FORMATS`; assorted micro
+  cleanups (exception chaining, redundant calls, stale lint
+  suppressions) (#138, #139).
 - The bundled fallback provider catalog is refreshed to
   `CiscoDevNet/meraki` **v1.13.0** (206 resource identity schemas, up
   from v1.12.2's 205). The only delta is the added
@@ -103,6 +124,73 @@ the project adheres to [Semantic Versioning](https://semver.org/).
   and every operator-facing message are unchanged.
 
 ### Fixed
+- **A tenant object name can no longer silently delete resource blocks
+  from the `resources.tf` baseline (#142).** A Meraki name or note
+  containing `<<` followed by a letter — an ordinary dashboard rename
+  like `HQ <<MOVED>> 2026` — was parsed as a Terraform heredoc opener by
+  the baseline block scanner, which then truncated the file to
+  end-of-file, over-deleted, or wrote a duplicate block that wedged
+  every later unattended run, while `coverage.json` still reported the
+  vanished objects as covered. The heredoc detector is now anchored and
+  quote-aware and fails closed on an unterminated span. In the same
+  change the kit writes (`imports.tf`, the address ledger, the
+  `resources.tf` prune, `provider.tf`) are made atomic (temp + fsync +
+  rename) so a disk-full or crash can no longer destroy the previous
+  good kit or leave a silently-valid truncated one.
+- **The drift alert can no longer be made to hide a destroy from the
+  operator (#143).** A tenant-controlled string rendered into a
+  `terraform plan` body could drive the alert's diff redactor to drop
+  every following line until brackets balanced, erasing a
+  `# … will be destroyed` hunk and the `Plan:` summary from the
+  `DRIFT_DETECTED` payload on every channel. The redactor now never
+  deletes structural lines — the plan summary and every resource-action
+  header always survive. The same change neutralizes control characters
+  in log records (no more forged log lines from a name containing a
+  newline) and escapes tenant text in Slack and Teams payloads (no
+  `@channel`, link, or markdown-link injection).
+- **Terraform state from a different organization is refused instead of
+  being reported as full coverage (#144).** A state file whose resource
+  addresses collide with the kit — which they do between any two
+  sanitized kits — was matched by address alone, so its managed
+  resources (holding another organization's IDs) were reported
+  `imported` at ~100% coverage with `RUN_SUCCESS`. The run now resolves
+  the state's organization from its instance attributes and refuses when
+  it differs from the discovered organization (local and remote
+  backends), mirroring the snapshot-vs-`--org-id` guard on the state
+  side.
+- **`--serial-map` now remaps every hardware-serial field, not just
+  `serial`/`serials` (#148).** In a hardware-loss restore the remapper
+  missed `spareSerial`, `deviceSerial`, `targetSerials`, `sourceSerial`,
+  `primarySerial`, and `redundantSerial`, so a warm-spare pair or a
+  per-device license restored bound to the dead hardware. The remapper
+  and the drill-skip classifier now share one serial-field predicate so
+  they cannot drift apart again. Re-validated by a scratch-org restore
+  drill.
+- **Concurrent runs on one workdir can no longer corrupt the kit
+  (#146).** meraki2tf holds an exclusive `flock` on the workdir for the
+  duration of a kit-writing run and refuses a second concurrent run,
+  closing a window where an overrunning scheduled run and an ad-hoc run
+  could interleave into a kit whose `coverage.json` vouched for
+  resources absent from `imports.tf`. Two enumerations that became
+  multi-hundred-KB single log lines on very large organizations are now
+  capped (the full lists stay in `coverage.json`/`runbook.md`), and a
+  per-scope spec lookup is memoized.
+- **Un-importable identifiers are reported as unsupported instead of
+  being silently rewritten into a covered-but-wrong import (#145).** An
+  ID carrying a lone UTF-16 surrogate or a control/whitespace character
+  was mutated (surrogate → `?`, whitespace stripped) after being counted
+  as covered, producing an import block that can never apply; such IDs
+  now surface in the coverage manifest as unsupported. Remaining C0/NUL
+  bytes in an import ID are escaped so the kit stays clean text. A
+  documentation note records that Terraform ≥1.9's azurerm backend
+  ignores a custom blob `endpoint` and always targets public Azure.
+- **The restore foreign-serial guard no longer under-checks claimed
+  devices (#141).** A silently-truncating `zip` over path placeholders
+  and values could leave the trailing claimed serial outside the
+  "refusing to write to hardware the restore does not own" check; the
+  pairing is now length-checked (`strict=True`) across the
+  restore/heal/discovery write paths, with the claim serial paired
+  explicitly. Re-validated by a scratch-org restore drill.
 - The Meraki SDK's 4.x "smart flow" rate limiter no longer persists its
   mapping cache. Enabled by default, it writes network IDs, device
   serials, and organization IDs to
@@ -390,5 +478,6 @@ heal drill.
   locators, never values. Credential env-vars only — never flags or
   config keys; log redaction at every verbosity.
 
-[Unreleased]: https://github.com/AutomationPlusPlus/meraki2tf/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/AutomationPlusPlus/meraki2tf/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/AutomationPlusPlus/meraki2tf/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/AutomationPlusPlus/meraki2tf/releases/tag/v0.1.0
