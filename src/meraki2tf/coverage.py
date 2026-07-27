@@ -31,13 +31,19 @@ credentials.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from pathlib import Path
 from typing import Any
 
 from meraki2tf.fileio import atomic_write_text
-from meraki2tf.hcl_generator import CapturedAsset, DuplicateAsset, UnsupportedAsset
+from meraki2tf.hcl_generator import (
+    IMPORTS_FILENAME,
+    CapturedAsset,
+    DuplicateAsset,
+    UnsupportedAsset,
+)
 from meraki2tf.models import SuspectEndpoint
 
 logger = logging.getLogger(__name__)
@@ -49,6 +55,19 @@ STATUS_IMPORTED = "imported"
 STATUS_PENDING_IMPORT = "pending-import"
 STATUS_UNSUPPORTED = "unsupported"
 STATUS_DUPLICATE_ID = "duplicate-id"
+
+#: Verdicts from :func:`verify_kit_fingerprint`. The manifest carries a
+#: fingerprint of the ``imports.tf`` it was written beside; recomputing
+#: and comparing it later answers whether the manifest and the kit still
+#: agree. ``KIT_MATCH`` — they agree; ``KIT_MISMATCH`` — the kit was
+#: edited, truncated, or vanished out from under the stamp (a corrupt DR
+#: kit vouched for by a stale manifest, the Cardinal-Rule-2 gap this
+#: closes); ``KIT_ABSENT`` — nothing to verify (a legacy manifest
+#: predating the stamp, or an unreadable manifest that is its own
+#: separate signal).
+KIT_MATCH = "match"
+KIT_MISMATCH = "mismatch"
+KIT_ABSENT = "absent"
 
 
 def unsupported_payload(assets: tuple[UnsupportedAsset, ...]) -> list[dict[str, Any]]:
@@ -224,8 +243,115 @@ def build_manifest(
     return manifest
 
 
+def kit_fingerprint(workdir: Path) -> dict[str, Any] | None:
+    """Fingerprint the workdir's ``imports.tf`` for the manifest stamp.
+
+    A file-integrity stamp, deliberately independent of the manifest's
+    own ``totals`` arithmetic: the point is to detect a kit that no
+    longer matches the manifest vouching for it (a manual edit, a
+    partial write, external tampering, or a pre-lock concurrent run),
+    so it must be recomputed from the file's own bytes, never inferred
+    from a count the manifest already carries.
+
+    Returns ``None`` when ``workdir/imports.tf`` does not exist — a run
+    with zero pending imports (or a default offline run) writes no kit,
+    and there is nothing to fingerprint. Otherwise returns
+    ``{"imports_sha256": <hex>, "import_block_count": <int>}``: the
+    sha256 over the raw file bytes, and the number of ``import {}``
+    blocks, counted from the stable block opener the generator emits
+    (:mod:`~meraki2tf.hcl_generator` writes each block as a line equal
+    to ``import {``). Reads bytes, decodes only for the line count, and
+    raises nothing on well-formed input.
+    """
+    imports_path = workdir / IMPORTS_FILENAME
+    if not imports_path.exists():
+        return None
+    raw = imports_path.read_bytes()
+    text = raw.decode("utf-8", errors="replace")
+    block_count = sum(
+        1 for line in text.splitlines() if line.strip() == "import {"
+    )
+    return {
+        "imports_sha256": hashlib.sha256(raw).hexdigest(),
+        "import_block_count": block_count,
+    }
+
+
+def verify_kit_fingerprint(workdir: Path) -> tuple[str, str]:
+    """Recompute the kit fingerprint and compare it to the manifest.
+
+    Reads ``coverage.json`` and its recorded ``kit`` stamp, recomputes
+    :func:`kit_fingerprint` from the live ``imports.tf``, and reports
+    whether the two still agree. Returns ``(status, detail)`` where
+    status is one of :data:`KIT_MATCH`, :data:`KIT_MISMATCH`,
+    :data:`KIT_ABSENT` and detail is a human-readable explanation.
+
+    Degrades rather than raises: a missing manifest, a legacy manifest
+    written before this feature (no ``kit`` key), or an
+    unreadable/corrupt manifest all return :data:`KIT_ABSENT` — a
+    corrupt manifest is its own separate signal and must not crash the
+    check. A recorded stamp whose ``imports.tf`` has since vanished is a
+    :data:`KIT_MISMATCH` (the kit the manifest vouches for is gone), as
+    is any divergence in the sha256 or the block count.
+    """
+    coverage_path = workdir / COVERAGE_JSON_FILENAME
+    if not coverage_path.exists():
+        return KIT_ABSENT, "no coverage.json in the workdir; nothing to verify"
+    try:
+        document = json.loads(coverage_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return KIT_ABSENT, f"coverage.json unreadable: {exc}"
+    if not isinstance(document, dict) or "kit" not in document:
+        return (
+            KIT_ABSENT,
+            "coverage.json carries no kit fingerprint "
+            "(legacy manifest predating this stamp)",
+        )
+    recorded = document["kit"]
+    current = kit_fingerprint(workdir)
+    if current is None:
+        return (
+            KIT_MISMATCH,
+            "coverage.json fingerprints a kit, but imports.tf is gone "
+            "(the kit vanished out from under the manifest)",
+        )
+    recorded_hash = ""
+    recorded_count: Any = None
+    if isinstance(recorded, dict):
+        recorded_hash = str(recorded.get("imports_sha256") or "")
+        recorded_count = recorded.get("import_block_count")
+    if (
+        recorded_hash == current["imports_sha256"]
+        and recorded_count == current["import_block_count"]
+    ):
+        return (
+            KIT_MATCH,
+            f"coverage.json matches imports.tf "
+            f"({current['import_block_count']} import block(s))",
+        )
+    return (
+        KIT_MISMATCH,
+        f"recorded {recorded_count} block(s) / {recorded_hash or '<none>'}, "
+        f"found {current['import_block_count']} block(s) / "
+        f"{current['imports_sha256']}",
+    )
+
+
 def write_manifest(manifest: dict[str, Any], workdir: Path) -> tuple[Path, Path]:
-    """Write coverage.json and its human-readable twin into the workdir."""
+    """Write coverage.json and its human-readable twin into the workdir.
+
+    Before serialization the manifest is stamped with a fingerprint of
+    the ``imports.tf`` the run just wrote beside it
+    (:func:`kit_fingerprint`), under a ``kit`` key, so the stamp lands
+    atomically inside the same ``coverage.json``. The stamp always
+    matches at write time — the value is a *later* verification
+    (:func:`verify_kit_fingerprint`, surfaced by ``--check``) detecting
+    that the kit and manifest have since drifted apart. Runs that wrote
+    no kit (zero pending imports) carry no ``kit`` key.
+    """
+    fingerprint = kit_fingerprint(workdir)
+    if fingerprint is not None:
+        manifest["kit"] = fingerprint
     json_path = workdir / COVERAGE_JSON_FILENAME
     atomic_write_text(
         json_path, json.dumps(manifest, indent=2, sort_keys=True) + "\n"

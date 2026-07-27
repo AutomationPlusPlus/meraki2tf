@@ -8,14 +8,25 @@ import pytest
 from meraki2tf.coverage import (
     COVERAGE_JSON_FILENAME,
     COVERAGE_SUMMARY_FILENAME,
+    KIT_ABSENT,
+    KIT_MATCH,
+    KIT_MISMATCH,
     STATUS_IMPORTED,
     STATUS_PENDING_IMPORT,
     STATUS_UNSUPPORTED,
     build_manifest,
+    kit_fingerprint,
     unsupported_payload,
+    verify_kit_fingerprint,
     write_manifest,
 )
-from meraki2tf.hcl_generator import CapturedAsset, UnsupportedAsset
+from meraki2tf.hcl_generator import IMPORTS_FILENAME, CapturedAsset, UnsupportedAsset
+
+#: Two well-formed import blocks, exactly as hcl_generator emits them.
+_KIT_TWO_BLOCKS = (
+    'import {\n  to = meraki_networks.n_1\n  id = "org-123,N_1"\n}\n'
+    'import {\n  to = meraki_devices.q2ab\n  id = "Q2AB"\n}\n'
+)
 
 CAPTURED = (
     CapturedAsset(
@@ -506,3 +517,181 @@ def test_summary_group_without_overflow_lists_all_examples(
     assert "(2 objects): same reason" in text
     assert "e.g. ids=N_1; ids=N_2" in text
     assert "...and" not in text
+
+
+# ---------------------------------------------------------------------------
+# Kit fingerprint: coverage.json <-> imports.tf cross-stamp (Cardinal Rule 2)
+# ---------------------------------------------------------------------------
+
+
+def test_kit_fingerprint_hashes_and_counts_a_written_kit(tmp_path: Path) -> None:
+    import hashlib
+
+    raw = _KIT_TWO_BLOCKS.encode("utf-8")
+    (tmp_path / IMPORTS_FILENAME).write_bytes(raw)
+
+    fingerprint = kit_fingerprint(tmp_path)
+
+    assert fingerprint == {
+        "imports_sha256": hashlib.sha256(raw).hexdigest(),
+        "import_block_count": 2,
+    }
+
+
+def test_kit_fingerprint_is_none_without_a_kit(tmp_path: Path) -> None:
+    assert kit_fingerprint(tmp_path) is None
+
+
+def test_kit_fingerprint_block_count_matches_known_kit(tmp_path: Path) -> None:
+    block = 'import {\n  to = meraki_networks.n_%d\n  id = "N_%d"\n}\n'
+    kit = "".join(block % (i, i) for i in range(5))
+    (tmp_path / IMPORTS_FILENAME).write_text(kit, encoding="utf-8")
+
+    fingerprint = kit_fingerprint(tmp_path)
+
+    assert fingerprint is not None
+    assert fingerprint["import_block_count"] == 5
+
+
+def test_write_manifest_stamps_the_kit_fingerprint(tmp_path: Path) -> None:
+    import hashlib
+
+    raw = _KIT_TWO_BLOCKS.encode("utf-8")
+    (tmp_path / IMPORTS_FILENAME).write_bytes(raw)
+    manifest = build_manifest(
+        organization_id="org-123",
+        captured=CAPTURED,
+        unsupported=UNSUPPORTED,
+        state_addresses=frozenset({"meraki_networks.n_1"}),
+    )
+
+    json_path, _ = write_manifest(manifest, tmp_path)
+
+    document = json.loads(json_path.read_text(encoding="utf-8"))
+    assert document["kit"] == {
+        "imports_sha256": hashlib.sha256(raw).hexdigest(),
+        "import_block_count": 2,
+    }
+
+
+def test_write_manifest_omits_kit_without_a_kit(tmp_path: Path) -> None:
+    manifest = build_manifest(
+        organization_id="org-123",
+        captured=CAPTURED,
+        unsupported=UNSUPPORTED,
+        state_addresses=frozenset(),
+    )
+
+    json_path, _ = write_manifest(manifest, tmp_path)
+
+    document = json.loads(json_path.read_text(encoding="utf-8"))
+    assert "kit" not in document
+
+
+def _stamped_workdir(tmp_path: Path) -> Path:
+    (tmp_path / IMPORTS_FILENAME).write_text(_KIT_TWO_BLOCKS, encoding="utf-8")
+    manifest = build_manifest(
+        organization_id="org-123",
+        captured=CAPTURED,
+        unsupported=UNSUPPORTED,
+        state_addresses=frozenset(),
+    )
+    write_manifest(manifest, tmp_path)
+    return tmp_path
+
+
+def test_verify_kit_fingerprint_matches_an_untouched_pair(
+    tmp_path: Path,
+) -> None:
+    workdir = _stamped_workdir(tmp_path)
+
+    status, detail = verify_kit_fingerprint(workdir)
+
+    assert status == KIT_MATCH
+    assert "2 import block(s)" in detail
+
+
+def test_verify_kit_fingerprint_flags_an_edited_kit(tmp_path: Path) -> None:
+    workdir = _stamped_workdir(tmp_path)
+    # A tampering edit lands AFTER coverage.json was stamped.
+    (workdir / IMPORTS_FILENAME).write_text(
+        _KIT_TWO_BLOCKS
+        + 'import {\n  to = meraki_networks.n_3\n  id = "N_3"\n}\n',
+        encoding="utf-8",
+    )
+
+    status, detail = verify_kit_fingerprint(workdir)
+
+    assert status == KIT_MISMATCH
+    assert "recorded 2 block(s)" in detail
+    assert "found 3 block(s)" in detail
+
+
+def test_verify_kit_fingerprint_flags_a_vanished_kit(tmp_path: Path) -> None:
+    workdir = _stamped_workdir(tmp_path)
+    (workdir / IMPORTS_FILENAME).unlink()
+
+    status, detail = verify_kit_fingerprint(workdir)
+
+    assert status == KIT_MISMATCH
+    assert "imports.tf is gone" in detail
+
+
+def test_verify_kit_fingerprint_absent_on_legacy_manifest(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / IMPORTS_FILENAME).write_text(_KIT_TWO_BLOCKS, encoding="utf-8")
+    (tmp_path / COVERAGE_JSON_FILENAME).write_text(
+        json.dumps({"organization_id": "org-123"}), encoding="utf-8"
+    )
+
+    status, detail = verify_kit_fingerprint(tmp_path)
+
+    assert status == KIT_ABSENT
+    assert "legacy manifest" in detail
+
+
+def test_verify_kit_fingerprint_absent_without_a_manifest(
+    tmp_path: Path,
+) -> None:
+    status, detail = verify_kit_fingerprint(tmp_path)
+
+    assert status == KIT_ABSENT
+    assert "nothing to verify" in detail
+
+
+def test_verify_kit_fingerprint_absent_on_corrupt_manifest(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / COVERAGE_JSON_FILENAME).write_text(
+        "{not valid json", encoding="utf-8"
+    )
+
+    status, detail = verify_kit_fingerprint(tmp_path)
+
+    assert status == KIT_ABSENT
+    assert "unreadable" in detail
+
+
+def test_verify_kit_fingerprint_absent_on_non_object_manifest(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / COVERAGE_JSON_FILENAME).write_text("[]", encoding="utf-8")
+
+    status, _ = verify_kit_fingerprint(tmp_path)
+
+    assert status == KIT_ABSENT
+
+
+def test_verify_kit_fingerprint_mismatch_on_malformed_kit_stamp(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / IMPORTS_FILENAME).write_text(_KIT_TWO_BLOCKS, encoding="utf-8")
+    (tmp_path / COVERAGE_JSON_FILENAME).write_text(
+        json.dumps({"kit": "not-a-dict"}), encoding="utf-8"
+    )
+
+    status, detail = verify_kit_fingerprint(tmp_path)
+
+    assert status == KIT_MISMATCH
+    assert "<none>" in detail
