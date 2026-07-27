@@ -74,7 +74,11 @@ from meraki2tf.config import (
 )
 from meraki2tf.coverage import build_manifest, unsupported_payload, write_manifest
 from meraki2tf.hcl_generator import HclImportGenerator
-from meraki2tf.logging_setup import LOG_FORMATS, configure_logging
+from meraki2tf.logging_setup import (
+    LOG_FORMATS,
+    configure_logging,
+    sanitize_control_chars,
+)
 from meraki2tf.models import DiscoveryDiagnostics, NetworkGraph
 from meraki2tf.openapi_parser import OpenApiParser
 from meraki2tf.orchestrator import (
@@ -1870,9 +1874,16 @@ def _list_orgs() -> int:
             "access in the Meraki dashboard."
         )
         return 0
+    # Organization names (and, defensively, IDs) are tenant-controlled
+    # free text printed to stdout; neutralize control characters up front
+    # so a crafted name cannot forge a table row or emit an ANSI escape.
+    # Sanitizing before the width calculation keeps the columns aligned.
     rows = sorted(
         (
-            (str(org.get("id", "")), str(org.get("name", "")))
+            (
+                sanitize_control_chars(str(org.get("id", ""))),
+                sanitize_control_chars(str(org.get("name", ""))),
+            )
             for org in organizations
         ),
         key=lambda row: row[1].lower(),

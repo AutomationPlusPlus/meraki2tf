@@ -3544,6 +3544,23 @@ def test_list_orgs_prints_sorted_table(
     assert captured["suppress_logging"] is True
 
 
+def test_list_orgs_neutralizes_control_chars_in_names(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Organization names are tenant-controlled free text printed to
+    stdout; a crafted newline must not forge a table row."""
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+    _stub_meraki_orgs(
+        monkeypatch,
+        [{"id": "111222", "name": "Acme\n999999  Forged Row\x1b[2J"}],
+    )
+    assert main(["--list-orgs"]) == 0
+    out = capsys.readouterr().out
+    assert "\n999999  Forged Row" not in out  # no forged data row
+    assert "\x1b" not in out  # no ANSI escape
+    assert "Acme\\n999999" in out  # newline made visible on one row
+
+
 def test_list_orgs_requires_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
     with pytest.raises(SystemExit) as excinfo:

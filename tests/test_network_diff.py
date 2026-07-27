@@ -233,3 +233,24 @@ def test_identical_networks_render_the_empty_note() -> None:
     assert comparison.diff.is_empty
     report = render_network_comparison(comparison)
     assert "No differences in comparable network-scoped configuration." in report
+
+
+def test_render_neutralizes_control_chars_in_network_names() -> None:
+    """A tenant-controlled network name reaches the stdout report; a
+    crafted newline must not forge a report line, and ANSI escapes must
+    not drive the terminal (the --diff-out JSON path is already safe)."""
+    from meraki2tf.network_diff import NetworkComparison
+    from meraki2tf.snapshot_diff import SnapshotDiff
+
+    comparison = NetworkComparison(
+        network_a=_network("N_1", "HQ"),
+        network_b=_network("N_2", "Branch\n2026-07-27 CRITICAL forged\x1b[2J"),
+        diff=SnapshotDiff(),
+        device_scoped_excluded=0,
+        org_scoped_excluded=0,
+        unreadable_excluded=0,
+    )
+    report = render_network_comparison(comparison)
+    assert "\n2026-07-27 CRITICAL forged" not in report  # no forged line
+    assert "\x1b" not in report  # no ANSI escape
+    assert "Branch\\n2026-07-27" in report  # newline made visible

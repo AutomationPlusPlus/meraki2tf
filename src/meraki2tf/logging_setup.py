@@ -23,6 +23,72 @@ _CLEAN_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 _VERBOSE_FORMAT = "%(asctime)s %(levelname)s [%(name)s:%(lineno)d] %(message)s"
 _REDACTED = "[REDACTED]"
 
+#: Control characters that let Meraki-controlled free text (network
+#: names, notes, tags) forge whole log records or drive the terminal: a
+#: ``\n``/``\r`` starts a byte-perfect fake line, ``\x1b`` opens an ANSI
+#: escape (screen-clear, colour). Every C0 control (incl. TAB), DEL, and
+#: the C1 range are neutralized. Printable text and normal Unicode are
+#: untouched.
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+_CONTROL_CHAR_NAMES = {"\n": "\\n", "\r": "\\r", "\t": "\\t", "\x1b": "\\x1b"}
+
+
+def sanitize_control_chars(text: str) -> str:
+    """Render control characters as their visible ``\\x`` escapes.
+
+    ``\\n``, ``\\r``, ``\\t`` and ``\\x1b`` (ESC) become their familiar
+    two-/four-character escapes; every other C0/C1 control and DEL
+    becomes ``\\xNN``. The result contains no control characters, so it
+    cannot forge a log line or emit a terminal escape sequence. The
+    transformation is idempotent — its own output (plain backslashes and
+    hex digits) contains nothing left to escape — so applying it after
+    JSON encoding, or twice, stays consistent.
+    """
+
+    def _replace(match: re.Match[str]) -> str:
+        char = match.group(0)
+        return _CONTROL_CHAR_NAMES.get(char, f"\\x{ord(char):02x}")
+
+    return _CONTROL_CHAR_RE.sub(_replace, text)
+
+
+class ControlCharFilter(logging.Filter):
+    """Neutralize control characters in every record before emission.
+
+    Installed centrally in :func:`configure_logging` alongside
+    :class:`SecretRedactionFilter` so no call site that logs raw tenant
+    text (network names in critical scope/heal messages, ``str(exc)``
+    from the SDK) can forge log records or inject ANSI escapes. In JSON
+    format the escapes stay valid JSON (backslash/hex only) and
+    ``json.dumps`` never sees a raw control character; in text format
+    each record stays a single line.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:
+            # Mirror SecretRedactionFilter: a malformed %-arg call must
+            # degrade rather than crash the caller (filters are not
+            # wrapped by Handler.handleError). Clear args so a later
+            # formatter cannot re-raise on the same broken template.
+            record.msg = sanitize_control_chars(str(record.msg))
+            record.args = None
+        else:
+            neutralized = sanitize_control_chars(message)
+            # Only rewrite when something actually changed, so benign
+            # records keep their ``msg``/``args`` untouched (log records
+            # are shared with other handlers, e.g. pytest's caplog).
+            if neutralized != message:
+                record.msg = neutralized
+                record.args = None
+        if record.exc_text:
+            neutralized_exc = sanitize_control_chars(record.exc_text)
+            if neutralized_exc != record.exc_text:
+                record.exc_text = neutralized_exc
+        return True
+
+
 # Matches Authorization / X-Cisco-Meraki-API-Key header values however they
 # were interpolated into a message (e.g. by HTTP debug logging). Quoted
 # values are consumed wholly, and unquoted scheme-prefixed values
@@ -119,6 +185,9 @@ def configure_logging(verbose: bool = False, log_format: str = "text") -> None:
             logging.Formatter(_VERBOSE_FORMAT if verbose else _CLEAN_FORMAT)
         )
     handler.addFilter(SecretRedactionFilter())
+    # Runs after redaction so tenant-controlled free text can neither
+    # forge a log line nor drive the terminal, in every format.
+    handler.addFilter(ControlCharFilter())
     root = logging.getLogger()
     root.handlers = [handler]
     root.setLevel(logging.DEBUG if verbose else logging.INFO)

@@ -694,6 +694,50 @@ def test_render_payload_rejects_unknown_formats() -> None:
         render_payload(_drift_event(), "discord")
 
 
+def _hostile_event() -> AlertEvent:
+    """An event whose tenant-derived text carries chat-app injection."""
+    return AlertEvent(
+        event_type=EventType.DRIFT_DETECTED,
+        severity=EventSeverity.WARNING,
+        summary=(
+            "drift near <!channel> <https://evil.example|click me> `x`"
+            "\nCRITICAL forged\x1b[2J"
+        ),
+        details={
+            "network": "Branch [pwn](https://evil.example) ```break",
+            "note": "line-one\nCRITICAL forged\x1b[2J",
+        },
+    )
+
+
+def test_render_slack_neutralizes_mrkdwn_and_mentions() -> None:
+    text = render_payload(_hostile_event(), "slack")["text"]
+    # <!channel> and <url|label> link syntax are defused by &<> escaping.
+    assert "<!channel>" not in text
+    assert "&lt;!channel&gt;" in text
+    assert "|click me>" not in text
+    # Tenant backticks cannot close the fenced details block: only the
+    # two structural fences remain.
+    assert text.count("```") == 2
+    # No forged line and no ANSI escape survive.
+    assert "\nCRITICAL forged" not in text
+    assert "\x1b" not in text
+    # Still a valid JSON body.
+    json.dumps(render_payload(_hostile_event(), "slack"))
+
+
+def test_render_teams_neutralizes_markdown_links() -> None:
+    body = render_payload(_hostile_event(), "teams")
+    texts = [block["text"] for block in body["attachments"][0]["content"]["body"]]
+    joined = "\n".join(texts)
+    # The markdown link becomes inert: no active "](", "[" is escaped.
+    assert "](https://evil.example)" not in joined
+    assert "\\[pwn\\]" in joined
+    assert "\x1b" not in joined
+    # Structurally still a valid Adaptive Card JSON body.
+    json.dumps(body)
+
+
 def test_webhook_posts_slack_format_when_configured(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
