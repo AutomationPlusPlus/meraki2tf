@@ -26,7 +26,7 @@ RUN pip wheel --no-deps --wheel-dir /wheels /src
 
 FROM python:3.14-slim
 
-ARG TERRAFORM_VERSION=1.9.8
+ARG TERRAFORM_VERSION=1.15.8
 
 # Terraform is downloaded and its checksum verified against HashiCorp's
 # published SHA256SUMS. Both files come from the same origin, so this

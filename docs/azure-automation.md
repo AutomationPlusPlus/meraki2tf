@@ -71,7 +71,7 @@ python3 -m venv /opt/meraki2tf/.venv
 # download against HashiCorp's published SHA256SUMS so a compromised CDN
 # or TLS-interception box cannot slip in a trojaned binary that would
 # then run every --sync job with the dashboard API key in its env.
-ver=1.9.8; tmp=$(mktemp -d)
+ver=1.15.8; tmp=$(mktemp -d)
 curl -fsSLo "$tmp/terraform.zip" \
   "https://releases.hashicorp.com/terraform/$ver/terraform_${ver}_linux_amd64.zip"
 curl -fsSLo "$tmp/SHA256SUMS" \
