@@ -967,29 +967,67 @@ def _body_property_names(op: OperationSpec) -> frozenset[str]:
     return frozenset()
 
 
+#: Body property names that bind a write to specific hardware.
+_SERIAL_PROPERTY = re.compile(r"(?i)serial")
+
+
+def _is_serial_property(name: str) -> bool:
+    """Whether a body property name binds a write to a device serial.
+
+    The single determinant of "this key carries a hardware serial",
+    shared by the drill-skip classifier (:func:`_body_serial_properties`)
+    and the ``--serial-map`` remapper (:func:`_remap_serial_fields`) so
+    the two never drift: a key that is skipped on a hardware-free drill
+    is exactly a key whose serial must be swapped on a hardware-loss
+    restore. Matches ``serial``/``serials`` plus every real
+    serial-bearing key the spec declares — ``spareSerial`` (warm spare),
+    ``deviceSerial`` (per-device license), ``sourceSerial`` /
+    ``targetSerials`` (device clone), ``primarySerial`` /
+    ``redundantSerial``, ``serialNumber``. Every such spec key is a
+    genuine device serial, so there is no substring false positive to
+    exclude.
+    """
+    return bool(_SERIAL_PROPERTY.search(name))
+
+
+def _remap_serial_value(value: Any, serial_map: Mapping[str, str]) -> Any:
+    """Swap a single serial field's value through the hardware map.
+
+    A string is remapped directly; a list of serials is remapped
+    element-wise. Unmapped serials pass through unchanged (existing
+    semantics). Any other shape under a serial-named key is left to the
+    recursive walk, so a serial-named container still has nested serial
+    fields remapped.
+    """
+    if isinstance(value, str):
+        return serial_map.get(value, value)
+    if isinstance(value, list):
+        return [
+            serial_map.get(item, item) if isinstance(item, str) else item
+            for item in value
+        ]
+    return _remap_serial_fields(value, serial_map)
+
+
 def _remap_serial_fields(
     value: Any, serial_map: Mapping[str, str]
 ) -> Any:
-    """Rewrite ``serial``/``serials`` fields through the hardware map.
+    """Rewrite every hardware-serial field through the hardware map.
 
     ``--serial-map`` exists for hardware-loss recovery: payloads that
-    embed dead serials (switch stacks, per-port references) must point
-    at the replacement hardware, not just the device-claim calls —
-    serial keys don't match the ``*Id`` reference grammar, so the ID
-    rewriter never sees them.
+    embed dead serials (switch stacks, per-port references, warm-spare
+    pairs, per-device licenses, device clones) must point at the
+    replacement hardware, not just the device-claim calls — serial keys
+    don't match the ``*Id`` reference grammar, so the ID rewriter never
+    sees them. Any key :func:`_is_serial_property` flags (the same
+    determinant the drill-skip classifier uses) is remapped, so the
+    remapper and the classifier stay consistent.
     """
     if isinstance(value, Mapping):
         out: dict[str, Any] = {}
         for key, inner in value.items():
-            if key == "serial" and isinstance(inner, str):
-                out[key] = serial_map.get(inner, inner)
-            elif key == "serials" and isinstance(inner, list):
-                out[key] = [
-                    serial_map.get(item, item)
-                    if isinstance(item, str)
-                    else item
-                    for item in inner
-                ]
+            if _is_serial_property(str(key)):
+                out[key] = _remap_serial_value(inner, serial_map)
             else:
                 out[key] = _remap_serial_fields(inner, serial_map)
         return out
@@ -997,9 +1035,6 @@ def _remap_serial_fields(
         return [_remap_serial_fields(item, serial_map) for item in value]
     return value
 
-
-#: Body property names that bind a write to specific hardware.
-_SERIAL_PROPERTY = re.compile(r"(?i)serial")
 
 #: Dashboard 400 texts meaning "an object with this name/slot already
 #: exists" — Meraki provisions defaults (payload templates, RF
@@ -1220,7 +1255,7 @@ def _body_serial_properties(op: OperationSpec) -> frozenset[str]:
     return frozenset(
         name
         for name in _body_property_names(op)
-        if _SERIAL_PROPERTY.search(name)
+        if _is_serial_property(name)
     )
 
 
