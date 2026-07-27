@@ -722,6 +722,11 @@ class TerraformRunner:
         backend reads the state file directly; a remote backend has no
         local file, so its state is read through terraform itself
         (``show -json``), which requires an initialized workspace.
+
+        Raises :class:`TerraformError` when the local state file exists
+        but cannot be read or parsed — a corrupt state is refused loudly
+        rather than mistaken for an empty one, which would re-import
+        already-tracked resources.
         """
         if self._backend.is_remote:
             return self._remote_existing_addresses()
@@ -870,6 +875,11 @@ class TerraformRunner:
         Requires an initialized workspace (:meth:`init`). This is the
         authoritative source for resource matching: the catalog always
         reflects the provider version terraform actually selected.
+
+        Raises :class:`TerraformError` when ``terraform providers
+        schema`` produces unparseable or non-object output — the catalog
+        must never be silently empty, as that would misreport every
+        resource as unmatched.
         """
         from meraki2tf.provider_catalog import ProviderCatalog
 
@@ -1133,6 +1143,11 @@ class TerraformRunner:
         ignored by terraform, and the saved plan file is guard-verified
         as import-only by :meth:`apply_import_plan` exactly like a full
         plan. Read-only toward Meraki, like every plan.
+
+        Raises :class:`ValueError` when no addresses are given — an empty
+        ``-target`` set silently degenerates into a full untargeted
+        multi-hour plan, reopening the race window this method exists to
+        close.
         """
         targets = list(addresses)
         if not targets:
@@ -1604,6 +1619,9 @@ class TerraformRunner:
         the baseline would make the plan propose destroying all of them.
         Split out so the orchestrator can refuse before spending a full
         discovery pass on a run that cannot proceed.
+
+        Raises :class:`TerraformError` when the state still tracks any
+        resource.
         """
         if existing_addresses:
             raise TerraformError(
@@ -1661,6 +1679,10 @@ class TerraformRunner:
         human-invoked ``--rebuild --confirm`` CLI action, and what runs
         is the exact plan file :meth:`plan_preview` showed the operator;
         terraform itself refuses the file if the state has changed since.
+
+        Raises :class:`TerraformError` when no saved rebuild plan exists
+        to apply — the preview must run first so the apply can only ever
+        execute a document a human has seen.
         """
         snapshot = self._rebuild_plan_snapshot
         if snapshot is None or not snapshot.exists():

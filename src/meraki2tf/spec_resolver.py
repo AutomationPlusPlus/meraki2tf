@@ -178,6 +178,11 @@ def resolve_spec(
     the file's version + sha256 are logged so the run's exact spec is
     on record. Only a completely missing file still downloads (there is
     nothing local to be deterministic about).
+
+    Raises :class:`SpecResolutionError` when a download fails or yields a
+    spec that is not valid JSON, is not an object, or carries no
+    ``paths`` — an unparseable or structurally empty spec is never
+    written or run against.
     """
     user_supplied = spec_path is not None
     path = spec_path if spec_path is not None else Path(DEFAULT_SPEC_FILENAME)

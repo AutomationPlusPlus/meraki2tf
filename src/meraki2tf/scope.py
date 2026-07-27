@@ -56,6 +56,9 @@ def parse_network_selectors(
     ``network:PATTERN`` form: an untyped or other-typed selector is a
     usage error, so the restriction can be lifted compatibly if finer
     export scoping is ever wanted.
+
+    Raises :class:`ScopeFilterError` for any selector that is not a
+    well-formed ``network:PATTERN``.
     """
     parsed: list[tuple[str, re.Pattern[str]]] = []
     for value in raw:
@@ -129,6 +132,9 @@ def scoped_plan_targets(captured_addresses: Iterable[str]) -> tuple[str, ...]:
     An empty set refuses loudly: terraform silently degenerates an
     empty ``-target`` list into a FULL plan, which is exactly the
     out-of-scope exposure targeting exists to prevent.
+
+    Raises :class:`ScopeFilterError` when the scoped discovery captured
+    no Terraform-addressable resources (an empty target set).
     """
     targets = tuple(sorted(captured_addresses))
     if not targets:
@@ -159,6 +165,9 @@ class SnapshotScope:
         A corrupted scope must fail loudly — silently reading it as
         "full organization" would let a partial snapshot through every
         full-org guard.
+
+        Raises :class:`ValueError` when the ``scope`` object, its
+        ``networks`` list, or its ``selectors`` list is malformed.
         """
         if not isinstance(value, dict):
             raise ValueError(

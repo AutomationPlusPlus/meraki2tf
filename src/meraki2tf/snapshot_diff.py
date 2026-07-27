@@ -155,6 +155,15 @@ def validate_baseline_header(
     call sites legitimately differ: the preflight *targets* an
     organization the operator asked for, while the mid-run check
     *discovered* one. Returns the baseline's recorded organization IDs.
+
+    Raises :class:`SanitizedBaselineError` when the baseline carries the
+    sanitized marker, :class:`PartialBaselineError` when it is a
+    ``--only`` scoped export, :class:`UnrecognizedBaselineError` when it
+    records no organization (not a meraki2tf snapshot, or truncated
+    before its header), and :class:`BaselineOrgMismatchError` when it was
+    captured from an organization other than the one this run resolves
+    to — each refusal guards against every asset falsely registering as
+    added or removed.
     """
     if provider.snapshot_sanitized:
         raise SanitizedBaselineError(

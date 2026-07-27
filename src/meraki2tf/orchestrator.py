@@ -240,6 +240,19 @@ class PipelineOrchestrator:
         self._reconciliation_alerted: set[str] = set()
 
     def run(self, organization_id: str | None = None) -> RunSummary:
+        """Acquire the workdir lock, then run the pipeline under it.
+
+        A thin wrapper around :meth:`_run` that serializes the whole run
+        behind an exclusive workdir lock: terraform locks only its state,
+        but the DR kit has none, so two overlapping runs on one workdir
+        could leave a coverage manifest vouching for resources absent
+        from ``imports.tf`` (Cardinal Rule 2). Raises
+        :class:`PreflightRefusalError` when another run already holds the
+        lock — an expected refusal, not a fault (no ``PROCESSING_FAULT``
+        alert, no traceback), and on contention nothing in the workdir is
+        touched so the holding run keeps sole ownership. The lock is
+        always released when the delegated run returns or raises.
+        """
         # Terraform locks only its state; the DR kit itself has none, so
         # two overlapping runs on one workdir would clobber each other and
         # could leave a coverage manifest vouching for resources absent

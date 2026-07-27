@@ -737,6 +737,12 @@ class ReferenceResolver:
         ``exclude`` is the referring object's own old identity on a
         create: a self-referential field is identity, not a dangling
         reference, so it passes through when nothing scoped matches.
+
+        Raises :class:`UnmappedReferenceError` when the reference is
+        ambiguous across rebuilt objects (refusing to guess) or when it
+        points at a snapshot object whose rebuilt counterpart does not
+        exist yet — writing a source-tenant ID could address the wrong,
+        possibly production, object.
         """
         referrer = frozenset(context)
         stem = _scope_stem(key)
@@ -803,6 +809,9 @@ class ReferenceResolver:
           org (mapped to the target up front) or an object this restore
           creates — so an unmapped one can only point *outside* the
           rebuilt organization (a crafted or inconsistent snapshot).
+
+        The first case raises :class:`UnmappedReferenceError`; the second
+        raises :class:`ForeignScopeError`.
         """
         referrer = frozenset(context)
         stem = _scope_stem(key)
@@ -1579,6 +1588,11 @@ class RestoreJournal:
         action skips and ID mappings against a *different* target would
         skip every create and then write the configure actions into the
         previous target's networks.
+
+        Raises :class:`RestoreJournalMismatchError` when the journal
+        already records a different target/source pair, or when it
+        predates target/source binding but carries completed actions or
+        mappings — adopting either would misdirect the restore.
         """
         claim = {"target": target, "source": source}
         if self.meta:
@@ -1750,6 +1764,22 @@ class OrgRestorer:
     def execute(
         self, graph: NetworkGraph, plan: RestorePlan
     ) -> RestoreResult:
+        """Rebuild the plan into the target org, wave-ordered and resumable.
+
+        Binds the journal to this target/source pair (see
+        :meth:`RestoreJournal.bind`) so a resumed run skips only its own
+        completed actions, then works the plan's actions in dependency
+        waves: alphabetical order can place a referrer before its
+        referent, so an action whose references are not yet resolvable
+        defers to the next round rather than failing, and a round that
+        settles nothing proves the remaining references genuinely dead.
+        Every create/claim records its old→new ID mapping through the
+        :class:`ReferenceResolver` so children rewire onto rebuilt
+        parents; children of a failed or drill-skipped parent are
+        skipped with a reason instead of firing writes at a source-tenant
+        ID (possibly production hardware). Returns a :class:`RestoreResult`
+        tallying executed, failed, skipped, and drill-placeholder actions.
+        """
         dashboard = self._dashboard()
         self._journal.bind(
             target=self._target, source=graph.organization_id
@@ -3431,7 +3461,15 @@ class OrgWiper:
         return self._client
 
     def preview(self, organization_id: str, expected_name: str) -> WipePreview:
-        """Validate every interlock and report the blast radius."""
+        """Validate every interlock and report the blast radius.
+
+        Raises :class:`WipeRefusedError` when any interlock trips: the
+        ``--wipe-org-name`` second factor does not match the
+        organization's actual name, the SDK cannot read the claimed
+        inventory to verify the org is hardware-free, or the org holds
+        any claimed device (network-assigned or inventory-only) — wiping
+        is permitted only for hardware-free drill organizations.
+        """
         dashboard = self._dashboard()
         organization = dashboard.organizations.getOrganization(organization_id)
         name = str(organization.get("name", ""))

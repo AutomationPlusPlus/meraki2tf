@@ -110,6 +110,16 @@ class WebhookNotifier(Notifier):
         return text
 
     def send(self, event: AlertEvent) -> None:
+        """POST the event as JSON to the configured webhook endpoint.
+
+        The body is rendered in the channel's payload format (a generic
+        JSON envelope, or a Slack/Teams message card), so one notifier
+        drives every webhook-shaped target. Raises
+        :class:`WebhookDeliveryError` when the request fails or the
+        endpoint answers HTTP >= 300; the message and exception chain are
+        scrubbed first so a URL carrying an embedded secret never reaches
+        a log or traceback.
+        """
         body = json.dumps(
             render_payload(event, self._payload_format)
         ).encode("utf-8")

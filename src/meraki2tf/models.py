@@ -35,6 +35,12 @@ class MerakiNetwork:
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "MerakiNetwork":
+        """Build a network from a raw API/dump payload.
+
+        Raises :class:`MalformedPayloadError` when the payload carries no
+        ``id`` — a network with no identity cannot be imported or
+        rebuilt, so it is refused rather than silently dropped.
+        """
         network_id = str(payload.get("id", ""))
         if not network_id.strip():
             raise MalformedPayloadError(f"Network payload has no 'id': {sorted(payload)}")
@@ -71,6 +77,12 @@ class MerakiDevice:
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "MerakiDevice":
+        """Build a device from a raw API/dump payload.
+
+        Raises :class:`MalformedPayloadError` when the payload carries no
+        ``serial`` — the serial is the device's identity for claiming and
+        import, so a payload lacking one is refused.
+        """
         serial = str(payload.get("serial", ""))
         if not serial.strip():
             raise MalformedPayloadError(f"Device payload has no 'serial': {sorted(payload)}")
@@ -148,7 +160,11 @@ class NetworkGraph:
 
 
 def coerce_sequence(value: Any, description: str) -> Sequence[Any]:
-    """Validate a raw JSON value is a list-like collection of payloads."""
+    """Validate a raw JSON value is a list-like collection of payloads.
+
+    Raises :class:`MalformedPayloadError` when the value is neither
+    ``None`` nor a non-string sequence.
+    """
     if value is None:
         return ()
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):

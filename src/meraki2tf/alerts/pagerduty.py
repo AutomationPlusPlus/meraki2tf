@@ -85,6 +85,16 @@ class PagerDutyNotifier(Notifier):
         return event.severity is not EventSeverity.INFO
 
     def send(self, event: AlertEvent) -> None:
+        """Trigger a PagerDuty Events API v2 incident for the event.
+
+        Maps the event's :class:`EventSeverity` onto PagerDuty's severity
+        vocabulary and posts a ``trigger`` action keyed by a routing key
+        read from the environment at send time. Raises
+        :class:`PagerDutyDeliveryError` when the request fails or the API
+        answers HTTP >= 300; the routing key is scrubbed from any error
+        text and the exception chain dropped so it cannot leak into a
+        log or traceback.
+        """
         key = _read_routing_key()
         summary = f"[meraki2tf] {event.event_type.value}: {event.summary}"
         body = json.dumps(
