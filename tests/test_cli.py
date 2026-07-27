@@ -1129,6 +1129,41 @@ def test_report_logs_reconciliation_outcomes(
     assert "meraki_wireless_ssid.s_0: psk" in text
 
 
+def test_report_caps_uncaptured_secret_log_enumeration(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """At scale the 'secrets not captured' WARNING must not become one
+    mega line; it caps at 50 entries and points to the durable lists."""
+    from meraki2tf.cli import _report
+    from meraki2tf.orchestrator import RunSummary
+
+    secrets = {
+        f"meraki_wireless_ssid.s_{i}": ("psk",) for i in range(60)
+    }
+    summary = RunSummary(
+        organization_id="org-123",
+        discovered_assets=60,
+        imports_written=0,
+        imports_skipped_existing=0,
+        unsupported_count=0,
+        drift_detected=False,
+        comparison_skipped=False,
+        pending_imports=0,
+        unmanaged_secret_attributes=secrets,
+    )
+    with caplog.at_level("WARNING", logger="meraki2tf.cli"):
+        _report(summary)
+    warning = next(
+        r.getMessage() for r in caplog.records
+        if "Secrets not captured" in r.getMessage()
+    )
+    assert "... and 10 more (see coverage.txt / runbook.md)" in warning
+    # No secret VALUES ever reach the log — only address:attribute names.
+    assert "psk" in warning
+    # The tail is collapsed, not enumerated.
+    assert "s_59:" not in warning
+
+
 # ------------------------------------------ alerting & exit-code contract
 
 

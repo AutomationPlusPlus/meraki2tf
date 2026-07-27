@@ -10,6 +10,8 @@ from meraki2tf.openapi_parser import OpenApiParser
 from meraki2tf.providers.discovery import (
     FeatureSectionMatcher,
     _collection_id_key,
+    _ITEM_OP_CACHE,
+    _resolve_item_operation,
     aggregation_collection_path,
     aggregation_mappings,
     config_collection_operations,
@@ -77,6 +79,53 @@ def test_item_operation_prefers_get_then_any_mutating_verb(
 
     syslog = _get_op(parser, "/networks/{networkId}/syslogServers")
     assert item_operation_for(parser, syslog) is None
+
+
+def test_item_operation_memoized_equals_unmemoized(
+    parser: OpenApiParser,
+) -> None:
+    """The per-parser memo returns exactly what a fresh scan would, and
+    the second call is served from the cache."""
+    collections = [
+        _get_op(parser, "/networks/{networkId}/appliance/vlans"),
+        _get_op(parser, "/organizations/{organizationId}/admins"),
+        _get_op(parser, "/networks/{networkId}/syslogServers"),
+    ]
+    # Start from a cold cache so the first lookup populates it.
+    _ITEM_OP_CACHE.pop(parser, None)
+    for op in collections:
+        expected = _resolve_item_operation(parser, op)
+        # First call fills the cache; second must return the identical
+        # object without re-scanning.
+        first = item_operation_for(parser, op)
+        second = item_operation_for(parser, op)
+        assert first is expected
+        assert second is expected
+        assert _ITEM_OP_CACHE[parser][op.path] is expected
+
+
+def test_item_operation_cache_does_not_leak_across_parsers(
+    tmp_path: Path,
+) -> None:
+    """Each parser (spec) owns its own memo; a second spec whose same path
+    resolves differently is never served the first parser's answer."""
+    paths = {
+        "/things": {"get": {"operationId": "getThings"}},
+        "/things/{id}": {"put": {"operationId": "updateThing"}},
+    }
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+    parser_a = _write_spec(dir_a, paths)
+    # Same collection path, but this spec exposes no item endpoint at all.
+    parser_b = _write_spec(dir_b, {"/things": paths["/things"]})
+    things_a = _get_op(parser_a, "/things")
+    things_b = _get_op(parser_b, "/things")
+
+    assert item_operation_for(parser_a, things_a) is not None
+    # Same key ("/things"), different parser → resolved independently.
+    assert item_operation_for(parser_b, things_b) is None
 
 
 def test_element_id_derives_collection_keyed_field(tmp_path: Path) -> None:
