@@ -54,7 +54,8 @@ RUN set -eux \
 # cannot silently pull an untested or tampered SDK.
 COPY --from=builder /wheels /wheels
 COPY requirements-lock.txt /tmp/requirements-lock.txt
-RUN pip install --no-cache-dir --require-hashes -r /tmp/requirements-lock.txt \
+RUN pip install --no-cache-dir --require-hashes --only-binary=:all: \
+        -r /tmp/requirements-lock.txt \
     && pip install --no-cache-dir --no-deps /wheels/*.whl \
     && rm -rf /wheels /tmp/requirements-lock.txt
 

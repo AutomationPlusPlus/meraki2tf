@@ -200,7 +200,13 @@ Changelog). Checklist:
    bottom.
 3. Bump `version` in `pyproject.toml` to match.
 4. Regenerate `requirements-lock.txt` if the `meraki` pin or its closure
-   moved (instructions in that file's header).
+   moved (instructions in that file's header). `tox -e lock` is the check —
+   it runs in CI on every PR, and re-resolving is required whenever the SDK
+   changes its *own* dependencies, not just when its version moves. A
+   Dependabot bump rewrites the pinned line only; it does not re-resolve
+   what sits underneath it, and a closure that no longer matches breaks the
+   hash-pinned worker and container installs while every other check stays
+   green.
 5. Merge that PR, then tag the merge commit (signed) and publish:
 
    ```bash

@@ -200,7 +200,7 @@ the runtime closure by hash so a mid-incident rebuild cannot silently
 pull an untested or tampered SDK:
 
 ```bash
-pip install --require-hashes -r requirements-lock.txt
+pip install --require-hashes --only-binary=:all: -r requirements-lock.txt
 pip install --no-deps .
 ```
 
