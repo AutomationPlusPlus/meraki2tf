@@ -150,7 +150,7 @@ def test_log_hygiene_arguments_cannot_be_overridden(
 def _smart_flow_dashboard_api(captured: dict[str, Any]) -> Any:
     """A stand-in carrying SDK 4.x's smart-flow constructor surface."""
 
-    def DashboardAPI(  # noqa: N802 - mirrors the SDK's class name
+    def DashboardAPI(  # mirrors the SDK's class name
         *,
         api_key: str,
         suppress_logging: bool = False,
@@ -200,7 +200,7 @@ def test_smart_flow_settings_are_not_sent_to_an_sdk_without_them(
     so the factory reads the constructor instead of assuming one."""
     captured: dict[str, Any] = {}
 
-    def DashboardAPI(  # noqa: N802 - mirrors the SDK's class name
+    def DashboardAPI(  # mirrors the SDK's class name
         *, api_key: str, suppress_logging: bool, print_console: bool, output_log: bool
     ) -> None:
         captured.update(locals())
@@ -221,7 +221,7 @@ def test_renamed_smart_flow_cache_fails_closed(
     switch off is a restructured cache. Refuse to build the client
     rather than silently resume writing identifiers to disk."""
 
-    def DashboardAPI(  # noqa: N802 - mirrors the SDK's class name
+    def DashboardAPI(  # mirrors the SDK's class name
         *,
         api_key: str,
         suppress_logging: bool,

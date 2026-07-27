@@ -588,7 +588,7 @@ class _RecordingSection:
         self._fail = fail_ops or set()
         self._responses = responses or {}
 
-    def __getattr__(self, operation_id: str):  # noqa: ANN204
+    def __getattr__(self, operation_id: str):
         def _dispatch(*args: object, **kwargs: object) -> dict:
             self._calls.append((operation_id, args, kwargs))
             if operation_id in self._fail:
@@ -5797,7 +5797,7 @@ def _mislabeled_delete(*args: object, **kwargs: object) -> dict:
     raise AssertionError("a mislabeled SDK method must never be called")
 
 
-def _as_meraki_method(func):  # noqa: ANN001, ANN201
+def _as_meraki_method(func):
     clone = __import__("types").FunctionType(
         func.__code__, func.__globals__, func.__name__,
         func.__defaults__, func.__closure__,
@@ -5889,9 +5889,9 @@ def _identity_preset() -> tuple:
     return (("network", "N_1", "N_1", ()),)
 
 
-def _heal_executor(  # noqa: ANN201
+def _heal_executor(
     tmp_path: Path,
-    section,  # noqa: ANN001
+    section,
     journal_name: str = "heal.jsonl",
     preset: tuple | None = None,
 ):
@@ -5912,7 +5912,7 @@ def _heal_executor(  # noqa: ANN201
     return restorer
 
 
-def _snmp_plan(tmp_path: Path):  # noqa: ANN201
+def _snmp_plan(tmp_path: Path):
     from meraki2tf.restorer import RestorePlan
 
     parser = _restore_spec(tmp_path)
@@ -6360,7 +6360,7 @@ def test_second_incident_reclaims_missing_devices(tmp_path: Path) -> None:
     restorer, _calls = _executor(tmp_path)
     assert restorer.execute(graph, plan).failed == ()
 
-    def resume(listings: list) -> tuple:  # noqa: ANN001
+    def resume(listings: list) -> tuple:
         calls: list = []
         section = _RecordingSection(
             calls,

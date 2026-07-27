@@ -2413,7 +2413,7 @@ def test_restore_confirm_executes_and_alerts(
     calls: list[tuple[str, tuple, dict]] = []
 
     class Section:
-        def __getattr__(self, operation_id: str):  # noqa: ANN204
+        def __getattr__(self, operation_id: str):
             def _dispatch(*args: Any, **kwargs: Any) -> dict:
                 calls.append((operation_id, args, kwargs))
                 if operation_id == "createOrganizationNetwork":
@@ -2565,7 +2565,7 @@ def test_restore_confirm_reports_failures_nonzero(
     monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
 
     class FailingSection:
-        def __getattr__(self, operation_id: str):  # noqa: ANN204
+        def __getattr__(self, operation_id: str):
             def _dispatch(*args: Any, **kwargs: Any) -> dict:
                 raise RuntimeError("simulated failure")
 
@@ -2661,7 +2661,7 @@ def test_sanitized_restore_proceeds_into_an_empty_target(
     calls: list[tuple[str, tuple, dict]] = []
 
     class Section:
-        def __getattr__(self, operation_id: str):  # noqa: ANN204
+        def __getattr__(self, operation_id: str):
             def _dispatch(*args: Any, **kwargs: Any) -> dict:
                 calls.append((operation_id, args, kwargs))
                 if operation_id == "createOrganizationNetwork":
@@ -3424,7 +3424,7 @@ def test_sanitized_restore_resume_honors_an_attempt_only_journal(
     calls: list[str] = []
 
     class Section:
-        def __getattr__(self, operation_id: str):  # noqa: ANN204
+        def __getattr__(self, operation_id: str):
             def _dispatch(*args: Any, **kwargs: Any) -> dict:
                 calls.append(operation_id)
                 if operation_id == "createOrganizationNetwork":

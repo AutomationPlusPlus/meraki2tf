@@ -660,7 +660,9 @@ def build_dispatcher(config: RuntimeConfig) -> AlertDispatcher:
         except WebhookConfigError as exc:
             # A misconfigured endpoint must not silently disable
             # alerting for the whole run: refuse loudly at startup.
-            raise SystemExit(f"Invalid --webhook-url / {WEBHOOK_URL_ENV_VAR}: {exc}")
+            raise SystemExit(
+                f"Invalid --webhook-url / {WEBHOOK_URL_ENV_VAR}: {exc}"
+            ) from None
     if config.pagerduty:
         if not routing_key_present():
             # Same loud-refusal rule as a bad webhook URL: a paging
@@ -677,7 +679,7 @@ def build_dispatcher(config: RuntimeConfig) -> AlertDispatcher:
         except EmailConfigError as exc:
             # Same loud-refusal rule as PagerDuty: a half-set AUTH pair
             # would otherwise fail every send after the discovery sweep.
-            raise SystemExit(str(exc))
+            raise SystemExit(str(exc)) from None
         dispatcher.register(
             EmailNotifier(
                 host=config.smtp_host,
@@ -1321,7 +1323,7 @@ def _restore(config: RuntimeConfig) -> int:
         # a different target still refuses at execute()'s bind).
         try:
             existing = _target_network_count(config.target_org)
-        except Exception as exc:  # noqa: BLE001 - fail closed
+        except Exception as exc:  # fail closed
             logger.critical(
                 "Cannot verify that target organization %s is empty "
                 "(%s); a sanitized-snapshot restore only writes into a "
