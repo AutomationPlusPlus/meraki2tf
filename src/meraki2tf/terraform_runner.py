@@ -190,28 +190,36 @@ _PLAN_NO_CHANGES_RE = re.compile(
 _RESOURCE_BLOCK_RE = re.compile(r'^resource\s+"(?P<type>[^"]+)"\s+"(?P<name>[^"]+)"\s*\{')
 
 
-def _block_body_end(lines: list[str], index: int) -> int:
-    """Index of the block's closing column-0 ``}`` line, heredoc-aware.
+def _block_body_end(lines: list[str], index: int) -> tuple[int, bool]:
+    """(index of the block's closing column-0 ``}`` line, closer-found).
 
     ``index`` points at the first line after the block opener. A
     column-0 ``}`` inside a heredoc string body (terraform's generator
     emits heredocs for webhook payloadTemplate bodies and other JSON
     blobs) is string content, not the block closer, and honoring it
-    would truncate the block. Returns ``len(lines)`` for an
-    unterminated block.
+    would truncate the block; the heredoc-opener scan is end-anchored
+    and quote-aware (see :func:`heredoc_delimiter`) so a ``<<TAG`` inside
+    a quoted attribute value can never open a phantom heredoc that runs
+    the scan off the end of the block.
+
+    Returns ``(len(lines), False)`` for an unterminated block (no
+    column-0 ``}`` before EOF — a corrupted baseline or a runaway
+    heredoc) so callers can **fail closed** instead of silently
+    truncating to EOF. This mirrors ``plan_reconciler._block_span``,
+    which returns ``None`` in the same case.
     """
     delimiter: str | None = None
     while index < len(lines):
         line = lines[index]
         if delimiter is None and line.startswith("}"):
-            return index
+            return index, True
         if delimiter is not None:
             if line.strip() == delimiter:
                 delimiter = None
         else:
             delimiter = heredoc_delimiter(line)
         index += 1
-    return index
+    return index, False
 
 
 def _split_resource_blocks(text: str) -> tuple[str, dict[str, str]]:
@@ -247,7 +255,7 @@ def _split_resource_blocks(text: str) -> tuple[str, dict[str, str]]:
         chunk.append(line)
         if line.rstrip().endswith("{"):  # multi-line block
             index += 1
-            body_end = _block_body_end(lines, index)
+            body_end, _ = _block_body_end(lines, index)
             chunk.extend(lines[index:body_end])
             index = body_end
             if index < len(lines):
@@ -258,6 +266,31 @@ def _split_resource_blocks(text: str) -> tuple[str, dict[str, str]]:
     preamble.extend(pending)
     joined = "".join(preamble)
     return (joined.rstrip("\n") + "\n" if joined.strip() else ""), blocks
+
+
+def _assert_no_merged_blocks(blocks: dict[str, str]) -> None:
+    """Raise if any parsed block body holds a second column-0 resource
+    opener.
+
+    Two openers in one block is the fingerprint of a mis-parse — a
+    runaway heredoc/closer scan folding two adjacent blocks into one.
+    Writing it out yields a duplicate/nested definition that fails
+    ``terraform validate`` and wedges every later unattended run, so
+    fail closed rather than absorb a corrupt baseline. With the
+    end-anchored, quote-aware opener scan this should be unreachable in
+    practice; it is belt-and-suspenders against any future regression.
+    """
+    for address, body in blocks.items():
+        openers = sum(
+            1 for line in body.splitlines() if _RESOURCE_BLOCK_RE.match(line)
+        )
+        if openers > 1:
+            raise TerraformError(
+                f"Refusing to absorb generated configuration: the parsed "
+                f"block for {address} contains {openers} resource openers, "
+                f"indicating a corrupted or mis-parsed {GENERATED_CONFIG_FILENAME}. "
+                "Investigate the workspace before rerunning."
+            )
 
 
 class TerraformError(RuntimeError):
@@ -613,9 +646,9 @@ class TerraformRunner:
         # workdir keeps whatever they chose for it.
         self._workdir.mkdir(mode=0o700, parents=True, exist_ok=True)
         provider_file = self._workdir / PROVIDER_FILENAME
-        provider_file.write_text(
+        atomic_write_text(
+            provider_file,
             _PROVIDER_TF_TEMPLATE.format(backend_block=self._backend_block()),
-            encoding="utf-8",
         )
         if self._backend.is_remote:
             logger.info(
@@ -1384,25 +1417,50 @@ class TerraformRunner:
         while index < len(lines):
             match = _RESOURCE_BLOCK_RE.match(lines[index])
             if match and f"{match['type']}.{match['name']}" in remove:
+                multiline = lines[index].rstrip().endswith("{")
+                if multiline:
+                    end, terminated = _block_body_end(lines, index + 1)
+                    if not terminated:
+                        # Fail closed: an unterminated block (no column-0
+                        # closer before EOF — a corrupted baseline or a
+                        # runaway heredoc) would delete every line to EOF,
+                        # silently dropping later resource blocks from the
+                        # DR baseline while coverage.json still reports
+                        # them imported/pending (Cardinal Rule 2). Keep
+                        # the block, warn, and leave the file untouched.
+                        logger.warning(
+                            "Skipped pruning %s.%s from %s: its block has no "
+                            "column-0 closing brace before end of file "
+                            "(corrupted baseline or unterminated heredoc); "
+                            "pruning would truncate the file and silently "
+                            "drop later resource blocks.",
+                            match["type"],
+                            match["name"],
+                            AGGREGATED_CONFIG_FILENAME,
+                        )
+                        kept.append(lines[index])
+                        index += 1
+                        continue
                 pruned += 1
                 # The block's `# __generated__ by Terraform from "<id>"`
                 # header travels with it; leaving it behind would stack
                 # stale deleted-object locators above the next block.
                 while kept and kept[-1].lstrip().startswith("#"):
                     kept.pop()
-                if not lines[index].rstrip().endswith("{"):  # one-line block
+                if not multiline:  # one-line block
                     index += 1
                 else:
-                    index += 1
-                    index = _block_body_end(lines, index)
-                    index += 1  # the closing brace itself
+                    index = end + 1  # past the closing brace
                 while index < len(lines) and not lines[index].strip():
                     index += 1  # the blank separator after the block
                 continue
             kept.append(lines[index])
             index += 1
         if pruned:
-            aggregated.write_text("".join(kept), encoding="utf-8")
+            # Atomic replace, never in-place rewrite: a torn resources.tf
+            # wedges every unattended run after it (matches the absorb
+            # path's guarantee below).
+            atomic_write_text(aggregated, "".join(kept))
             logger.info(
                 "Pruned %d resource block(s) from %s.", pruned, AGGREGATED_CONFIG_FILENAME
             )
@@ -1431,6 +1489,9 @@ class TerraformRunner:
             )
             old_preamble, old_blocks = _split_resource_blocks(existing)
             new_preamble, new_blocks = _split_resource_blocks(content)
+            # Defence-in-depth: never write a block that a mis-parse
+            # merged two definitions into (would fail validate).
+            _assert_no_merged_blocks(new_blocks)
             replayed = (
                 bool(new_blocks)
                 and all(

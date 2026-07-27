@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from meraki2tf.alerts import AlertDispatcher, unsupported_feature_flagged
+from meraki2tf.fileio import atomic_write_text
 from meraki2tf.hcl import hcl_quote
 from meraki2tf.models import UNREADABLE_MARKER, NetworkGraph
 from meraki2tf.openapi_parser import OpenApiParser, snake_case
@@ -446,9 +447,7 @@ class HclImportGenerator:
         unsupported.extend(spec_gaps)
 
         imports_file = workdir / IMPORTS_FILENAME
-        imports_file.write_text(
-            _FILE_HEADER + "\n" + "\n".join(blocks), encoding="utf-8"
-        )
+        atomic_write_text(imports_file, _FILE_HEADER + "\n" + "\n".join(blocks))
         self._write_ledger(
             workdir,
             ledger,
@@ -659,8 +658,9 @@ class HclImportGenerator:
         }
         merged.update(assignments)
         document = {"addresses": dict(sorted(merged.items()))}
-        (workdir / ADDRESS_LEDGER_FILENAME).write_text(
-            json.dumps(document, indent=1) + "\n", encoding="utf-8"
+        atomic_write_text(
+            workdir / ADDRESS_LEDGER_FILENAME,
+            json.dumps(document, indent=1) + "\n",
         )
 
     @staticmethod

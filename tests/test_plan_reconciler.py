@@ -1080,6 +1080,63 @@ def test_unterminated_heredoc_block_is_left_alone(tmp_path: Path) -> None:
     assert drop_resource_blocks((config,), {"meraki_x.a"}) == 0
 
 
+def test_heredoc_delimiter_only_matches_a_trailing_opener() -> None:
+    """A real opener is the last token on its line; a ``<<TAG`` inside a
+    quoted value (an ordinary dashboard rename) is string data, not an
+    opener, and must not be reported as one."""
+    from meraki2tf.plan_reconciler import heredoc_delimiter
+
+    assert heredoc_delimiter("  body = <<-EOT") == "EOT"
+    assert heredoc_delimiter("  body = <<EOT") == "EOT"
+    # Quoted-value false positives — none of these open a heredoc:
+    assert heredoc_delimiter('  name = "HQ <<MOVED>> 2026"') is None
+    assert heredoc_delimiter('  notes = "Guest <<LEGACY"') is None
+    assert heredoc_delimiter('  name = "HQ <<MOVED') is None  # unterminated quote
+    assert heredoc_delimiter('  name = "esc \\" <<X"') is None  # escaped quote
+
+
+def test_quoted_double_angle_value_does_not_truncate_the_baseline(
+    tmp_path: Path,
+) -> None:
+    """A block carrying ``name = "HQ <<MOVED>> 2026"`` must not be read
+    as opening a heredoc: dropping an *earlier* block must leave this one
+    (and everything after it) intact rather than truncating to EOF."""
+    hostile = (
+        'resource "meraki_networks" "hostile" {\n'
+        '  network_id = "N_1"\n'
+        '  name       = "HQ <<MOVED>> 2026"\n'
+        "}\n"
+    )
+    config = tmp_path / "resources.tf"
+    config.write_text(BLOCK + "\n" + hostile + "\n" + BLOCK.replace("l_1", "l_2"),
+                      encoding="utf-8")
+    # Drop the FIRST block; the hostile block and the trailing block must
+    # both survive (pre-fix, the phantom heredoc swallowed them).
+    assert drop_resource_blocks((config,), {"meraki_network_snmp.l_1"}) == 1
+    text = config.read_text(encoding="utf-8")
+    assert 'resource "meraki_networks" "hostile"' in text
+    assert 'name       = "HQ <<MOVED>> 2026"' in text
+    assert 'resource "meraki_network_snmp" "l_2"' in text
+
+
+def test_dropping_the_hostile_block_reports_the_right_count(
+    tmp_path: Path,
+) -> None:
+    """drop_resource_blocks must remove exactly the hostile block and
+    report 1 — not over-delete a following block via a phantom heredoc."""
+    hostile = (
+        'resource "meraki_networks" "hostile" {\n'
+        '  name = "Guest <<LEGACY"\n'
+        "}\n"
+    )
+    config = tmp_path / "resources.tf"
+    config.write_text(hostile + "\n" + BLOCK, encoding="utf-8")
+    assert drop_resource_blocks((config,), {"meraki_networks.hostile"}) == 1
+    text = config.read_text(encoding="utf-8")
+    assert "hostile" not in text
+    assert text.rstrip("\n") == BLOCK.rstrip("\n")  # neighbor fully intact
+
+
 def test_remediations_edit_every_file_holding_the_address(
     tmp_path: Path,
 ) -> None:

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from meraki2tf.fileio import atomic_write_text
+from meraki2tf.fileio import _fsync_directory, atomic_write_text
 
 
 def test_atomic_write_replaces_content(tmp_path: Path) -> None:
@@ -33,3 +33,31 @@ def test_failed_replace_cleans_temp_and_preserves_target(
     monkeypatch.undo()
     assert target.read_text(encoding="utf-8") == "intact runbook"
     assert list(tmp_path.iterdir()) == [target]
+
+
+def test_write_fsyncs_file_and_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The durable path flushes the file before the rename and the
+    containing directory after it, so a crash cannot expose a rolled-back
+    or zero-length artifact."""
+    fsynced: list[object] = []
+    real_fsync = os.fsync
+
+    def recording_fsync(fd: int) -> None:
+        fsynced.append(fd)
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", recording_fsync)
+    target = tmp_path / "coverage.json"
+    atomic_write_text(target, "durable document")
+    # One fsync for the temp file, one for the directory handle.
+    assert len(fsynced) == 2
+    assert target.read_text(encoding="utf-8") == "durable document"
+
+
+def test_directory_fsync_is_best_effort(tmp_path: Path) -> None:
+    """Platforms/filesystems that cannot open a directory must not raise
+    (mirrors the snapshot writer's guarantee)."""
+    _fsync_directory(tmp_path / "does-not-exist")  # no raise
+    _fsync_directory(tmp_path)  # the happy path is quiet too
