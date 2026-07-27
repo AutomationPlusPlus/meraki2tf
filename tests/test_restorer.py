@@ -1299,6 +1299,146 @@ def test_serial_map_rewrites_embedded_serial_references(
     assert snmp[2]["users"] == [{"serial": "Q9ZZ-NEWW-HWSN"}]
 
 
+# Serial keys the OpenAPI write schemas really declare — a warm-spare
+# ``spareSerial``, a per-device license ``deviceSerial``, a device
+# clone's ``sourceSerial``/``targetSerials``, etc. Every one is a
+# genuine device serial (no substring false positive), so --serial-map
+# must remap them all, not just ``serial``/``serials``.
+_ALL_SERIAL_KEYS = (
+    "serial",
+    "serials",
+    "spareSerial",
+    "deviceSerial",
+    "primarySerial",
+    "redundantSerial",
+    "sourceSerial",
+    "targetSerials",
+    "serialNumber",
+)
+
+
+@pytest.mark.parametrize(
+    "key", [k for k in _ALL_SERIAL_KEYS if k != "serials" and
+            k != "targetSerials"],
+)
+def test_remap_serial_fields_remaps_scalar_serial_keys(key: str) -> None:
+    """A dead serial under any serial-scalar key (spareSerial,
+    deviceSerial, primarySerial, sourceSerial, redundantSerial, …) is
+    swapped for the replacement, not just ``serial``."""
+    from meraki2tf.restorer import _remap_serial_fields
+
+    out = _remap_serial_fields({key: "Q2XX-DEAD-HW01"},
+                               {"Q2XX-DEAD-HW01": "Q9ZZ-NEWW-HW02"})
+    assert out == {key: "Q9ZZ-NEWW-HW02"}
+
+
+def test_remap_serial_fields_remaps_serial_lists() -> None:
+    """A list-valued serial key (targetSerials, serials) is remapped
+    element-wise; unmapped members pass through unchanged."""
+    from meraki2tf.restorer import _remap_serial_fields
+
+    out = _remap_serial_fields(
+        {"targetSerials": ["Q2XX-DEAD-HW01", "Q2XX-DEAD-HW02",
+                           "Q2XX-KEPT-HW03"]},
+        {"Q2XX-DEAD-HW01": "Q9ZZ-NEWW-HW01",
+         "Q2XX-DEAD-HW02": "Q9ZZ-NEWW-HW02"},
+    )
+    assert out == {
+        "targetSerials": ["Q9ZZ-NEWW-HW01", "Q9ZZ-NEWW-HW02",
+                          "Q2XX-KEPT-HW03"]
+    }
+
+
+def test_remap_serial_fields_recurses_into_nested_serials() -> None:
+    """Nested ``serials`` (switch stacks) are still remapped — the
+    recursive walk is unchanged."""
+    from meraki2tf.restorer import _remap_serial_fields
+
+    out = _remap_serial_fields(
+        {"stack": {"serials": ["Q2XX-DEAD-HW01"]}},
+        {"Q2XX-DEAD-HW01": "Q9ZZ-NEWW-HW01"},
+    )
+    assert out == {"stack": {"serials": ["Q9ZZ-NEWW-HW01"]}}
+
+
+def test_remap_serial_fields_passes_through_unmapped_serial() -> None:
+    """A serial with no --serial-map entry passes through unchanged
+    (existing semantics), under any serial key."""
+    from meraki2tf.restorer import _remap_serial_fields
+
+    out = _remap_serial_fields(
+        {"spareSerial": "Q2XX-KEPT-HW01"}, {"Q2XX-DEAD-HW09": "Q9ZZ-X"}
+    )
+    assert out == {"spareSerial": "Q2XX-KEPT-HW01"}
+
+
+def test_remap_serial_fields_ignores_non_serial_keys() -> None:
+    """A non-serial key is never remapped, even when its value looks
+    exactly like a mapped serial."""
+    from meraki2tf.restorer import _remap_serial_fields
+
+    out = _remap_serial_fields(
+        {"name": "Q2XX-DEAD-HW01", "notes": "Q2XX-DEAD-HW01"},
+        {"Q2XX-DEAD-HW01": "Q9ZZ-NEWW-HW01"},
+    )
+    assert out == {"name": "Q2XX-DEAD-HW01", "notes": "Q2XX-DEAD-HW01"}
+
+
+def test_remap_serial_fields_guards_non_str_serial_values() -> None:
+    """A serial-named key carrying a non-str/non-list value is left
+    untouched (type guard) — a nested dict under it is still walked."""
+    from meraki2tf.restorer import _remap_serial_fields
+
+    out = _remap_serial_fields(
+        {"serialConfig": {"serial": "Q2XX-DEAD-HW01", "count": 3}},
+        {"Q2XX-DEAD-HW01": "Q9ZZ-NEWW-HW01"},
+    )
+    assert out == {
+        "serialConfig": {"serial": "Q9ZZ-NEWW-HW01", "count": 3}
+    }
+
+
+def test_remap_serial_fields_consistent_with_body_serial_properties() -> None:
+    """Consistency guard: every key the drill-skip classifier flags as a
+    serial property is one the --serial-map remapper will remap. The two
+    share :func:`_is_serial_property`, so this can never drift."""
+    from meraki2tf.spec.engine import OperationSpec
+
+    from meraki2tf.restorer import (
+        _body_serial_properties,
+        _remap_serial_fields,
+    )
+
+    op = OperationSpec(
+        operation_id="cloneDevices",
+        method="post",
+        path="/devices/clone",
+        path_params=(),
+        tags=("devices",),
+        raw={
+            "requestBody": {
+                "content": {
+                    "application/json": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {k: {} for k in _ALL_SERIAL_KEYS}
+                            | {"enabled": {}, "name": {}},
+                        }
+                    }
+                }
+            }
+        },
+    )
+    flagged = _body_serial_properties(op)
+    assert flagged == frozenset(_ALL_SERIAL_KEYS)
+    # Every flagged key is remapped by the remapper.
+    remapped = _remap_serial_fields(
+        {k: "Q2XX-DEAD-HW01" for k in flagged},
+        {"Q2XX-DEAD-HW01": "Q9ZZ-NEWW-HW01"},
+    )
+    assert all(remapped[k] == "Q9ZZ-NEWW-HW01" for k in flagged)
+
+
 def test_drill_mode_skips_objects_referencing_production_serials(
     tmp_path: Path,
 ) -> None:
