@@ -5,4 +5,4 @@ ingested dynamically to derive the resource registry, so no endpoint or
 mapping table is ever hard-coded.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
