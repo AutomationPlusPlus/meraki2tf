@@ -861,3 +861,25 @@ def test_partial_snapshot_whole_scope_deleted_heals_full_subtree(
     ) in kinds
     assert (SNMP_PATH, "configure") in kinds
     assert plan.surviving_count == 0
+
+
+def test_path_pairs_prefix_claim_and_skew() -> None:
+    """Scope-containment pairing: gap records pair their short prefix,
+    the claim path's extra trailing serial pairs explicitly, and values
+    outnumbering placeholders (an identity hiding in an unpaired tail)
+    fail loudly instead of silently shrinking heal's scope."""
+    from meraki2tf.healer import _path_pairs
+    from meraki2tf.restorer import DEVICE_CLAIM_PATH
+
+    assert _path_pairs(GP_ITEM, ("N_1", "100")) == (
+        ("network", "N_1"), ("grouppolicy", "100"),
+    )
+    # Scope-less diagnostic gap records carry fewer values than the
+    # path declares; the leading prefix still pairs.
+    assert _path_pairs(GP_ITEM, ("N_1",)) == (("network", "N_1"),)
+    assert _path_pairs(GP_ITEM, ()) == ()
+    assert _path_pairs(DEVICE_CLAIM_PATH, ("N_1", "Q2AB-CDEF-GHIJ")) == (
+        ("network", "N_1"), ("serial", "Q2AB-CDEF-GHIJ"),
+    )
+    with pytest.raises(ValueError):
+        _path_pairs(GP_ITEM, ("N_1", "100", "extra"))

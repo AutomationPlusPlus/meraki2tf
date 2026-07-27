@@ -125,7 +125,9 @@ def build_manifest(
         if verdict is not None:
             entry["restore_via"] = verdict
         objects.append(entry)
-    for raw, entry in zip(unsupported, unsupported_payload(unsupported)):
+    for raw, entry in zip(
+        unsupported, unsupported_payload(unsupported), strict=True
+    ):
         record = {"status": STATUS_UNSUPPORTED, **entry}
         verdict = restore_lookup.get((raw.api_path, raw.identifiers))
         if verdict is None:

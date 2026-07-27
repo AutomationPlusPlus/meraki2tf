@@ -2719,7 +2719,7 @@ def _run_multi_org(config: RuntimeConfig, dispatcher: AlertDispatcher) -> int:
         "Multi-organization run complete: %s.",
         "; ".join(
             f"{org_id}: exit {code}"
-            for org_id, code in zip(config.org_ids, codes)
+            for org_id, code in zip(config.org_ids, codes, strict=True)
         ),
     )
     if not config.sync:

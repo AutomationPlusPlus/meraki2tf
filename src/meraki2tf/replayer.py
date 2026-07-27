@@ -690,7 +690,15 @@ class GapReplayer:
 
     @staticmethod
     def _network_scope(action: ReplayAction) -> str | None:
-        """The action's snapshot-side ``{networkId}`` scope value."""
+        """The action's snapshot-side ``{networkId}`` scope value.
+
+        Best-effort probe used only to classify a failure that already
+        happened: it runs inside the per-object exception handler, so
+        it must never raise. The write operation's path may
+        legitimately carry a different parameter arity than the asset
+        address the values belong to, hence the deliberately
+        non-strict prefix zip — a miss just returns ``None``.
+        """
         for name, value in zip(
             _placeholders(action.operation.path), action.path_values
         ):
@@ -894,7 +902,9 @@ class GapReplayer:
                 f"{len(placeholders)} parameter(s) but "
                 f"{len(action.path_values)} value(s) were discovered."
             )
-        known = dict(zip(placeholders, (remap(v) for v in action.path_values)))
+        known = dict(zip(
+            placeholders, (remap(v) for v in action.path_values), strict=True
+        ))
         known.setdefault("organizationId", target_organization_id)
         params: dict[str, str] = {}
         for name in _placeholders(action.operation.path):

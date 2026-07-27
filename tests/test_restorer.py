@@ -6555,3 +6555,193 @@ def test_resolver_recorded_targets() -> None:
     resolver.record("network", "N_1", "B")
     assert resolver.recorded_targets("network", "N_1") == ("A", "B")
     assert resolver.recorded_targets("vlan", "9") == ()
+
+
+# --------------------------------- zip(strict) path-pairing hardening
+
+
+def test_scoped_path_pairs_claim_tail_and_skew() -> None:
+    from meraki2tf.restorer import DEVICE_CLAIM_PATH, _scoped_path_pairs
+
+    assert _scoped_path_pairs(SNMP_PATH, ("N_1",)) == (("networkId", "N_1"),)
+    # The claim's trailing serial pairs explicitly instead of being
+    # silently dropped by a truncating zip() — it must stay visible to
+    # the foreign-hardware refusal.
+    assert _scoped_path_pairs(
+        DEVICE_CLAIM_PATH, ("N_1", "Q2AB-CDEF-GHIJ")
+    ) == (("networkId", "N_1"), ("serial", "Q2AB-CDEF-GHIJ"))
+    # A claim row without the extra serial still pairs strictly.
+    assert _scoped_path_pairs(DEVICE_CLAIM_PATH, ("N_1",)) == (
+        ("networkId", "N_1"),
+    )
+    with pytest.raises(ValueError):
+        _scoped_path_pairs(GP_ITEM, ("N_1",))  # one value short
+    with pytest.raises(ValueError):
+        _scoped_path_pairs(SNMP_PATH, ("N_1", "extra"))  # unpaired tail
+    with pytest.raises(ValueError):
+        _scoped_path_pairs(DEVICE_CLAIM_PATH, ("N_1", "a", "b"))
+
+
+def test_executor_refuses_placeholder_value_skew(tmp_path: Path) -> None:
+    """A plan row whose path_values fell short of its placeholders used
+    to sweep the safety guards over a silently truncated zip() pairing
+    (an unpaired trailing value escaped the foreign-serial and
+    failed/skipped-parent checks); it must fail loudly on the record
+    and never dispatch."""
+    from meraki2tf.restorer import RestoreAction, RestorePlan
+    from meraki2tf.spec.engine import OperationSpec
+
+    put = OperationSpec(
+        operation_id="updateNetworkGroupPolicy", method="put",
+        path=GP_ITEM, path_params=("networkId", "groupPolicyId"),
+        tags=("networks",),
+    )
+    post = OperationSpec(
+        operation_id="createNetworkGroupPolicy", method="post",
+        path=GP_COLLECTION, path_params=("networkId",),
+        tags=("networks",),
+    )
+    skewed_create = RestoreAction(
+        kind="create", wave=WAVE_NETWORK_FEATURES, api_path=GP_ITEM,
+        path_values=("gp_9",),  # one short of the two placeholders
+        operation=post, payload={"name": "kiosk"},
+    )
+    skewed_configure = RestoreAction(
+        kind="configure", wave=WAVE_NETWORK_FEATURES, api_path=SNMP_PATH,
+        path_values=(), operation=put, payload={"access": "none"},
+    )
+    child = RestoreAction(
+        kind="configure", wave=WAVE_NETWORK_FEATURES, api_path=GP_ITEM,
+        path_values=("N_1", "gp_9"), operation=put, payload={"name": "x"},
+    )
+    plan = RestorePlan(
+        actions=(skewed_create, skewed_configure, child),
+        unrestorable=(), defaults=(),
+    )
+    restorer, calls = _executor(tmp_path)
+    result = restorer.execute(_graph(), plan)
+
+    reasons = dict(result.failed)
+    assert "placeholder/value skew" in reasons[skewed_create.key]
+    assert "placeholder/value skew" in reasons[skewed_configure.key]
+    # The skewed create poisons its children like any failed parent.
+    assert any(
+        entry["target"] == child.key
+        and "gp_9 failed to restore" in entry["reason"]
+        for entry in result.skipped
+    )
+    # Nothing was ever dispatched to the dashboard.
+    assert calls == []
+
+
+def test_probe_liveness_refuses_skewed_addresses(tmp_path: Path) -> None:
+    from dataclasses import replace as _replace
+    from types import SimpleNamespace
+
+    from meraki2tf.restorer import ReferenceResolver
+    from meraki2tf.spec.engine import OperationSpec
+
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(SNMP_PATH, ("N_1",), {"access": "none"})
+    )
+    plan = plan_restore(graph, parser)
+    snmp = next(a for a in plan.actions if a.api_path == SNMP_PATH)
+    restorer, _calls = _executor(tmp_path)
+    resolver = ReferenceResolver(graph)
+    resolver.record("network", "N_1", "L_NEW")
+
+    class Reader:
+        @staticmethod
+        def getNetworkSnmp(network_id: str) -> dict:
+            return {"access": "full"}
+
+    dash = SimpleNamespace(networks=Reader())
+    # Sanity: a sound address answers alive.
+    assert restorer._probe_liveness(dash, snmp, resolver, "org-123") == (
+        "alive", None,
+    )
+    # A placeholder/value skew cannot even address the object.
+    skewed = _replace(snmp, path_values=())
+    assert restorer._probe_liveness(dash, skewed, resolver, "org-123") == (
+        "unverifiable", None,
+    )
+    # A lookup declaring more parameters than the action carries scope
+    # values would previously read a silently truncated scope.
+    wide = _replace(snmp, lookup=OperationSpec(
+        operation_id="getNetworkSnmp", method="get", path=SNMP_PATH,
+        path_params=("networkId", "extraId"), tags=("networks",),
+    ))
+    assert restorer._probe_liveness(dash, wide, resolver, "org-123") == (
+        "unverifiable", None,
+    )
+
+
+def test_dispatch_refuses_under_scoped_writes(tmp_path: Path) -> None:
+    """More write path parameters than scope values used to zip() down
+    to a prefix, leaving parameters unfilled and letting same-named
+    payload fields slip into the body."""
+    from types import SimpleNamespace
+
+    from meraki2tf.models import NetworkGraph as _NetworkGraph
+    from meraki2tf.restorer import (
+        OrgRestorer,
+        ReferenceResolver,
+        RestoreAction,
+        RestoreJournal,
+    )
+    from meraki2tf.spec.engine import OperationSpec
+
+    op = OperationSpec(
+        operation_id="updateNetworkSnmp", method="put", path=SNMP_PATH,
+        path_params=("networkId", "extraId"), tags=("networks",),
+    )
+    action = RestoreAction(
+        kind="configure", wave=WAVE_NETWORK_FEATURES, api_path=SNMP_PATH,
+        path_values=("N_1",), operation=op, payload={"access": "none"},
+    )
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "skew.jsonl")
+    )
+    resolver = ReferenceResolver(_NetworkGraph("org-123", (), (), ()))
+    with pytest.raises(RuntimeError, match="under-scoped write"):
+        restorer._dispatch(SimpleNamespace(), action, resolver, "org-123")
+
+
+def test_list_collection_skips_over_wide_lookups(tmp_path: Path) -> None:
+    """An adoption lookup declaring more path parameters than the
+    action carries scope values must be skipped (proceed without
+    adoption), never listed against a silently truncated scope."""
+    from types import SimpleNamespace
+
+    from meraki2tf.models import NetworkGraph as _NetworkGraph
+    from meraki2tf.restorer import (
+        OrgRestorer,
+        ReferenceResolver,
+        RestoreAction,
+        RestoreJournal,
+    )
+    from meraki2tf.spec.engine import OperationSpec
+
+    post = OperationSpec(
+        operation_id="createNetworkGroupPolicy", method="post",
+        path=GP_COLLECTION, path_params=("networkId",),
+        tags=("networks",),
+    )
+    wide_lookup = OperationSpec(
+        operation_id="getNetworkGroupPolicies", method="get",
+        path=GP_COLLECTION, path_params=("networkId", "extraId"),
+        tags=("networks",),
+    )
+    action = RestoreAction(
+        kind="create", wave=WAVE_NETWORK_FEATURES, api_path=GP_COLLECTION,
+        path_values=("N_1",), operation=post, payload={"name": "kiosk"},
+        lookup=wide_lookup,
+    )
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "wide.jsonl")
+    )
+    resolver = ReferenceResolver(_NetworkGraph("org-123", (), (), ()))
+    assert restorer._list_collection(
+        SimpleNamespace(), action, resolver, "org-123"
+    ) is None

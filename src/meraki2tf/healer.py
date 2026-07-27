@@ -47,6 +47,7 @@ from meraki2tf.restorer import (
     _REFERENCE_KEY_RE,
     _own_identity,
     _scope_stem,
+    _scoped_path_pairs,
     plan_restore,
 )
 
@@ -339,12 +340,25 @@ def _selector_hits(
 def _path_pairs(
     api_path: str, path_values: tuple[str, ...]
 ) -> tuple[tuple[str, str], ...]:
-    """(scope stem, value) per positionally-paired path placeholder."""
+    """(scope stem, value) per positionally-paired path placeholder.
+
+    Scope-less diagnostic gap records legitimately carry fewer values
+    than their path declares (the unresolvable tail scope was never
+    discovered), so a short row pairs its leading prefix. Everything
+    else routes through the restorer's strict pairing: values may
+    never silently OUTNUMBER placeholders — an identity hiding in an
+    unpaired tail would shrink heal's scope containment — and the
+    claim path's extra trailing serial pairs explicitly.
+    """
+    names = _PATH_PARAM_RE.findall(api_path)
+    if len(path_values) < len(names):
+        return tuple(
+            (_scope_stem(name), value)
+            for name, value in zip(names, path_values)
+        )
     return tuple(
         (_scope_stem(name), value)
-        for name, value in zip(
-            _PATH_PARAM_RE.findall(api_path), path_values
-        )
+        for name, value in _scoped_path_pairs(api_path, path_values)
     )
 
 
