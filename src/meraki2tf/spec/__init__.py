@@ -6,6 +6,6 @@ derived at runtime from the OpenAPI document. Hard-coded endpoint or
 mapping tables are prohibited by the project contract.
 """
 
-from meraki2tf.spec.engine import OperationSpec, ResourceGroup, SpecIngestionEngine
+from meraki2tf.spec.engine import OperationSpec, SpecIngestionEngine
 
-__all__ = ["OperationSpec", "ResourceGroup", "SpecIngestionEngine"]
+__all__ = ["OperationSpec", "SpecIngestionEngine"]
