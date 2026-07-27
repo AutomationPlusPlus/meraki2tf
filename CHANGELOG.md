@@ -6,6 +6,15 @@ the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- `coverage.json` now carries a `kit` fingerprint of `imports.tf`
+  (`imports_sha256` + `import_block_count`), and `--check` gains a "kit
+  integrity" verdict that recomputes it and reports PASS/FAIL/SKIP — so
+  a manifest that vouches for a kit it no longer matches (a kit corrupted
+  by a manual edit, a pre-lock run, or external tampering) is detected,
+  not just prevented by the workdir lock (#150). Offline, no API key
+  required.
+
 ## [0.2.0] - 2026-07-27
 
 ### Added
