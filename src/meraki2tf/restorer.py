@@ -1431,6 +1431,30 @@ def _own_identity(action: RestoreAction) -> tuple[str, str]:
     return (stem, action.path_values[-1])
 
 
+def _scoped_path_pairs(
+    api_path: str, path_values: tuple[str, ...]
+) -> tuple[tuple[str, str], ...]:
+    """(placeholder name, value) pairs for an address's scope segments.
+
+    Claim actions carry the claimed serial as one extra trailing value
+    beyond the claim path's placeholders (``…/devices/claim`` has no
+    serial segment); it pairs under a literal ``serial`` name so the
+    safety guards see it too. Every other address's placeholders and
+    values are equal-length by construction, and ``strict=True`` turns
+    any skew into a loud ``ValueError`` instead of a silently
+    truncated — and therefore under-checked — guard sweep (a foreign
+    serial hiding in the unpaired tail would otherwise slip past the
+    "hardware the restore does not own" refusal).
+    """
+    names = _PATH_PARAM_RE.findall(api_path)
+    if api_path == DEVICE_CLAIM_PATH and len(path_values) == len(names) + 1:
+        return (
+            *zip(names, path_values[:-1], strict=True),
+            ("serial", path_values[-1]),
+        )
+    return tuple(zip(names, path_values, strict=True))
+
+
 class RestoreJournalMismatchError(RuntimeError):
     """The journal belongs to a different restore (target or source)."""
 
@@ -1804,6 +1828,27 @@ class OrgRestorer:
             deferred: list[tuple[RestoreAction, str]] = []
             throttled: list[RestoreAction] = []
             for action in pending:
+                try:
+                    path_pairs = _scoped_path_pairs(
+                        action.api_path, action.path_values
+                    )
+                except ValueError:
+                    # A placeholder/value skew means every positional
+                    # guard below (foreign serials, failed/skipped
+                    # parents, unclaimed waits) would sweep a silently
+                    # truncated pairing and leave the tail unchecked.
+                    # Fail the action loudly and on the record instead
+                    # of executing an under-checked write.
+                    failed.append(
+                        (action.key, "path placeholder/value skew: "
+                         f"{action.api_path} declares a different "
+                         "number of scope segments than the action "
+                         "carries values, so its safety guards cannot "
+                         "pair them; refusing to execute the write")
+                    )
+                    if action.kind in ("create", "claim"):
+                        failed_parents.add(_own_identity(action))
+                    continue
                 if self._skip_claims and action.wave in (
                     WAVE_DEVICE_CLAIM, WAVE_DEVICE_FEATURES
                 ):
@@ -1894,10 +1939,7 @@ class OrgRestorer:
                         continue
                 foreign_serials = [
                     value
-                    for name, value in zip(
-                        _PATH_PARAM_RE.findall(action.api_path),
-                        action.path_values,
-                    )
+                    for name, value in path_pairs
                     if _scope_stem(name) == "serial"
                     and value not in known_serials
                 ]
@@ -1922,10 +1964,7 @@ class OrgRestorer:
                 )
                 dead = [
                     value
-                    for name, value in zip(
-                        _PATH_PARAM_RE.findall(action.api_path),
-                        action.path_values,
-                    )
+                    for name, value in path_pairs
                     if (_scope_stem(name), value) in failed_parents
                     and (_scope_stem(name), value) != own
                 ]
@@ -1937,10 +1976,7 @@ class OrgRestorer:
                     continue
                 held = [
                     value
-                    for name, value in zip(
-                        _PATH_PARAM_RE.findall(action.api_path),
-                        action.path_values,
-                    )
+                    for name, value in path_pairs
                     if (_scope_stem(name), value) in skipped_parents
                     and (_scope_stem(name), value) != own
                 ]
@@ -1960,10 +1996,7 @@ class OrgRestorer:
                 if action.kind != "claim":
                     waiting = [
                         value
-                        for name, value in zip(
-                            _PATH_PARAM_RE.findall(action.api_path),
-                            action.path_values,
-                        )
+                        for name, value in path_pairs
                         if _scope_stem(name) == "serial"
                         and value in unclaimed
                     ]
@@ -2444,13 +2477,18 @@ class OrgRestorer:
             if action.kind in ("create", "claim")
             else None
         )
-        scope_pairs = [
-            (_scope_stem(name), value)
-            for name, value in zip(
-                _PATH_PARAM_RE.findall(action.api_path),
-                action.path_values,
-            )
-        ]
+        try:
+            scope_pairs = [
+                (_scope_stem(name), value)
+                for name, value in _scoped_path_pairs(
+                    action.api_path, action.path_values
+                )
+            ]
+        except ValueError:
+            # A placeholder/value skew cannot even address the object;
+            # unverifiable reports louder than uncertain and never
+            # licenses a write.
+            return ("unverifiable", None)
         if any(
             pair != own and pair in self._minted for pair in scope_pairs
         ):
@@ -2473,10 +2511,22 @@ class OrgRestorer:
         scope_values = action.path_values
         if action.wave == WAVE_NETWORKS:
             scope_values = (source_org,)
+        if len(op.path_params) > len(scope_values):
+            # The lookup declares more parameters than the action
+            # carries scope values: zip() would silently pair a prefix
+            # and probe the wrong (shorter) scope. No usable read.
+            return ("unverifiable", None)
         try:
+            # The lookup addresses the parent scope, so any trailing
+            # own-identity values are deliberately dropped; the slice
+            # plus the arity check above make that pairing explicit.
             params = tuple(
                 resolver.resolve_scope(name, value, action.path_values)
-                for name, value in zip(op.path_params, scope_values)
+                for name, value in zip(
+                    op.path_params,
+                    scope_values[:len(op.path_params)],
+                    strict=True,
+                )
             )
         except (UnmappedReferenceError, ForeignScopeError):
             return ("proceed", None)
@@ -2899,7 +2949,24 @@ class OrgRestorer:
             scope_values = (source_org,)
         elif action.kind == "claim":
             scope_values = (action.path_values[0],)
-        for name, value in zip(op.path_params, scope_values):
+        if len(op.path_params) > len(scope_values):
+            # zip() would silently pair a prefix, leave the remaining
+            # parameters unfilled, and let same-named payload fields
+            # (the snapshot tenant's identifiers) slip into the body —
+            # an under-scoped write must fail loudly instead. The
+            # per-object isolation in execute() records it as a failed
+            # action; nothing is dispatched.
+            raise RuntimeError(
+                f"operation {op.operation_id} needs "
+                f"{len(op.path_params)} path parameter(s) but the "
+                f"action carries {len(scope_values)} scope value(s); "
+                "refusing an under-scoped write"
+            )
+        # A create's trailing own-identity value is deliberately not
+        # sent: the collection POST scopes one level above the item.
+        for name, value in zip(
+            op.path_params, scope_values[:len(op.path_params)], strict=True
+        ):
             params[name] = resolver.resolve_scope(
                 name, value, action.path_values
             )
@@ -3088,10 +3155,28 @@ class OrgRestorer:
         scope_values = action.path_values
         if action.wave == WAVE_NETWORKS:
             scope_values = (source_org,)
+        if len(op.path_params) > len(scope_values):
+            # zip() would silently pair a prefix and list a collection
+            # one scope short of the intended one; adopting from the
+            # wrong listing is worse than skipping adoption.
+            logger.warning(
+                "Adoption lookup %r for %s declares more path "
+                "parameters than the action carries scope values; "
+                "proceeding without it.", op.operation_id, action.key,
+            )
+            return None
         try:
+            # The collection GET scopes one level above the item, so a
+            # create's trailing own-identity value is deliberately
+            # dropped; the slice plus the arity check above make that
+            # pairing explicit.
             params = {
                 param: resolver.resolve_scope(param, value, action.path_values)
-                for param, value in zip(op.path_params, scope_values)
+                for param, value in zip(
+                    op.path_params,
+                    scope_values[:len(op.path_params)],
+                    strict=True,
+                )
             }
         except (UnmappedReferenceError, ForeignScopeError) as exc:
             # A journaled-complete parent whose ID mapping was never

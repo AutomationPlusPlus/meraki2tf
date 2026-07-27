@@ -478,7 +478,10 @@ class LiveApiDataProvider(MerakiDataProvider):
         def _fetch(
             op: OperationSpec, scope_values: tuple[str, ...]
         ) -> list[FeatureConfiguration]:
-            params = dict(zip(op.path_params, scope_values))
+            # Every caller pairs exactly one value per parameter; a
+            # skew must abort the level (fail fast and loud in
+            # _run_level), never silently query a truncated scope.
+            params = dict(zip(op.path_params, scope_values, strict=True))
             if checkpoint is not None:
                 recorded = checkpoint.get(op.path, scope_values)
                 if recorded is not None:

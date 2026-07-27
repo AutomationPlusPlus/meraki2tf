@@ -588,7 +588,7 @@ def _values_equal(before: Any, after: Any) -> bool:
             return _canonical_multiset(before) == _canonical_multiset(after)
         return all(
             _values_equal(b_item, a_item)
-            for b_item, a_item in zip(before, after)
+            for b_item, a_item in zip(before, after, strict=True)
         )
     return deep_json_equal(before, after)
 

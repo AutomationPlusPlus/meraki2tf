@@ -417,7 +417,7 @@ def deep_json_equal(before: Any, after: Any) -> bool:
     if isinstance(before, list) and isinstance(after, list):
         return len(before) == len(after) and all(
             deep_json_equal(b_item, a_item)
-            for b_item, a_item in zip(before, after)
+            for b_item, a_item in zip(before, after, strict=True)
         )
     if isinstance(before, str) and isinstance(after, str):
         try:
