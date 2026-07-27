@@ -721,6 +721,13 @@ Notes:
   parsing, not hours into a run. Connection settings with environment
   fallbacks (s3 `region`, azurerm `resource_group_name`, …) are left to
   `terraform init` to enforce.
+- **`azurerm` targets public Azure only.** On Terraform ≥ 1.9 the
+  rewritten `azurerm` backend accepts a custom blob `endpoint`
+  `--backend-config` with only a deprecation warning and then ignores it,
+  sending traffic to the public `https://<account>.blob.core.windows.net`
+  DNS name regardless — so pointing it at an emulator or an Azure Stack /
+  sovereign-cloud endpoint silently talks to public Azure. Use `s3`/`gcs`
+  (or a supported alternative) if you must target a non-public endpoint.
 - Prefer keeping the backend settings in a file? Pass
   `--backend-config-file org-123456.tfbackend` instead of (or alongside)
   the individual `--backend-config` flags.
