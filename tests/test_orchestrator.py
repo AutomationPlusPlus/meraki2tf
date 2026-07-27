@@ -159,6 +159,9 @@ class StubRunner:
         self.baseline_reset = False
         self.config_baseline = True
         self.state_addresses: set[str] = set()
+        #: Organization the state resolves to for the G1 foreign-state
+        #: guard; None (default) = fresh/ambiguous state, guard is a no-op.
+        self.state_org: str | None = None
         self.removed: list[tuple[str, ...]] = []
         self.saved_plan_discarded = False
         #: Reconciliation outcomes every plan_with_generation reports.
@@ -174,6 +177,9 @@ class StubRunner:
 
     def existing_addresses(self) -> frozenset[str]:
         return frozenset(self.state_addresses)
+
+    def state_organization(self) -> str | None:
+        return self.state_org
 
     def has_config_baseline(self) -> bool:
         return self.config_baseline
@@ -1154,6 +1160,78 @@ def test_meraki_deletions_are_alert_only(tmp_path: Path, api_key: None) -> None:
         (tmp_path / PENDING_DELETIONS_FILENAME).read_text(encoding="utf-8")
     )
     assert record["addresses"] == ["meraki_networks.deleted"]
+
+
+def test_foreign_state_org_is_refused(tmp_path: Path, api_key: None) -> None:
+    """Finding G1: a state belonging to a different organization than the
+    run discovered must be refused (a PROCESSING_FAULT, nonzero exit) —
+    colliding addresses would otherwise report false full coverage."""
+    orchestrator, recorder, _, runner = _orchestrator(tmp_path)
+    runner.state_addresses = {"meraki_networks.n_1"}
+    runner.state_org = "other-org"  # discovery yields "org-123"
+    with pytest.raises(PipelineError, match="state inspection"):
+        orchestrator.run("org-123")
+    fault = recorder.events[-1]
+    assert fault.event_type is EventType.PROCESSING_FAULT
+    assert "belongs to organization other-org" in fault.details["error"]
+    assert "discovered organization org-123" in fault.details["error"]
+    # Refused at state inspection: no success alert, nothing applied.
+    assert not runner.applied
+    assert EventType.RUN_SUCCESS not in [e.event_type for e in recorder.events]
+
+
+def test_matching_state_org_proceeds(tmp_path: Path, api_key: None) -> None:
+    """A state naming the SAME organization is fine — the guard must not
+    block the normal case."""
+    orchestrator, recorder, _, runner = _orchestrator(tmp_path)
+    runner.state_addresses = {"meraki_networks.n_1"}
+    runner.state_org = "org-123"
+    summary = orchestrator.run("org-123")
+    assert summary.organization_id == "org-123"
+    assert recorder.events[-1].event_type is EventType.RUN_SUCCESS
+
+
+def test_org_less_state_still_proceeds(tmp_path: Path, api_key: None) -> None:
+    """A fresh/ambiguous state naming no organization (state_org None)
+    must not be refused — the legitimate first run has to work."""
+    orchestrator, recorder, _, runner = _orchestrator(tmp_path)
+    runner.state_addresses = {"meraki_networks.n_1"}
+    runner.state_org = None
+    summary = orchestrator.run("org-123")
+    assert summary.organization_id == "org-123"
+    assert recorder.events[-1].event_type is EventType.RUN_SUCCESS
+
+
+def test_total_deletion_alert_carries_foreign_state_note(
+    tmp_path: Path, api_key: None
+) -> None:
+    """Finding G3: when EVERY tracked resource vanishes in one run, the
+    deletion alert notes the state may be foreign/mis-pointed (the org
+    guard covers the differing-org case; this covers a disjoint state
+    with no org attribute). Deletion semantics are unchanged."""
+    orchestrator, recorder, _, runner = _orchestrator(tmp_path)
+    # None of these are in the stub generator's captured addresses, so
+    # all are "missing" this run; state_org None so the G1 guard passes.
+    runner.state_addresses = {"meraki_networks.gone_a", "meraki_networks.gone_b"}
+    orchestrator.run("org-123")
+    pending = recorder.events[0]
+    assert pending.event_type is EventType.DELETION_PENDING_CONFIRMATION
+    assert "verify --state-file" in pending.details["note"]
+    assert runner.removed == []  # semantics unchanged: nothing removed
+
+
+def test_partial_deletion_alert_has_no_foreign_state_note(
+    tmp_path: Path, api_key: None
+) -> None:
+    """A partial deletion (some tracked resources survive) is a normal
+    deletion, not the foreign-state fingerprint — no G3 note."""
+    orchestrator, recorder, _, runner = _orchestrator(tmp_path)
+    # n_1 survives (captured by the stub generator); only "gone" vanishes.
+    runner.state_addresses = {"meraki_networks.n_1", "meraki_networks.gone"}
+    orchestrator.run("org-123")
+    pending = recorder.events[0]
+    assert pending.event_type is EventType.DELETION_PENDING_CONFIRMATION
+    assert "note" not in pending.details
 
 
 def test_deletions_detected_even_without_api_key(

@@ -86,6 +86,18 @@ _HARMLESS_ACTIONS = frozenset({"no-op", "read"})
 #: missing on the confirmation run. Plain address list, no secrets.
 PENDING_DELETIONS_FILENAME = "pending-deletions.json"
 
+#: Diagnosis note (round-9 finding G3) attached to the deletion alert
+#: when EVERY tracked resource is missing in one run: a foreign or
+#: mis-pointed state reads as a mass deletion. The org guard (G1) catches
+#: the common case first; this covers a disjoint state with no org
+#: attribute to compare. It changes no deletion semantics — nothing is
+#: removed without --confirm-deletions — it only warns before confirming.
+FOREIGN_STATE_DELETION_NOTE = (
+    "Every state-tracked resource is missing this run — the state may not "
+    "correspond to this organization/kit; verify --state-file before "
+    "confirming."
+)
+
 
 class PipelineError(RuntimeError):
     """The run failed; a PROCESSING_FAULT alert has already been dispatched."""
@@ -255,6 +267,7 @@ class PipelineOrchestrator:
 
             stage = "state inspection"
             existing = self._runner.existing_addresses()
+            self._guard_state_organization(graph)
             if existing:
                 logger.info(
                     "%d resource(s) already tracked in state; only the delta "
@@ -732,6 +745,40 @@ class PipelineOrchestrator:
             json.dumps({"addresses": sorted(addresses)}, indent=2) + "\n",
         )
 
+    def _guard_state_organization(self, graph: NetworkGraph) -> None:
+        """Refuse a Terraform state belonging to a different organization
+        than the one just discovered (round-9 finding G1).
+
+        The state-inspection path keys tracked resources by address
+        string (``type.name``) alone; a foreign organization's state
+        whose addresses collide — trivially true between two sanitized
+        kits, which share the ``net_0001`` pseudonym space — would report
+        every asset "already imported", write a clean ``coverage.json``,
+        and fire RUN_SUCCESS while the state actually holds another
+        organization's resource IDs and cannot rebuild THIS one. Meraki
+        is never contacted on an offline weekly run, so nothing corrects
+        it — the "what is covered?" answer is silently wrong.
+
+        The state's organization is resolved from the same
+        ``organization_id`` attribute ``--rebuild`` / ``--expect-org``
+        already trust (unanimous across managed instances). A fresh or
+        ambiguous state names no organization and is allowed through so
+        the legitimate first run still works. Being attribute-based, this
+        also catches a foreign disjoint state (finding G3) before it is
+        misread as a mass deletion.
+        """
+        state_org = self._runner.state_organization()
+        if state_org is None:
+            return
+        discovered = str(graph.organization_id or "").strip()
+        if discovered and state_org != discovered:
+            raise TerraformError(
+                f"Terraform state belongs to organization {state_org} but "
+                f"this run discovered organization {discovered} — wrong "
+                "--state-file/--workdir? Refusing to avoid a false coverage "
+                "report."
+            )
+
     def _review_deletions(
         self, existing: frozenset[str], report: GenerationReport
     ) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -772,6 +819,13 @@ class PipelineOrchestrator:
             # removal on some later run.
             self._persist_alerted_deletions(())
             return (), ()
+        # Finding G3: every tracked resource vanishing in one run is the
+        # fingerprint of a foreign/mis-pointed state, not a real mass
+        # deletion. Attach a verify-the-state note to the alert (the org
+        # guard already refuses the case where the state names a
+        # different org; this covers a disjoint state with no org to
+        # compare). Deletion semantics are unchanged.
+        note = FOREIGN_STATE_DELETION_NOTE if deleted == existing else None
         if self._confirm_deletions:
             alerted = self._load_alerted_deletions()
             confirmed = tuple(sorted(deleted & alerted))
@@ -790,13 +844,15 @@ class PipelineOrchestrator:
                     "%d deletion(s) were first seen on this run and are NOT "
                     "covered by --confirm-deletions (the operator reviewed "
                     "an earlier alert, not these): %s. Alert-only — re-run "
-                    "with --confirm-deletions after review to remove them.",
+                    "with --confirm-deletions after review to remove them.%s",
                     len(unalerted), ", ".join(unalerted),
+                    f" {note}" if note else "",
                 )
                 self._dispatcher.dispatch(
                     deletion_pending_confirmation(
                         addresses=unalerted,
                         workspace=str(self._runner.workdir),
+                        note=note,
                     )
                 )
             self._persist_alerted_deletions(unalerted)
@@ -805,12 +861,14 @@ class PipelineOrchestrator:
         logger.warning(
             "%d resource(s) tracked in the DR kit were not discovered in "
             "Meraki (deleted?): %s. Alert-only — re-run with "
-            "--confirm-deletions after review to remove them.",
+            "--confirm-deletions after review to remove them.%s",
             len(pending), ", ".join(pending),
+            f" {note}" if note else "",
         )
         self._dispatcher.dispatch(
             deletion_pending_confirmation(
-                addresses=pending, workspace=str(self._runner.workdir)
+                addresses=pending, workspace=str(self._runner.workdir),
+                note=note,
             )
         )
         self._persist_alerted_deletions(pending)

@@ -363,6 +363,32 @@ def test_resolve_rebuild_org_ambiguous_imports_is_unknown(
     assert preflight.resolve_rebuild_organization(tmp_path, None) is None
 
 
+def test_public_state_organization_wrapper(tmp_path: Path) -> None:
+    """The round-9 foreign-state guard consumes this thin public wrapper
+    over the private extraction; a matching state names its org and an
+    absent one names none."""
+    assert preflight.state_organization(None) is None
+    state = tmp_path / "meraki2tf.tfstate"
+    state.write_text(
+        json.dumps(
+            {
+                "resources": [
+                    {
+                        "mode": "managed",
+                        "type": "meraki_network",
+                        "name": "n_1",
+                        "instances": [
+                            {"attributes": {"organization_id": "654321"}}
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert preflight.state_organization(state) == "654321"
+
+
 def test_resolve_rebuild_org_nothing_available(tmp_path: Path) -> None:
     assert preflight.resolve_rebuild_organization(tmp_path, None) is None
 
