@@ -16,6 +16,7 @@ import json
 from typing import Any
 
 from meraki2tf.alerts.models import AlertEvent
+from meraki2tf.logging_setup import sanitize_control_chars
 
 #: Accepted values for the webhook payload format selection.
 WEBHOOK_FORMATS = ("json", "slack", "teams")
@@ -43,12 +44,47 @@ def _headline(event: AlertEvent) -> str:
     return f"[meraki2tf] {event.event_type.value} ({event.severity.value})"
 
 
+def _slack_escape(text: str) -> str:
+    """Neutralize Slack mrkdwn in tenant-derived text.
+
+    ``&``/``<``/``>`` escaping defuses ``<!channel>`` mentions and
+    ``<https://evil|click>`` link syntax; the backtick becomes a
+    look-alike modifier grave so a name cannot close the fenced details
+    block (or open an inline code span in the unfenced summary); control
+    characters are made visible so no ANSI escape or forged line
+    survives. Only the JSON structure of the payload is preserved — the
+    text is display-only.
+    """
+    text = sanitize_control_chars(text)
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("`", "ˋ")
+    )
+
+
+def _teams_escape(text: str) -> str:
+    """Neutralize Teams Adaptive-Card markdown in tenant-derived text.
+
+    A ``TextBlock`` renders a markdown subset even under ``Monospace``,
+    so ``[label](https://evil.example)`` would become a clickable
+    attacker link. Backslash-escaping the markdown-active characters
+    (``[ ] ( ) * _`` and the backtick) keeps the literal text inert;
+    control characters are made visible for the same reasons as Slack.
+    """
+    text = sanitize_control_chars(text)
+    for char in "[]()*_`":
+        text = text.replace(char, "\\" + char)
+    return text
+
+
 def render_slack(event: AlertEvent) -> dict[str, Any]:
     """Slack incoming-webhook body: mrkdwn ``text`` with a code block."""
     return {
         "text": (
-            f"*{_headline(event)}*\n{event.summary}\n"
-            f"```{_details_block(event)}```"
+            f"*{_headline(event)}*\n{_slack_escape(event.summary)}\n"
+            f"```{_slack_escape(_details_block(event))}```"
         )
     }
 
@@ -85,13 +121,13 @@ def render_teams(event: AlertEvent) -> dict[str, Any]:
                         {
                             "type": "TextBlock",
                             "wrap": True,
-                            "text": event.summary,
+                            "text": _teams_escape(event.summary),
                         },
                         {
                             "type": "TextBlock",
                             "wrap": True,
                             "fontType": "Monospace",
-                            "text": _details_block(event),
+                            "text": _teams_escape(_details_block(event)),
                         },
                     ],
                 },

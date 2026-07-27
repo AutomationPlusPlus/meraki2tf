@@ -444,6 +444,115 @@ def test_redact_diff_brackets_inside_quotes_do_not_end_the_mask() -> None:
     assert "notes = \"public\"" in redacted
 
 
+def test_redact_diff_heredoc_close_with_arrow_does_not_swallow_plan() -> None:
+    """A heredoc whose close line carries terraform's ``-> null`` suffix
+    (a destroyed attribute) must still close: the F5 drift-concealment
+    bug let it run to EOF, erasing later hunks and the ``Plan:`` summary
+    — a Cardinal-Rule-2 violation. The value stays masked; the second
+    destroy hunk header and the plan summary MUST survive."""
+    diff = "\n".join(
+        [
+            "  # meraki_appliance_vpn.x will be destroyed",
+            "  - resource \"meraki_appliance_vpn\" \"x\" {",
+            "      - psk = <<-EOT",
+            "            [[[[[[[",
+            "        EOT -> null",
+            "    }",
+            "",
+            "  # meraki_network.legit will be destroyed",
+            "  - resource \"meraki_network\" \"legit\" {",
+            "      - name = \"legit\" -> null",
+            "    }",
+            "",
+            "Plan: 0 to add, 0 to change, 2 to destroy.",
+        ]
+    )
+    redacted = redact_diff(diff)
+    assert "[[[[[[[" not in redacted  # heredoc body masked
+    assert "psk = (value redacted)" in redacted
+    assert "# meraki_network.legit will be destroyed" in redacted
+    assert "Plan: 0 to add, 0 to change, 2 to destroy." in redacted
+
+
+def test_redact_diff_unterminated_heredoc_cannot_conceal_the_summary() -> None:
+    """Even a heredoc whose delimiter never recurs cannot eat the plan
+    summary: a column-0 ``Plan:`` line force-closes any open value-skip
+    (belt-and-suspenders behind the delimiter match)."""
+    diff = "\n".join(
+        [
+            "      - psk = <<-EOT",
+            "            malicious body with no closing delimiter",
+            "Plan: 0 to add, 0 to change, 1 to destroy.",
+        ]
+    )
+    redacted = redact_diff(diff)
+    assert "malicious body" not in redacted
+    assert "Plan: 0 to add, 0 to change, 1 to destroy." in redacted
+
+
+def test_redact_diff_nonsecret_heredoc_body_is_opaque() -> None:
+    """A Meraki-controlled multi-line value in a NON-secret attribute
+    (webhook payload template, splash body) is opaque: its body can hold
+    a line that looks like ``psk = [[[`` yet must not be re-parsed as a
+    runaway secret and swallow the following hunk/summary."""
+    diff = "\n".join(
+        [
+            "      + payloadTemplate = <<-EOT",
+            "            psk = [[[[[[[",
+            "        EOT",
+            "      + name = \"public\"",
+            "",
+            "Plan: 1 to add, 0 to change, 0 to destroy.",
+        ]
+    )
+    redacted = redact_diff(diff)
+    assert "name = \"public\"" in redacted
+    assert "Plan: 1 to add, 0 to change, 0 to destroy." in redacted
+
+
+def test_redact_diff_bounds_a_runaway_bracket_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A masked value whose brackets never balance is force-closed after
+    the skip budget so it can never run to the end of the diff."""
+    import meraki2tf.alerts.models as models
+
+    monkeypatch.setattr(models, "_MAX_VALUE_SKIP_LINES", 2)
+    diff = "\n".join(
+        [
+            "      + secrets = [",
+            "          + \"a\",",
+            "          + \"b\",",
+            "          + \"c\",",
+            "      + notes = \"public\"",
+        ]
+    )
+    redacted = redact_diff(diff)
+    # After the 2-line budget the skip is abandoned; later lines survive.
+    assert "notes = \"public\"" in redacted
+
+
+def test_redact_diff_bounds_a_runaway_heredoc_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A heredoc whose delimiter never recurs is force-closed after the
+    skip budget, so its body can never run to the end of the diff."""
+    import meraki2tf.alerts.models as models
+
+    monkeypatch.setattr(models, "_MAX_VALUE_SKIP_LINES", 1)
+    diff = "\n".join(
+        [
+            "      + psk = <<-EOT",
+            "            body-line-one",
+            "            body-line-two",
+            "      + notes = \"public\"",
+        ]
+    )
+    redacted = redact_diff(diff)
+    assert "psk = (value redacted)" in redacted
+    assert "notes = \"public\"" in redacted
+
+
 # ---------------------------------------------------------------------------
 # spec_resolver: transfer deadline + RecursionError degradation
 # ---------------------------------------------------------------------------

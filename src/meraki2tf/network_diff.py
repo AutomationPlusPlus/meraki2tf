@@ -41,6 +41,7 @@ from meraki2tf.models import (
     MerakiNetwork,
     NetworkGraph,
 )
+from meraki2tf.logging_setup import sanitize_control_chars
 from meraki2tf.openapi_parser import OpenApiParser
 from meraki2tf.scope import describe_networks, glob_pattern
 from meraki2tf.snapshot_diff import (
@@ -229,8 +230,12 @@ def render_network_comparison(comparison: NetworkComparison) -> str:
     """Human-readable conformance report — attribute names, never values."""
     a, b = comparison.network_a, comparison.network_b
     diff = comparison.diff
-    label_a = f"{a.name} ({a.network_id})"
-    label_b = f"{b.name} ({b.network_id})"
+    # Network names are tenant-controlled free text printed to stdout;
+    # neutralize control characters so a crafted name cannot forge a
+    # report line or emit an ANSI escape (the JSON --diff-out path is
+    # already safe via json.dumps).
+    label_a = f"{sanitize_control_chars(a.name)} ({a.network_id})"
+    label_b = f"{sanitize_control_chars(b.name)} ({b.network_id})"
     lines = [
         f"Cross-network configuration diff: {label_a} vs {label_b}",
         (

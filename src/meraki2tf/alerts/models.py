@@ -60,7 +60,31 @@ def condense_diff(text: str) -> str:
 #: brackets so a bracket *inside* a rendered value cannot open or close
 #: a masked block.
 _QUOTED_STRING_RE = re.compile(r'"(?:\\.|[^"\\])*"')
-_HEREDOC_OPENER_RE = re.compile(r"<<[-~]?\s*(\w+)")
+
+#: A heredoc opener always terminates the line it appears on
+#: (``attr = <<-EOT``), so anchor the match at end-of-line: a bare
+#: ``<<`` *inside* a quoted value ("use << here") must not be mistaken
+#: for one and swallow the following lines.
+_HEREDOC_OPENER_RE = re.compile(r"<<[-~]?\s*(\w+)\s*$")
+
+#: Structural lines that MUST survive redaction no matter what a
+#: Meraki-controlled value contains — the column-0 plan summary
+#: (mirrors ``terraform_runner._PLAN_SUMMARY_RE``'s column anchoring)
+#: and the indented ``# <address> will be <action>`` hunk headers. If a
+#: value-skip (bracket depth or heredoc body) is ever still open when
+#: one of these appears, the skip is abandoned so the line — and every
+#: line after it — is emitted. Concealing a hunk or the plan summary
+#: would violate Cardinal Rule 2 ("nothing Terraform can't rebuild goes
+#: unreported"), so a crafted value can never suppress them.
+_ALWAYS_KEEP_RE = re.compile(
+    r"^Plan: |^No changes\.|^Apply complete|^\s*# \S.* will be "
+)
+
+#: Hard ceiling on how many continuation lines a single masked value may
+#: consume before the skip is forced closed — belt-and-suspenders so a
+#: value whose brackets never balance (or a heredoc whose delimiter
+#: never recurs) can never run away to the end of the diff.
+_MAX_VALUE_SKIP_LINES = 100_000
 
 
 def _bracket_delta(fragment: str) -> int:
@@ -77,34 +101,85 @@ def redact_diff(text: str) -> str:
     Terraform masks attributes the provider declares ``sensitive``, but
     the alert contract ("names and locators, never values") must not
     depend on the provider's schema being complete: any diff line whose
-    attribute name is secret-shaped loses everything after the ``=``
-    (or ``:``) before the diff leaves the process. Values terraform
-    renders across multiple lines (lists, maps, heredocs) are masked to
-    their closing delimiter — a line-local redactor would strip only
-    the name line and pass every continuation line through raw.
+    attribute name is secret-shaped is replaced by an ``<attr> = (value
+    redacted)`` marker before the diff leaves the process. Values
+    terraform renders across multiple lines (lists, maps, heredocs) have
+    their continuation lines dropped up to the value's own closing
+    delimiter — a line-local redactor would strip only the name line and
+    pass every continuation line through raw.
+
+    Redaction never DELETES structural lines. Heredoc bodies are tracked
+    for *every* attribute (not just secret-named ones) so a
+    Meraki-controlled multi-line value — e.g. a webhook payload template
+    or splash-page body — cannot be re-parsed as an attribute and make a
+    stray ``[`` run the skip away; the body is opaque and ends at the
+    delimiter terraform guarantees never recurs inside it. Every
+    value-skip is additionally bounded and is force-closed the instant a
+    plan-summary or hunk-header line appears, so a hostile value can
+    never conceal drift.
     """
     redacted: list[str] = []
     depth = 0
-    heredoc_tag: str | None = None
+    skip_budget = 0
+    heredoc_close: re.Pattern[str] | None = None
     for line in text.splitlines():
-        if heredoc_tag is not None:
-            if line.strip() == heredoc_tag:
-                heredoc_tag = None
+        # Belt-and-suspenders: a structural line always survives and
+        # breaks out of any still-open value-skip.
+        if _ALWAYS_KEEP_RE.search(line):
+            depth = 0
+            heredoc_close = None
+            redacted.append(line)
+            continue
+        if heredoc_close is not None:
+            if heredoc_close.match(line):
+                heredoc_close = None
+            skip_budget -= 1
+            if skip_budget <= 0:
+                heredoc_close = None
             continue
         if depth > 0:
             depth += _bracket_delta(line)
+            skip_budget -= 1
+            if depth <= 0 or skip_budget <= 0:
+                depth = 0
             continue
+        # Determine whether this line assigns a secret-named attribute.
+        is_secret = False
+        head = sep = value = ""
         for separator in ("=", ":"):
-            head, sep, value = line.partition(separator)
-            tokens = head.split()
-            if sep and tokens and SECRET_KEY_PATTERN.search(tokens[-1]):
-                opener = _HEREDOC_OPENER_RE.search(value)
-                if opener is not None:
-                    heredoc_tag = opener.group(1)
-                else:
-                    depth = max(0, _bracket_delta(value))
-                line = f"{head}{separator} (value redacted)"
+            candidate_head, candidate_sep, candidate_value = line.partition(
+                separator
+            )
+            tokens = candidate_head.split()
+            if (
+                candidate_sep
+                and tokens
+                and SECRET_KEY_PATTERN.search(tokens[-1])
+            ):
+                is_secret = True
+                head, sep, value = (
+                    candidate_head,
+                    candidate_sep,
+                    candidate_value,
+                )
                 break
+        # A heredoc opener (secret or not) makes the body opaque until
+        # its delimiter recurs, so body content can never be re-parsed.
+        opener = _HEREDOC_OPENER_RE.search(line)
+        if opener is not None:
+            heredoc_close = re.compile(
+                rf"^\s*{re.escape(opener.group(1))}\s*(?:->.*)?$"
+            )
+            skip_budget = _MAX_VALUE_SKIP_LINES
+            if is_secret:
+                line = f"{head}{sep} (value redacted)"
+            redacted.append(line)
+            continue
+        if is_secret:
+            depth = max(0, _bracket_delta(value))
+            if depth > 0:
+                skip_budget = _MAX_VALUE_SKIP_LINES
+            line = f"{head}{sep} (value redacted)"
         redacted.append(line)
     return "\n".join(redacted)
 

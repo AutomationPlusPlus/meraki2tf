@@ -1,5 +1,6 @@
 """Verbose/clean logging controls and mandatory secret redaction."""
 
+import json
 import logging
 import sys
 
@@ -183,3 +184,85 @@ def test_text_format_stays_the_default() -> None:
     rendered = handler.format(record)
     assert "hello" in rendered
     assert not rendered.startswith("{")
+
+
+# ---------------------------------------------------------------------------
+# Control-character neutralization (tenant free text cannot forge records)
+# ---------------------------------------------------------------------------
+
+
+def _control_filtered(msg: object, args: object = None) -> logging.LogRecord:
+    from meraki2tf.logging_setup import ControlCharFilter
+
+    record = logging.LogRecord(
+        name="test", level=logging.CRITICAL, pathname=__file__, lineno=1,
+        msg=msg, args=args, exc_info=None,
+    )
+    assert ControlCharFilter().filter(record)
+    return record
+
+
+def test_newline_bearing_name_yields_exactly_one_text_line() -> None:
+    forged = (
+        "Branch-07\n2026-07-27 03:14:15 CRITICAL meraki2tf: apply "
+        "succeeded; 0 gaps"
+    )
+    record = _control_filtered(forged)
+    rendered = logging.Formatter("%(levelname)s %(message)s").format(record)
+    assert "\n" not in rendered  # exactly one physical log line
+    assert "\\n" in record.getMessage()  # the newline is now visible text
+
+
+def test_ansi_escape_is_neutralized() -> None:
+    record = _control_filtered("name \x1b[2J screen-clear")
+    message = record.getMessage()
+    assert "\x1b" not in message
+    assert "\\x1b" in message
+
+
+def test_json_mode_stays_a_single_valid_object() -> None:
+    from meraki2tf.logging_setup import JsonLineFormatter
+
+    record = _control_filtered("line-one\nline-two")
+    out = JsonLineFormatter().format(record)
+    assert out.count("\n") == 0  # one JSON object, one line
+    entry = json.loads(out)  # still valid JSON
+    assert entry["message"] == "line-one\\nline-two"
+
+
+def test_control_char_neutralization_is_idempotent() -> None:
+    from meraki2tf.logging_setup import sanitize_control_chars
+
+    once = sanitize_control_chars("a\nb\tc")
+    assert sanitize_control_chars(once) == once
+
+
+def test_exc_text_control_chars_are_neutralized() -> None:
+    from meraki2tf.logging_setup import ControlCharFilter
+
+    record = logging.LogRecord(
+        name="test", level=logging.ERROR, pathname=__file__, lineno=1,
+        msg="boom", args=None, exc_info=None,
+    )
+    record.exc_text = "Traceback\nValueError: injected\x1b[2J\nmore"
+    assert ControlCharFilter().filter(record)
+    assert "\n" not in record.exc_text
+    assert "\x1b" not in record.exc_text
+
+
+def test_malformed_args_degrade_without_crashing() -> None:
+    record = _control_filtered("needs %s and %s", ("only-one",))
+    # getMessage() would raise on the raw record; the filter degraded to
+    # the template and cleared args, so rendering is safe now.
+    assert record.args is None
+    assert "needs %s and %s" in record.getMessage()
+
+
+def test_control_filter_installed_alongside_redaction() -> None:
+    from meraki2tf.logging_setup import ControlCharFilter, SecretRedactionFilter
+
+    configure_logging()
+    handler = logging.getLogger().handlers[0]
+    kinds = [type(f) for f in handler.filters]
+    assert SecretRedactionFilter in kinds
+    assert ControlCharFilter in kinds
