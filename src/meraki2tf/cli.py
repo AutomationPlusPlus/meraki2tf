@@ -86,6 +86,7 @@ from meraki2tf.orchestrator import (
     PipelineOrchestrator,
     PreflightRefusalError,
     RunSummary,
+    cap_log_enumeration,
 )
 from meraki2tf import preflight
 from meraki2tf.provider_catalog import (
@@ -3051,9 +3052,12 @@ def _report(summary: RunSummary) -> None:
         logger.warning(
             "Secrets not captured in the DR kit (restore manually after a "
             "rebuild): %s",
-            "; ".join(
-                f"{address}: {', '.join(attrs)}"
-                for address, attrs in summary.unmanaged_secret_attributes.items()
+            cap_log_enumeration(
+                [
+                    f"{address}: {', '.join(attrs)}"
+                    for address, attrs in
+                    summary.unmanaged_secret_attributes.items()
+                ]
             ),
         )
     if summary.resources_added_to_state:

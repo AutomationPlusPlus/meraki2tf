@@ -18,7 +18,9 @@ from meraki2tf.orchestrator import (
     PipelineError,
     PipelineOrchestrator,
     PreflightRefusalError,
+    cap_log_enumeration,
 )
+from meraki2tf.workdir_lock import WorkdirLock
 from meraki2tf.providers.base import MerakiDataProvider
 from meraki2tf.terraform_runner import (
     ImportGuardViolation,
@@ -428,6 +430,79 @@ def test_unsupported_assets_warn_for_manual_dr_rebuild(
     assert success.details["unsupported"][0]["api_path"] == (
         "/networks/{networkId}/mystery"
     )
+
+
+def test_cap_log_enumeration_shapes_the_tail() -> None:
+    # Under the cap: nothing is hidden, no tail appended.
+    assert cap_log_enumeration(["a", "b"], cap=5) == "a; b"
+    # Over the cap: first `cap` shown, remainder collapsed to a pointer.
+    capped = cap_log_enumeration(["a", "b", "c", "d"], cap=2)
+    assert capped == "a; b; ... and 2 more (see coverage.txt / runbook.md)"
+    # Degenerate cap=0: the message is the pointer alone, never a stray
+    # leading separator.
+    only_tail = cap_log_enumeration(["a", "b"], cap=0)
+    assert only_tail == "... and 2 more (see coverage.txt / runbook.md)"
+
+
+def test_concurrent_run_refuses_to_share_workdir(
+    tmp_path: Path, api_key: None
+) -> None:
+    """A second run against a workdir a run already holds refuses cleanly
+    (a preflight, no fault alert) rather than clobbering the kit; once the
+    holder releases, a later run acquires and completes normally."""
+    orchestrator, recorder, _, _ = _orchestrator(tmp_path)
+    holder = WorkdirLock(tmp_path)
+    holder.acquire()
+    try:
+        with pytest.raises(PreflightRefusalError, match="another meraki2tf run"):
+            orchestrator.run("org-123")
+        # Refused before any artifact write or discovery — no alert fired.
+        assert recorder.events == []
+    finally:
+        holder.release()
+
+    summary = orchestrator.run("org-123")
+    assert summary.organization_id == "org-123"
+    assert [e.event_type for e in recorder.events] == [EventType.RUN_SUCCESS]
+
+
+def test_unsupported_warning_caps_inline_enumeration(
+    tmp_path: Path, api_key: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    """At scale the MANUAL-rebuild WARNING must not become one mega line:
+    it caps at 50 entries and points to the durable lists, while the full
+    set stays in the coverage manifest and the success alert."""
+    assets = tuple(
+        UnsupportedAsset(
+            api_path=f"/networks/{{networkId}}/mystery/{i}",
+            reason="No Terraform resource maps to this API path.",
+            identifiers=(f"N_{i}",),
+        )
+        for i in range(60)
+    )
+    generator = StubGenerator(unsupported=assets)
+    orchestrator, recorder, _, _ = _orchestrator(tmp_path, generator=generator)
+    with caplog.at_level("WARNING", logger="meraki2tf.orchestrator"):
+        summary = orchestrator.run("org-123")
+
+    warning = next(
+        r.message for r in caplog.records if "MANUAL rebuild" in r.message
+    )
+    assert "... and 10 more (see coverage.txt / runbook.md)" in warning
+    assert "/mystery/0 " in warning  # first entries still enumerated
+    assert "/mystery/59 " not in warning  # tail collapsed, not spelled out
+
+    # The full list is preserved where DR actually reads it.
+    assert summary.unsupported_count == 60
+    assert recorder.events[-1].details["unsupported_count"] == 60
+    manifest = json.loads(
+        (tmp_path / COVERAGE_JSON_FILENAME).read_text(encoding="utf-8")
+    )
+    unsupported = [
+        entry for entry in manifest["objects"]
+        if entry["status"] == "unsupported"
+    ]
+    assert len(unsupported) == 60
 
 
 def test_rebaseline_resets_before_generation(tmp_path: Path, api_key: None) -> None:

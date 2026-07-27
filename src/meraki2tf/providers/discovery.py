@@ -22,6 +22,7 @@ import logging
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
+from weakref import WeakKeyDictionary
 
 from meraki2tf.models import UNREADABLE_MARKER, FeatureConfiguration
 from meraki2tf.openapi_parser import (
@@ -126,6 +127,18 @@ def parent_item_path(path: str) -> str:
     return "/".join(segments[: last_param + 1])
 
 
+#: Per-parser memo for :func:`item_operation_for`. The lookup scans all
+#: ~957 spec endpoints and, at ~200k discovered objects, is called once per
+#: (collection-endpoint × scope) — ~1.1s of graph-build spent re-deriving a
+#: result that depends only on the collection path. Keyed on the parser
+#: instance (weakly, so a runner processing several specs never leaks one
+#: spec's answers into another and the cache dies with its parser), then on
+#: the collection path.
+_ITEM_OP_CACHE: WeakKeyDictionary[
+    OpenApiParser, dict[str, OperationSpec | None]
+] = WeakKeyDictionary()
+
+
 def item_operation_for(
     parser: OpenApiParser, op: OperationSpec
 ) -> OperationSpec | None:
@@ -134,7 +147,25 @@ def item_operation_for(
     A GET item endpoint is preferred; entities that only expose PUT or
     DELETE on the item path (e.g. organization admins) still yield the
     path template needed to address elements for import.
+
+    Memoized per parser on ``op.path`` (the sole determinant): repeated
+    lookups for the same collection are O(1) instead of re-scanning every
+    endpoint. See :func:`_resolve_item_operation` for the un-memoized body.
     """
+    cache = _ITEM_OP_CACHE.get(parser)
+    if cache is None:
+        cache = {}
+        _ITEM_OP_CACHE[parser] = cache
+    key = op.path
+    if key not in cache:
+        cache[key] = _resolve_item_operation(parser, op)
+    return cache[key]
+
+
+def _resolve_item_operation(
+    parser: OpenApiParser, op: OperationSpec
+) -> OperationSpec | None:
+    """Un-memoized item-endpoint resolution (see item_operation_for)."""
     fallback: OperationSpec | None = None
     for candidate in parser.endpoints():
         if (

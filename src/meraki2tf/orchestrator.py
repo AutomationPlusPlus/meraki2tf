@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -73,11 +74,41 @@ from meraki2tf.terraform_runner import (
     TerraformError,
     TerraformRunner,
 )
+from meraki2tf.workdir_lock import WorkdirLock, WorkdirLockError
 
 logger = logging.getLogger(__name__)
 
 #: Plan actions that do not mutate anything (imports plan as no-op).
 _HARMLESS_ACTIONS = frozenset({"no-op", "read"})
+
+#: Cap on how many items a single log line enumerates inline. At ~200k
+#: discovered objects the full unsupported / uncaptured-secret lists would
+#: each be one enormous single-line record (hundreds of KB) that
+#: journald/aggregators truncate exactly when the enumeration matters. The
+#: full lists stay durable in coverage.json / coverage.txt / runbook.md;
+#: only the LOG line is capped. Mirrors snapshot_diff.render_diff's limit.
+LOG_ENUMERATION_CAP = 50
+
+
+def cap_log_enumeration(
+    entries: Sequence[str],
+    sep: str = "; ",
+    cap: int = LOG_ENUMERATION_CAP,
+) -> str:
+    """Join ``entries`` for a log line, capping the inline enumeration.
+
+    Beyond ``cap`` items the tail collapses to "... and N more (see
+    coverage.txt / runbook.md)" so one log record stays bounded even at
+    ~200k objects. The full list lives durably in the coverage manifest and
+    runbook — this only shapes the transient log line, never those.
+    """
+    shown = sep.join(entries[:cap])
+    hidden = len(entries) - cap
+    if hidden > 0:
+        tail = f"... and {hidden} more (see coverage.txt / runbook.md)"
+        shown = f"{shown}{sep}{tail}" if shown else tail
+    return shown
+
 
 #: Workdir file carrying the deletion addresses a DELETION_PENDING_
 #: CONFIRMATION alert already reached the operator with. A later
@@ -209,6 +240,25 @@ class PipelineOrchestrator:
         self._reconciliation_alerted: set[str] = set()
 
     def run(self, organization_id: str | None = None) -> RunSummary:
+        # Terraform locks only its state; the DR kit itself has none, so
+        # two overlapping runs on one workdir would clobber each other and
+        # could leave a coverage manifest vouching for resources absent
+        # from imports.tf (Cardinal Rule 2). Take an exclusive workdir lock
+        # for the whole run and refuse a second concurrent kit-writing run.
+        # On contention nothing in the workdir is touched, so the holding
+        # run keeps sole ownership — and the refusal is an expected
+        # preflight, not a fault (no PROCESSING_FAULT alert, no traceback).
+        lock = WorkdirLock(self._runner.workdir)
+        try:
+            lock.acquire()
+        except WorkdirLockError as exc:
+            raise PreflightRefusalError(str(exc)) from exc
+        try:
+            return self._run(organization_id)
+        finally:
+            lock.release()
+
+    def _run(self, organization_id: str | None = None) -> RunSummary:
         stage = "startup"
         try:
             if self._rebaseline:
@@ -306,10 +356,12 @@ class PipelineOrchestrator:
                     "%d asset(s) cannot be expressed by the Terraform provider "
                     "and would need MANUAL rebuild in a DR event: %s",
                     len(report.unsupported),
-                    "; ".join(
-                        f"{item.api_path} "
-                        f"(ids={','.join(item.identifiers) or '<none>'})"
-                        for item in report.unsupported
+                    cap_log_enumeration(
+                        [
+                            f"{item.api_path} "
+                            f"(ids={','.join(item.identifiers) or '<none>'})"
+                            for item in report.unsupported
+                        ]
                     ),
                 )
             logger.info(
