@@ -74,7 +74,7 @@ from meraki2tf.config import (
 )
 from meraki2tf.coverage import build_manifest, unsupported_payload, write_manifest
 from meraki2tf.hcl_generator import HclImportGenerator
-from meraki2tf.logging_setup import configure_logging
+from meraki2tf.logging_setup import LOG_FORMATS, configure_logging
 from meraki2tf.models import DiscoveryDiagnostics, NetworkGraph
 from meraki2tf.openapi_parser import OpenApiParser
 from meraki2tf.orchestrator import (
@@ -268,7 +268,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     core.add_argument(
         "--log-format",
-        choices=["text", "json"],
+        choices=LOG_FORMATS,
         default="text",
         help=(
             "Console log output (default: %(default)s). 'json' emits one "

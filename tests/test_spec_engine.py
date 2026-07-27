@@ -48,18 +48,11 @@ def test_operations_are_discovered_dynamically() -> None:
     assert vlan_get.tags == ("appliance", "vlans")
 
 
-def test_resource_groups_cluster_by_path_template() -> None:
-    groups = SpecIngestionEngine(MOCK_SPEC).resource_groups()
-    vlan = groups["/networks/{networkId}/appliance/vlans/{vlanId}"]
-    assert vlan.methods == frozenset({"get", "put"})
-    assert groups["/organizations"].methods == frozenset({"get"})
-
-
 def test_from_file_round_trip(tmp_path: Path) -> None:
     spec_path = tmp_path / "spec.json"
     spec_path.write_text(json.dumps(MOCK_SPEC), encoding="utf-8")
     engine = SpecIngestionEngine.from_file(spec_path)
-    assert len(engine.resource_groups()) == 3
+    assert len(list(engine.operations())) == 4
 
 
 def test_from_file_rejects_invalid_json(tmp_path: Path) -> None:
@@ -191,13 +184,3 @@ def test_unresolvable_ref_path_items_warn_by_path(
         "/organizations" in record.getMessage() and "$ref" in record.message
         for record in caplog.records
     )
-
-
-def test_from_latest_release_builds_from_remote_spec(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from meraki2tf import spec_resolver
-
-    monkeypatch.setattr(spec_resolver, "fetch_latest_spec", lambda: MOCK_SPEC)
-    engine = SpecIngestionEngine.from_latest_release()
-    assert len(engine.resource_groups()) == 3

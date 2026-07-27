@@ -3260,7 +3260,6 @@ class WipePreview:
     organization_id: str
     organization_name: str
     network_count: int
-    claimed_device_count: int
     #: Admins other than the caller. A restore drill from a snapshot
     #: recreates the source org's admins (as pseudonyms in sanitized
     #: drills), and the dashboard refuses to delete an organization
@@ -3392,7 +3391,6 @@ class OrgWiper:
             organization_id=organization_id,
             organization_name=name,
             network_count=len(networks),
-            claimed_device_count=0,
             other_admin_count=len(self._other_admins(organization_id)),
             config_template_count=len(
                 self._config_templates(organization_id)

@@ -79,23 +79,6 @@ class OperationSpec:
     raw: Mapping[str, Any] = field(repr=False, hash=False, compare=False, default_factory=dict)
 
 
-@dataclass(frozen=True)
-class ResourceGroup:
-    """Operations sharing one resource path, keyed by canonical path template.
-
-    A group whose members include a ``get`` and a ``put`` on the same
-    templated path is the primary signal for a manageable Terraform
-    resource; read-only groups become data sources.
-    """
-
-    path: str
-    operations: tuple[OperationSpec, ...]
-
-    @property
-    def methods(self) -> frozenset[str]:
-        return frozenset(op.method for op in self.operations)
-
-
 class SpecIngestionEngine:
     """Parses a Meraki OpenAPI document into a dynamic operation registry."""
 
@@ -117,13 +100,6 @@ class SpecIngestionEngine:
         if not isinstance(document, Mapping):
             raise MalformedSpecError(f"OpenAPI spec {path} is not a JSON object.")
         return cls(document)
-
-    @classmethod
-    def from_latest_release(cls) -> "SpecIngestionEngine":
-        """Pull the latest published Meraki OpenAPI spec from GitHub."""
-        from meraki2tf.spec_resolver import fetch_latest_spec
-
-        return cls(fetch_latest_spec())
 
     def operations(self) -> Iterator[OperationSpec]:
         """Walk every path/method pair in the document, in spec order."""
@@ -179,19 +155,3 @@ class SpecIngestionEngine:
             )
             return None
         return resolved
-
-    def resource_groups(self) -> dict[str, ResourceGroup]:
-        """Cluster operations by shared path template.
-
-        The path template is the natural resource boundary in the Meraki
-        API (e.g. all methods under
-        ``/networks/{networkId}/appliance/vlans/{vlanId}`` describe one
-        resource), so grouping needs no name heuristics.
-        """
-        buckets: dict[str, list[OperationSpec]] = {}
-        for op in self.operations():
-            buckets.setdefault(op.path, []).append(op)
-        return {
-            path: ResourceGroup(path=path, operations=tuple(ops))
-            for path, ops in buckets.items()
-        }
