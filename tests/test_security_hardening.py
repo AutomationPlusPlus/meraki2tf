@@ -147,6 +147,116 @@ def test_log_hygiene_arguments_cannot_be_overridden(
         dashboard_client(suppress_logging=False)
 
 
+def _smart_flow_dashboard_api(captured: dict[str, Any]) -> Any:
+    """A stand-in carrying SDK 4.x's smart-flow constructor surface."""
+
+    def DashboardAPI(  # noqa: N802 - mirrors the SDK's class name
+        *,
+        api_key: str,
+        suppress_logging: bool = False,
+        print_console: bool = True,
+        output_log: bool = True,
+        smart_flow_enabled: bool = True,
+        smart_flow_cache_mode: str = "lazy",
+        smart_flow_cache_path: str = "~/.meraki/.cache/x.json",
+        smart_flow_cache_ttl: float = 604800.0,
+        smart_flow_logging: bool = True,
+        **rest: Any,
+    ) -> None:
+        captured.update(locals())
+        captured.update(captured.pop("rest", {}))
+
+    return DashboardAPI
+
+
+def test_smart_flow_mapping_cache_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SDK 4.x's rate limiter persists network IDs, device serials, and
+    organization IDs to ~/.meraki/.cache/rate_limit_cache.json — an
+    undeclared artifact of tenant identifiers, outside the workdir, at
+    the process umask, kept for a week. The limiter is worth having; its
+    cache is not, and an empty path switches only the cache off."""
+    captured: dict[str, Any] = {}
+
+    stub = types.ModuleType("meraki")
+    stub.DashboardAPI = _smart_flow_dashboard_api(captured)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "meraki", stub)
+    monkeypatch.setenv("MERAKI_DASHBOARD_API_KEY", "k" * 40)
+
+    dashboard_client(wait_on_rate_limit=True)
+    assert captured["smart_flow_cache_path"] == ""
+    assert captured["smart_flow_logging"] is False
+    # Only the cache is off — the limiter still paces the shared budget.
+    assert captured["smart_flow_enabled"] is True
+    assert captured["wait_on_rate_limit"] is True
+
+
+def test_smart_flow_settings_are_not_sent_to_an_sdk_without_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The declared range spans both SDK majors. 3.x has no smart flow
+    and no cache to disable, and would raise TypeError on the argument,
+    so the factory reads the constructor instead of assuming one."""
+    captured: dict[str, Any] = {}
+
+    def DashboardAPI(  # noqa: N802 - mirrors the SDK's class name
+        *, api_key: str, suppress_logging: bool, print_console: bool, output_log: bool
+    ) -> None:
+        captured.update(locals())
+
+    stub = types.ModuleType("meraki")
+    stub.DashboardAPI = DashboardAPI  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "meraki", stub)
+    monkeypatch.setenv("MERAKI_DASHBOARD_API_KEY", "k" * 40)
+
+    dashboard_client()
+    assert not [k for k in captured if k.startswith("smart_flow")]
+
+
+def test_renamed_smart_flow_cache_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An SDK that has smart flow but not the parameter we know how to
+    switch off is a restructured cache. Refuse to build the client
+    rather than silently resume writing identifiers to disk."""
+
+    def DashboardAPI(  # noqa: N802 - mirrors the SDK's class name
+        *,
+        api_key: str,
+        suppress_logging: bool,
+        print_console: bool,
+        output_log: bool,
+        smart_flow_enabled: bool = True,
+        smart_flow_store_path: str = "~/.meraki/.cache/x.json",
+    ) -> None:  # pragma: no cover - must never be reached
+        raise AssertionError("client built despite an unrecognized cache")
+
+    stub = types.ModuleType("meraki")
+    stub.DashboardAPI = DashboardAPI  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "meraki", stub)
+    monkeypatch.setenv("MERAKI_DASHBOARD_API_KEY", "k" * 40)
+
+    with pytest.raises(RuntimeError, match="smart_flow_cache_path"):
+        dashboard_client()
+
+
+def test_smart_flow_cache_cannot_be_re_enabled_by_a_caller(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same rule as the log-hygiene arguments: a caller re-passing the
+    cache path is a TypeError, not a silent re-enable."""
+    captured: dict[str, Any] = {}
+
+    stub = types.ModuleType("meraki")
+    stub.DashboardAPI = _smart_flow_dashboard_api(captured)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "meraki", stub)
+    monkeypatch.setenv("MERAKI_DASHBOARD_API_KEY", "k" * 40)
+
+    with pytest.raises(TypeError, match="smart_flow_cache_path"):
+        dashboard_client(smart_flow_cache_path="/tmp/cache.json")
+
+
 # ---------------------------------------------------------------------------
 # live provider: spec-poisoned dispatch must verify the SDK verb
 # ---------------------------------------------------------------------------
