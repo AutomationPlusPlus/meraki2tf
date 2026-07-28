@@ -7,6 +7,18 @@ the project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- Discovery no longer issues a redundant SDK smart-flow `getNetwork`
+  probe for every config-template-scoped request (#154). The SDK 4.x
+  rate limiter resolves each network URL to its organization with a
+  `getNetwork` call and never negatively-caches a failed resolution, so
+  a config template — whose `getNetwork` is a 404 — was re-probed on
+  every one of its ~85 template-scoped endpoint calls, roughly doubling
+  the discovery call volume against the shared 10 req/s budget on
+  template-heavy (i.e. most production) organizations. Discovery already
+  paces itself through its own `AdaptiveTokenBucket`, so the limiter is
+  turned off for the discovery client; the DR write engines keep it.
+  Measured on the dev org: 251 wasted template `getNetwork` 404s → 0,
+  ~1250 → 938 total calls, with an identical snapshot.
 - `--dump-to snapshot.json.gz` now writes a genuinely gzip-compressed
   snapshot instead of plain JSON under a misleading `.gz` name (#153).
   The v2 stream writer already honored `.gz`; the v1 writer ignored it,

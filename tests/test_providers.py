@@ -139,6 +139,10 @@ def live_provider(
         # waiting OFF because the shared AIMD bucket owns all pacing.
         assert kwargs["wait_on_rate_limit"] in (True, False)
         assert kwargs["maximum_retries"] == 10
+        # Discovery's shared AdaptiveTokenBucket owns all pacing, so the
+        # redundant SDK smart-flow limiter — which re-probes getNetwork
+        # for every unresolved (config-template) URL — is turned off.
+        assert kwargs["smart_flow_enabled"] is False
         return FakeDashboard()
 
     stub = types.ModuleType("meraki")
