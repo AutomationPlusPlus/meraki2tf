@@ -3513,6 +3513,17 @@ def test_version_flag_prints_version(
     assert out.strip() != "meraki2tf"
 
 
+def test_dunder_version_matches_distribution_metadata() -> None:
+    """``meraki2tf.__version__`` must track the distribution version (i.e.
+    pyproject) rather than being a hardcoded copy that silently goes stale
+    the moment the version is bumped for a release."""
+    import importlib.metadata
+
+    import meraki2tf
+
+    assert meraki2tf.__version__ == importlib.metadata.version("meraki2tf")
+
+
 def test_module_entrypoint_matches_console_script() -> None:
     import importlib
     import subprocess
