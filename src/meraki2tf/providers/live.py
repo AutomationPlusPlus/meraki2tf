@@ -281,6 +281,19 @@ class LiveApiDataProvider(MerakiDataProvider):
         return dashboard_client(
             wait_on_rate_limit=wait_on_rate_limit,
             maximum_retries=_SDK_MAXIMUM_RETRIES,
+            # Discovery paces itself: the shared AdaptiveTokenBucket owns
+            # every rate decision (see fetch_network_graph). The SDK 4.x
+            # smart-flow limiter is a second, redundant pacer here — and a
+            # costly one, because it resolves each network URL to its org
+            # with a getNetwork call and NEVER negatively-caches a failed
+            # resolution. A config template (whose getNetwork is a 404)
+            # therefore re-probes on EVERY template-scoped request: on a
+            # template-heavy production org that roughly doubles the
+            # discovery call volume against the shared 10 req/s budget for
+            # no benefit the bucket does not already provide. Turn it off
+            # for discovery; the DR write engines (restore/heal/replay),
+            # which have no bucket of their own, keep it.
+            smart_flow_enabled=False,
         )
 
     def _dashboard(self) -> Any:
