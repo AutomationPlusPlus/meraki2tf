@@ -197,6 +197,29 @@ def test_snapshot_v2_is_dramatically_smaller_than_v1(tmp_path: Path) -> None:
     assert v2.stat().st_size < v1.stat().st_size
 
 
+def test_v1_snapshot_honors_gz_suffix(tmp_path: Path) -> None:
+    """A v1 (.json) path ending in .gz is really gzip-compressed, not
+    plain JSON under a misleading name: the content-sniffing reader
+    always loaded either, but external gzip/zcat consumers and any
+    compression expectation at scale broke on an uncompressed .gz."""
+    import gzip
+
+    graph = _payload_graph()
+    gz = write_snapshot(graph, tmp_path / "snap.json.gz")
+    assert oct(gz.stat().st_mode & 0o777) == "0o600"
+    assert gz.read_bytes()[:2] == b"\x1f\x8b"
+    # A stdlib gzip consumer (i.e. anything trusting the extension) reads it.
+    with gzip.open(gz, "rt", encoding="utf-8") as handle:
+        document = json.load(handle)
+    assert document["organizationId"] == "org-123"
+    # The tool's own reader still round-trips it.
+    loaded = StaticJsonDataProvider(gz).fetch_network_graph()
+    assert loaded.organization_id == "org-123"
+    # A plain .json path stays uncompressed.
+    plain = write_snapshot(graph, tmp_path / "snap.json")
+    assert plain.read_bytes()[:1] == b"{"
+
+
 def test_snapshot_v2_loader_tolerates_stray_lines(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

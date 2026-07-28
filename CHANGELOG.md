@@ -7,6 +7,14 @@ the project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- `--dump-to snapshot.json.gz` now writes a genuinely gzip-compressed
+  snapshot instead of plain JSON under a misleading `.gz` name (#153).
+  The v2 stream writer already honored `.gz`; the v1 writer ignored it,
+  so a `.json.gz` export was uncompressed. The content-sniffing reader
+  loaded it either way, but external `gzip`/`zcat` consumers failed on
+  it and — at the scale where compression matters most — a user who
+  asked for a compressed snapshot silently got none. Plain `.json`
+  stays uncompressed; the reader is unchanged.
 - Discovery no longer silently drops an object when the API answers a
   config GET with HTTP 200 and a bare `null` (or empty) body (#152). Such
   a response — a transient API glitch, a captive-portal/proxy body, a

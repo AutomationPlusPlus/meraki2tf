@@ -188,10 +188,7 @@ def write_snapshot(
                 document["specVersion"] = spec_version
             if spec_sha256 is not None:
                 document["specSha256"] = spec_sha256
-            with tmp.open("w", encoding="utf-8") as handle:
-                handle.write(json.dumps(document, indent=2) + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
+            _write_v1_document(document, path, tmp)
         os.replace(tmp, path)
     except BaseException:
         tmp.unlink(missing_ok=True)
@@ -241,6 +238,33 @@ def _warn_kind_collision(
             "Write a v1 (.json) snapshot to keep it.",
             record_kind.capitalize(), identifier,
         )
+
+
+def _write_v1_document(
+    document: dict[str, Any], path: Path, target: Path
+) -> None:
+    """Write the v1 pretty-printed document, honoring a ``.gz`` name.
+
+    Format selection keys on the *final* path's name (bytes land in the
+    temporary file the caller renames into place), matching the v2
+    writer. Without this a ``--dump-to snapshot.json.gz`` produced plain
+    JSON under a ``.gz`` name: the content-sniffing reader still loaded
+    it, but every external ``gzip``/``zcat`` consumer failed on it and,
+    at scale, a user who asked for compression silently got none.
+    """
+    body = json.dumps(document, indent=2) + "\n"
+    with target.open("wb") as raw:
+        if path.name.lower().endswith(".gz"):
+            # Close the gzip layer before the fsync: the final deflate
+            # block and CRC trailer are written on close, so an earlier
+            # fsync could persist — then atomically rename into place — a
+            # truncated stream.
+            with gzip.GzipFile(fileobj=raw, mode="wb") as compressed:
+                compressed.write(body.encode("utf-8"))
+        else:
+            raw.write(body.encode("utf-8"))
+        raw.flush()
+        os.fsync(raw.fileno())
 
 
 def _write_snapshot_v2(
