@@ -6,6 +6,18 @@ the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- Discovery no longer silently drops an object when the API answers a
+  config GET with HTTP 200 and a bare `null` (or empty) body (#152). Such
+  a response — a transient API glitch, a captive-portal/proxy body, a
+  partial outage — yields no object, and the discovery engine had
+  conflated it with a genuine 400/404 scope refusal: the object vanished
+  from **both** the snapshot and the coverage manifest with no gap record,
+  while coverage still reported a confident percentage. A successful call
+  whose body is `null` now rides the unreadable-coverage rail exactly like
+  a 200 whose body never parsed — surfaced as a coverage gap and reported,
+  never silently absent (Cardinal Rule 2).
+
 ### Added
 - `coverage.json` now carries a `kit` fingerprint of `imports.tf`
   (`imports_sha256` + `import_block_count`), and `--check` gains a "kit
