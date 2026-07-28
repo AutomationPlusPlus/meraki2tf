@@ -7,6 +7,13 @@ the project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- `meraki2tf.__version__` now derives from the installed distribution
+  metadata (the single source of truth in `pyproject.toml`) instead of
+  a hardcoded copy (#155). The copy was unreferenced and untested, so it
+  would have silently reported the old version the moment the number was
+  bumped for a release — while `--version`, which already reads the
+  metadata, reported the new one. A regression test now asserts the two
+  agree.
 - Discovery no longer issues a redundant SDK smart-flow `getNetwork`
   probe for every config-template-scoped request (#154). The SDK 4.x
   rate limiter resolves each network URL to its organization with a
