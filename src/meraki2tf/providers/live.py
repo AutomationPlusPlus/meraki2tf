@@ -1003,6 +1003,22 @@ class LiveApiDataProvider(MerakiDataProvider):
                     "this endpoint"
                 ) from exc
             bucket.on_success()
+            if result is None:
+                # A successful HTTP call whose body is a bare ``null`` (or
+                # empty) is NOT a scope refusal: those come back as ``None``
+                # from the 400/404 branch above and are legitimately absent.
+                # This is an anomalous 200 — a transient API glitch, a
+                # captive-portal/proxy body, a partial outage — that yields
+                # no object. Returning it silently would let ``_fetch`` treat
+                # it as a refusal and drop a discoverable, rebuildable object
+                # from BOTH the snapshot and the coverage manifest with no
+                # gap record, exactly the silent DR under-capture Cardinal
+                # Rule 2 forbids. Surface it as an unreadable gap, just like a
+                # 200 whose body never parsed.
+                raise _EndpointUnreadable(
+                    "HTTP 200 with an empty/null body: the endpoint returned "
+                    "no object to read"
+                )
             if stats is not None:
                 stats.record(op.path, refused=False)
             return result

@@ -874,6 +874,35 @@ def test_try_call_returns_nothing_once_aborted(
     assert calls["n"] == 0
 
 
+def test_null_body_on_success_becomes_coverage_gap(
+    live_provider: LiveApiDataProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A 200 whose body is a bare ``null`` yields no object, but it is NOT
+    a scope refusal (those arrive as a 400/404). Treating it as one would
+    silently drop a discoverable, rebuildable object from the snapshot AND
+    the coverage manifest — the exact Cardinal-Rule-2 under-capture a
+    transient API glitch or captive-portal proxy could cause. It must ride
+    the unreadable-coverage rail, just like a body that never parsed."""
+
+    def _null(self: Any, organizationId: str) -> None:
+        return None
+
+    monkeypatch.setattr(FakeOrganizations, "getOrganizationAdmins", _null)
+    with caplog.at_level("WARNING", logger="meraki2tf.providers.live"):
+        graph = live_provider.fetch_network_graph("org-123")
+
+    gaps = [f for f in graph.features if UNREADABLE_MARKER in f.payload]
+    assert len(gaps) == 1
+    assert gaps[0].api_path.endswith("/admins")
+    assert gaps[0].path_values == ("org-123",)
+    assert "null body" in gaps[0].payload[UNREADABLE_MARKER]
+    assert any("could not be read" in r.message for r in caplog.records)
+    # The rest of discovery survived the anomalous endpoint.
+    assert len(graph.features) > 1
+
+
 @pytest.mark.parametrize("status", [500, 502, 503, 504])
 def test_persistent_server_error_becomes_coverage_gap(
     live_provider: LiveApiDataProvider,
