@@ -1139,3 +1139,103 @@ def test_heal_executed_reports_verified_alive_skips_distinctly() -> None:
     )
     assert "verified alive" not in plain.summary
     assert "verified_alive_skips" not in plain.to_payload()["details"]
+
+
+# ---------------------------------------------------------------------------
+# PagerDuty body budgeting (Events API v2 rejects bodies past 512 KB).
+# ---------------------------------------------------------------------------
+
+
+def _pagerduty_body(
+    monkeypatch: pytest.MonkeyPatch, event: AlertEvent
+) -> dict[str, Any]:
+    """POST the event through the notifier and return the decoded body."""
+    monkeypatch.setenv(ROUTING_KEY_ENV_VAR, "rk-test-0001")
+    captured: dict[str, Any] = {}
+
+    def fake_urlopen(request: urllib.request.Request, timeout: float) -> FakeResponse:
+        captured["raw"] = request.data
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse(202)
+
+    monkeypatch.setattr(pagerduty_module, "_open", fake_urlopen)
+    PagerDutyNotifier().send(event)
+    return captured
+
+
+def test_pagerduty_small_event_is_sent_untrimmed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The budget must not disturb ordinary events."""
+    captured = _pagerduty_body(
+        monkeypatch, drift_detected(diff="~ plan delta", workspace="generated")
+    )
+    details = captured["body"]["payload"]["custom_details"]
+    assert details["diff"] == "~ plan delta"
+    assert "truncated_for_delivery" not in details
+
+
+def test_pagerduty_oversized_diff_is_trimmed_under_the_api_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A drift diff larger than the 512 KB body limit still pages.
+
+    An unbudgeted body is refused outright by the Events API, which
+    would silently cost the DR pipeline its most important alert.
+    """
+    captured = _pagerduty_body(
+        monkeypatch,
+        drift_detected(diff="D" * 900_000, workspace="/srv/dr/workdir"),
+    )
+    assert len(captured["raw"]) <= pagerduty_module._BODY_BYTE_LIMIT
+    details = captured["body"]["payload"]["custom_details"]
+    # The locators an on-call responder acts on survive the trim.
+    assert details["workspace"] == "/srv/dr/workdir"
+    assert details["origin"] == "terraform-plan"
+    # The excerpt is marked as one, and says how much was dropped.
+    assert details["diff"].startswith("DDD")
+    assert len(details["diff"]) < 900_000
+    omitted = details["truncated_for_delivery"]["omitted"]
+    assert "more characters" in omitted["diff"]
+
+
+def test_pagerduty_trim_prefers_bulk_fields_over_locators(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Long lists are sliced; the identifying scalars are untouched."""
+    event = drift_detected(diff="~ delta", workspace="generated")
+    event.details["unsupported"] = [
+        {"api_path": f"/networks/{{networkId}}/thing{index}", "reason": "R" * 200}
+        for index in range(4000)
+    ]
+    event.details["organization_id"] = "123456"
+    captured = _pagerduty_body(monkeypatch, event)
+
+    assert len(captured["raw"]) <= pagerduty_module._BODY_BYTE_LIMIT
+    details = captured["body"]["payload"]["custom_details"]
+    assert details["organization_id"] == "123456"
+    assert details["diff"] == "~ delta"
+    assert 0 < len(details["unsupported"]) < 4000
+    assert "more item(s)" in details["truncated_for_delivery"]["omitted"]["unsupported"]
+
+
+def test_pagerduty_budget_survives_many_small_oversized_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The last-resort path keeps the event deliverable regardless.
+
+    Thousands of individually-small fields can overflow the limit
+    without any single one being worth trimming; the essential locators
+    are kept and the event still reaches PagerDuty.
+    """
+    event = drift_detected(diff="~ delta", workspace="generated")
+    event.details["organization_id"] = "123456"
+    for index in range(40_000):
+        event.details[f"field_{index}"] = f"value-{index}"
+    captured = _pagerduty_body(monkeypatch, event)
+
+    assert len(captured["raw"]) <= pagerduty_module._BODY_BYTE_LIMIT
+    details = captured["body"]["payload"]["custom_details"]
+    assert details["organization_id"] == "123456"
+    assert details["workspace"] == "generated"
+    assert "truncated_for_delivery" in details

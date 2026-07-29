@@ -34,6 +34,35 @@ _DEFAULT_TIMEOUT_SECONDS = 10.0
 #: Events API v2 caps ``payload.summary`` at 1024 characters.
 _SUMMARY_CHAR_LIMIT = 1024
 
+#: Events API v2 rejects any event body past 512 KB outright. A drift
+#: event carries the whole speculative plan, which passes that on its
+#: own for even a small organization — so an unbudgeted ``custom_details``
+#: means the DRIFT_DETECTED page never fires, the one alert the DR
+#: mission most depends on. The details are trimmed to fit instead: an
+#: excerpt plus the workdir pointer pages someone, where a rejected
+#: event pages nobody.
+_BODY_BYTE_LIMIT = 512_000
+
+#: Headroom under the hard limit for the envelope (routing key, summary,
+#: severity) and for the truncation marker appended to the details.
+_BODY_SAFETY_MARGIN = 8_192
+
+#: Keys whose value is a locator or a count rather than bulk text. They
+#: are what an on-call responder acts on, so they survive trimming even
+#: when the bulky diff/list fields do not.
+_ESSENTIAL_DETAIL_KEYS = frozenset(
+    {
+        "organization_id",
+        "origin",
+        "workspace",
+        "apply_aborted",
+        "unsupported_count",
+        "stage",
+        "error",
+        "action",
+    }
+)
+
 #: meraki2tf severities → Events API v2 severities (which lack a
 #: dedicated "info"; INFO events never reach send() anyway).
 _PD_SEVERITY = {
@@ -66,6 +95,90 @@ def _read_routing_key() -> str:
     return key
 
 
+def _encoded_size(value: Any) -> int:
+    """Byte length of ``value`` as the notifier would serialize it."""
+    return len(json.dumps(value, default=str).encode("utf-8"))
+
+
+def _shrink(value: Any, budget: int) -> tuple[Any, str] | None:
+    """``value`` reduced to roughly ``budget`` bytes, plus a note.
+
+    Returns ``None`` when the value is already small enough to be worth
+    keeping whole. Strings keep a leading excerpt (a plan diff's first
+    lines carry the actionable resource names); sequences keep a leading
+    slice of their elements; anything else is dropped to a placeholder.
+    """
+    if _encoded_size(value) <= budget:
+        return None
+    if isinstance(value, str):
+        keep = max(budget - 64, 0)
+        return value[:keep], f"{len(value) - keep} more characters"
+    if isinstance(value, (list, tuple)):
+        kept = list(value)
+        while kept and _encoded_size(kept) > budget:
+            kept = kept[: len(kept) // 2]
+        return kept, f"{len(value) - len(kept)} more item(s)"
+    return "<omitted: too large for PagerDuty delivery>", "value omitted"
+
+
+def _budgeted_details(details: dict[str, Any], budget: int) -> dict[str, Any]:
+    """``details`` trimmed so its JSON encoding fits ``budget`` bytes.
+
+    Bulk fields (the plan diff, the unsupported list) are shrunk largest
+    first until the payload fits, and every cut is recorded under
+    ``truncated_for_delivery`` so the responder knows the excerpt is an
+    excerpt and where the full copy lives.
+    """
+    total = _encoded_size(details)
+    if total <= budget:
+        return details
+    trimmed = dict(details)
+    sizes = {key: _encoded_size(value) for key, value in details.items()}
+    omissions: dict[str, str] = {}
+    # Largest first: one oversized field is what blows the budget, not
+    # the dozens of small locators an on-call responder actually reads.
+    # The running total is adjusted per field rather than re-encoding the
+    # whole mapping each pass, so a details dict with many thousands of
+    # keys stays linear.
+    for key in sorted(sizes, key=lambda k: sizes[k], reverse=True):
+        if total <= budget:
+            break
+        if key in _ESSENTIAL_DETAIL_KEYS:
+            continue
+        result = _shrink(trimmed[key], max(budget // 4, 1024))
+        if result is None:
+            continue
+        trimmed[key], omissions[key] = result
+        shrunk_size = _encoded_size(trimmed[key])
+        total += shrunk_size - sizes[key]
+        sizes[key] = shrunk_size
+    if omissions:
+        trimmed["truncated_for_delivery"] = {
+            "omitted": omissions,
+            "note": (
+                "Trimmed to fit PagerDuty's 512 KB event limit; the full "
+                "payload is in the run log and the workdir artifacts."
+            ),
+        }
+    # Last resort: thousands of small keys can still overflow, and a
+    # rejected event is worse than a lossy one.
+    if _encoded_size(trimmed) > budget:
+        essential = {
+            key: value
+            for key, value in trimmed.items()
+            if key in _ESSENTIAL_DETAIL_KEYS
+        }
+        essential["truncated_for_delivery"] = {
+            "omitted": {"details": f"{len(trimmed)} field(s)"},
+            "note": (
+                "Details exceeded PagerDuty's 512 KB event limit even "
+                "after trimming; see the run log and workdir artifacts."
+            ),
+        }
+        return essential
+    return trimmed
+
+
 def _open(request: urllib.request.Request, timeout: float) -> Any:
     """Module seam over urlopen (tests patch this; the URL is fixed
     to the https Events API endpoint, so no scheme validation rides
@@ -89,7 +202,10 @@ class PagerDutyNotifier(Notifier):
 
         Maps the event's :class:`EventSeverity` onto PagerDuty's severity
         vocabulary and posts a ``trigger`` action keyed by a routing key
-        read from the environment at send time. Raises
+        read from the environment at send time. The details are budgeted
+        down to the Events API's 512 KB body limit first (see
+        :func:`_budgeted_details`) so a large drift diff cannot cost the
+        incident entirely. Raises
         :class:`PagerDutyDeliveryError` when the request fails or the API
         answers HTTP >= 300; the routing key is scrubbed from any error
         text and the exception chain dropped so it cannot leak into a
@@ -97,6 +213,9 @@ class PagerDutyNotifier(Notifier):
         """
         key = _read_routing_key()
         summary = f"[meraki2tf] {event.event_type.value}: {event.summary}"
+        details = _budgeted_details(
+            event.details, _BODY_BYTE_LIMIT - _BODY_SAFETY_MARGIN
+        )
         body = json.dumps(
             {
                 "routing_key": key,
@@ -105,7 +224,7 @@ class PagerDutyNotifier(Notifier):
                     "summary": summary[:_SUMMARY_CHAR_LIMIT],
                     "source": "meraki2tf",
                     "severity": _PD_SEVERITY[event.severity],
-                    "custom_details": event.details,
+                    "custom_details": details,
                 },
             },
             default=str,
