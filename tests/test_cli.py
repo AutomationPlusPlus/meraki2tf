@@ -2041,6 +2041,48 @@ def test_export_with_drift_baseline_reports_snapshot_drift(
     assert delivered[1]["details"]["drift_was_detected"] is True
 
 
+def test_export_run_refuses_a_workdir_another_run_holds(
+    spec_file: Path,
+    dump_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--dump-to must take the same workdir lock the pipeline takes.
+
+    An export run writes coverage.json, coverage.txt, runbook.md and the
+    sanitizer salt into the workdir, so two overlapping runs interleave
+    those artifacts exactly as two overlapping pipeline runs would. The
+    lock was only ever acquired on the pipeline path, which left the
+    scheduled weekly job — a --dump-to run, the most frequently
+    scheduled invocation there is — with no protection. Observed live:
+    a second run against a held workdir ran 772 API requests into full
+    discovery instead of refusing, and both runs' throughput halved.
+    """
+    from meraki2tf.workdir_lock import WorkdirLock
+
+    _no_network(monkeypatch)
+    workdir = tmp_path / "workspace"
+    workdir.mkdir()
+    holder = WorkdirLock(workdir)
+    holder.acquire()
+    try:
+        exit_code = main(
+            ["--spec", str(spec_file), "--from-dump", str(dump_file),
+             "--dump-to", str(tmp_path / "out.json"), "--workdir", str(workdir)]
+        )
+        assert exit_code == 2
+        # Refused before writing anything into the held workdir.
+        assert not (workdir / "coverage.json").exists()
+    finally:
+        holder.release()
+
+    # Once released, the same invocation completes normally.
+    assert main(
+        ["--spec", str(spec_file), "--from-dump", str(dump_file),
+         "--dump-to", str(tmp_path / "out2.json"), "--workdir", str(workdir)]
+    ) == 0
+
+
 def test_export_drift_alert_carries_the_coverage_gaps(
     spec_file: Path,
     dump_file: Path,
