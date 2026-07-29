@@ -37,6 +37,7 @@ import json
 import logging
 import os
 import threading
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
@@ -73,8 +74,17 @@ def _read_intact_lines(path: Path) -> list[str]:
     """Every intact line of the journal; a torn tail is dropped.
 
     A crash mid-append can leave a partial final line — or, for gzip
-    journals, a member without its trailer (``EOFError``). Everything
-    up to the tear is valid; the torn record's call simply re-runs.
+    journals, a member without its trailer (``EOFError``) or one whose
+    last deflate block was only half written (``zlib.error``, which
+    descends from ``Exception`` rather than ``OSError`` and so has to be
+    named explicitly). Everything up to the tear is valid; the torn
+    record's call simply re-runs.
+
+    Letting any of these escape would be the worst outcome available:
+    the journal exists so an aborted multi-hour sweep resumes, and an
+    unhandled decompression error instead makes every subsequent run
+    fail at startup until a human deletes the file — a scheduled job
+    wedged permanently by the very artifact meant to rescue it.
     """
     lines: list[str] = []
     try:
@@ -86,7 +96,7 @@ def _read_intact_lines(path: Path) -> list[str]:
             with path.open("r", encoding="utf-8") as handle:
                 for line in handle:
                     lines.append(line)
-    except (EOFError, OSError, UnicodeDecodeError) as exc:
+    except (EOFError, OSError, UnicodeDecodeError, zlib.error) as exc:
         logger.warning(
             "Checkpoint %s has a torn tail (%s); records after the "
             "tear are discarded and their calls will re-run.",

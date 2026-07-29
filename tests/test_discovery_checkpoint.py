@@ -158,6 +158,39 @@ def test_torn_gzip_tail_is_discarded_with_a_warning(
     resumed.close()
 
 
+def test_corrupt_gzip_block_is_salvaged_not_fatal(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A journal whose deflate stream is damaged mid-block must not
+    wedge the run.
+
+    Chopping the trailer raises EOFError; damage *inside* a block
+    raises ``zlib.error``, which descends from Exception rather than
+    OSError and so slipped past the torn-tail handler. The journal
+    exists so an aborted multi-hour sweep resumes — letting the error
+    escape instead failed every subsequent run at startup until a human
+    deleted the file, wedging a scheduled job with the very artifact
+    meant to rescue it. Seen for real: a killed sweep against a large
+    organization left exactly this shape.
+    """
+    path = tmp_path / "discovery.ckpt.jsonl.gz"
+    journal = DiscoveryCheckpoint(path, "org-123", "sha-1")
+    for index in range(400):
+        journal.record(f"/p{index}", (), CallOutcome(kind=OUTCOME_REFUSED))
+    journal.close()
+
+    raw = path.read_bytes()
+    midpoint = len(raw) // 2
+    path.write_bytes(raw[:midpoint] + b"\xff\x00\xde\xad\xbe\xef" + raw[midpoint + 6:])
+
+    with caplog.at_level(logging.WARNING):
+        resumed = DiscoveryCheckpoint(path, "org-123", "sha-1")
+    # Salvaged the readable prefix rather than raising.
+    assert "torn tail" in caplog.text
+    assert 0 < resumed.resumed_count < 400
+    resumed.close()
+
+
 def test_malformed_record_stops_loading_with_a_warning(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
