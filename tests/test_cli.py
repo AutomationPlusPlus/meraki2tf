@@ -2629,7 +2629,11 @@ def test_restore_defers_writes_to_hardware_that_is_not_online(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """A restore into freshly claimed hardware reports offline devices
-    apart from real failures, and points at the resumable journal."""
+    apart from real failures, and points at the resumable journal.
+
+    Deferred writes still fail the run: exit 0 means the organization
+    was fully rebuilt, and objects that never landed do not qualify.
+    """
     import sys as _sys
     import types as _types
 
@@ -2661,9 +2665,12 @@ def test_restore_defers_writes_to_hardware_that_is_not_online(
     )
     console = capsys.readouterr().err
 
-    # Nothing was genuinely lost, so the run does not report failures.
-    assert exit_code == 0
+    # Nothing was genuinely lost — no failures are reported — but the
+    # restore is incomplete until the hardware comes up, so it is not
+    # a clean exit either.
+    assert exit_code == 1
     assert "0 failed" in console
+    assert "deferred (device offline)" in console
     assert "Restore DEFERRED for" in console
     assert "re-run '--restore --confirm' once it is online" in console
 
@@ -4262,6 +4269,46 @@ def test_heal_confirm_reports_failures_nonzero(
         "Heal FAILED for wireless-ssids|update|N_1,0: simulated failure"
         in console
     )
+
+
+def test_heal_with_only_deferrals_still_exits_nonzero(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Nothing failed, but the heal did not finish either.
+
+    A snapshot object that never made it back into the organization
+    means work remains, so the run must not report the clean exit a
+    scheduler or an && chain would read as "recovery complete".
+    """
+    from meraki2tf import restorer as restorer_module
+
+    dump = _heal_confirm_setup(monkeypatch, tmp_path)
+
+    def all_deferred(self: Any, graph: Any, plan: Any) -> Any:
+        return restorer_module.RestoreResult(
+            executed=("networks|create|N_1",),
+            unreachable=(
+                (
+                    "devices|managementInterface|Q3GA",
+                    "devices, updateDeviceManagementInterface - 400 Bad "
+                    "Request, {'errors': ['Failed to contact device']}",
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(restorer_module.OrgRestorer, "execute", all_deferred)
+    exit_code = main(
+        ["--spec", str(spec_file), "--heal", "--from-dump", str(dump),
+         "--org-id", "org-123", "--workdir", str(tmp_path / "ws"), "--confirm"]
+    )
+    console = capsys.readouterr().err
+
+    assert exit_code == 1
+    assert "0 failed, 1 deferred (device offline)" in console
+    assert "re-run '--heal --confirm' once it is online" in console
 
 
 def test_heal_reports_offline_hardware_apart_from_real_failures(

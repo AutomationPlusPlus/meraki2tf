@@ -57,9 +57,12 @@ names and locators only.
 ## Scheduled (cron) execution
 
 The CLI is non-interactive end to end and reports outcome via exit code
-(0 clean, 1 fault, 2 usage error, 3 coverage gaps with `--fail-on-gaps`,
-4 sync auto-apply aborted for human review, 5 run succeeded but at
-least one alert reached no configured channel), so each scheduled job
+(0 clean, 1 fault — including a `--heal`/`--restore` that left writes
+deferred because the hardware was not reachable yet, which re-running
+once it boots clears, 2 usage error, 3 coverage gaps with
+`--fail-on-gaps`, 4 sync auto-apply aborted for human review, 5 run
+succeeded but at least one alert reached no configured channel), so
+each scheduled job
 is one crontab line. The recommended cadence is a weekly snapshot job
 plus a monthly terraform rehearsal:
 
