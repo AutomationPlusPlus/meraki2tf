@@ -18,8 +18,22 @@ from meraki2tf.spec_resolver import (
 )
 
 
+#: A structurally usable stand-in: resolution cares about versions and
+#: freshness, but an EMPTY paths object is a refused document (it maps
+#: nothing to Terraform), so the fixture carries one real endpoint.
+_MINIMAL_PATHS: dict[str, Any] = {
+    "/organizations": {
+        "get": {"operationId": "getOrganizations", "tags": ["organizations"]}
+    }
+}
+
+
 def _spec(version: str) -> dict[str, Any]:
-    return {"openapi": "3.0.1", "info": {"version": version}, "paths": {}}
+    return {
+        "openapi": "3.0.1",
+        "info": {"version": version},
+        "paths": dict(_MINIMAL_PATHS),
+    }
 
 
 def _write_spec(path: Path, version: str) -> None:
@@ -212,6 +226,41 @@ def test_structurally_empty_remote_never_clobbers_a_good_local_spec(
     assert path.read_text(encoding="utf-8") == original
 
 
+def test_empty_paths_remote_never_clobbers_a_good_local_spec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty 'paths' object is as unusable as a missing one.
+
+    A truncated download can parse cleanly and still describe zero
+    endpoints. Writing that over the working spec would leave the next
+    run mapping nothing to Terraform — an empty DR kit — with no good
+    copy left on disk.
+    """
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / DEFAULT_SPEC_FILENAME
+    _write_spec(path, "1.40.0")
+    original = path.read_text(encoding="utf-8")
+    _patch_remote(
+        monkeypatch,
+        json.dumps({"openapi": "3.0.1", "info": {"version": "9.9.9"}, "paths": {}}),
+    )
+
+    assert resolve_spec(None) == Path(DEFAULT_SPEC_FILENAME)
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_empty_paths_remote_is_never_written_fresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "spec3.json"
+    _patch_remote(
+        monkeypatch, json.dumps({"openapi": "3.0.1", "paths": {}})
+    )
+    with pytest.raises(SpecResolutionError, match="paths"):
+        resolve_spec(path)
+    assert not path.exists()
+
+
 def test_structurally_empty_remote_is_never_written_fresh(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -228,7 +277,7 @@ def test_remote_without_version_still_refreshes_default_spec(
     monkeypatch.chdir(tmp_path)
     path = tmp_path / DEFAULT_SPEC_FILENAME
     _write_spec(path, "1.40.0")
-    remote_text = json.dumps({"openapi": "3.0.1", "paths": {}})
+    remote_text = json.dumps({"openapi": "3.0.1", "paths": dict(_MINIMAL_PATHS)})
     _patch_remote(monkeypatch, remote_text)
 
     resolve_spec(None)

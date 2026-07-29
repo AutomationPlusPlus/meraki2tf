@@ -121,9 +121,17 @@ def _version_of(document: dict[str, Any]) -> str | None:
 
 
 def _has_paths(document: dict[str, Any]) -> bool:
-    """Structural sanity: a JSON object without a ``paths`` object (an
-    API error body, a wrong file) parses fine but kills ingestion."""
-    return isinstance(document.get("paths"), dict)
+    """Structural sanity: a JSON object without a usable ``paths`` object
+    (an API error body, a wrong file, a truncated download) parses fine
+    but kills ingestion.
+
+    An EMPTY ``paths`` is just as unusable as a missing one — it yields
+    an empty dispatch table, so nothing would map to Terraform and the
+    kit would come out empty — and must never be written over a
+    known-good spec or adopted as one.
+    """
+    paths = document.get("paths")
+    return isinstance(paths, dict) and bool(paths)
 
 
 def _local_version(path: Path) -> str | None:

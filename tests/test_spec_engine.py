@@ -184,3 +184,21 @@ def test_unresolvable_ref_path_items_warn_by_path(
         "/organizations" in record.getMessage() and "$ref" in record.message
         for record in caplog.records
     )
+
+
+def test_engine_rejects_a_structurally_empty_paths_object(tmp_path: Path) -> None:
+    """An empty 'paths' is as unusable as a missing one.
+
+    It parses fine and then yields an empty dispatch table: nothing maps
+    to Terraform, the kit comes out with zero import blocks, and the run
+    would report success over a DR kit that rebuilds nothing.
+    """
+    spec_path = tmp_path / "empty-paths.json"
+    spec_path.write_text(
+        json.dumps(
+            {"openapi": "3.0.0", "info": {"title": "x", "version": "1"}, "paths": {}}
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(MalformedSpecError, match="empty"):
+        SpecIngestionEngine.from_file(spec_path)
