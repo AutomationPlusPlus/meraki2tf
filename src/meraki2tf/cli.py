@@ -797,11 +797,11 @@ def _export_coverage(
     config: RuntimeConfig,
     parser: OpenApiParser,
     dispatcher: AlertDispatcher,
-    drift_was_detected: bool,
+    pending_drift: tuple[str, str] | None,
     scope_networks: tuple[str, ...] | None = None,
     diagnostics: DiscoveryDiagnostics | None = None,
 ) -> dict[str, Any]:
-    """Coverage manifest + RUN_SUCCESS for a snapshot-export run.
+    """Coverage manifest + drift/RUN_SUCCESS for a snapshot-export run.
 
     The scheduled weekly job is a --dump-to invocation, and Cardinal
     Rule 2 does not pause for it: every run must answer "what is and
@@ -809,6 +809,11 @@ def _export_coverage(
     operator. Classification reuses the pipeline's generator against a
     throwaway directory — terraform itself is never invoked, and the
     workdir's accumulated kit is not touched.
+
+    ``pending_drift`` is the (summary, rendered diff) the caller held
+    back for this reason: its DRIFT_DETECTED alert is dispatched here,
+    after classification, so it carries the coverage gaps rather than
+    claiming there are none.
     """
     from meraki2tf.restorer import plan_restore, restore_verdicts
     from meraki2tf.runbook import (
@@ -865,6 +870,21 @@ def _export_coverage(
         parser=parser,
         scope_networks=scope_networks,
     )
+    gaps = unsupported_payload(report.unsupported)
+    if pending_drift is not None:
+        summary, diff = pending_drift
+        logger.warning(
+            "Dispatching DRIFT_DETECTED alert for snapshot drift (%s) "
+            "with %d coverage gap(s).", summary, len(gaps),
+        )
+        dispatcher.dispatch(
+            drift_detected(
+                diff=diff,
+                workspace=str(config.dump_to),
+                unsupported=gaps,
+                origin="snapshot-diff",
+            )
+        )
     logger.info(
         "Snapshot export complete; dispatching RUN_SUCCESS notification. "
         "The Meraki organization was not modified — every run is "
@@ -873,11 +893,11 @@ def _export_coverage(
     dispatcher.dispatch(
         run_success(
             imports_written=report.imports_written,
-            drift_was_detected=drift_was_detected,
+            drift_was_detected=pending_drift is not None,
             workspace=str(config.workdir),
             discovered_assets=graph.asset_count(),
             imports_already_tracked=report.skipped_existing,
-            unsupported=unsupported_payload(report.unsupported),
+            unsupported=gaps,
             pending_imports=None,
             comparison_performed=False,
             coverage_percent=float(manifest["coverage_percent"]),
@@ -908,7 +928,14 @@ def _export_snapshot(
             "--replay-gaps, and --drift-baseline will refuse it.",
             len(graph.networks),
         )
-    drift_was_detected = False
+    # Computed here but dispatched from _export_coverage, once the run
+    # has classified the organization: DRIFT_DETECTED is the
+    # WARNING-severity event that pages someone on a drifted week
+    # (RUN_SUCCESS is INFO and is routinely filtered), so it is the one
+    # payload that must carry the manual-rebuild list. Sent at
+    # comparison time it stated unsupported_count: 0 on an organization
+    # with dozens of gaps.
+    pending_drift: tuple[str, str] | None = None
     if config.drift_baseline is not None:
         from meraki2tf.snapshot_diff import baseline_drift, render_diff
 
@@ -916,18 +943,8 @@ def _export_snapshot(
         if drift.is_empty:
             logger.info("Snapshot drift vs baseline: none.")
         else:
-            drift_was_detected = True
-            logger.warning(
-                "Snapshot drift vs baseline (%s); dispatching "
-                "DRIFT_DETECTED alert.", drift.summary(),
-            )
-            dispatcher.dispatch(
-                drift_detected(
-                    diff=render_diff(drift),
-                    workspace=str(config.dump_to),
-                    origin="snapshot-diff",
-                )
-            )
+            logger.warning("Snapshot drift vs baseline (%s).", drift.summary())
+            pending_drift = (drift.summary(), render_diff(drift))
     # Classification keys on the raw graph: after sanitization the
     # identifiers are pseudonyms and the manifest would name objects
     # the operator cannot find in the dashboard.
@@ -966,7 +983,7 @@ def _export_snapshot(
         config,
         parser,
         dispatcher,
-        drift_was_detected,
+        pending_drift,
         scope_networks=(
             tuple(n.network_id for n in raw_graph.networks)
             if config.only
