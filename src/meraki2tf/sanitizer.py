@@ -104,11 +104,25 @@ _SECRET_KEY = SECRET_KEY_PATTERN
 #: bare-digit hardware/subscriber identifiers with no recognizable
 #: value shape, so they must be caught by key like names and serials.
 _IDENTITY_KEY = re.compile(
-    r"name$|names$|email|url$|urls$|address|notes|^mac$|^tags$|serial|phone"
+    # `tags$` rather than `^tags$`: compound spellings (availabilityTags)
+    # hold the same customer-chosen labels, and the anchor let an
+    # organization's own name through in one.
+    r"name$|names$|email|url$|urls$|address|notes|^mac$|tags$|serial|phone"
+    # `comment`/`description` are operator free text exactly like
+    # `notes`, and treating only `notes` as identity-bearing was an
+    # asymmetry, not a design: a real firewall rule comment read
+    # "Allow <org> DCs to reach MGMT Vlan", naming the organization and
+    # its topology inside a file stamped sanitized. Structural-ID
+    # substitution alone cannot help here — human names are ambiguous
+    # (a network called "Main") so they are deliberately never globally
+    # substituted, which leaves the whole-value pseudonym as the only
+    # safe treatment for free text.
+    r"|comment|description"
     # enrollmentString is a customer-chosen, globally unique SM slug
     # (the public n.meraki.com/<slug> enrollment path) — it identifies
-    # the organization as surely as its name does.
-    r"|^imei$|^iccid$|^eid$|^meid$|^msisdn$|^enrollmentstring$",
+    # the organization as surely as its name does; SAML `subdomain` is
+    # the same shape.
+    r"|^imei$|^iccid$|^eid$|^meid$|^msisdn$|^enrollmentstring$|subdomain",
     re.IGNORECASE,
 )
 _COORDINATE_KEYS = frozenset({"lat", "lng"})
