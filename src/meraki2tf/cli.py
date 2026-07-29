@@ -1427,7 +1427,11 @@ def _restore(config: RuntimeConfig) -> int:
             unreachable=result.unreachable,
         )
     )
-    if result.failed:
+    # Deferred writes are not failures, but they ARE unfinished work:
+    # exit 0 means "clean", and a snapshot object that never made it
+    # into the organization does not qualify. The operator re-runs once
+    # the hardware is online; the log line and the alert say so.
+    if result.failed or result.unreachable:
         return 1
     # Writes happened; an undelivered RESTORE_EXECUTED alert must
     # surface as the notifier-outage exit, like the pipeline paths.
@@ -1707,7 +1711,11 @@ def _heal(config: RuntimeConfig) -> int:
             ),
         )
     )
-    if result.failed:
+    # Deferred writes are not failures, but they ARE unfinished work:
+    # exit 0 means "clean", and a snapshot object that never made it
+    # back into the organization does not qualify. The operator re-runs
+    # once the hardware is online; the log line and the alert say so.
+    if result.failed or result.unreachable:
         return 1
     # Writes happened; an undelivered HEAL_EXECUTED alert must surface
     # as the notifier-outage exit, like the pipeline paths.
