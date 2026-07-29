@@ -86,6 +86,17 @@ class SpecIngestionEngine:
         paths = spec.get("paths")
         if not isinstance(paths, Mapping):
             raise MalformedSpecError("OpenAPI document has no 'paths' object.")
+        if not paths:
+            # An EMPTY paths object parses fine and then yields an empty
+            # dispatch table: nothing maps to a Terraform resource, the
+            # kit comes out with zero import blocks, and the run reports
+            # success over a DR kit that would rebuild nothing. A
+            # truncated download or a wrong file has to fail the run
+            # rather than quietly empty it.
+            raise MalformedSpecError(
+                "OpenAPI document's 'paths' object is empty: it describes "
+                "no endpoints, so it cannot map anything to Terraform."
+            )
         self._spec = spec
         self._paths: Mapping[str, Any] = paths
         logger.debug("Ingested spec with %d path template(s)", len(paths))
