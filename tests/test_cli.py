@@ -2622,6 +2622,52 @@ def test_restore_confirm_reports_failures_nonzero(
     assert exit_code == 1
 
 
+def test_restore_defers_writes_to_hardware_that_is_not_online(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A restore into freshly claimed hardware reports offline devices
+    apart from real failures, and points at the resumable journal."""
+    import sys as _sys
+    import types as _types
+
+    _no_network(monkeypatch)
+    monkeypatch.setenv(API_KEY_ENV_VAR, "test-token")
+
+    class UnreachableSection:
+        def __getattr__(self, operation_id: str):
+            def _dispatch(*args: Any, **kwargs: Any) -> dict:
+                raise RuntimeError(
+                    "devices, updateDevice - 400 Bad Request, "
+                    "{'errors': ['Failed to contact device']}"
+                )
+
+            return _dispatch
+
+    section = UnreachableSection()
+    dashboard = SimpleNamespace(
+        organizations=section, networks=section, wireless=section
+    )
+    stub = _types.ModuleType("meraki")
+    stub.DashboardAPI = lambda **kwargs: dashboard  # type: ignore[attr-defined]
+    monkeypatch.setitem(_sys.modules, "meraki", stub)
+    dump = _restore_dump(tmp_path)
+    exit_code = main(
+        ["--spec", str(spec_file), "--restore", "--from-dump", str(dump),
+         "--target-org", "org-999", "--workdir", str(tmp_path / "ws"),
+         "--confirm"]
+    )
+    console = capsys.readouterr().err
+
+    # Nothing was genuinely lost, so the run does not report failures.
+    assert exit_code == 0
+    assert "0 failed" in console
+    assert "Restore DEFERRED for" in console
+    assert "re-run '--restore --confirm' once it is online" in console
+
+
 def test_skip_claims_requires_restore(spec_file: Path) -> None:
     with pytest.raises(SystemExit):
         main(["--spec", str(spec_file), "--org-id", "org-123", "--skip-claims"])
@@ -4174,7 +4220,9 @@ def test_heal_confirm_executes_and_alerts(
     console = capsys.readouterr().err
     assert exit_code == 0
     assert "Heal skipped devices|claim: drill mode" in console
-    assert "1 recreated, 0 failed, 1 skipped" in console
+    assert "1 recreated, 0 failed, 0 deferred (device offline), 1 skipped" in (
+        console
+    )
     (event,) = delivered
     assert event["event_type"] == "HEAL_EXECUTED"
     assert event["details"]["organization_id"] == "org-123"
@@ -4214,6 +4262,74 @@ def test_heal_confirm_reports_failures_nonzero(
         "Heal FAILED for wireless-ssids|update|N_1,0: simulated failure"
         in console
     )
+
+
+def test_heal_reports_offline_hardware_apart_from_real_failures(
+    spec_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A device that has not come online yet is deferred, not failed.
+
+    Freshly claimed hardware refuses every device-scoped write until it
+    boots, so a post-disaster rebuild produces one of these per device.
+    Counting them as failures would bury the genuine losses.
+    """
+    from meraki2tf import restorer as restorer_module
+
+    dump = _heal_confirm_setup(monkeypatch, tmp_path)
+
+    def partly_unreachable(self: Any, graph: Any, plan: Any) -> Any:
+        return restorer_module.RestoreResult(
+            executed=("networks|create|N_1",),
+            failed=(("wireless-ssids|update|N_1,0", "simulated real failure"),),
+            unreachable=(
+                (
+                    "devices|managementInterface|Q3GA",
+                    "devices, updateDeviceManagementInterface - 400 Bad "
+                    "Request, {'errors': ['Failed to contact device']}",
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(
+        restorer_module.OrgRestorer, "execute", partly_unreachable
+    )
+    delivered: list[dict[str, Any]] = []
+
+    def fake_urlopen(request: Any, timeout: float) -> FakeResponse:
+        delivered.append(json.loads(request.data.decode("utf-8")))
+        return FakeResponse()
+
+    monkeypatch.setattr("meraki2tf.alerts.webhook._open", fake_urlopen)
+    exit_code = main(
+        ["--spec", str(spec_file), "--heal", "--from-dump", str(dump),
+         "--org-id", "org-123", "--workdir", str(tmp_path / "ws"),
+         "--confirm", "--webhook-url", "https://hooks.example/dr"]
+    )
+    console = capsys.readouterr().err
+
+    # The real failure still fails the run; the offline device does not
+    # inflate that count.
+    assert exit_code == 1
+    assert "1 recreated, 1 failed, 1 deferred (device offline)" in console
+    assert "Heal DEFERRED for devices|managementInterface|Q3GA" in console
+    assert "re-run '--heal --confirm' once it is online" in console
+    assert (
+        "Heal FAILED for wireless-ssids|update|N_1,0: simulated real failure"
+        in console
+    )
+
+    (event,) = delivered
+    details = event["details"]
+    assert [row[0] for row in details["failed"]] == [
+        "wireless-ssids|update|N_1,0"
+    ]
+    assert [row[0] for row in details["unreachable"]] == [
+        "devices|managementInterface|Q3GA"
+    ]
+    assert "deferred: the hardware is not reachable yet" in event["summary"]
 
 
 # ---------------------------------------------------------------------------

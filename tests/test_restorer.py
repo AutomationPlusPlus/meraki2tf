@@ -6885,3 +6885,93 @@ def test_list_collection_skips_over_wide_lookups(tmp_path: Path) -> None:
     assert restorer._list_collection(
         SimpleNamespace(), action, resolver, "org-123"
     ) is None
+
+
+# ---------------------------------------------------------------------------
+# Hardware that has not come online yet (device-unreachable refusals).
+# ---------------------------------------------------------------------------
+
+
+def test_is_device_unreachable_recognizes_dashboard_phrasings() -> None:
+    from meraki2tf.restorer import _is_device_unreachable
+
+    assert _is_device_unreachable(
+        "devices, updateDeviceManagementInterface - 400 Bad Request, "
+        "{'errors': ['Failed to contact device']}"
+    )
+    assert _is_device_unreachable("400 Bad Request: Device is offline")
+    # A genuine configuration rejection must stay a failure.
+    assert not _is_device_unreachable(
+        "400 Bad Request, {'errors': ['Name contains illegal characters']}"
+    )
+    assert not _is_device_unreachable("404 Not Found")
+
+
+def test_executor_defers_writes_to_hardware_that_is_not_online(
+    tmp_path: Path,
+) -> None:
+    """A device-unreachable refusal is its own verdict, not a failure.
+
+    Freshly claimed hardware refuses every device-scoped write until it
+    finishes booting, so a post-disaster claim wave produces one of
+    these per device. Folding them into ``failed`` would report a
+    working rebuild as mass data loss.
+    """
+    from meraki2tf.restorer import OrgRestorer, RestoreJournal
+
+    class _UnreachableSection(_RecordingSection):
+        def __getattr__(self, operation_id: str):
+            def _dispatch(*args: object, **kwargs: object) -> dict:
+                self._calls.append((operation_id, args, kwargs))
+                if operation_id == "updateNetworkSnmp":
+                    raise RuntimeError(
+                        "networks, updateNetworkSnmp - 400 Bad Request, "
+                        "{'errors': ['Failed to contact device']}"
+                    )
+                if operation_id == "createOrganizationNetwork":
+                    return {"id": "L_NEW"}
+                return {}
+
+            return _dispatch
+
+    parser = _restore_spec(tmp_path)
+    graph = _graph(
+        FeatureConfiguration(SNMP_PATH, ("N_1",), {"access": "none"}),
+    )
+    plan = plan_restore(graph, parser)
+    calls: list = []
+    restorer = OrgRestorer(
+        "org-TARGET", RestoreJournal(tmp_path / "unreachable.jsonl")
+    )
+    section = _UnreachableSection(calls)
+    restorer._client = __import__("types").SimpleNamespace(
+        organizations=section, networks=section, wireless=section,
+        switch=section, appliance=section,
+    )
+    result = restorer.execute(graph, plan)
+
+    assert result.failed == ()
+    assert [key for key, _ in result.unreachable] == [f"{SNMP_PATH}::N_1"]
+    assert "Failed to contact device" in result.unreachable[0][1]
+
+
+def test_capability_regex_covers_hardware_dependent_network_features() -> None:
+    """Network-scoped features can still demand real hardware.
+
+    A network earns settings like appliance uplink selection by holding
+    a failover-capable MX. A --skip-claims drill organization has no
+    hardware at all, so the dashboard refuses them — a drill artifact,
+    not a defect in the rebuild, and it must not fail the drill.
+    """
+    from meraki2tf.restorer import _CAPABILITY_RE
+
+    assert _CAPABILITY_RE.search(
+        "appliance, updateNetworkApplianceTrafficShapingUplinkSelection - "
+        "400 Bad Request, {'errors': ['Unsupported for networks without a "
+        "failover capable MX']}"
+    )
+    assert _CAPABILITY_RE.search("This feature requires an MX appliance")
+    # A real rejection must still fail loudly.
+    assert not _CAPABILITY_RE.search(
+        "400 Bad Request, {'errors': ['Subnet overlaps with another VLAN']}"
+    )

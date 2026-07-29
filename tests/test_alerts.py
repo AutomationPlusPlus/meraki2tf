@@ -1260,3 +1260,34 @@ def test_pagerduty_oversized_mapping_field_becomes_a_placeholder(
     assert details["nested"] == "<omitted: too large for PagerDuty delivery>"
     assert details["truncated_for_delivery"]["omitted"]["nested"] == "value omitted"
     assert details["diff"] == "~ delta"
+
+
+def test_restore_executed_reports_offline_hardware_separately() -> None:
+    """Deferred device writes warn without inflating the failure list."""
+    from meraki2tf.alerts import restore_executed
+
+    event = restore_executed(
+        target_organization_id="123456",
+        executed=["create /networks"],
+        failed=[],
+        skipped=[],
+        unreachable=[
+            ["/devices/{serial}/managementInterface::Q3GA", "400 offline"]
+        ],
+    )
+    assert event.severity is EventSeverity.WARNING
+    assert event.details["failed"] == []
+    assert event.details["unreachable"] == [
+        ["/devices/{serial}/managementInterface::Q3GA", "400 offline"]
+    ]
+    assert "1 device-scoped write(s) deferred" in event.summary
+
+    clean = restore_executed(
+        target_organization_id="123456",
+        executed=["create /networks"],
+        failed=[],
+        skipped=[],
+    )
+    assert clean.severity is EventSeverity.INFO
+    assert "unreachable" not in clean.details
+    assert "deferred" not in clean.summary

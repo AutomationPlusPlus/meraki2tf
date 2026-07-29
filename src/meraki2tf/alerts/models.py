@@ -432,25 +432,40 @@ def restore_executed(
     executed: Sequence[str],
     failed: Sequence[Sequence[str]],
     skipped: Sequence[Mapping[str, Any]],
+    unreachable: Sequence[Sequence[str]] = (),
 ) -> AlertEvent:
     """Contract payload for a human-invoked full restore into a target
     organization. Entries are value-free action labels — restored
-    payloads and secret values never leave the process."""
-    severity = EventSeverity.WARNING if failed else EventSeverity.INFO
+    payloads and secret values never leave the process. ``unreachable``
+    carries the device-scoped writes the dashboard refused because the
+    hardware is not online yet: the normal state of a fresh claim wave,
+    so they are reported apart from real failures and clear on a
+    re-run."""
+    severity = (
+        EventSeverity.WARNING if failed or unreachable else EventSeverity.INFO
+    )
+    summary = (
+        f"Restore into organization {target_organization_id}: "
+        f"{len(executed)} restored, {len(failed)} failed, "
+        f"{len(skipped)} skipped."
+    )
+    details: dict[str, Any] = {
+        "target_organization_id": target_organization_id,
+        "executed": list(executed),
+        "failed": [list(item) for item in failed],
+        "skipped": [dict(item) for item in skipped],
+    }
+    if unreachable:
+        summary += (
+            f" {len(unreachable)} device-scoped write(s) deferred: the "
+            "hardware is not reachable yet — re-run once it is online."
+        )
+        details["unreachable"] = [list(item) for item in unreachable]
     return AlertEvent(
         event_type=EventType.RESTORE_EXECUTED,
         severity=severity,
-        summary=(
-            f"Restore into organization {target_organization_id}: "
-            f"{len(executed)} restored, {len(failed)} failed, "
-            f"{len(skipped)} skipped."
-        ),
-        details={
-            "target_organization_id": target_organization_id,
-            "executed": list(executed),
-            "failed": [list(item) for item in failed],
-            "skipped": [dict(item) for item in skipped],
-        },
+        summary=summary,
+        details=details,
     )
 
 
@@ -463,6 +478,7 @@ def heal_executed(
     only: Sequence[str] = (),
     snapshot_scope: Sequence[str] = (),
     verified_alive: int = 0,
+    unreachable: Sequence[Sequence[str]] = (),
 ) -> AlertEvent:
     """Contract payload for a human-invoked same-org heal: accidentally
     deleted objects recreated from a snapshot, surviving objects never
@@ -475,8 +491,13 @@ def heal_executed(
     ``verified_alive`` counts the planned actions the pre-write
     verification found alive and skipped (additive-only): a nonzero
     value means the discovery sweep undercounted survivors and deserves
-    its own line in the alert."""
-    severity = EventSeverity.WARNING if failed else EventSeverity.INFO
+    its own line in the alert. ``unreachable`` carries the device-scoped
+    writes the dashboard refused because the hardware is not online yet
+    — the normal state of freshly claimed devices, so they are reported
+    apart from real failures and clear on a re-run."""
+    severity = (
+        EventSeverity.WARNING if failed or unreachable else EventSeverity.INFO
+    )
     summary = (
         f"Heal of organization {organization_id}: {len(executed)} "
         f"missing object(s) recreated, {len(failed)} failed, "
@@ -490,6 +511,12 @@ def heal_executed(
         "failed": [list(item) for item in failed],
         "skipped": [dict(item) for item in skipped],
     }
+    if unreachable:
+        summary += (
+            f" {len(unreachable)} device-scoped write(s) deferred: the "
+            "hardware is not reachable yet — re-run once it is online."
+        )
+        details["unreachable"] = [list(item) for item in unreachable]
     if verified_alive:
         summary += (
             f" {verified_alive} planned action(s) were verified alive "
