@@ -8,6 +8,7 @@ from meraki2tf.models import (
     NetworkGraph,
 )
 import ipaddress
+import json
 import re
 import stat
 from pathlib import Path
@@ -307,7 +308,7 @@ def test_identity_shaped_values_are_scrubbed_regardless_of_key() -> None:
                         {
                             "destCidr": "10.20.30.0/24",
                             "srcCidr": "Any",
-                            "comment": "allow radius",
+                            "objects": "allow radius",
                         }
                     ],
                     "host": "1.2.3.4",
@@ -329,7 +330,7 @@ def test_identity_shaped_values_are_scrubbed_regardless_of_key() -> None:
     rule = payload["rules"][0]
     assert rule["destCidr"].startswith("10.") and rule["destCidr"].endswith("/24")
     assert rule["srcCidr"] == "Any"  # semantic literal, not an address
-    assert rule["comment"] == "allow radius"
+    assert rule["objects"] == "allow radius"
     assert payload["host"].startswith("10.") and payload["host"] != "1.2.3.4"
     # Hostname/URL pseudonyms keep their shape (firewall destinations
     # and webhook receivers validate them on restore).
@@ -803,7 +804,7 @@ def test_known_ids_are_mapped_inside_comma_lists_and_free_text() -> None:
                 ("N_123456789012345",),
                 {
                     "objects": "N_123456789012345, other",
-                    "comment": "temp rule for N_123456789012345 cutover",
+                    "text": "temp rule for N_123456789012345 cutover",
                 },
             ),
         ),
@@ -812,7 +813,7 @@ def test_known_ids_are_mapped_inside_comma_lists_and_free_text() -> None:
     raw = str(payload)
     assert "N_123456789012345" not in raw
     assert payload["objects"].startswith("net-0001, ")
-    assert "net-0001" in payload["comment"]
+    assert "net-0001" in payload["objects"]
 
 
 def test_fqdns_embedded_in_free_text_are_pseudonymized() -> None:
@@ -824,13 +825,13 @@ def test_fqdns_embedded_in_free_text_are_pseudonymized() -> None:
             FeatureConfiguration(
                 "/networks/{networkId}/appliance/firewall/l3FirewallRules",
                 ("N_1",),
-                {"comment": "allow AD to dc01.corp.example from HQ"},
+                {"objects": "allow AD to dc01.corp.example from HQ"},
             ),
         ),
     )
     payload = sanitize_graph(graph).features[0].payload
-    assert "dc01.corp.example" not in payload["comment"]
-    assert "allow AD to host-" in payload["comment"]
+    assert "dc01.corp.example" not in payload["objects"]
+    assert "allow AD to host-" in payload["objects"]
 
 
 def test_embedded_email_addresses_are_fully_pseudonymized() -> None:
@@ -844,7 +845,7 @@ def test_embedded_email_addresses_are_fully_pseudonymized() -> None:
                 ("N_1",),
                 {
                     "contact": "jsmith@corp.example",
-                    "description": "escalate to jdoe+oncall@ops.corp.example",
+                    "objects": "escalate to jdoe+oncall@ops.corp.example",
                 },
             ),
         ),
@@ -856,8 +857,8 @@ def test_embedded_email_addresses_are_fully_pseudonymized() -> None:
     # on write, so the sanitized snapshot must stay restore-drillable)
     # and its own domain must survive the FQDN rewrite.
     assert re.fullmatch(r"user-[0-9a-f]{16}@drill\.invalid", payload["contact"])
-    assert "escalate to user-" in payload["description"]
-    assert "@drill.invalid" in payload["description"]
+    assert "escalate to user-" in payload["objects"]
+    assert "@drill.invalid" in payload["objects"]
     # Deterministic under one salt: the same address maps to the same
     # pseudonym.
     again = sanitize_graph(graph, salt=b"fixed-salt").features[0].payload
@@ -1333,7 +1334,7 @@ def test_x509_fingerprints_survive_while_real_macs_still_sanitize() -> None:
                 {
                     "x509certSha1Fingerprint": fingerprint,
                     "bssid": "aa:bb:cc:dd:ee:ff",
-                    "comment": "gateway at aa:bb:cc:dd:ee:ff.",
+                    "objects": "gateway at aa:bb:cc:dd:ee:ff.",
                     "ip": "2001:0db8:1111:2222:3333:4444:5555:6666",
                 },
             ),
@@ -1344,8 +1345,8 @@ def test_x509_fingerprints_survive_while_real_macs_still_sanitize() -> None:
     # Standalone six-group MACs still become fake locally-administered
     # MACs, including ones embedded in free text with punctuation.
     assert payload["bssid"].startswith("02:")
-    assert "aa:bb:cc:dd:ee:ff" not in payload["comment"]
-    assert "02:" in payload["comment"]
+    assert "aa:bb:cc:dd:ee:ff" not in payload["objects"]
+    assert "02:" in payload["objects"]
     # Full 8-group IPv6 addresses still pseudonymize into 2001:db8::/32.
     assert payload["ip"].startswith("2001:db8:")
     assert "3333" not in payload["ip"]
@@ -1385,3 +1386,51 @@ def test_extra_path_values_are_pseudonymized_never_leaked(
     assert feature.path_values[3] == ""
     warnings = [record.message for record in caplog.records]
     assert sum("path value(s) for" in message for message in warnings) == 2
+
+
+def test_free_text_and_compound_tag_keys_are_pseudonymized() -> None:
+    """Operator free text and compound tag keys must not pass through.
+
+    Found against a real organization: its own name survived
+    --sanitize in three field families the identity-key pattern missed.
+    `^tags$` was anchored, so `availabilityTags` escaped; `comment`,
+    `description` and SAML `subdomain` were absent entirely. A firewall
+    rule comment read "Allow <org> DCs to reach MGMT Vlan" — naming the
+    organization AND its topology — in a file stamped sanitized and
+    documented as safe to attach to a bug report.
+    """
+    org = "AcmeCorp"
+    graph = NetworkGraph(
+        "org-123", (), (),
+        (
+            FeatureConfiguration(
+                "/organizations/{organizationId}/devices/availabilities/"
+                "changeHistory",
+                ("org-123",),
+                {"payload": {"availabilityTags": [org]}},
+            ),
+            FeatureConfiguration(
+                "/networks/{networkId}/appliance/firewall/l3FirewallRules",
+                ("N_1",),
+                {"rules": [{"comment": f"Allow {org} DCs to reach MGMT Vlan"}]},
+            ),
+            FeatureConfiguration(
+                "/organizations/{organizationId}/saml/idps",
+                ("org-123",),
+                {"spInitiated": {"subdomain": org}},
+            ),
+            FeatureConfiguration(
+                "/networks/{networkId}/groupPolicies",
+                ("N_1",),
+                {"description": f"{org} corporate policy"},
+            ),
+        ),
+    )
+    sanitized = sanitize_graph(graph, salt=b"fixed")
+    blob = json.dumps([f.payload for f in sanitized.features])
+    assert org not in blob, "the organization's own name survived --sanitize"
+    # Still structurally processable: the shapes survive, only values change.
+    assert sanitized.features[0].payload["payload"]["availabilityTags"]
+    assert sanitized.features[1].payload["rules"][0]["comment"]
+    assert sanitized.features[2].payload["spInitiated"]["subdomain"]
+    assert sanitized.features[3].payload["description"]
