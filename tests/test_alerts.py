@@ -1239,3 +1239,24 @@ def test_pagerduty_budget_survives_many_small_oversized_fields(
     assert details["organization_id"] == "123456"
     assert details["workspace"] == "generated"
     assert "truncated_for_delivery" in details
+
+
+def test_pagerduty_oversized_mapping_field_becomes_a_placeholder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bulky field that is neither text nor a sequence still gets out.
+
+    A nested mapping has no meaningful prefix to keep, so it is replaced
+    wholesale rather than left to push the body past the API limit.
+    """
+    event = drift_detected(diff="~ delta", workspace="generated")
+    event.details["nested"] = {
+        f"key_{index}": "V" * 100 for index in range(8000)
+    }
+    captured = _pagerduty_body(monkeypatch, event)
+
+    assert len(captured["raw"]) <= pagerduty_module._BODY_BYTE_LIMIT
+    details = captured["body"]["payload"]["custom_details"]
+    assert details["nested"] == "<omitted: too large for PagerDuty delivery>"
+    assert details["truncated_for_delivery"]["omitted"]["nested"] == "value omitted"
+    assert details["diff"] == "~ delta"
