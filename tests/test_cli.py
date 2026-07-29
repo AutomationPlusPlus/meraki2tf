@@ -2041,6 +2041,59 @@ def test_export_with_drift_baseline_reports_snapshot_drift(
     assert delivered[1]["details"]["drift_was_detected"] is True
 
 
+def test_export_drift_alert_carries_the_coverage_gaps(
+    spec_file: Path,
+    dump_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The weekly job's DRIFT_DETECTED must name the manual-rebuild list.
+
+    DRIFT_DETECTED is the WARNING-severity event that pages someone on a
+    drifted week; RUN_SUCCESS is INFO and is routinely filtered. Sent
+    before classification, the drift payload stated there were no
+    coverage gaps on an organization that had them — a false statement
+    to the operator and to anything triaging the payload.
+    """
+    _no_network(monkeypatch)
+    delivered: list[dict[str, Any]] = []
+
+    def fake_urlopen(request: Any, timeout: float) -> FakeResponse:
+        delivered.append(json.loads(request.data.decode("utf-8")))
+        return FakeResponse()
+
+    monkeypatch.setattr("meraki2tf.alerts.webhook._open", fake_urlopen)
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(
+        json.dumps(
+            {"organizationId": "org-123", "networks": [], "devices": [],
+             "features": []}
+        ),
+        encoding="utf-8",
+    )
+    exit_code = main(
+        [
+            "--spec", str(spec_file),
+            "--from-dump", str(dump_file),
+            "--dump-to", str(tmp_path / "current.json"),
+            "--drift-baseline", str(baseline),
+            "--workdir", str(tmp_path / "workspace"),
+            "--webhook-url", "https://hooks.example/dr",
+        ]
+    )
+    assert exit_code == 0
+    drift = next(e for e in delivered if e["event_type"] == "DRIFT_DETECTED")
+    success = next(e for e in delivered if e["event_type"] == "RUN_SUCCESS")
+
+    # Whatever the organization's gaps are, both payloads agree on them:
+    # the drift alert never understates what Terraform cannot rebuild.
+    assert drift["details"]["unsupported"] == success["details"]["unsupported"]
+    assert (
+        drift["details"]["unsupported_count"]
+        == success["details"]["unsupported_count"]
+    )
+
+
 def test_export_with_identical_drift_baseline_is_quiet(
     spec_file: Path,
     dump_file: Path,
