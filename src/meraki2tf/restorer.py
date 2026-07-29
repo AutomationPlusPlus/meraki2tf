@@ -1050,6 +1050,11 @@ _CAPABILITY_RE = re.compile(
     r"(?i)only supports organizations with .+ networks"
     r"|is not supported for this network"
     r"|consider upgrading your devices"
+    # "Unsupported for networks without a failover capable MX" and its
+    # siblings: the source network earns the feature by holding real
+    # hardware, which a --skip-claims drill organization never has.
+    r"|unsupported for networks without"
+    r"|requires (?:an?|at least) .{0,40}\b(?:MX|MS|MR|MG|MV|MT)\b"
 )
 
 #: Dashboard 400 texts meaning "this setting is governed by the
@@ -1122,6 +1127,28 @@ _NATURAL_MATCH_KEYS = ("name", "sgt", "shortName")
 #: saturation is the DESIGN CASE for a restore: throttled writes are
 #: transient pressure, never a verdict on the object.
 _MAX_THROTTLE_ATTEMPTS = 40
+
+#: Dashboard refusals that mean "the hardware is not talking to Meraki
+#: yet", not "this configuration is lost". A device-scoped PUT against a
+#: box that is still booting, dormant, or offline is refused with a 400
+#: of this shape — and that is the NORMAL state of freshly-claimed
+#: hardware, i.e. exactly what a post-disaster rebuild produces for
+#: every device at once. Reporting it as a plain failure would bury the
+#: genuine losses under hundreds of rows that only need a re-run once
+#: the hardware boots, so it gets its own verdict.
+_DEVICE_UNREACHABLE_MARKERS = (
+    "failed to contact device",
+    "device is offline",
+    "device is unreachable",
+    "could not contact device",
+)
+
+
+def _is_device_unreachable(error: str) -> bool:
+    """Whether a dispatch failure is 'hardware not online yet'."""
+    lowered = error.lower()
+    return any(marker in lowered for marker in _DEVICE_UNREACHABLE_MARKERS)
+
 
 #: The one configure endpoint whose payload embeds org-local catalog
 #: references (firmware version IDs) that no snapshot mapping can
@@ -1732,6 +1759,12 @@ class RestoreResult:
     executed: tuple[str, ...] = ()
     failed: tuple[tuple[str, str], ...] = ()
     skipped: tuple[dict[str, str], ...] = ()
+    #: Writes the dashboard refused because the device is not reachable
+    #: yet (see _DEVICE_UNREACHABLE_MARKERS). Held apart from ``failed``
+    #: so a mass re-claim — every box offline while it boots — does not
+    #: read as mass data loss; each one restores on a re-run once the
+    #: hardware comes online.
+    unreachable: tuple[tuple[str, str], ...] = ()
     #: action key → comma-joined secret paths that received drill
     #: placeholders (sanitized-snapshot drills only). Real secrets must
     #: be re-entered per the runbook if the org is ever kept.
@@ -2427,11 +2460,30 @@ class OrgRestorer:
                     f"{key} ({paths})" for key, paths in drill_placeholders
                 ),
             )
+        # Split the hardware-not-online-yet refusals out of the failure
+        # list only at the end, so every earlier code path (dependency
+        # accounting, salvage, journalling) keeps treating them as the
+        # failures they are for this pass.
+        unreachable = tuple(
+            entry for entry in failed if _is_device_unreachable(entry[1])
+        )
+        if unreachable:
+            logger.warning(
+                "%d device-scoped write(s) were refused because the "
+                "hardware is not reachable yet — normal for freshly "
+                "claimed devices. Re-run once the device(s) come online "
+                "to restore: %s",
+                len(unreachable),
+                ", ".join(key for key, _ in unreachable),
+            )
         return RestoreResult(
             executed=tuple(executed),
-            failed=tuple(failed),
+            failed=tuple(
+                entry for entry in failed if not _is_device_unreachable(entry[1])
+            ),
             skipped=tuple(skipped),
             drill_placeholders=tuple(drill_placeholders),
+            unreachable=unreachable,
         )
 
     def _bookkeep_success(

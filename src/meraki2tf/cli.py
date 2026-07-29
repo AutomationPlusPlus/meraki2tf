@@ -1395,6 +1395,13 @@ def _restore(config: RuntimeConfig) -> int:
         return 1
     for key, reason in result.failed:
         logger.error("Restore FAILED for %s: %s", key, reason)
+    for key, reason in result.unreachable:
+        logger.warning(
+            "Restore DEFERRED for %s: %s — the device is not reachable "
+            "yet; re-run '--restore --confirm' once it is online (the "
+            "journal resumes, so completed writes are not repeated).",
+            key, reason,
+        )
     for entry in result.skipped:
         logger.warning("Restore skipped %s: %s", entry["target"], entry["reason"])
     for key, paths in result.drill_placeholders:
@@ -1405,9 +1412,10 @@ def _restore(config: RuntimeConfig) -> int:
             key, paths,
         )
     logger.info(
-        "Restore into %s complete: %d executed, %d failed, %d skipped "
-        "(journal: %s).",
+        "Restore into %s complete: %d executed, %d failed, %d deferred "
+        "(device offline), %d skipped (journal: %s).",
         config.target_org, len(result.executed), len(result.failed),
+        len(result.unreachable),
         len(result.skipped), config.workdir / "restore-journal.jsonl",
     )
     dispatcher.dispatch(
@@ -1416,6 +1424,7 @@ def _restore(config: RuntimeConfig) -> int:
             executed=result.executed,
             failed=result.failed,
             skipped=result.skipped,
+            unreachable=result.unreachable,
         )
     )
     if result.failed:
@@ -1652,12 +1661,19 @@ def _heal(config: RuntimeConfig) -> int:
         return 1
     for key, reason in result.failed:
         logger.error("Heal FAILED for %s: %s", key, reason)
+    for key, reason in result.unreachable:
+        logger.warning(
+            "Heal DEFERRED for %s: %s — the device is not reachable yet; "
+            "re-run '--heal --confirm' once it is online.", key, reason,
+        )
     for entry in result.skipped:
         logger.warning("Heal skipped %s: %s", entry["target"], entry["reason"])
     logger.info(
-        "Heal of %s complete: %d recreated, %d failed, %d skipped, "
+        "Heal of %s complete: %d recreated, %d failed, %d deferred "
+        "(device offline), %d skipped, "
         "%d surviving object(s) untouched (journal: %s)%s.",
         config.org_id, len(result.executed), len(result.failed),
+        len(result.unreachable),
         len(result.skipped), plan.surviving_count,
         config.workdir / "heal-journal.jsonl",
         (
@@ -1675,6 +1691,7 @@ def _heal(config: RuntimeConfig) -> int:
             failed=result.failed,
             skipped=result.skipped,
             only=config.only,
+            unreachable=result.unreachable,
             snapshot_scope=(
                 tuple(heal_scope.network_ids)
                 if heal_scope is not None
