@@ -81,6 +81,7 @@ from meraki2tf.logging_setup import (
 )
 from meraki2tf.models import DiscoveryDiagnostics, NetworkGraph
 from meraki2tf.openapi_parser import OpenApiParser
+from meraki2tf.workdir_lock import WorkdirLock, WorkdirLockError
 from meraki2tf.orchestrator import (
     PipelineError,
     PipelineOrchestrator,
@@ -915,7 +916,37 @@ def _export_snapshot(
     dispatcher: AlertDispatcher,
     spec_file: Path | None = None,
 ) -> int:
-    """Discover the graph and write it as an offline snapshot (--dump-to)."""
+    """Discover the graph and write it as an offline snapshot (--dump-to).
+
+    Holds the same exclusive workdir lock the pipeline takes. An export
+    run writes coverage.json, coverage.txt, runbook.md and the
+    sanitizer salt into the workdir, so two overlapping runs interleave
+    those artifacts exactly as two overlapping pipeline runs would — and
+    the scheduled weekly job IS a --dump-to run, which made it the most
+    frequently scheduled invocation with no protection at all. A raced
+    sanitizer salt is the nastiest of the set: divergent pseudonyms
+    silently destroy week-over-week diffability.
+    """
+    assert config.dump_to is not None  # guarded by the caller
+    lock = WorkdirLock(config.workdir)
+    try:
+        lock.acquire()
+    except WorkdirLockError as exc:
+        raise PreflightRefusalError(str(exc)) from exc
+    try:
+        return _export_snapshot_locked(provider, config, parser, dispatcher, spec_file)
+    finally:
+        lock.release()
+
+
+def _export_snapshot_locked(
+    provider: MerakiDataProvider,
+    config: RuntimeConfig,
+    parser: OpenApiParser,
+    dispatcher: AlertDispatcher,
+    spec_file: Path | None = None,
+) -> int:
+    """The export body, under the workdir lock held by the caller."""
     assert config.dump_to is not None  # guarded by the caller
     with provider as source:
         graph = source.fetch_network_graph(config.org_id)
@@ -2873,12 +2904,17 @@ def _run_org_pipeline(
                     provider, config, spec_parser, dispatcher,
                     spec_file=spec_file,
                 )
-            except (ScopeFilterError, CheckpointMismatchError) as exc:
+            except (
+                ScopeFilterError,
+                CheckpointMismatchError,
+                PreflightRefusalError,
+            ) as exc:
                 # Operator input error (a --only selector matched no
-                # network, or a stale/foreign discovery checkpoint),
+                # network, or a stale/foreign discovery checkpoint) or a
+                # refused preflight (another run holds this workdir):
                 # not a processing fault: fail loudly and actionably,
                 # no alert — mirroring the HealFilterError handling in
-                # _heal.
+                # _heal. A contended workdir must not page anyone.
                 logger.critical("%s", exc)
                 return 2
             except Exception as exc:
