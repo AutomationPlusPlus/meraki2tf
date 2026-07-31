@@ -6,6 +6,13 @@ the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-07-31
+
+Promotes 1.0.0rc1 to the stable 1.0.0 release. No functional changes
+since the release candidate; the Dependabot auto-merge workflow was
+restored now that branch protection gates every merge on the full CI
+suite.
+
 ## [1.0.0rc1] - 2026-07-31
 
 ### Fixed
@@ -528,7 +535,8 @@ heal drill.
   locators, never values. Credential env-vars only — never flags or
   config keys; log redaction at every verbosity.
 
-[Unreleased]: https://github.com/AutomationPlusPlus/meraki2tf/compare/v1.0.0rc1...HEAD
+[Unreleased]: https://github.com/AutomationPlusPlus/meraki2tf/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/AutomationPlusPlus/meraki2tf/compare/v1.0.0rc1...v1.0.0
 [1.0.0rc1]: https://github.com/AutomationPlusPlus/meraki2tf/compare/v0.2.0...v1.0.0rc1
 [0.2.0]: https://github.com/AutomationPlusPlus/meraki2tf/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/AutomationPlusPlus/meraki2tf/releases/tag/v0.1.0
