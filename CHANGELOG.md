@@ -6,6 +6,8 @@ the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.0rc1] - 2026-07-31
+
 ### Fixed
 - `meraki2tf.__version__` now derives from the installed distribution
   metadata (the single source of truth in `pyproject.toml`) instead of
@@ -526,6 +528,7 @@ heal drill.
   locators, never values. Credential env-vars only — never flags or
   config keys; log redaction at every verbosity.
 
-[Unreleased]: https://github.com/AutomationPlusPlus/meraki2tf/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/AutomationPlusPlus/meraki2tf/compare/v1.0.0rc1...HEAD
+[1.0.0rc1]: https://github.com/AutomationPlusPlus/meraki2tf/compare/v0.2.0...v1.0.0rc1
 [0.2.0]: https://github.com/AutomationPlusPlus/meraki2tf/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/AutomationPlusPlus/meraki2tf/releases/tag/v0.1.0
